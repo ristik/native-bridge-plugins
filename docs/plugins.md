@@ -81,5 +81,5 @@ Full-token scans run before SDK byte decoding and also gate decoded-token verifi
 refresh. Nested J/PDR/UC/value/reason/predicate-code CBOR shares the outer depth/item budget. Every ordinary and
 embedded UC has the 16 KiB limit, native summary/shard/path/signature/node-ID sublimits and the
 supported 65-byte signature encoding. Embedded UC, ordinary UC-tree paths and RSMT paths share
-one cumulative 2048-step budget. The provisional fixtures are still separate from the missing
-authenticated PR2 corpus; corpus CI remains a merge gate.
+one cumulative 2048-step budget. The independent constructor fixtures are separate from the released Go corpus;
+corpus integrity/regeneration and joined component CI check their respective boundaries.
