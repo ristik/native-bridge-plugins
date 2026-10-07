@@ -1,0 +1,183 @@
+$ python3 -B -m unittest discover -s tests/joined -v
+log-sha256: 23a43c19c3e290d6851c86dafe19bb458c5dbbd25a15b24306e23fd9544035be
+test_compiler_wait_uses_untruncated_executable (test_harness.EvidenceGuards.test_compiler_wait_uses_untruncated_executable) ... WAIT: another build is active; no parallel heavy builds
+ok
+test_component_green_never_means_live_acceptance (test_harness.EvidenceGuards.test_component_green_never_means_live_acceptance) ... ok
+test_dirty_pinned_source_is_refused (test_harness.EvidenceGuards.test_dirty_pinned_source_is_refused) ... ok
+test_failed_component_cannot_be_hidden_by_blocker (test_harness.EvidenceGuards.test_failed_component_cannot_be_hidden_by_blocker) ... ok
+test_untracked_source_is_refused (test_harness.EvidenceGuards.test_untracked_source_is_refused) ... ok
+test_wrong_source_revision_is_refused (test_harness.EvidenceGuards.test_wrong_source_revision_is_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 2.570s
+
+OK
+
+$ python3 -B tests/joined/mutate.py
+log-sha256: 21973bd202110e37768118ad01c33034eb69f0c13db55477314b09b80312893d
+KILLED test_wrong_source_revision_is_refused
+KILLED test_dirty_pinned_source_is_refused
+KILLED test_failed_component_cannot_be_hidden_by_blocker
+KILLED test_component_green_never_means_live_acceptance
+
+$ python3 -B -m unittest discover -s tests/interop -v
+log-sha256: 2385726a79afbf84898edbd5584560ac122433e84d9452954675208b0ec12972
+test_bad_hash (test_manifest.ManifestTests.test_bad_hash) ... ok
+test_chain_overflow (test_manifest.ManifestTests.test_chain_overflow) ... ok
+test_duplicate_vault (test_manifest.ManifestTests.test_duplicate_vault) ... ok
+test_missing_embedded_policy_pin (test_manifest.ManifestTests.test_missing_embedded_policy_pin) ... ok
+test_nonempty_aggregator_prefix (test_manifest.ManifestTests.test_nonempty_aggregator_prefix) ... ok
+test_numeric_chain_id (test_manifest.ManifestTests.test_numeric_chain_id) ... ok
+test_old_epoch_bundle_rejected (test_manifest.ManifestTests.test_old_epoch_bundle_rejected) ... ok
+test_old_protocol (test_manifest.ManifestTests.test_old_protocol) ... ok
+test_sdk_network_range (test_manifest.ManifestTests.test_sdk_network_range) ... ok
+test_structural_offline_manifest (test_manifest.ManifestTests.test_structural_offline_manifest) ... ok
+test_trust_document_digest_required (test_manifest.ManifestTests.test_trust_document_digest_required) ... ok
+test_trust_update_fields_rejected (test_manifest.ManifestTests.test_trust_update_fields_rejected) ... ok
+test_unknown_fields (test_manifest.ManifestTests.test_unknown_fields) ... ok
+test_wrong_coin (test_manifest.ManifestTests.test_wrong_coin) ... ok
+test_wrong_registry_key (test_manifest.ManifestTests.test_wrong_registry_key) ... ok
+test_wrong_trust_network (test_manifest.ManifestTests.test_wrong_trust_network) ... ok
+test_pinned_oracle_ignores_dirty_worktree_and_compares_bytes (test_regenerate.RegenerateTests.test_pinned_oracle_ignores_dirty_worktree_and_compares_bytes) ... ok
+test_digest_mismatch (test_sdk_trust.FixedSdkTrustTests.test_digest_mismatch) ... ok
+test_epoch_overflow_rejected (test_sdk_trust.FixedSdkTrustTests.test_epoch_overflow_rejected) ... ok
+test_exact_installed_bytes (test_sdk_trust.FixedSdkTrustTests.test_exact_installed_bytes) ... ok
+test_non_unit_weight_rejected (test_sdk_trust.FixedSdkTrustTests.test_non_unit_weight_rejected) ... ok
+test_unsupported_document_version (test_sdk_trust.FixedSdkTrustTests.test_unsupported_document_version) ... ok
+test_wrong_count_quorum_rejected (test_sdk_trust.FixedSdkTrustTests.test_wrong_count_quorum_rejected) ... ok
+test_abandoned_trust_model_rejected (test_vectors.CorpusTests.test_abandoned_trust_model_rejected) ... ok
+test_deleted_file_rejected (test_vectors.CorpusTests.test_deleted_file_rejected) ... ok
+test_extra_file_rejected (test_vectors.CorpusTests.test_extra_file_rejected) ... ok
+test_failed_import_preserves_destination (test_vectors.CorpusTests.test_failed_import_preserves_destination) ... ok
+test_floating_oracle_rejected (test_vectors.CorpusTests.test_floating_oracle_rejected) ... ok
+test_import_and_check (test_vectors.CorpusTests.test_import_and_check) ... ok
+test_manifest_digest_rejected (test_vectors.CorpusTests.test_manifest_digest_rejected) ... ok
+test_missing_digest_rejected (test_vectors.CorpusTests.test_missing_digest_rejected) ... ok
+test_mutated_fixture_rejected (test_vectors.CorpusTests.test_mutated_fixture_rejected) ... ok
+test_old_normative_pins_rejected (test_vectors.CorpusTests.test_old_normative_pins_rejected) ... ok
+test_old_protocol_rejected (test_vectors.CorpusTests.test_old_protocol_rejected) ... ok
+test_sdk_document_fixture_mutation_rejected (test_vectors.CorpusTests.test_sdk_document_fixture_mutation_rejected) ... ok
+test_semantic_profile_pin_rejected (test_vectors.CorpusTests.test_semantic_profile_pin_rejected) ... ok
+test_symlink_rejected (test_vectors.CorpusTests.test_symlink_rejected) ... ok
+test_wrong_consumer_pin_rejected (test_vectors.CorpusTests.test_wrong_consumer_pin_rejected) ... ok
+test_wrong_profile_version_rejected (test_vectors.CorpusTests.test_wrong_profile_version_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 39 tests in 124.935s
+
+OK
+
+$ npm test --workspace @unicitylabs/native-bridge-plugin (local serial runner)
+log-sha256: 41ed2d45b1c1600ad14e4fda386c4c5309b010dcea2bfdc75a5f48f6636b8e40
+
+> @unicitylabs/native-bridge-plugin@0.1.0 test
+> tsx --test test/*.test.ts
+
+✔ return envelope round trips and passes policy and anchor checks (2243.307214ms)
+✔ envelope framing is canonical (1265.156948ms)
+✔ policy check names each tuple mismatch (1200.203063ms)
+✔ input record opening is bound to the anchor (1055.863661ms)
+✔ refresh to a later anchor preserves t and J and verifies (1914.601169ms)
+✔ refresh changing t or certification data is rejected (347.173448ms)
+✔ proofs at different roots cannot be assembled into one return (1035.8671ms)
+✔ aggregator certificates are checked against the pinned policy and the SDK quorum (1775.026888ms)
+✔ deployment registry rejects duplicates (58.486939ms)
+✔ the committed fixtures are exactly what the TypeScript constructors generate (8125.767347ms)
+✔ every fixture replays to its recorded verdict (4293.087742ms)
+✔ native Go PDR encoding and both hash preimages match independent construction (16.869829ms)
+✔ baseline lock proof verifies (1778.993527ms)
+✔ cfg and trustBaseId must match the installed deployment and trust base (423.40667ms)
+✔ quorum: one short is rejected, three of four is enough, strangers add nothing (1955.721449ms)
+✔ certificate guards: false root, wrong network, wrong epoch, round before start (1142.976769ms)
+✔ EVM partition, shard and configuration pins (2552.826681ms)
+✔ header bindings (1361.609018ms)
+✔ account and storage proofs: mutated, extra, missing, empty nodes (2904.70835ms)
+✔ a digest with leading zero bytes round trips through the stored word (1329.034594ms)
+✔ certificates outside the SDK-decodable subset are unsupported (182.342662ms)
+✔ node count, node size and combined bytes boundaries (749.417919ms)
+✔ certificate, header and PDR boundaries (452.629952ms)
+✔ over-bound evidence never triggers online fallback; justification is bounded first (133.771087ms)
+✔ proof arity and version are exact (97.256789ms)
+﹣ DEFERRED: rotation, weighted and historical-committee scenarios are unsupported (0.280369ms) # common SDK trust-base work (bft-core#421)
+✔ a schema-shaped manifest loads the recomputed deployment and installs under the pinned document (182.54317ms)
+✔ every identity and profile field is recomputed or rejected (1845.179823ms)
+✔ installed artifacts must match their pins and the genesis PDR must yield the pinned configuration (141.844794ms)
+✔ symbol is not identity (32.635451ms)
+✔ the registry key must be the tokenTypeHex and a replaced vault may not equal the active one (55.459852ms)
+✔ the pinned document digest must be the installed trust input (91.090884ms)
+✔ endpoints and locations are installation metadata, never verification inputs (22.566575ms)
+✔ verifier sources contain no network or filesystem capability (74.121453ms)
+✔ receipt verification succeeds with the network disabled (1093.323803ms)
+✔ rlp rejects every non-canonical form (91.30796ms)
+✔ mpt accepts the exact path and nothing else (69.095965ms)
+✔ mpt embedded children and single-entry tries (2.420476ms)
+✔ hex-prefix flags are validated (0.712603ms)
+✔ identifier derivations follow the family domain string (1.96159ms)
+✔ value envelope bytes are exact (1.089385ms)
+✔ cfg and policy round trip; deployment construction rejects forged identity (608.046434ms)
+✔ header fields are each pinned (2.276438ms)
+✔ ordinary UC byte limit is enforced before SDK decoding and on decoded tokens (6957.369126ms)
+✔ native UC sublimits apply equally to ordinary and standalone embedded UCs (288.503675ms)
+✔ UC tree paths and RSMT paths share the full-token cumulative budget (2121.484229ms)
+✔ nested payloads share depth and item budgets with the outer token (480.939819ms)
+✔ an otherwise valid receipt cannot hide an oversized ordinary UC in unknown signatures (233.226601ms)
+✔ the cumulative path boundary includes the immutable embedded certificate (2207.430728ms)
+✔ embedded UC rule is the SDK count quorum (1014.789293ms)
+✔ embedded UC rejects false root and wrong network like the SDK (202.199082ms)
+✔ an unknown or wrong-key signer adds nothing (177.731439ms)
+✔ non-unit or non-matching configurations are rejected at installation (145.082017ms)
+✔ installed document must hash to the pin and parse (111.438148ms)
+✔ the SDK base round trips to the pinned document bytes (the id hashes B) (9.538578ms)
+✔ a foreign epoch inside a lock proof is rejected end to end (458.233858ms)
+﹣ DEFERRED: weighted acceptance, historical/current committees, rotation, seal parity (0.229882ms) # common SDK trust-base work (bft-core#421); unsupported in the current bridge profile
+✔ the published SDK trust-base fixture installs, and its digest is the trustBaseId (12.073664ms)
+✔ receipt with transfers exports leaves in order (1647.221065ms)
+✔ return with terminal burn commits the release and the nullifier (1101.792719ms)
+✔ prague header with requestsHash verifies (645.432861ms)
+✔ explicit deadlines bound the leaf time strictly (872.413833ms)
+✔ deadline equal to or below the leaf time is expired; one above is fine (859.767787ms)
+✔ transfer deadline equal to the leaf time is expired (213.085498ms)
+✔ an old transaction never expires because the anchor is later (548.847941ms)
+✔ certification data deadline must equal the transaction deadline, including null (382.951234ms)
+✔ leaf time after the anchor is rejected, equal is accepted (794.272106ms)
+✔ mutating only the proofs reference time breaks the path (363.82495ms)
+✔ mint binding rejections each name their guard (832.317894ms)
+✔ value envelope variants are each rejected (761.55678ms)
+✔ old and foreign justifications are rejected (224.922641ms)
+✔ justification fields name the allow-listed deployment (337.95061ms)
+✔ strict unlock: length, scalars, recovery id and parity (1631.621568ms)
+✔ a mint signed by a non-minter key is rejected (142.196528ms)
+✔ intermediate transfer data, early burn, wrong terminal shapes (774.235169ms)
+✔ burn reason rules (903.413424ms)
+✔ nullifier excludes time, paths and unlock representation (1263.971654ms)
+✔ transfer count budget: 64 verify, 65 is a budget failure (13356.320227ms)
+✔ compact history projection round trips and rejects malformed bytes (594.802436ms)
+✔ prepareLock binds cfg, nonce, amount, id and recipient (11.169511ms)
+✔ relation alone enforces certification data deadline equality (209.967549ms)
+✔ relation alone enforces t strictly below the deadline (326.20137ms)
+✔ receive and export gate on full-history verification (2899.325625ms)
+✔ validation cache is bound to token bytes, trust digest and revisions (2172.812296ms)
+✔ burn is gated before the wallet acts and the burned blob is rechecked (3353.656931ms)
+✔ burnForReturn journals the verified blob before the burn is acknowledged (3220.949466ms)
+✔ burnForReturn does not acknowledge when the journal write fails (2519.609304ms)
+✔ recoverPendingBurns re-journals a settled burn after interruption (829.836865ms)
+✔ mint pre-check verifies the certified EVM lock before submission (263.953176ms)
+✔ return proof assembly with an optional untrusted transport (1442.588366ms)
+✔ SDK seam: NativeBridgeTokenVerifier composes SDK and strict verification (1236.2697ms)
+✔ SDK context registers the justification verifier and one issuance policy per type (564.064416ms)
+✔ claim calldata is the guarded pull payment selector and arguments (1.246749ms)
+✔ burn result must extend the requested token and credit the requested recipient (8002.673838ms)
+✔ durable handoff survives adapter restart, including interrupted burn recovery (4464.763941ms)
+ℹ tests 95
+ℹ suites 0
+ℹ pass 93
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 2
+ℹ todo 0
+ℹ duration_ms 36837.094843
+
+$ node_modules/.bin/tsx tests/joined/construct.ts (prefix assertions, same bytes as CI)
+log-sha256: bf58f281b9f4fe23b755b1b7b509fabd648a319cc3680f1f3cfe92316e59de64
+constructed 5 B2 requests and 9 SDK3 leaf paths; refresh preserves J/M/T/CD/t/nullifier
+

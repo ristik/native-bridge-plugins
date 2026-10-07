@@ -31,10 +31,38 @@ Source checks reject floating revisions and dirty checkouts; four isolated
 mutation probes catch source-pin, cleanliness, failed-step and false-acceptance
 regressions. Green component commands still produce exit 2 / BLOCKED.
 
-Local component results and immutable log hashes will be recorded after the
-serial run completes. CI uploads the complete command logs and generated join
-artifact; it fails if any component fails or is omitted. Its green result means
-**component checks passed with live acceptance blocked**.
+The [joined CI run](https://github.com/ristik/native-bridge-plugins/actions/runs/37662677997)
+passed all 20 component commands on branch head `44bb3ccd114f3d6ce06d3780e5fa59c8cf2a807e`.
+GitHub tested merge commit `c1936a7038b66df2df5460a520defcb1612ea97d`, whose
+parents are that head and the accepted plug-in baseline. The full
+[artifact](https://github.com/ristik/native-bridge-plugins/actions/runs/37662677997/artifacts/11501832944)
+contains every log, the exact generated join bytes and resolved B2 build lock.
+The [raw report](pr6-components.json) preserves commands, timings, toolchains,
+harness input hashes and artifact digests. All recorded hashes were verified,
+and the local TS join bytes reproduce the CI join byte-for-byte.
+
+| Check | Result / evidence boundary |
+| --- | --- |
+| TS plug-in suite | CI: 92 passed / 3 skipped; local: 93 passed / 2 deferred skips |
+| Network-disabled receipt | Passed locally; Linux CI sandbox unavailable and explicitly skipped |
+| Rust suite | 150 passed / 4 ignored deferred scenarios; fmt, clippy and alloc-only check passed |
+| SDK3 aggregator join | 9 codec/leaf/path positives; 27 isolated sentinel rejections |
+| Merged B2 library | 5 exact-ABI cases; exact gas and gas-1 OOG; framing and outer input budget refusals |
+| Go oracle | Targeted bridgeprofile and b1ref passed; released corpus regenerated exactly |
+| Contract goldens | Byte-identical regeneration; all 68 shared values agree with merged corpus |
+| Foundry bridge suite | 239 passed / 0 failed / 0 skipped, including custody invariants; native precompiles are doubles |
+| Evidence guards | 6 tests passed; 4/4 isolated guard removals killed |
+| Local Python interop | 39 passed |
+
+The [local check logs](evidence/local-checks.log) preserve the platform-specific
+receipt and guard results. Local compiled phases were stopped **while queued**
+after the isolated CI run passed, avoiding a parallel build with another agent's
+ureth compilation. No local native build is counted as completed.
+
+The driver observed provisional B2 charges of 38,160 (prepare), 91,200 (mint)
+and 133,280 (return/refresh/invalid unlock). These are deterministic library
+charges, not full-transaction gas benchmarks or measured activation budgets.
+CI's green result means **component checks passed with live acceptance blocked**.
 
 The synthetic SDK world binds the real plug-in's offline certified EVM lock
 proof to mint -> transfer -> burn. The resulting leaves and compact history
