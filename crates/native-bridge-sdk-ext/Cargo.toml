@@ -5,13 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+description = "Native Unicity bridge extensions over the unicity-token SDK (v3.0.1): lock-proof verification, strict history semantics, return-proof assembly."
 
 [features]
-default = ["alloc"]
+default = ["alloc", "host"]
 alloc = []
-host = ["alloc"]
+# Host conveniences: std error integration, JSON trust-document and manifest loading.
+host = ["alloc", "unicity-token/std", "k256/std", "sha2/std", "sha3/std", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 unicity-token = { git = "https://github.com/unicitynetwork/state-transition-sdk-rust.git", tag = "v3.0.1", default-features = false, features = ["alloc"] }
 k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "alloc"] }
 sha2 = { version = "=0.10.9", default-features = false }
+sha3 = { version = "=0.10.9", default-features = false }
+num-bigint = { version = "=0.4.8", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+unicity-token = { git = "https://github.com/unicitynetwork/state-transition-sdk-rust.git", tag = "v3.0.1", features = ["std", "client"] }
