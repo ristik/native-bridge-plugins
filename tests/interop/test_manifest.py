@@ -72,6 +72,21 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'bytes digest mismatch'):
             p.validate_manifest(self.registry)
 
+    def test_sdk_network_range(self):
+        for network in (0, 1, 65535, 65536):
+            for trust_only in (False, True):
+                with self.subTest(network=network, trust_only=trust_only):
+                    registry = synthetic()
+                    entry = next(iter(registry.values()))
+                    entry['trustBase']['networkId'] = network
+                    if not trust_only:
+                        entry['networkId'] = network
+                    if 1 <= network <= 65535:
+                        p.validator().validate(registry)
+                    else:
+                        with self.assertRaises(ValidationError):
+                            p.validator().validate(registry)
+
     def test_wrong_trust_network(self):
         self.entry['trustBase']['networkId'] = 2
         with self.assertRaisesRegex(AssertionError, 'trust anchor mismatch'):
