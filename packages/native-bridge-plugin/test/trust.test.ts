@@ -80,13 +80,13 @@ test('the published SDK trust-base fixture installs, and its digest is the trust
   const { readFileSync } = await import('node:fs');
   const file = new URL('../../../protocol/vectors/config/sdk-root-trust-base.json', import.meta.url);
   const bytes = new Uint8Array(readFileSync(file));
-  assert.equal(bytes.length, 358);
-  const pin = 'e503a064a16d43c5ad3d53bb8b859667781a349f26e7d4ca03446652741d3c08';
+  assert.equal(bytes.length, 524);
+  const pin = 'e5454ae4fe566b05dab8c1b15c88a05356b8816b1cd66a2b7adcce184af27fb5';
   const t = TrustInput.fromJson(bytes, Buffer.from(pin, 'hex'));
   assert.equal(Buffer.from(t.id).toString('hex'), pin);
-  assert.equal(t.base.networkId.id, 1);
-  assert.equal(t.base.epoch, 7n);
-  assert.equal(t.base.epochStartRound, 100n);
+  assert.equal(t.base.networkId.id, 3);
+  assert.equal(t.base.epoch, 1n);
+  assert.equal(t.base.epochStartRound, 0n);
   // The same bytes re-emitted by the SDK are the same bytes (id = SHA256(B)).
   const b = new TextEncoder().encode(JSON.stringify(t.base.toJSON()));
   assert.deepEqual(b, bytes);

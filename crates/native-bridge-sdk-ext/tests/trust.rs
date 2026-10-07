@@ -254,16 +254,16 @@ fn the_published_sdk_trust_base_fixture_installs_with_its_digest_as_the_id() {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../protocol/vectors/config/sdk-root-trust-base.json");
     let bytes = std::fs::read(p).unwrap();
-    assert_eq!(bytes.len(), 358);
+    assert_eq!(bytes.len(), 524);
     let pin: [u8; 32] =
-        from_hex("e503a064a16d43c5ad3d53bb8b859667781a349f26e7d4ca03446652741d3c08")
+        from_hex("e5454ae4fe566b05dab8c1b15c88a05356b8816b1cd66a2b7adcce184af27fb5")
             .unwrap()
             .try_into()
             .unwrap();
     let t = TrustInput::from_json(&bytes, &pin).unwrap();
     assert_eq!(t.id(), pin);
-    assert_eq!(t.base().network_id.id(), 1);
-    assert_eq!(t.base().epoch, 7);
-    assert_eq!(t.base().epoch_start_round, 100);
+    assert_eq!(t.base().network_id.id(), 3);
+    assert_eq!(t.base().epoch, 1);
+    assert_eq!(t.base().epoch_start_round, 0);
     assert_eq!(t.base().root_nodes.len(), 1);
 }
