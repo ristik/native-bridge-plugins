@@ -1,0 +1,38 @@
+name: plugins
+on:
+  pull_request:
+  push:
+    branches: [main, pr3/plugins]
+permissions:
+  contents: read
+jobs:
+  rust-extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: alloc-only core builds for wasm
+        run: cargo check --locked -p native-bridge-sdk-ext --no-default-features --target wasm32-unknown-unknown
+      - name: receipt verification with the network namespace removed
+        run: cargo test --locked -p native-bridge-sdk-ext --test manifest_and_offline receipt_verification_succeeds_with_the_network_disabled -- --exact --nocapture
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: fixtures are exactly what the TypeScript constructors generate
+        run: |
+          cd packages/native-bridge-plugin
+          npx tsx scripts/gen-fixtures.ts > /tmp/fixtures.json
+          diff /tmp/fixtures.json ../../tests/interop/fixtures.json
+      - name: browser entry loads without Node built-ins in the bundle
+        run: |
+          npx --yes esbuild@0.23.1 packages/native-bridge-plugin/src/index.ts --bundle --platform=browser --format=esm --outfile=/tmp/browser-bundle.js
+          ! grep -E 'node:(fs|net|http|https|child_process)' /tmp/browser-bundle.js

@@ -13,14 +13,24 @@
     }
   },
   "files": [
-    "lib"
+    "lib",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@unicitylabs/state-transition-sdk": "3.0.1",
-    "@unicitylabs/bridge-core": "file:../../vendor/unicitylabs-bridge-core-0.1.0-bridge.2.tgz"
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "@unicitylabs/bridge-core": "file:../../vendor/unicitylabs-bridge-core-0.1.0-bridge.2.tgz",
+    "@unicitylabs/state-transition-sdk": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.14",
+    "tsx": "4.19.2"
   }
 }

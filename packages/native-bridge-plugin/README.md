@@ -1,14 +1,13 @@
-# @unicitylabs/native-bridge-plugin 0.1.0
+# @unicitylabs/native-bridge-plugin
 
-Private skeleton: exports only profile constants. No verifier or wallet policy
-is implemented yet; callers must not treat this package as issuance authority.
-PR3 adds createNativeBridgePlugin, bridgeTokenPlugin, verifyNativeToken,
-mintBridgedToken, burnForReturn, buildReturnProof and claim, with strict wrappers
-and a network-incapable verification API. Construction/submission has separate
-optional transport. Native identity types stay local; do not cast unicity-native
-into bridge-core's tron|eip155 ChainFamily. Standard BridgePayments defaults to
-null deadlines; explicit native options bypass its deadline-less interface.
+Native bridge plug-in over `@unicitylabs/state-transition-sdk@3.0.1` and
+`@unicitylabs/bridge-core@0.1.0-bridge.2`. Not published (`private`); see `docs/plugins.md` at the
+repository root.
 
-Verification uses one fixed unit-weight SDK RootTrustBase and the existing SDK
-count quorum. Trust-base updates/fetching, arbitrary weights and epoch evolution
-are deferred to common SDK work (#421), not implemented by this plug-in.
+```ts
+const trust = TrustInput.fromJson(documentBytes, pinnedTrustBaseId);
+const bridge = new NativeBridge(loadManifests(manifestJson), trust);
+await bridge.verifyNativeTokenBytes(tokenBytes, 'receipt'); // fully offline
+```
+
+License: MIT OR Apache-2.0.
