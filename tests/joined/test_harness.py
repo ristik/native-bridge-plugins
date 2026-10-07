@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('joined', Path(__file__).with_name('run.py'))
 joined = importlib.util.module_from_spec(spec)
@@ -17,6 +18,14 @@ class EvidenceGuards(unittest.TestCase):
 
     def test_failed_component_cannot_be_hidden_by_blocker(self):
         self.assertEqual(joined.acceptance_status([{'status': 'PASS'}, {'status': 'FAIL'}]), ('FAIL', 1))
+
+    def test_compiler_wait_uses_untruncated_executable(self):
+        with patch.object(joined.subprocess, 'check_output', side_effect=[
+            '/Users/test/.rustup/toolchains/stable/bin/cargo test --no-run\n', '',
+        ]) as ps, patch.object(joined.time, 'sleep') as sleep:
+            joined.wait_for_compilers()
+            sleep.assert_called_once_with(30)
+            ps.assert_called_with(['ps', '-axo', 'args='], text=True)
 
     def repo(self, p):
         def git(*args):

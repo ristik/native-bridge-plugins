@@ -2,7 +2,7 @@ name: joined components
 on:
   pull_request:
   push:
-    branches: [main, nbp/pr6-joined-acceptance]
+    branches: [main]
 permissions:
   contents: read
 jobs:
