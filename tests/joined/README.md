@@ -10,7 +10,7 @@ requires exact clean checkouts; the plug-in implementation and released corpus
 must match the accepted baseline. Harness changes do not alter protocol bytes.
 
 Prepare clean worktrees named `nbp-pr6-{ureth,contracts,oracle,aggregator}` under
-a source directory at the commits in `pins.json`. Initialize the contracts'
+a source directory outside this repository at the commits in `pins.json`. Initialize the contracts'
 submodules. Install Node >=22, Python with `tools/requirements.txt`, Go >=1.25,
 Rust stable (rustfmt/clippy), and Foundry 1.8.1 / solc 0.8.37 on PATH.
 

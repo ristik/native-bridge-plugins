@@ -38,12 +38,12 @@ jobs:
       - name: Fetch exact component sources
         run: |
           python3 - <<'PY'
-          import json, pathlib, subprocess
+          import json, os, pathlib, subprocess
           pins = json.load(open('tests/joined/pins.json'))['sources']
           urls = {'ureth': 'ristik/ureth', 'contracts': 'ristik/unicity-pos-contracts',
                   'oracle': 'ristik/bft-core', 'aggregator': 'unicitynetwork/aggregator-go'}
           for key, repo in urls.items():
-              path = pathlib.Path('.joined-sources') / ('nbp-pr6-' + key)
+              path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'joined-sources' / ('nbp-pr6-' + key)
               subprocess.run(['git', 'init', str(path)], check=True)
               subprocess.run(['git', '-C', str(path), 'remote', 'add', 'origin', 'https://github.com/' + repo + '.git'], check=True)
               subprocess.run(['git', '-C', str(path), 'fetch', 'origin', pins[key]], check=True)
@@ -54,7 +54,7 @@ jobs:
       - name: Serial component run (live acceptance must remain blocked)
         run: |
           set +e
-          python3 tests/joined/run.py --sources .joined-sources --out /tmp/joined-evidence
+          python3 tests/joined/run.py --sources "$RUNNER_TEMP/joined-sources" --out /tmp/joined-evidence
           result=$?
           set -e
           test "$result" -eq 2

@@ -4,4 +4,3 @@ target/
 .venv/
 __pycache__/
 *.pyc
-.joined-sources/
