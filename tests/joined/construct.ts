@@ -7,6 +7,7 @@ import { DataHasherFactory } from '@unicitylabs/state-transition-sdk/lib/crypto/
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/HashAlgorithm.js';
 import { NodeDataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/NodeDataHasher.js';
 import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radix/SparseMerkleTree.js';
+import { CborDeserializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 import { concat, toHex } from '../../packages/native-bridge-plugin/src/bytes.js';
 import { projectToken, prepareLock, type Outcome } from '../../packages/native-bridge-plugin/src/history.js';
@@ -40,8 +41,9 @@ const paths: unknown[] = [];
 function add(name: string, op: bigint, payload: Uint8Array, o: Outcome) {
   cases.push({ name, request: toHex(request(op, payload)), expected: toHex(result(o)) });
 }
-add('prepare', 0n, arr(u(s.nonce), bs(s.amount), ownerPredicate(s.owner).toCBOR()),
-  prepareLock(w.dep, s.nonce, s.amount, ownerPredicate(s.owner).toCBOR()));
+const prepared = prepareLock(w.dep, s.nonce, s.amount, ownerPredicate(s.owner).toCBOR());
+add('prepare', 0n, arr(u(s.nonce), bs(s.amount), ownerPredicate(s.owner).toCBOR()), prepared);
+let previous: { tx: Uint8Array; cd: Uint8Array; t: bigint }[] = [];
 let burned: Awaited<ReturnType<typeof buildToken>> | undefined;
 for (const [name, steps, expect] of [
   ['mint', [], 'receipt'],
@@ -50,6 +52,13 @@ for (const [name, steps, expect] of [
 ] as const) {
   const out = await buildToken(w, s, [...steps], t, ts);
   const verified = await w.bridge.verifyNativeTokenBytes(out.bytes, expect);
+  const committed = [out.token.genesis, ...out.token.transactions].map(c => ({
+    tx: CborDeserializer.decodeArray(c.toCBOR(), 2)[0],
+    cd: c.inclusionProof.certificationData.toCBOR(), t: c.inclusionProof.referenceTime,
+  }));
+  assert.deepEqual(committed.slice(0, previous.length), previous, 'flow must extend exactly the prior certified history');
+  previous = committed;
+  if (name === 'mint') assert.deepEqual({ ...verified.outcome, leaves: [] }, prepared);
   // Operation 1 is pure mint; receipt verification above covers the transfer.
   if (name !== 'transfer') add(name, expect === 'return' ? 2n : 1n, projectToken(out.token), verified.outcome);
   if (name === 'burn') burned = out;

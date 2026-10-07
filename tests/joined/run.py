@@ -39,7 +39,7 @@ def wait_for_compilers():
     # Do not compete with an agent building the full client on a 16 GB host.
     deadline = time.monotonic() + 3600
     while True:
-        rows = subprocess.check_output(['ps', '-axo', 'comm=,args='], text=True).splitlines()
+        rows = subprocess.check_output(['ps', '-axo', 'args='], text=True).splitlines()
         active = [r for r in rows if Path(r.split()[0]).name in ('cargo', 'rustc', 'solc')
                   or (Path(r.split()[0]).name == 'go' and any(x in r for x in (' test ', ' build ', ' run ')))]
         if not active:
