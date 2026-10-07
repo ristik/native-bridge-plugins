@@ -20,17 +20,15 @@ class RegenerateTests(unittest.TestCase):
             oracle, corpus = tmp / 'oracle', tmp / 'corpus'
             (oracle / 'cmd/test-generator').mkdir(parents=True)
             (oracle / 'go.mod').write_text('module test.invalid/oracle\n\ngo 1.22\n')
-            program = '''package main
-import ("os"; "path/filepath")
-func main() {
-  out := os.Args[1]
-  for _, family := range []string{"config","wire","unlock","policy","lock","history","proof","return","vault"} {
-    if err := os.MkdirAll(filepath.Join(out, family), 0755); err != nil { panic(err) }
-    if err := os.WriteFile(filepath.Join(out, family, "synthetic.json"), []byte("{}\\n"), 0644); err != nil { panic(err) }
-  }
-  if err := os.WriteFile(filepath.Join(out, "config", "semantic-profile.json"), []byte("{}\\n"), 0644); err != nil { panic(err) }
-}
-'''
+            profile = (ROOT / 'protocol/profile-v2.json').read_bytes()
+            files = {f'{family}/synthetic.json': '{}\n' for family in v.FAMILIES}
+            files['config/semantic-profile.json'] = profile.decode()
+            for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
+                files['config/' + name] = (ROOT / 'protocol/vectors/config' / name).read_text()
+            entries = ',\n'.join(json.dumps(name) + ':' + json.dumps(data) for name, data in files.items())
+            program = 'package main\nimport ("os"; "path/filepath")\nfunc main() {\n'
+            program += 'files := map[string]string{\n' + entries + ',\n}\n'
+            program += 'for name, data := range files { path := filepath.Join(os.Args[1],name); if err := os.MkdirAll(filepath.Dir(path),0755); err != nil {panic(err)}; if err := os.WriteFile(path,[]byte(data),0644); err != nil {panic(err)} }\n}\n'
             (oracle / 'cmd/test-generator/main.go').write_text(program)
             def git(*args):
                 return subprocess.check_output(['git', '-C', str(oracle), *args], stderr=subprocess.DEVNULL, text=True).strip()
@@ -41,8 +39,10 @@ func main() {
             for f in v.FAMILIES:
                 (corpus / f).mkdir(parents=True)
                 (corpus / f / 'synthetic.json').write_bytes(b'{}\n')
-            (corpus / 'config/semantic-profile.json').write_bytes(b'{}\n')
-            provenance = {'protocolVersion': 2, 'sdkVersion': '3.0.1', 'semanticProfileSha256': v.digest(b'{}\n'), 'generator': {'repository': v.REPOSITORY, 'commit': commit, 'command': ['go', 'run', './cmd/test-generator', '{output}']}}
+            (corpus / 'config/semantic-profile.json').write_bytes(profile)
+            for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
+                (corpus / 'config' / name).write_bytes((ROOT / 'protocol/vectors/config' / name).read_bytes())
+            provenance = {'protocolVersion': 2, 'sdkVersion': '3.0.1', 'semanticProfileSha256': v.digest(profile), 'generator': {'repository': v.REPOSITORY, 'commit': commit, 'command': ['go', 'run', './cmd/test-generator', '{output}']}}
             v.seal(corpus, provenance)
             # A dirty companion checkout must never be executed.
             (oracle / 'cmd/test-generator/main.go').write_text('broken uncommitted source')

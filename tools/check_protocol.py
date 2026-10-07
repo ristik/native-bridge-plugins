@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tarfile
 import tomllib
 
@@ -47,8 +48,22 @@ def validate_manifest(registry):
             assert dep['aggregatorPolicy']['partition'] != dep['evmBackingPolicy']['partition'], 'partition collision'
             for data, expected in [(bytes.fromhex(dep['cfgHex']), dep['cfgHash']), (bytes.fromhex(dep['aggregatorPolicy']['bodyHex']), dep['aggregatorPolicy']['sha256'])]:
                 assert hashlib.sha256(data).hexdigest() == expected, 'canonical bytes digest mismatch'
-    # Full canonical Cfg/Policy parsing, artifact loading, runtime and epoch
-    # authentication are mandatory installation gates implemented in PR3.
+    # Full Cfg/Policy parsing, fixed SDK document loading/authentication, unit
+    # stakes and matching count quorum are mandatory PR3 installation gates.
+
+
+def validate_sdk_trust_document(data, expected_digest):
+    """Fixed-profile document checks only; never authenticates authority or UCs."""
+    assert hashlib.sha256(data).hexdigest() == expected_digest, 'SDK document digest mismatch'
+    doc = json.loads(data)
+    assert doc['version'] == '1', 'SDK document version'
+    assert all(node['stake'] == '1' for node in doc['rootNodes']), 'non-unit stake unsupported'
+    n = len(doc['rootNodes'])
+    assert n > 0 and doc['quorumThreshold'] == str(n - (n - 1) // 3), 'SDK count quorum mismatch'
+    for name in ('epoch', 'epochStartRound'):
+        value = doc[name]
+        assert isinstance(value, str) and value == str(int(value)) and 0 <= int(value) < 1 << 64, 'SDK epoch field outside uint64'
+    return doc
 
 
 def main():
@@ -63,6 +78,18 @@ def main():
     profile = load('protocol/profile-v2.json')
     assert profile['nativeBridgeProtocolVersion'] == 2 and profile['sdkVersion'] == '3.0.1'
     assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
+    assert profile['trustModel']['scope'] == 'fixed-sdk-root-trust-base'
+    assert profile['trustModel']['validatorStake'] == '1'
+    assert profile['trustModel']['verification'] == 'existing-sdk-3.0.1'
+    assert profile['trustModel']['deferredIssue'] == 'https://github.com/ristik/bft-core/issues/421'
+    for name, expected in profile['normativeArtifactSha256'].items():
+        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, 'normative artifact digest mismatch'
+    fixture = ROOT / 'protocol/vectors/config/sdk-root-trust-base.json'
+    provenance = load('protocol/vectors/config/sdk-root-trust-base.provenance.json')
+    assert provenance['sha256'] == 'e503a064a16d43c5ad3d53bb8b859667781a349f26e7d4ca03446652741d3c08'
+    assert len(fixture.read_bytes()) == provenance['byteLength'] == 358
+    validate_sdk_trust_document(fixture.read_bytes(), provenance['sha256'])
+    subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs')], check=True)
     assert 'NATIVE_BRIDGE_PROTO_VERSION=2' in (ROOT / 'protocol/interop.md').read_text()
     assert JS_COMMIT in (ROOT / 'protocol/interop.md').read_text()
     assert RUST_COMMIT in (ROOT / 'protocol/interop.md').read_text()

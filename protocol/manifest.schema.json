@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/ristik/native-bridge-plugins/protocol/manifest.schema.json",
   "title": "Native bridge deployment registry v1",
-  "description": "Structural validation is not authorization. Installation MUST recompute identifiers, Cfg, policies and runtime/trust pins per interop.md. Hex has no 0x. Epoch bundle pins historical keys/weights, signing profiles, activation intervals/checkpoints; locations are installation-only.",
+  "description": "Structural validation is not authorization. Installation MUST recompute identifiers, Cfg, policies and runtime/trust pins per interop.md. Hex has no 0x. Trust input is one pinned SDK RootTrustBase JSON document and its exact-file SHA-256; locations are installation-only. Fixed unit-weight committee/epoch only; trust evolution is deferred.",
   "type": "object",
   "minProperties": 1,
   "propertyNames": {
@@ -327,19 +327,20 @@
             "rootGenesisHash": {
               "$ref": "#/$defs/hash"
             },
-            "bundle": {
-              "$ref": "#/$defs/artifact"
-            },
             "format": {
-              "const": "native-epoch-indexed-v1"
+              "const": "sdk-root-trust-base-json-v1"
+            },
+            "document": {
+              "$ref": "#/$defs/artifact"
             }
           },
           "required": [
             "networkId",
             "rootGenesisHash",
-            "bundle",
+            "document",
             "format"
-          ]
+          ],
+          "description": "One installed SDK 3.0.1 RootTrustBase document B, whose exact-file SHA-256 is the immutable trustBaseId in J. Installation authenticates correspondence to network/root genesis and enforces unit stakes, matching count quorum and one fixed epoch."
         },
         "proofEndpoints": {
           "type": "array",

@@ -8,3 +8,7 @@ and a network-incapable verification API. Construction/submission has separate
 optional transport. Native identity types stay local; do not cast unicity-native
 into bridge-core's tron|eip155 ChainFamily. Standard BridgePayments defaults to
 null deadlines; explicit native options bypass its deadline-less interface.
+
+Verification uses one fixed unit-weight SDK RootTrustBase and the existing SDK
+count quorum. Trust-base updates/fetching, arbitrary weights and epoch evolution
+are deferred to common SDK work (#421), not implemented by this plug-in.

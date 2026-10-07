@@ -2,7 +2,10 @@
 
 Awaiting bft-core PR2's SDK3 candidate. VERSION, SHA256SUMS, MANIFEST.sha256 and
 provenance.json are deliberately absent; `vectors.py check` and corpus CI fail.
-.gitkeep files are scaffolding, never conformance fixtures. Do not import the
+.gitkeep files are scaffolding, never conformance fixtures. The exact SDK JSON
+fixture at config/sdk-root-trust-base.json and its provenance are published
+now; this partial set is not a released corpus or a replacement for its missing
+manifest. Candidate import MUST retain these exact bytes. Do not import the
 old `bridge-pr1-vectors-v1.json` or make up deployment/runtime pins.
 
 The candidate producer writes fixtures under all nine family directories.
@@ -13,8 +16,14 @@ and provenance. Preserve the 99 baseline IDs as mapped regressions where
 meaningful; the SDK3 corpus count/bytes need not equal the old corpus. Required
 new coverage includes deadlines/time equality and mutations, IR openings,
 refresh preserving t, all pre-3.0 shapes, exact recovery, value/issuance policy,
-embedded UC/header/MPT bindings and budgets, historical trust rotation, offline
-receipts, crash-recovered burn and nonce replay/accounting failures.
+embedded UC/header/MPT bindings and budgets, fixed-base offline receipt,
+JSON digest mismatch, missing/mismatched base, epoch mismatch rejection,
+unit-weight count-quorum boundaries, supported certificate encoding, and
+same-base refresh preserving J/M/CD/t; crash-recovered burn and nonce replay/
+accounting failures. DEFERRED under bft-core #421: arbitrary weights, mixed
+committees, trust-base append/fetch, interval closure, old-J validity through
+rotation and full B1/SDK seal acceptance parity. These are unsupported scenarios,
+not passing coverage or current-profile activation prerequisites.
 
 Provenance JSON has exactly these fields (replace metavariables with real pins):
 

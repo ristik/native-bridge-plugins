@@ -2,6 +2,9 @@
 
 Status: protocol v2, development profile; implementation and activation gates
 remain open. This document is the sole normative native byte contract.
+This unreleased v2 draft incorporates the fixed SDK trust model in
+[sdk-trust-base.md](sdk-trust-base.md); earlier epoch-bundle draft assumptions
+are abandoned, with no compatibility or acceptance promise.
 `NATIVE_BRIDGE_PROTO_VERSION=2` is independent of SDK Token.VERSION and the
 external bridge's BRIDGE_PROTO_VERSION. Any byte/derivation change MUST bump
 this version and semantic profile. Consensus parsers accept only this profile;
@@ -132,18 +135,40 @@ Native tags stay 39049 lock / 39048 return; reject external 1330002, old
 pointer-only reasons, null/unknown/split reasons and detached backing evidence.
 PDR and UC are complete canonical native encodings. UC contains InputRecord,
 shard-tree certificate, Unicity-tree certificate and quorum-signed root seal.
-`trustBaseId=H(exact canonical signer-epoch root trust artifact)` selects only
-preinstalled authority. It never supplies keys or authorizes a new trust base.
+`trustBaseId=SHA256(B)` identifies the exact installed SDK RootTrustBase JSON
+bytes defined in [sdk-trust-base.md](sdk-trust-base.md), not an epoch artifact,
+stateHash or a reconstructed Rust serialization. It MUST equal the manifest's
+installed document digest; it never authorizes keys or a different base.
 
 Receipt verification MUST have only token plus locally pinned configuration
-and trust history. It has no RPC, URL, node or witness-provider capability.
-Bound and parse canonically before allocation/crypto; match chain/vault/native
-asset/cfg and allow-listed deployment. Select signer epoch only from the pinned
-historical bundle; verify network, authenticated activation interval, native
-signing scheme, unique weighted quorum, all native UC tree folds and admitted
-EVM partition/shard/configuration. Hash PDR to UC's configuration commitment;
-match pinned execution/genesis/fork settings. Require
-`keccak256(headerRLP)==UC.InputRecord.blockHash` and
+and the single installed SDK trust base. It has no RPC, URL, node or
+witness-provider capability. Installation admits only unit-weight validators,
+one fixed epoch/committee and the SDK count threshold `N-(N-1)/3` matching the
+native deployment. Reject non-unit configuration; do not flatten weights.
+
+Bound and parse canonically before SDK allocation/crypto; match
+chain/vault/native asset/cfg and allow-listed deployment. Every ordinary and
+embedded UC seal MUST match the pinned base's network/epoch and have root round
+at least epochStartRound. Use existing SDK 3.0.1 token/UC verification as is,
+including count quorum and SDK signature acceptance. For the embedded EVM UC,
+TS calls public seal-root/quorum rules; Rust uses only the minimal composition
+of public SDK primitives described in sdk-trust-base.md because standalone UC
+verification is private. No plug-in native-weight verifier or epoch resolver.
+
+Both ordinary and embedded UCs MUST be in the canonical native/SDK-decodable
+intersection: 65-byte seal signatures with native suffix 0/1, byte-string IR summary, array-valued
+shard siblings and Unicity steps (including empty arrays), valid signature maps,
+SDK integer/key widths, and existing native/bridge bounds. Construction/import/
+refresh fail `UnsupportedCertificateEncoding` outside this subset. Never append
+a suffix to a 64-byte seal, rewrite null to empty, or mutate J. Shared positives
+use low-s correctly recoverable signatures accepted by both SDKs and native B1.
+SDK/native seal acceptance differences remain documented limitations; strict
+token-unlock recovery remains separate and unchanged.
+
+After SDK UC verification, enforce the bridge-specific pinned EVM partition,
+shard and configuration relation; hash PDR to UC's configuration commitment,
+require PDR epoch = IR epoch and match pinned execution/genesis/fork settings.
+Require `keccak256(headerRLP)==UC.InputRecord.blockHash` and
 `header.stateRoot==UC.InputRecord.hash`, using pinned header encoding.
 
 Verify account MPT key keccak256(vault20) under header.stateRoot. Canonical
@@ -162,13 +187,17 @@ after certification. Historical proof establishes permanent lock existence,
 not current spent=0. Certified single-spend history and live vault nonce guard
 have distinct roles. Historical backing has no live B1 W_cert requirement.
 
-Keep epoch-indexed keys/weights/signing profiles and authenticated intervals
-across rotation. Import successors only via authenticated native handoff or an
-explicitly pinned checkpoint, before verification. Unknown epoch returns
-`UnknownTrustEpoch` offline; never fetch or use today's keys. This applies to
-ordinary SDK proofs too. Historical keys alone cannot prevent long-range
-forgeries after retired-key compromise; a stronger freshness deployment must
-locally provision authenticated checkpoints. Tokens never initialize trust.
+J stays byte-identical after certification. Offline receipt is supported only
+under the pinned fixed base. Aggregator refresh may replace paths/UCs within
+that same base/epoch while preserving M/T, CD and original t. Another epoch or
+base is unsupported: never install it from token input, union keys or fetch it.
+
+**DEFERRED: common SDK trust-base work / unsupported in this profile** — epoch
+changes, trust-base append/fetch, arbitrary weights, mixed historical/current
+committees, interval closure, old-J validity through rotation and full B1/SDK
+seal acceptance parity. Tracked in [bft-core #421](https://github.com/ristik/bft-core/issues/421).
+No bridge-owned epoch artifact, interval sidecar or trust-history service exists.
+Native return B1 keeps its independent consensus, registry, window and ABI.
 
 ## Whole-token history and return
 
@@ -273,7 +302,8 @@ credited recipient redirects payment. Preserve custody on every verifier error.
 Schema v1 registry is keyed by tokenTypeHex (lowercase hex, no 0x).
 `manifest.schema.json` defines structural rules; application installation also
 MUST recompute identifiers, chainRef, Cfg/cfg, policy hashes, semantic-profile
-hash and runtime/trust pins, match key to tokenTypeHex, reject ambiguous
+hash and runtime/trust pins (one SDK document plus exact-file digest), match
+key to tokenTypeHex, reject ambiguous
 network/chain/vault entries and inconsistent replacement records. JSON text is
 never the Cfg preimage. Hash canonical published artifacts exactly, never an
 unspecified JSON serialization. Artifact locations are installation metadata,

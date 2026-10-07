@@ -21,6 +21,11 @@ The layout follows `unicitynetwork/unicity-bridge` at
 unicity-pos-contracts; execution in ureth; the independent semantic oracle in
 bft-core. External SDKs are dependencies, never copied or patched here.
 
+This unreleased profile supports one fixed SDK RootTrustBase, unit validator
+weights and SDK count quorum. Epoch evolution, arbitrary weights and trust-base
+append/fetch are deferred to [common SDK work #421](https://github.com/ristik/bft-core/issues/421).
+See [the exact SDK trust-document/UC contract](protocol/sdk-trust-base.md).
+
 ```sh
 npm ci
 npm run build && npm run typecheck && npm test

@@ -20,7 +20,9 @@ class CorpusTests(unittest.TestCase):
         for family in v.FAMILIES:
             (self.root / family).mkdir()
             (self.root / family / 'synthetic.json').write_text('{"testOnly":true}\n')
-        profile = b'{"testOnly":true}\n'
+        profile = (ROOT / 'protocol/profile-v2.json').read_bytes()
+        for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
+            (self.root / 'config' / name).write_bytes((ROOT / 'protocol/vectors/config' / name).read_bytes())
         (self.root / 'config/semantic-profile.json').write_bytes(profile)
         self.provenance = {'protocolVersion': 2, 'sdkVersion': '3.0.1', 'semanticProfileSha256': hashlib.sha256(profile).hexdigest(), 'generator': {'repository': v.REPOSITORY, 'commit': 'b'*40, 'command': ['go', 'run', './cmd/test-generator', '-out', '{output}']}}
         self.pin = v.seal(self.root, self.provenance)
@@ -79,6 +81,33 @@ class CorpusTests(unittest.TestCase):
         p['semanticProfileSha256'] = 'f'*64
         with self.assertRaisesRegex(v.CorpusError, 'semantic profile artifact mismatch'):
             v.seal(self.root, p)
+
+    def test_abandoned_trust_model_rejected(self):
+        import json
+        profile = json.loads((self.root / 'config/semantic-profile.json').read_bytes())
+        profile['trustModel']['scope'] = 'native-epoch-indexed-v1'
+        data = json.dumps(profile).encode()
+        (self.root / 'config/semantic-profile.json').write_bytes(data)
+        p = copy.deepcopy(self.provenance)
+        p['semanticProfileSha256'] = v.digest(data)
+        with self.assertRaisesRegex(v.CorpusError, 'unsupported trust model'):
+            v.seal(self.root, p)
+
+    def test_old_normative_pins_rejected(self):
+        import json
+        profile = json.loads((self.root / 'config/semantic-profile.json').read_bytes())
+        profile['normativeArtifactSha256']['protocol/interop.md'] = 'f' * 64
+        data = json.dumps(profile).encode()
+        (self.root / 'config/semantic-profile.json').write_bytes(data)
+        p = copy.deepcopy(self.provenance)
+        p['semanticProfileSha256'] = v.digest(data)
+        with self.assertRaisesRegex(v.CorpusError, 'normative artifact pins mismatch'):
+            v.seal(self.root, p)
+
+    def test_sdk_document_fixture_mutation_rejected(self):
+        (self.root / 'config/sdk-root-trust-base.json').write_bytes(b'{}')
+        with self.assertRaisesRegex(v.CorpusError, 'SDK trust fixture mismatch'):
+            v.seal(self.root, self.provenance)
 
     def test_old_protocol_rejected(self):
         p = copy.deepcopy(self.provenance)

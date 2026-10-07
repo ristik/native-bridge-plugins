@@ -68,6 +68,17 @@ def provenance_check(provenance):
     require(not any('{' in x.replace('{output}', '') or '}' in x.replace('{output}', '') for x in cmd), 'unknown command template')
 
 
+def fixed_profile_check(files):
+    """Reject abandoned trust drafts even if their own digest is consistent."""
+    expected_profile = json.loads((ROOT / 'protocol/profile-v2.json').read_bytes())
+    actual_profile = json.loads(files['config/semantic-profile.json'])
+    require(actual_profile.get('trustModel') == expected_profile['trustModel'], 'unsupported trust model')
+    require(actual_profile.get('normativeArtifactSha256') == expected_profile['normativeArtifactSha256'], 'normative artifact pins mismatch')
+    for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
+        key = 'config/' + name
+        require(files.get(key) == (ROOT / 'protocol/vectors' / key).read_bytes(), 'SDK trust fixture mismatch')
+
+
 def seal(root, provenance):
     """Candidate producer helper; it does not make a candidate trusted."""
     provenance_check(provenance)
@@ -75,6 +86,7 @@ def seal(root, provenance):
     for family in FAMILIES:
         require(any(n.startswith(family + '/') for n in files), f'missing family: {family}')
     require('config/semantic-profile.json' in files and digest(files['config/semantic-profile.json']) == provenance['semanticProfileSha256'], 'semantic profile artifact mismatch')
+    fixed_profile_check(files)
     (root / 'VERSION').write_bytes(b'2\n')
     (root / 'provenance.json').write_bytes(canonical_json(provenance))
     files.update({n: (root / n).read_bytes() for n in ('VERSION', 'provenance.json')})
@@ -100,6 +112,7 @@ def check(root, expected=None):
     for family in FAMILIES:
         require(any(n.startswith(family + '/') for n in files), f'missing family: {family}')
     require('config/semantic-profile.json' in files and digest(files['config/semantic-profile.json']) == provenance['semanticProfileSha256'], 'semantic profile artifact mismatch')
+    fixed_profile_check(files)
     files.update({n: (root / n).read_bytes() for n in ('VERSION', 'provenance.json')})
     sums = ''.join(f'{digest(data)}  {name}\n' for name, data in sorted(files.items())).encode()
     require((root / 'SHA256SUMS').read_bytes() == sums, 'file inventory/digest mismatch')

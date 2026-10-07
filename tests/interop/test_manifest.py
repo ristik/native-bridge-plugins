@@ -20,7 +20,7 @@ def synthetic():
     d = f'1:{h}:{h}:1:' + '0'*40
     ty = hashlib.sha256(('unicity-bridge:unicity-native:' + d).encode()).hexdigest()
     coin = hashlib.sha256(('unicity-bridge-coin:unicity-native:' + d).encode()).hexdigest()
-    e = {'schemaVersion': 1, 'protocolVersion': 2, 'family': 'unicity-native', 'sdkVersion': '3.0.1', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'bundle': artifact, 'format': 'native-epoch-indexed-v1'}}
+    e = {'schemaVersion': 1, 'protocolVersion': 2, 'family': 'unicity-native', 'sdkVersion': '3.0.1', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'document': artifact, 'format': 'sdk-root-trust-base-json-v1'}}
     return {ty: e}
 
 
@@ -75,6 +75,22 @@ class ManifestTests(unittest.TestCase):
     def test_wrong_trust_network(self):
         self.entry['trustBase']['networkId'] = 2
         with self.assertRaisesRegex(AssertionError, 'trust anchor mismatch'):
+            p.validate_manifest(self.registry)
+
+    def test_old_epoch_bundle_rejected(self):
+        self.entry['trustBase']['bundle'] = self.entry['trustBase'].pop('document')
+        self.entry['trustBase']['format'] = 'native-epoch-indexed-v1'
+        with self.assertRaises(ValidationError):
+            p.validate_manifest(self.registry)
+
+    def test_trust_document_digest_required(self):
+        del self.entry['trustBase']['document']['sha256']
+        with self.assertRaises(ValidationError):
+            p.validate_manifest(self.registry)
+
+    def test_trust_update_fields_rejected(self):
+        self.entry['trustBase']['successor'] = 'f' * 64
+        with self.assertRaises(ValidationError):
             p.validate_manifest(self.registry)
 
     def test_nonempty_aggregator_prefix(self):
