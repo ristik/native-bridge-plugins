@@ -101,6 +101,7 @@ impl TrustInput {
 /// root equals the seal hash, and at least `quorum_threshold` distinct valid root-node signatures
 /// over the seal hash. Unknown or invalid signatures are skipped, as in the SDK.
 pub fn verify_embedded_uc(input: &TrustInput, uc: &UnicityCertificate) -> Result<()> {
+    crate::resources::preflight_uc(&uc.to_cbor())?;
     input.check_guards(uc)?;
     let tb = input.base();
     tb.validate().map_err(|_| E::TrustBase)?;

@@ -109,18 +109,18 @@ export function trie(entries: [Uint8Array, Uint8Array][], target: Uint8Array): {
 
 export function pdrBytes(epoch: bigint, setting: bigint): Uint8Array {
   const params = concat(Uint8Array.of(0xa1), C.encodeTextString('chainId'), C.encodeTextString('7777'));
-  return arr(
+  return C.encodeTag(39008, arr(
     u(1), u(NETWORK), u(EVM_PARTITION), bs(Uint8Array.of(0x80)), u(1), C.encodeNull(), u(0), u(256), bs(new Uint8Array()),
     u(2_500_000_000n + setting), C.encodeNull(), params, u(epoch), u(0),
     arr(arr(C.encodeTextString('evm-1'), bs(signer(99).publicKey), u(1))),
-  );
+  ));
 }
 
 /** The genesis ConfigHash of {@link pdrBytes}: neutralised validators, epoch and activation round. */
 export function pdrConfigHash(): Uint8Array {
   const raw = pdrBytes(5n, 0n);
-  const elems = splitArray(raw);
-  return H(arr(...elems.slice(0, 12), u(0), u(0), C.encodeNull()));
+  const elems = splitArray(raw.subarray(3));
+  return H(C.encodeTag(39008, arr(...elems.slice(0, 12), u(0), u(0), C.encodeNull())));
 }
 
 function splitArray(b: Uint8Array): Uint8Array[] {

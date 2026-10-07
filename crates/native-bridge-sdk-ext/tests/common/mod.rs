@@ -18,7 +18,7 @@ use unicity_token::api::{
     CertificationData, InclusionCertificate, InclusionProof, NetworkId, StateId,
 };
 use unicity_token::cbor::{
-    encode_array, encode_byte_string, encode_null, encode_text_string, encode_uint,
+    encode_array, encode_byte_string, encode_null, encode_tag, encode_text_string, encode_uint,
 };
 use unicity_token::crypto::hash::{DataHash, HashAlgorithm};
 use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
@@ -163,27 +163,30 @@ pub fn pdr_bytes(epoch: u64, setting: u64) -> Vec<u8> {
         m.extend(encode_text_string("7777"));
         m
     };
-    encode_array(&[
-        &encode_uint(1),
-        &encode_uint(NETWORK as u64),
-        &encode_uint(EVM_PARTITION as u64),
-        &encode_byte_string(&[0x80]),
-        &encode_uint(1),
-        &encode_null(),
-        &encode_uint(0),
-        &encode_uint(256),
-        &encode_byte_string(&[]),
-        &encode_uint(2_500_000_000 + setting),
-        &encode_null(),
-        &params,
-        &encode_uint(epoch),
-        &encode_uint(0),
-        &encode_array(&[&encode_array(&[
-            &encode_text_string("evm-1"),
-            &encode_byte_string(signer(99).public_key().as_bytes()),
+    encode_tag(
+        39008,
+        &encode_array(&[
             &encode_uint(1),
-        ])]),
-    ])
+            &encode_uint(NETWORK as u64),
+            &encode_uint(EVM_PARTITION as u64),
+            &encode_byte_string(&[0x80]),
+            &encode_uint(1),
+            &encode_null(),
+            &encode_uint(0),
+            &encode_uint(256),
+            &encode_byte_string(&[]),
+            &encode_uint(2_500_000_000 + setting),
+            &encode_null(),
+            &params,
+            &encode_uint(epoch),
+            &encode_uint(0),
+            &encode_array(&[&encode_array(&[
+                &encode_text_string("evm-1"),
+                &encode_byte_string(signer(99).public_key().as_bytes()),
+                &encode_uint(1),
+            ])]),
+        ]),
+    )
 }
 
 /// The genesis ConfigHash of [`pdr_bytes`]: neutralised validators, epoch and activation round.
@@ -195,7 +198,7 @@ pub fn pdr_config_hash() -> [u8; 32] {
     parts.push(encode_uint(0));
     parts.push(encode_null());
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    sha(&encode_array(&refs))
+    sha(&encode_tag(39008, &encode_array(&refs)))
 }
 
 pub fn header_rlp(state_root: &[u8; 32], number: u64, fields: usize) -> Vec<u8> {

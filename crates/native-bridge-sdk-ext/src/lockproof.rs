@@ -167,7 +167,7 @@ pub(crate) fn config_hash(pdr_elems: &[&[u8]]) -> [u8; 32] {
     parts.push(encode_uint(0));
     parts.push(encode_null());
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    h(&encode_array(&refs))
+    h(&encode_tag(39008, &encode_array(&refs)))
 }
 
 /// The genesis `ConfigHash` of a canonical PDR: every non-membership setting.
@@ -214,6 +214,7 @@ pub fn verify(
     if entry_id != trust.id() {
         return Err(E::LockProofTrust);
     }
+    crate::resources::preflight_uc(lp.uc)?;
     let uc = {
         let d = Decoder::with_limits(lp.uc, unicity_token::cbor::DecodeLimits::DEFAULT);
         let uc = UnicityCertificate::from_cbor(d).map_err(|_| E::UnsupportedCertificateEncoding)?;

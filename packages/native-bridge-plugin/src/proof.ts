@@ -10,6 +10,7 @@ import { CborDeserializer } from '@unicitylabs/state-transition-sdk/lib/serializ
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 
+import { preflightToken } from './resources.js';
 import { eq } from './bytes.js';
 import { checkAnchor, checkPolicy, encodeEnvelope, type Anchor, type Envelope, type LeafProof } from './envelope.js';
 import { fail } from './errors.js';
@@ -33,7 +34,9 @@ export async function refreshToken(token: Token, fresh: InclusionProof[]): Promi
     }
     return arr(CborDeserializer.decodeArray(c.toCBOR(), 2)[0], fresh[i].toCBOR());
   });
-  return Token.fromCBOR(C.encodeTag(39040, arr(u(2), certified[0], arr(...certified.slice(1)))));
+  const bytes = C.encodeTag(39040, arr(u(2), certified[0], arr(...certified.slice(1))));
+  preflightToken(bytes);
+  return Token.fromCBOR(bytes);
 }
 
 /**

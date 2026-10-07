@@ -17,6 +17,7 @@ import { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-
 import { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
 
+import { preflightUc } from './resources.js';
 import { eq } from './bytes.js';
 import { fail } from './errors.js';
 import { H } from './profile.js';
@@ -67,6 +68,7 @@ export class TrustInput {
    * takes an inclusion proof, so its two constituent public rules are called directly.
    */
   public async verifyEmbeddedUc(uc: UnicityCertificate): Promise<void> {
+    preflightUc(uc.toCBOR());
     this.checkGuards(uc);
     if ((await UnicitySealHashMatchesWithRootHashRule.verify(uc)).status !== VerificationStatus.OK) fail('ErrSealRoot');
     const rule = new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier());

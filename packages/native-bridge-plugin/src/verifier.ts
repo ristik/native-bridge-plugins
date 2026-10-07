@@ -8,6 +8,7 @@
 import { UnicityCertificateVerifier } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/UnicityCertificateVerifier.js';
 import { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
+import { CborDeserializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 import { PredicateVerifierService } from '@unicitylabs/state-transition-sdk/lib/predicate/verification/PredicateVerifierService.js';
 import { CertifiedMintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/CertifiedMintTransaction.js';
@@ -24,11 +25,12 @@ import type { WalletIssuancePolicy } from '@unicitylabs/bridge-core';
 import { VerificationResult } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationResult.js';
 import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
 
+import { preflightToken } from './resources.js';
 import { eq, toHex } from './bytes.js';
 import type { Deployment, DeploymentRegistry } from './deployment.js';
 import { NativeError, fail, type NativeReason } from './errors.js';
 import { decodeHistory, checkJustification, checkMintData, projectToken, verifyHistory, type Leaf, type Outcome } from './history.js';
-import { MAX_PATH_STEPS, MAX_TOKEN_BYTES, MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
+import { MAX_PATH_STEPS, MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
 import { parseJustification, verifyLockProof, type Justification, type VerifiedLock } from './lockproof.js';
 import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord } from './profile.js';
 import type { TrustInput } from './trust.js';
@@ -99,7 +101,7 @@ export class NativeBridge {
 
   /** Decode canonical token bytes (bounded, re-encoding equal) and verify them. */
   public async verifyNativeTokenBytes(bytes: Uint8Array, expect: Expect): Promise<VerifiedToken> {
-    if (bytes.length > MAX_TOKEN_BYTES) fail('ErrInputTooLarge');
+    preflightToken(bytes);
     let token: Token;
     try {
       token = await Token.fromCBOR(bytes);
@@ -110,8 +112,28 @@ export class NativeBridge {
     return this.verifyNativeToken(token, expect);
   }
 
+  /** Verify a return as the completion of this exact held-token burn request. */
+  public async verifyBurnRequestBytes(held: Uint8Array, burned: Uint8Array, reason: Uint8Array): Promise<VerifiedToken> {
+    await this.verifyNativeTokenBytes(held, 'receipt');
+    const verified = await this.verifyNativeTokenBytes(burned, 'return');
+    const before = await Token.fromCBOR(held);
+    const after = await Token.fromCBOR(burned);
+    if (after.transactions.length !== before.transactions.length + 1) fail('ErrBurnReason');
+    const old = [before.genesis, ...before.transactions];
+    const next = [after.genesis, ...after.transactions];
+    for (let i = 0; i < old.length; i++) {
+      if (!eq(CborDeserializer.decodeArray(old[i].toCBOR(), 2)[0], CborDeserializer.decodeArray(next[i].toCBOR(), 2)[0]) ||
+          !eq(old[i].inclusionProof.certificationData.toCBOR(), next[i].inclusionProof.certificationData.toCBOR()) ||
+          old[i].inclusionProof.referenceTime !== next[i].inclusionProof.referenceTime) fail('ErrBurnReason');
+    }
+    const data = after.transactions.at(-1)!.data;
+    if (data === null || !eq(data, reason)) fail('ErrBurnReason');
+    return verified;
+  }
+
   public async verifyNativeToken(token: Token, expect: Expect, parts?: Partial<Pick<IVerificationContext, 'predicateVerifier' | 'unicityCertificateVerifier'>>): Promise<VerifiedToken> {
     if (token.transactions.length > MAX_TRANSFERS) fail('ErrTooManyTx');
+    preflightToken(token.toCBOR());
     const g = token.genesis;
     // The generic data hook skips null data, so missing genesis data/justification is explicit here.
     if (g.justification === null) fail('ErrMintJustif');

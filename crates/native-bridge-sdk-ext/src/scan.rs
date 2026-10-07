@@ -235,16 +235,23 @@ pub fn fixed<const N: usize>(it: &Item<'_>) -> Result<[u8; N]> {
 
 // ---- partition description records -------------------------------------------------------------
 
-/// Split a canonical native PDR array into the raw bytes of its elements.
+/// Split a canonical native tag(39008, PDR array) into the raw bytes of its elements.
 ///
 /// The PDR carries text (partition parameters) and a map, so it cannot use [`scan_one`]. Canonical
 /// form is still enforced: shortest heads, definite lengths, strictly bytewise-increasing map keys,
-/// valid UTF-8, no floats, no tags and no simple value other than null and booleans.
+/// valid UTF-8, no floats, no nested tags and no simple value other than null and booleans.
 pub fn pdr_elements(b: &[u8]) -> Result<Vec<&[u8]>> {
     let mut pos = 0usize;
-    let mut tokens = 0usize;
+    let mut tokens = 2usize;
+    let (major, tag) = read_head(b, &mut pos)?;
+    if major != 6 {
+        return Err(E::Shape);
+    }
+    if tag != 39008 {
+        return Err(E::Tag);
+    }
     let (major, n) = read_head(b, &mut pos)?;
-    if major != 4 {
+    if major != 4 || n != 15 {
         return Err(E::Shape);
     }
     if n > b.len() as u64 {
@@ -253,7 +260,7 @@ pub fn pdr_elements(b: &[u8]) -> Result<Vec<&[u8]>> {
     let mut out = Vec::new();
     for _ in 0..n {
         let start = pos;
-        skip_canonical(b, &mut pos, 1, &mut tokens)?;
+        skip_canonical(b, &mut pos, 2, &mut tokens)?;
         out.push(&b[start..pos]);
     }
     if pos != b.len() {

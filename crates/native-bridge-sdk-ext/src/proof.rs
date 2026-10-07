@@ -46,7 +46,9 @@ pub fn refresh_token(token: &Token, fresh: &[InclusionProof]) -> Result<Token> {
             p.clone(),
         ));
     }
-    Ok(Token::new(genesis, transfers))
+    let refreshed = Token::new(genesis, transfers);
+    crate::resources::preflight_token(&refreshed.to_cbor())?;
+    Ok(refreshed)
 }
 
 /// Assemble the return envelope from a token whose every aggregator proof is anchored at one

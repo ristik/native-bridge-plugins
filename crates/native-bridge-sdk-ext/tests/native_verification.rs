@@ -946,3 +946,70 @@ fn relation_alone_enforces_t_strictly_below_the_deadline() {
         }
     }
 }
+
+#[test]
+fn burn_request_binds_token_history_time_and_recipient_but_allows_refresh() {
+    let w = make_world(20);
+    let s = spec(1);
+    let held = build_token(&w, &s, &[tx_step(2, 7, T0 + 10)], T0, UC_TS);
+    let reason = return_reason(
+        CHAIN_ID,
+        &VAULT,
+        &[0; 20],
+        &w.dep.cfg.ty,
+        &w.dep.cfg.aid,
+        &recipient20(),
+        &s.amount,
+    );
+    let mut other = spec(1);
+    other.nonce = 2;
+    other.evm.nonce = 2;
+    let wrong_token = build_token(
+        &w,
+        &other,
+        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
+        T0,
+        UC_TS,
+    );
+    assert_eq!(
+        w.bridge
+            .verify_burn_request_bytes(&held.token.to_cbor(), &wrong_token.token.to_cbor(), &reason)
+            .unwrap_err(),
+        E::BurnReason
+    );
+    let burn = Step::Burn {
+        recipient: [0xe0; 20],
+        deadline: None,
+        t: T0 + 20,
+    };
+    let wrong_recipient = build_token(&w, &s, &[tx_step(2, 7, T0 + 10), burn], T0, UC_TS);
+    assert_eq!(
+        w.bridge
+            .verify_burn_request_bytes(
+                &held.token.to_cbor(),
+                &wrong_recipient.token.to_cbor(),
+                &reason
+            )
+            .unwrap_err(),
+        E::BurnReason
+    );
+    for step in [tx_step(2, 8, T0 + 10), tx_step(2, 7, T0 + 11)] {
+        let changed = build_token(&w, &s, &[step, burn_step(T0 + 20)], T0, UC_TS);
+        assert_eq!(
+            w.bridge
+                .verify_burn_request_bytes(&held.token.to_cbor(), &changed.token.to_cbor(), &reason)
+                .unwrap_err(),
+            E::BurnReason
+        );
+    }
+    let refreshed = build_token(
+        &w,
+        &s,
+        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
+        T0,
+        UC_TS + 1,
+    );
+    w.bridge
+        .verify_burn_request_bytes(&held.token.to_cbor(), &refreshed.token.to_cbor(), &reason)
+        .unwrap();
+}

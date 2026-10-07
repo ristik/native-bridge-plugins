@@ -30,6 +30,7 @@ import type { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/To
 import { Token as TokenClass } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 
+import { preflightToken } from './resources.js';
 import { concat, eq, toHex } from './bytes.js';
 import { NativeError, fail } from './errors.js';
 import { checkJustification, checkMintData } from './history.js';
@@ -111,6 +112,7 @@ export interface RedemptionJournal {
   list(): Promise<RedemptionEntry[]>;
 }
 
+/** Explicit test/demo journal. Its writes are not durable; the handoff callback remains required. */
 export class MemoryRedemptionJournal implements RedemptionJournal {
   private readonly m = new Map<string, RedemptionEntry>();
   public put(e: RedemptionEntry): Promise<void> {
@@ -132,7 +134,7 @@ export class NativeBridgePayments implements BridgePayments {
   public constructor(
     private readonly plugin: NativeBridgePlugin,
     private readonly backend: NativeWalletBackend,
-    public readonly journal: RedemptionJournal = new MemoryRedemptionJournal(),
+    public readonly journal: RedemptionJournal,
   ) {
     this.cache = new VerdictCache(plugin);
   }
@@ -161,7 +163,7 @@ export class NativeBridgePayments implements BridgePayments {
     const result = await this.backend.burn(request);
     if (!result.success || !result.burnedToken) return result;
     // Never trust a wallet success flag alone.
-    await this.plugin.verifyNativeToken(result.burnedToken, 'return');
+    await this.plugin.bridge.verifyBurnRequestBytes(bytes, result.burnedToken, request.reasonBytes);
     return result;
   }
 
@@ -202,24 +204,32 @@ export function mintBridgedToken(payments: NativeBridgePayments, request: MintRe
 export async function burnForReturn(
   plugin: NativeBridgePlugin,
   payments: NativeBridgePayments,
-  args: Omit<BurnForReturnArgs, 'persist'> & { persist?: BurnForReturnArgs['persist'] },
+  // persist must durably store the complete blob before resolving, even with a memory journal.
+  args: BurnForReturnArgs,
 ): Promise<BurnForReturnResult> {
+  if (typeof args.persist !== 'function') throw new TypeError('A durable persist callback is required');
   return coreBurnForReturn(payments, {
     tokenId: args.tokenId,
     reasonBytes: args.reasonBytes,
     persist: async (blob, burnId) => {
       const v = await plugin.verifyNativeToken(blob, 'return');
       await payments.journal.put({ burnId, tokenId: args.tokenId, burnedToken: blob, nullifier: v.outcome.nullifier, releaseTo: v.outcome.releaseTo, status: 'burned' });
-      await args.persist?.(blob, burnId);
+      await args.persist(blob, burnId);
     },
   });
 }
 
-/** Recover burns interrupted between the wallet burn and the acknowledgement. */
-export function recoverPendingBurns(plugin: NativeBridgePlugin, payments: NativeBridgePayments): Promise<readonly BurnForReturnResult[]> {
+/** Recover interrupted burns. `persist` must durably store the complete blob before resolving. */
+export function recoverPendingBurns(plugin: NativeBridgePlugin, payments: NativeBridgePayments, persist: BurnForReturnArgs['persist']): Promise<readonly BurnForReturnResult[]> {
+  if (typeof persist !== 'function') throw new TypeError('A durable persist callback is required');
   return coreRecoverPendingBurns(payments, async (blob, burnId) => {
     const v = await plugin.verifyNativeToken(blob, 'return');
-    await payments.journal.put({ burnId, tokenId: '', burnedToken: blob, nullifier: v.outcome.nullifier, releaseTo: v.outcome.releaseTo, status: 'burned' });
+    const pending = (await payments.pendingBurns()).find((p) => p.burnId === burnId) ?? fail('ErrMissingBacking');
+    const token = await TokenClass.fromCBOR(blob);
+    const data = token.transactions.at(-1)?.data;
+    if (!data || !eq(data, pending.reasonBytes)) fail('ErrBurnReason');
+    await payments.journal.put({ burnId, tokenId: pending.tokenId, burnedToken: blob, nullifier: v.outcome.nullifier, releaseTo: v.outcome.releaseTo, status: 'burned' });
+    await persist(blob, burnId);
   });
 }
 
@@ -231,6 +241,7 @@ export type ProofSource = (token: Token) => Promise<InclusionProof[]>;
  * Refresh keeps J/M/T/CD and the original `t`; a proof for another epoch is rejected by verification.
  */
 export async function buildNativeReturnProof(plugin: NativeBridgePlugin, tokenBytes: Uint8Array, source?: ProofSource): Promise<{ encoded: Uint8Array; nullifier: Uint8Array }> {
+  preflightToken(tokenBytes);
   let token = await TokenClass.fromCBOR(tokenBytes);
   if (source) token = await refreshToken(token, await source(token));
   const { encoded, verified } = await buildReturnProof(plugin.bridge, token);

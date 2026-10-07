@@ -9,6 +9,7 @@
 import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 
+import { preflightUc } from './resources.js';
 import { eq } from './bytes.js';
 import type { Deployment } from './deployment.js';
 import { fail } from './errors.js';
@@ -94,7 +95,7 @@ export function configHashOfPdr(pdr: Uint8Array): Uint8Array {
 
 function configHash(elems: Uint8Array[]): Uint8Array {
   // Every non-membership setting: validators, epoch and activation round are neutralised.
-  return H(arr(...elems.slice(0, 12), u(0), u(0), C.encodeNull()));
+  return H(C.encodeTag(39008, arr(...elems.slice(0, 12), u(0), u(0), C.encodeNull())));
 }
 
 const smallUint = (raw: Uint8Array): bigint => uint(scanOne(raw));
@@ -111,6 +112,7 @@ export async function verifyLockProof(dep: Deployment, trust: TrustInput, j: Jus
   if (j.chainId !== dep.cfg.chainId || !eq(j.vault, dep.cfg.vault) || !eq(j.zero, dep.cfg.zeroAddress)) fail('ErrMintJustif');
   if (!eq(lp.cfg, dep.cfgHash)) fail('ErrLockProofCfg');
   if (!eq(lp.trustBaseId, trust.id)) fail('ErrLockProofTrust');
+  preflightUc(lp.uc);
   let uc: UnicityCertificate;
   try {
     uc = UnicityCertificate.fromCBOR(lp.uc);

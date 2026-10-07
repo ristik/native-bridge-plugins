@@ -65,9 +65,7 @@ impl NativeBridge {
 
     /// Decode canonical token bytes (bounded, re-encoding equal) and verify them.
     pub fn verify_native_token_bytes(&self, bytes: &[u8], expect: Expect) -> Result<VerifiedToken> {
-        if bytes.len() > MAX_TOKEN_BYTES {
-            return Err(E::InputTooLarge);
-        }
+        crate::resources::preflight_token(bytes)?;
         let token = Token::from_cbor(bytes).map_err(|_| E::SdkDecode)?;
         if token.to_cbor() != bytes {
             return Err(E::NonCanonical);
@@ -75,11 +73,59 @@ impl NativeBridge {
         self.verify_native_token(&token, expect)
     }
 
+    /// Verify a return as completion of the exact held-token burn request. Proof refresh is allowed;
+    /// genesis, prior transactions, certification data and reference times must stay identical.
+    pub fn verify_burn_request_bytes(
+        &self,
+        held: &[u8],
+        burned: &[u8],
+        reason: &[u8],
+    ) -> Result<VerifiedToken> {
+        self.verify_native_token_bytes(held, Expect::Receipt)?;
+        let verified = self.verify_native_token_bytes(burned, Expect::Return)?;
+        let before = Token::from_cbor(held).map_err(|_| E::SdkDecode)?;
+        let after = Token::from_cbor(burned).map_err(|_| E::SdkDecode)?;
+        if after.transactions().len() != before.transactions().len() + 1 {
+            return Err(E::BurnReason);
+        }
+        let same = |a: &InclusionProof, b: &InclusionProof| {
+            a.certification_data.to_cbor() == b.certification_data.to_cbor()
+                && a.reference_time == b.reference_time
+        };
+        if before.genesis().transaction().to_cbor() != after.genesis().transaction().to_cbor()
+            || !same(
+                before.genesis().inclusion_proof(),
+                after.genesis().inclusion_proof(),
+            )
+        {
+            return Err(E::BurnReason);
+        }
+        for (a, b) in before.transactions().iter().zip(after.transactions()) {
+            if a.transaction().to_cbor() != b.transaction().to_cbor()
+                || !same(a.inclusion_proof(), b.inclusion_proof())
+            {
+                return Err(E::BurnReason);
+            }
+        }
+        if after
+            .transactions()
+            .last()
+            .ok_or(E::BurnReason)?
+            .transaction()
+            .data()
+            != Some(reason)
+        {
+            return Err(E::BurnReason);
+        }
+        Ok(verified)
+    }
+
     /// Verify a decoded token over its whole history.
     pub fn verify_native_token(&self, token: &Token, expect: Expect) -> Result<VerifiedToken> {
         if token.transactions().len() > MAX_TRANSFERS {
             return Err(E::TooManyTx);
         }
+        crate::resources::preflight_token(&token.to_cbor())?;
         let mint = token.genesis().transaction();
         // The generic data hook skips null data, so missing genesis data and justification are
         // rejected here before anything else runs.

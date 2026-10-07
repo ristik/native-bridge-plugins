@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod mpt;
 pub mod profile;
 pub mod proof;
+pub mod resources;
 pub mod rlp;
 pub mod scan;
 pub mod token;

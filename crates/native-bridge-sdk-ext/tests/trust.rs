@@ -53,23 +53,34 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
         out.token.genesis().transaction().lock_script(),
         out.token.genesis().transaction().source_state_hash(),
     );
-    let sdk_rejects = |uc: unicity_token::api::bft::UnicityCertificate| {
+    verify_embedded_uc(&ti, &proof.unicity_certificate).unwrap();
+    proof
+        .verify_for(&sid, proof.reference_time, ti.base())
+        .unwrap();
+    let sdk_error = |uc: unicity_token::api::bft::UnicityCertificate| {
         let mut p = proof.clone();
         p.unicity_certificate = uc;
-        p.verify_for(&sid, p.reference_time, ti.base()).is_err()
+        p.verify_for(&sid, p.reference_time, ti.base()).unwrap_err()
     };
     // Wrong network.
-    let mut uc = uc_with(r, 4);
+    let mut uc = proof.unicity_certificate.clone();
     uc.unicity_seal.network_id = unicity_token::api::NetworkId::new(NETWORK + 1).unwrap();
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::SealNetwork);
-    assert!(sdk_rejects(uc));
+    assert_eq!(
+        sdk_error(uc),
+        unicity_token::verify::VerificationError::SealNetworkMismatch
+    );
     // Wrong root: the seal hash no longer matches the recomputed tree.
-    let mut uc = uc_with(r, 4);
+    let mut uc = proof.unicity_certificate.clone();
     uc.unicity_seal.hash[0] ^= 1;
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::SealRoot);
-    assert!(sdk_rejects(uc));
+    assert_eq!(
+        sdk_error(uc),
+        unicity_token::verify::VerificationError::SealRootMismatch
+    );
     // Insufficient valid count: two valid, two corrupt.
-    let mut uc = uc_with(r, 2);
+    let mut uc = proof.unicity_certificate.clone();
+    uc.unicity_seal.signatures.truncate(2);
     let d = uc.unicity_seal.calculate_hash();
     for k in 2..4 {
         let mut bad = r.signers[k].1.sign(&d).encode().to_vec();
@@ -79,7 +90,10 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
             .push((r.signers[k].0.clone(), bad));
     }
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::QuorumNotMet);
-    assert!(sdk_rejects(uc));
+    assert_eq!(
+        sdk_error(uc),
+        unicity_token::verify::VerificationError::QuorumNotMet
+    );
 }
 
 #[test]

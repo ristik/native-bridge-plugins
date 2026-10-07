@@ -148,3 +148,30 @@ fn rust_constructors_reproduce_the_typescript_positives_byte_for_byte() {
         assert_eq!(bytes, token_hex(&f, name), "{name}");
     }
 }
+
+#[test]
+fn native_go_pdr_encoding_and_both_hash_preimages_match_independent_construction() {
+    let f: Value =
+        serde_json::from_str(include_str!("../../../tests/interop/native-pdr.json")).unwrap();
+    let native = hx(&f["native"]);
+    assert_eq!(pdr_bytes(5, 0), native);
+    assert_eq!(sha(&native).as_slice(), hx(&f["fullHash"]));
+    assert_eq!(sha(&hx(&f["neutralized"])).as_slice(), hx(&f["configHash"]));
+    assert_eq!(pdr_config_hash().as_slice(), hx(&f["configHash"]));
+    assert_eq!(
+        native_bridge_sdk_ext::lockproof::config_hash_of_pdr(&native)
+            .unwrap()
+            .as_slice(),
+        hx(&f["configHash"])
+    );
+    assert_eq!(
+        native_bridge_sdk_ext::scan::pdr_elements(&native[3..]).unwrap_err(),
+        native_bridge_sdk_ext::NativeError::Shape
+    );
+    let mut wrong_tag = native.clone();
+    wrong_tag[2] ^= 1;
+    assert_eq!(
+        native_bridge_sdk_ext::scan::pdr_elements(&wrong_tag).unwrap_err(),
+        native_bridge_sdk_ext::NativeError::Tag
+    );
+}

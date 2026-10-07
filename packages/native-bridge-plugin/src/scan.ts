@@ -126,20 +126,23 @@ export function nullableUint(it: Item): bigint | null {
 // ---- partition description records -------------------------------------------------------------
 
 /**
- * Split a canonical native PDR array into the raw bytes of its elements. The PDR carries text and a
+ * Split a canonical native tag(39008, PDR array) into the raw bytes of its elements. The PDR carries text and a
  * map, so it cannot use {@link scanOne}; canonical form is still enforced: shortest heads, definite
- * lengths, strictly bytewise-increasing map keys, valid UTF-8, no floats, no tags.
+ * lengths, strictly bytewise-increasing map keys, valid UTF-8, no floats, no nested tags.
  */
 export function pdrElements(b: Uint8Array): Uint8Array[] {
   const p = { pos: 0 };
-  let tokens = 0;
+  let tokens = 2;
+  const tag = readHead(b, p);
+  if (tag.major !== 6) fail('ErrShape');
+  if (tag.arg !== 39008n) fail('ErrTag');
   const head = readHead(b, p);
-  if (head.major !== 4) fail('ErrShape');
+  if (head.major !== 4 || head.arg !== 15n) fail('ErrShape');
   if (head.arg > BigInt(b.length)) fail('ErrTruncated');
   const out: Uint8Array[] = [];
   for (let i = 0n; i < head.arg; i++) {
     const s = p.pos;
-    skip(b, p, 1, () => ++tokens);
+    skip(b, p, 2, () => ++tokens);
     out.push(b.subarray(s, p.pos));
   }
   if (p.pos !== b.length) fail('ErrTrailing');
