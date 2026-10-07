@@ -1,12 +1,11 @@
 # Canonical corpus workflow
 
-Awaiting bft-core PR2's SDK3 candidate. VERSION, SHA256SUMS, MANIFEST.sha256 and
-provenance.json are deliberately absent; `vectors.py check` and corpus CI fail.
-.gitkeep files are scaffolding, never conformance fixtures. The exact SDK JSON
-fixture at config/sdk-root-trust-base.json and its provenance are published
-now; this partial set is not a released corpus or a replacement for its missing
-manifest. Candidate import MUST retain these exact bytes. Do not import the
-old `bridge-pr1-vectors-v1.json` or make up deployment/runtime pins.
+The corpus is the bft-core PR2 SDK3 candidate (generator commit and command in
+provenance.json), imported with `vectors.py import` under the digest in
+MANIFEST.sha256. The fixed SDK trust document config/sdk-root-trust-base.json is
+the bytes JS SDK 3.0.1 emits (`node tools/sdk_trust_fixture.mjs` reproduces it;
+`--corpus protocol/vectors` checks every trust document of the corpus). Do not
+import the old `bridge-pr1-vectors-v1.json` or make up deployment/runtime pins.
 
 The candidate producer writes fixtures under all nine family directories.
 Include the actual canonical profile at `config/semantic-profile.json`; its

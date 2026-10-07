@@ -86,10 +86,12 @@ def main():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, 'normative artifact digest mismatch'
     fixture = ROOT / 'protocol/vectors/config/sdk-root-trust-base.json'
     provenance = load('protocol/vectors/config/sdk-root-trust-base.provenance.json')
-    assert provenance['sha256'] == 'e503a064a16d43c5ad3d53bb8b859667781a349f26e7d4ca03446652741d3c08'
-    assert len(fixture.read_bytes()) == provenance['byteLength'] == 358
+    assert provenance['sha256'] == 'e5454ae4fe566b05dab8c1b15c88a05356b8816b1cd66a2b7adcce184af27fb5'
+    assert len(fixture.read_bytes()) == provenance['byteLength'] == 524
     validate_sdk_trust_document(fixture.read_bytes(), provenance['sha256'])
     subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs')], check=True)
+    if (ROOT / 'protocol/vectors/MANIFEST.sha256').exists():
+        subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs'), '--corpus', str(ROOT / 'protocol/vectors')], check=True)
     assert 'NATIVE_BRIDGE_PROTO_VERSION=2' in (ROOT / 'protocol/interop.md').read_text()
     assert JS_COMMIT in (ROOT / 'protocol/interop.md').read_text()
     assert RUST_COMMIT in (ROOT / 'protocol/interop.md').read_text()

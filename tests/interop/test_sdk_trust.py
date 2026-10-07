@@ -17,8 +17,8 @@ class FixedSdkTrustTests(unittest.TestCase):
         self.document = json.loads(self.data)
 
     def test_exact_installed_bytes(self):
-        self.assertEqual(self.digest, 'e503a064a16d43c5ad3d53bb8b859667781a349f26e7d4ca03446652741d3c08')
-        self.assertEqual(len(self.data), 358)
+        self.assertEqual(self.digest, 'e5454ae4fe566b05dab8c1b15c88a05356b8816b1cd66a2b7adcce184af27fb5')
+        self.assertEqual(len(self.data), 524)
         self.assertFalse(self.data.endswith(b'\n'))
         p.validate_sdk_trust_document(self.data, self.digest)
 

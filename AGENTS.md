@@ -9,8 +9,8 @@ Use `npm ci`, `npm run build`, `npm run typecheck`, `npm test`,
 `cargo test --locked`, and `cargo check --locked --no-default-features`.
 Protocol tooling: `python3 -m unittest discover -s tests/interop -v`;
 `python3 tools/check_protocol.py`; `python3 tools/vectors.py check`.
-The last command must fail while the candidate corpus is missing. Do not
-silence it or substitute old-profile fixtures. Read protocol/vectors/README.md.
+The corpus is imported from the pinned oracle; never hand-edit it, silence
+the check or substitute old-profile fixtures. Read protocol/vectors/README.md.
 
 Publishing is disabled. No SDK checkouts, vault source, SP1 workspace or path
 SDK dependencies belong here. Receipt verification has no network capability.
