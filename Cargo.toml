@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/native-bridge-sdk-ext"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.81"
+license = "MIT OR Apache-2.0"
+publish = false

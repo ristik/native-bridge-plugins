@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/unicitynetwork/unicity-bridge.git",
+  "commit": "deb2b86c0a1fa0398928cb88caac9feccda6f4e9",
+  "directory": "packages/bridge-core",
+  "name": "@unicitylabs/bridge-core",
+  "version": "0.1.0-bridge.2",
+  "tarball": "unicitylabs-bridge-core-0.1.0-bridge.2.tgz",
+  "sha256": "61bb461800dc17368b4afd5e07207667951e540eef85165e8bdc361d7898e596",
+  "integrity": "sha512-0Ef1LClprt6JNRCpMkY9GOQFFe87dJOIkKwuuxM+JhL9YjkGZPy80TmzstNg3RvAIIQk/URgHehmNLxzJnhT6A==",
+  "build": [
+    "npm ci --ignore-scripts",
+    "npm run build",
+    "npm pack --ignore-scripts"
+  ],
+  "nodeVersion": "24.21.0",
+  "npmVersion": "11.21.0"
+}

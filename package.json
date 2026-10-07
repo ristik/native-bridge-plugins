@@ -1,0 +1,23 @@
+{
+  "name": "native-bridge-plugins",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "workspaces": [
+    "packages/native-bridge-plugin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "node --test tests/interop/package.test.mjs",
+    "check:protocol": "python3 tools/check_protocol.py",
+    "vectors": "python3 tools/vectors.py check"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+packages/*/lib/
+target/
+.venv/
+__pycache__/
+*.pyc
