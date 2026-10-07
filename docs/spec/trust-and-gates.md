@@ -41,7 +41,7 @@ external bridge-plugin trust implementation, generic split support or detached
 lock witness is part of this profile. Use bridge-core structural contracts;
 native identity stays local because its ChainFamily union excludes this family.
 
-bft-core is private. Corpus regeneration CI needs a read-only
-`BFT_CORE_READ_TOKEN` repository secret scoped to that repository. No credential
-is committed or auto-installed. The missing-corpus gate fails before access is
-attempted; provision the read-only credential when importing the candidate.
+bft-core and native-bridge-plugins are public. Corpus regeneration CI checks out
+the exact provenance commit anonymously; no repository secret is needed. No credential
+is committed or auto-installed. The integrity gate verifies the imported sealed
+corpus before regeneration.

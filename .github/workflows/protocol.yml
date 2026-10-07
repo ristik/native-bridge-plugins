@@ -44,7 +44,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Deliberately fails until PR2 candidate is imported with its exact digest.
       - run: python3 tools/vectors.py check
       - name: Read pinned oracle revision
         id: oracle
@@ -59,7 +58,6 @@ jobs:
           repository: ristik/bft-core
           ref: ${{ steps.oracle.outputs.commit }}
           path: .oracle
-          token: ${{ secrets.BFT_CORE_READ_TOKEN }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: .oracle/go.mod
