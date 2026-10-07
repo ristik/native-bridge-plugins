@@ -58,6 +58,8 @@ jobs:
           repository: ristik/bft-core
           ref: ${{ steps.oracle.outputs.commit }}
           path: .oracle
+          # Regeneration fetches this pinned commit into an isolated checkout.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: .oracle/go.mod
