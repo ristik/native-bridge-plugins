@@ -1,0 +1,26 @@
+{
+  "name": "@unicitylabs/native-bridge-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@unicitylabs/state-transition-sdk": "3.0.1",
+    "@unicitylabs/bridge-core": "file:../../vendor/unicitylabs-bridge-core-0.1.0-bridge.2.tgz"
+  }
+}

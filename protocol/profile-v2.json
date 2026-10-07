@@ -1,0 +1,54 @@
+{
+  "artifactVersion": 1,
+  "nativeBridgeProtocolVersion": 2,
+  "sdkVersion": "3.0.1",
+  "status": "development-provisional-unactivated",
+  "identityFamily": "unicity-native",
+  "tags": {
+    "predicate": 39032,
+    "mint": 39041,
+    "transfer": 39045,
+    "certificationData": 39031,
+    "token": 39040,
+    "inclusionProof": 39033,
+    "lock": 39049,
+    "returnReason": 39048,
+    "value": 39050
+  },
+  "versions": {
+    "mint": 2,
+    "transfer": 2,
+    "certificationData": 2,
+    "token": 2,
+    "inclusionProof": 1,
+    "predicate": 1,
+    "lock": 2,
+    "lockProof": 1,
+    "returnReason": 1,
+    "value": 1
+  },
+  "limits": {
+    "justificationBytes": 65536,
+    "ucBytes": 16384,
+    "pdrBytes": 16384,
+    "headerBytes": 2048,
+    "mptNodesPerTrie": 65,
+    "mptNodeBytes": 1024,
+    "combinedMptBytes": 24576,
+    "cborDepth": 16,
+    "rlpDepth": 16,
+    "cborItems": 32768,
+    "semanticBytes": 131072,
+    "envelopeBytes": 262144,
+    "transfers": 64,
+    "leaves": 65,
+    "pathSteps": 2048,
+    "policyBytes": 128,
+    "aggregatorAnchors": 1
+  },
+  "normativeArtifacts": [
+    "protocol/interop.md",
+    "protocol/abi.json"
+  ],
+  "hashing": "Activation descriptor must bind exact SHA-256 of the normative artifacts and final measured bounds; no deployment semanticProfileHash is claimed here."
+}
