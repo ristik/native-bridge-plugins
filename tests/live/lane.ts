@@ -66,13 +66,17 @@ async function sendAll(to: string, sig: string, args: string[], key: string, gas
   const nonce = String(parseInt(await rpc(eth, 'eth_getTransactionCount', [sender, 'pending']), 16));
   const raw = cast('mktx', to, ...(sig ? [sig, ...args] : []), ...(value ? ['--value', value] : []), '--private-key', key, '--gas-limit', gas, '--nonce', nonce, '--chain', String(lane.chainId), '--legacy', '--gas-price', '2000000000');
   const txHash = `0x${hex(keccak256(unhex(raw)))}`;
-  await Promise.all(lane.ethUrls.map(async (url) => {
+  const accepted = await Promise.all(lane.ethUrls.map(async (url) => {
     try {
       await rpc(url, 'eth_sendRawTransaction', [raw]);
+      return true;
     } catch (e) {
-      if (!/already known|known transaction|nonce too low/.test(String(e))) throw e;
+      if (/already known|known transaction/.test(String(e))) return true;
+      console.log(`  send to ${url} refused: ${String(e).slice(0, 160)}`);
+      return false;
     }
   }));
+  assert.ok(accepted.some(Boolean), `no validator pool accepted ${txHash}`);
   const r1 = await round();
   const rc = await until(`receipt of ${txHash}`, 120_000, async () => (await rpc(eth, 'eth_getTransactionReceipt', [txHash])) ?? undefined);
   console.log(`  tx ${sig || 'transfer'}: signed at root round ${r0}, published at ${r1}, receipt seen at ${await round()}, block ${parseInt(rc.blockNumber, 16)}`);
