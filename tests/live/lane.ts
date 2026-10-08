@@ -66,13 +66,13 @@ async function sendAll(to: string, sig: string, args: string[], key: string, gas
   const nonce = String(parseInt(await rpc(eth, 'eth_getTransactionCount', [sender, 'pending']), 16));
   const raw = cast('mktx', to, ...(sig ? [sig, ...args] : []), ...(value ? ['--value', value] : []), '--private-key', key, '--gas-limit', gas, '--nonce', nonce, '--chain', String(lane.chainId), '--legacy', '--gas-price', '2000000000');
   const txHash = `0x${hex(keccak256(unhex(raw)))}`;
-  for (const url of lane.ethUrls) {
+  await Promise.all(lane.ethUrls.map(async (url) => {
     try {
-      run('cast', ['publish', raw, '--rpc-url', url]);
+      await rpc(url, 'eth_sendRawTransaction', [raw]);
     } catch (e) {
       if (!/already known|known transaction|nonce too low/.test(String(e))) throw e;
     }
-  }
+  }));
   const r1 = await round();
   const rc = await until(`receipt of ${txHash}`, 120_000, async () => (await rpc(eth, 'eth_getTransactionReceipt', [txHash])) ?? undefined);
   console.log(`  tx ${sig || 'transfer'}: signed at root round ${r0}, published at ${r1}, receipt seen at ${await round()}, block ${parseInt(rc.blockNumber, 16)}`);
@@ -255,6 +255,23 @@ const selector = (sig: string): string => run('cast', ['sig', sig]);
   const d = callRevert(THIRD_PARTY_ADDR, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`]);
   step('control: the same burn redeemed twice is refused', { revertData: d, alreadyRedeemed: d === selector('AlreadyRedeemed(uint256)') });
 }
+if (process.env.DNB_REPO) {
+  // Interruption between redeem and claim: every shard validator and ureth is stopped at once and started again from its own state.
+  const heightsOf = async (): Promise<number[]> => Promise.all(lane.ethUrls.map(async (u) => parseInt(await rpc(u, 'eth_blockNumber', []), 16)));
+  const before = await heightsOf();
+  run('bash', [`${process.env.DNB_REPO}/scripts/dnb-devnet.sh`, 'restart-all'], {});
+  const after = await until('all four clients to advance past their old heads', 300_000, async () => {
+    const h = await heightsOf();
+    return h.every((x, i) => x > before[i] + 1) && Math.max(...h) - Math.min(...h) <= 1 ? h : undefined;
+  });
+  const stillCredited = BigInt(cast('call', lane.vault, 'claimable(address)(uint256)', RECIPIENT).split(' ')[0]);
+  const nullifierKept = unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString()));
+  assert.equal(stillCredited, amountWei, 'the credit survived the interruption exactly once');
+  assert.equal(hex(nullifierKept), hex(ret.verified.outcome.nullifier), 'the recorded nullifier survived');
+  const again = callRevert(THIRD_PARTY_ADDR, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`]);
+  assert.notEqual(again, 'NO REVERT', 'the old proof cannot credit twice');
+  step('interruption: all validators and clients restarted between redeem and claim', { heightsBefore: before, heightsAfter: after, credit: stillCredited, replayedProofRefusedWith: again });
+}
 const payee = payeeAddr;
 const before = BigInt(await rpc(eth, 'eth_getBalance', [payee, 'latest']));
 const claimTx = await sendAll(lane.vault, 'claim(uint256,address)', [amountWei.toString(), payee], RECIPIENT_KEY, '500000');
@@ -264,4 +281,15 @@ assert.equal(after - before, amountWei, 'the payee received the locked amount');
 step('claim paid', { gasUsed: BigInt(claimTx.gasUsed), paid: after - before, vaultBefore, vaultAfter: BigInt(await rpc(eth, 'eth_getBalance', [lane.vault, 'latest'])) });
 void gasPaid;
 
+writeFileSync(`${lane.dir}/lane-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
+
+// ---- budget probes: what a hostile redemption costs the submitter on the running chain --------------------------------------------------
+for (const [name, at] of [['first byte of the certificate (malformed CBOR head)', 0], ['middle of the certificate', ret.envelope.anchors[0].uc.length >> 1]] as const) {
+  const base = Buffer.from(ret.encoded).indexOf(Buffer.from(ret.envelope.anchors[0].uc));
+  const bad = Uint8Array.from(ret.encoded);
+  bad[base + at] ^= 0xff;
+  const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(bad)}`], THIRD_PARTY_KEY, '7000000');
+  assert.equal(rc.status, '0x0');
+  step(`budget: redemption with a corrupted ${name} reverts`, { gasUsed: BigInt(rc.gasUsed), gasLimit: 7_000_000n });
+}
 writeFileSync(`${lane.dir}/lane-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
