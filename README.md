@@ -1,20 +1,22 @@
 # Native bridge plug-ins
 
 Bridge-owned native UCT protocol and SDK extensions, licensed MIT OR Apache-2.0.
-This is a development skeleton. It contains no working token verifier, deployed
-vault or released corpus. Package publication is disabled.
+The TS and Rust SDK 3.0.1 extensions and shared corpus are implemented. Native
+activation and a deployed bridge remain gated on joined acceptance. Package
+publication is disabled.
 
 | Path | Responsibility |
 | --- | --- |
 | `protocol/interop.md` | Sole normative native byte contract, protocol v2 |
 | `protocol/manifest.schema.json` | Strict deployment registry schema v1 |
 | `protocol/abi.json` | Frozen cross-stack ABI layout |
-| `protocol/vectors/` | Sole released corpus; awaiting the PR2 candidate |
-| `packages/native-bridge-plugin/` | TypeScript facade, version 0.1.0 |
+| `protocol/vectors/` | Sole released corpus, pinned to the merged oracle |
+| `packages/native-bridge-plugin/` | TypeScript verifier/wallet adapter, version 0.1.0 |
 | `crates/native-bridge-sdk-ext/` | alloc-compatible Rust extension, version 0.1.0 |
 | `deployments/` | Frozen manifests (none installed yet) |
 | `docs/spec/` | Trust boundary and implementation gates |
 | `tests/interop/`, `tools/` | Schema, provenance, import and regeneration checks |
+| `tests/joined/` | Pinned serial component harness; live acceptance blocked on B1 integration |
 
 The layout follows `unicitynetwork/unicity-bridge` at
 `deb2b86c0a1fa0398928cb88caac9feccda6f4e9`. Native custody stays in
@@ -40,7 +42,8 @@ python3.12 -m venv .venv
 .venv/bin/python tools/vectors.py check
 ```
 
-`corpus` CI intentionally fails until the candidate and its digest are imported.
-See [vector workflow](protocol/vectors/README.md). PR1 remains draft until then.
-CI does not claim PR3's independent SDK constructors, contract conformance,
-ureth measurements or PR6's joined native round trip.
+Corpus CI checks the released bytes and regenerates them with the pinned Go
+oracle. See [vector workflow](protocol/vectors/README.md) and [plug-in usage](docs/plugins.md).
+The [joined harness](tests/joined/README.md) distinguishes component evidence
+from the pending private one-shard round trip; see the
+[acceptance report](docs/acceptance/pr6.md).

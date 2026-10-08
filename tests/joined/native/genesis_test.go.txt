@@ -1,0 +1,66 @@
+package registrygenesis_test
+
+// Applied by tests/joined/run.py as a Go overlay on the pinned oracle; never committed there.
+// Runs the production B1 genesis path (q3format.NewHistory -> registrygenesis.GenerateB1) over the
+// fixed one-member root authority of the released corpus ("root-1"), for the golden dev deployment
+// (network 3, EVM partition 7, chain 31337) via bridgeprofile.NewDeployment.
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/stretchr/testify/require"
+	"github.com/unicitynetwork/bft-core/b1registry"
+	"github.com/unicitynetwork/bft-core/bridgeprofile"
+	"github.com/unicitynetwork/bft-core/b1state"
+	"github.com/unicitynetwork/bft-core/q3format"
+	"github.com/unicitynetwork/bft-core/registrygenesis"
+)
+
+func TestNBPPR6NativeGenesis(t *testing.T) {
+	out := os.Getenv("NBP_PR6_NATIVE_OUT")
+	if out == "" {
+		t.Skip("NBP_PR6_NATIVE_OUT not set")
+	}
+	d, err := bridgeprofile.NewDeployment()
+	require.NoError(t, err)
+	h, err := q3format.NewHistory(d.TB)
+	require.NoError(t, err)
+
+	const w = 1
+	p := b1state.Profile{Network: 3, RootGenesisID: h.Genesis(), ExecutionChainID: 31337,
+		RuntimeHash: [32]byte(common.HexToHash(b1registry.CodeHashHex)), CompilerHash: b1registry.CompilerHash(),
+		WCert: w, DeltaEV: w + 1, DeltaHold: w + 2, RestGas: 1096500 + 1141500*(w+1),
+		CompanionBytes: 1 << 20, OtherCompanionBytes: 65536, OrdinaryCapacity: 7000000}
+	p.SystemGas, err = p.RequiredSystemGas()
+	require.NoError(t, err)
+	p.MaxGas = p.SystemGas + p.OrdinaryCapacity
+	profileHash, err := p.Hash()
+	require.NoError(t, err)
+
+	// The oracle fixture names the parameter "chainId"; production genesis requires "chain_id".
+	confValue := *d.EVMPDR
+	confValue.PartitionParams = map[string]string{registrygenesis.ChainIDParam: "31337"}
+	conf := &confValue
+	g, err := registrygenesis.GenerateB1(conf, p, h, registrygenesis.EVMParams{GasLimit: p.MaxGas, BaseFee: registrygenesis.DefaultEVMParams.BaseFee})
+	require.NoError(t, err)
+
+	words := map[string]string{}
+	for k, v := range g.B1Words() {
+		words[k.Hex()] = v.Hex()
+	}
+	doc := map[string]any{
+		"network": p.Network, "executionChainId": p.ExecutionChainID, "wCert": p.WCert,
+		"rootGenesisId": hex.EncodeToString(p.RootGenesisID[:]), "profileHash": hex.EncodeToString(profileHash[:]),
+		"runtimeHash": hex.EncodeToString(p.RuntimeHash[:]), "systemGas": p.SystemGas, "maxGas": p.MaxGas,
+		"ordinaryCapacity": p.OrdinaryCapacity, "restGas": p.RestGas,
+		"evmGenesisHash": g.EVMGenesisHash().Hex(), "shardConfHash": g.FullShardConfHash().Hex(),
+		"registryWords": words, "genesis": json.RawMessage(g.GenesisJSON()),
+	}
+	enc, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(out, append(enc, '\n'), 0o644))
+}

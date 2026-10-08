@@ -1,0 +1,72 @@
+name: joined components
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  acceptance-components:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+      - run: npm ci --ignore-scripts && python3 -m pip install -r tools/requirements.txt
+      - name: Evidence guards and isolated mutations
+        run: |
+          python3 -B -m unittest discover -s tests/joined -v
+          python3 -B tests/joined/mutate.py
+      - name: Fetch exact component sources
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          pins = json.load(open('tests/joined/pins.json'))['sources']
+          urls = {'ureth': 'ristik/ureth', 'contracts': 'ristik/unicity-pos-contracts',
+                  'oracle': 'ristik/bft-core', 'aggregator': 'unicitynetwork/aggregator-go'}
+          for key, repo in urls.items():
+              path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'joined-sources' / ('nbp-pr6-' + key)
+              subprocess.run(['git', 'init', str(path)], check=True)
+              subprocess.run(['git', '-C', str(path), 'remote', 'add', 'origin', 'https://github.com/' + repo + '.git'], check=True)
+              subprocess.run(['git', '-C', str(path), 'fetch', 'origin', pins[key]], check=True)
+              subprocess.run(['git', '-C', str(path), 'checkout', '--detach', pins[key]], check=True)
+              if key == 'contracts':
+                  subprocess.run(['git', '-C', str(path), 'submodule', 'update', '--init', '--recursive'], check=True)
+          PY
+      - name: Serial component run (live acceptance must remain blocked)
+        run: |
+          set +e
+          python3 tests/joined/run.py --sources "$RUNNER_TEMP/joined-sources" --out /tmp/joined-evidence
+          result=$?
+          set -e
+          test "$result" -eq 2
+          python3 - <<'PY'
+          import json
+          r = json.load(open('/tmp/joined-evidence/report.json'))
+          assert r['status'] == 'BLOCKED'
+          assert r['blocked']
+          assert all(s['status'] == 'PASS' for s in r['steps']), r['steps']
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: joined-component-evidence
+          path: /tmp/joined-evidence

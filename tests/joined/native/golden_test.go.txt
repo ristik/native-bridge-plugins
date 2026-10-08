@@ -1,0 +1,172 @@
+package bridgeprofile
+
+// Applied by tests/joined/run.py as a Go overlay on the pinned oracle together with the contracts'
+// own golden generator (whose helpers it reuses); never committed there.
+//
+// The contracts' golden.json pins a fixture verifier code hash. A real vault deployed with the real
+// compiled TokenVerifier has a different cfg, so its kernel inputs and proofs differ. This test
+// runs the oracle's own deployment, overrides the verifier code hash with the real compiled
+// runtime hash and the root genesis, execution genesis and B1 profile hash with those of the executed
+// genesis (NBP_PR6_NATIVE_GENESIS, so ty/aid change too), and regenerates prepare / mint / return with the same
+// code path as TestGenPR5Golden. Anchors are real certificates of the one-member root authority at
+// root round 100, authenticated by the oracle's reference B1; the lock backing is the oracle's
+// synthetic EVM state proof, not state of the chain the native test executes.
+
+import (
+	"encoding/json"
+	"math/big"
+	"encoding/hex"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/ethereum/go-ethereum/crypto"
+)
+
+func TestNBPPR6NativeGolden(t *testing.T) {
+	path, artifact := os.Getenv("NBP_PR6_NATIVE_GOLDEN"), os.Getenv("NBP_PR6_VERIFIER_ARTIFACT")
+	if path == "" || artifact == "" || os.Getenv("NBP_PR6_NATIVE_GENESIS") == "" {
+		t.Skip("NBP_PR6_NATIVE_GOLDEN / NBP_PR6_VERIFIER_ARTIFACT / NBP_PR6_NATIVE_GENESIS not set")
+	}
+	d, err := NewDeployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := d.F
+	cfg := f.Cfg
+	// TokenVerifier is stateless (no immutables), so its deployed bytecode is its runtime.
+	raw, err := os.ReadFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var art struct {
+		Deployed struct {
+			Object string `json:"object"`
+		} `json:"deployedBytecode"`
+	}
+	if err := json.Unmarshal(raw, &art); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := hex.DecodeString(strings.TrimPrefix(art.Deployed.Object, "0x"))
+	if err != nil || len(runtime) == 0 {
+		t.Fatal("verifier artifact has no runtime", err)
+	}
+	cfg.TokenVerifierCodeHash = [32]byte(crypto.Keccak256(runtime))
+
+	// The deployment identities are those of the executed genesis (written by TestNBPPR6NativeGenesis),
+	// not the oracle fixture's: root genesis, execution genesis and B1 profile hash, and with them ty/aid.
+	var gen struct {
+		RootGenesisID  string `json:"rootGenesisId"`
+		EVMGenesisHash string `json:"evmGenesisHash"`
+		ProfileHash    string `json:"profileHash"`
+	}
+	graw, err := os.ReadFile(os.Getenv("NBP_PR6_NATIVE_GENESIS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(graw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	word := func(s string) (out [32]byte) {
+		b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
+		if err != nil || len(b) != 32 {
+			t.Fatalf("bad 32-byte identity %q", s)
+		}
+		copy(out[:], b)
+		return
+	}
+	cfg.RootGenesis, cfg.ExecutionGenesis, cfg.B1ProfileHash = word(gen.RootGenesisID), word(gen.EVMGenesisHash), word(gen.ProfileHash)
+	cfg.Ty = DeriveType(cfg.Network, cfg.RootGenesis, cfg.ExecutionGenesis, cfg.ChainID)
+	cfg.Aid = DeriveAsset(cfg.Network, cfg.RootGenesis, cfg.ExecutionGenesis, cfg.ChainID)
+	ch := cfg.Hash()
+	g := map[string]any{}
+	g["cfg"] = map[string]any{
+		"network": cfg.Network, "rootGenesis": x32(cfg.RootGenesis), "chainId": cfg.ChainID, "executionGenesis": x32(cfg.ExecutionGenesis),
+		"evmPartition": cfg.EVMPartition, "evmShard": x(cfg.EVMShard), "vault": x(cfg.Vault[:]), "zeroAddress": x(cfg.ZeroAddress[:]),
+		"ty": x32(cfg.Ty), "aid": x32(cfg.Aid), "semanticProfileHash": x32(cfg.SemanticProfileHash),
+		"tokenVerifier": x(cfg.TokenVerifierAddress[:]), "tokenVerifierCodeHash": x32(cfg.TokenVerifierCodeHash),
+		"b1ProfileHash": x32(cfg.B1ProfileHash), "aggregatorPolicyHash": x32(cfg.AggregatorPolicyHash),
+		"bytes": x(cfg.Bytes()), "hash": x32(ch),
+	}
+	g["policy"] = map[string]any{"partition": f.Policy.Partition, "conf": x32(f.Policy.ShardConf), "bytes": x(f.Policy.Bytes()), "hash": x32(f.Policy.Hash())}
+	g["ucRootRound"] = 100
+
+	owner0 := KeyFromSeed("owner0")
+	p0 := sigPred(owner0).Bytes()
+	amt := big.NewInt(1_000_000_000_000_000_000)
+	pr, err := PrepareLock(cfg, 1, amt, p0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := PreparePayload(1, amt, p0)
+	g["prepare"] = map[string]any{"n": 1, "amount": amt.String(), "p0": x(p0), "payload": x(payload),
+		"kernelInput": x(kernelIn(t, OpPrepareLock, cfg.Bytes(), payload)),
+		"result":      resOut(pr), "kernelOutput": x(kernelOut(t, true, pr))}
+
+	hist, _, err := d.Backed(1, amt, []*secp256k1.PrivateKey{owner0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb := hist.Bytes()
+	mr, err := VerifyMint(cfg, mb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mint := map[string]any{"history": x(mb), "kernelInput": x(kernelIn(t, OpMint, cfg.Bytes(), mb)),
+		"result": resOut(mr), "kernelOutput": x(kernelOut(t, true, mr))}
+	mint["envelope"] = composed(t, d, OpMint, mb, mr, mr.Leaves[0].ReferenceTime+5)
+	g["mint"] = mint
+
+	owner1 := KeyFromSeed("owner1")
+	rh, _, err := d.Backed(1, amt, []*secp256k1.PrivateKey{owner0, owner1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recip [20]byte
+	copy(recip[:], []byte("recipient-address-01"))
+	f.AppendBurn(rh, owner1, recip, amt)
+	rb := rh.Bytes()
+	rr, err := VerifyReturn(cfg, rb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxT uint64
+	for _, l := range rr.Leaves {
+		if l.ReferenceTime > maxT {
+			maxT = l.ReferenceTime
+		}
+	}
+	ret := map[string]any{"history": x(rb), "kernelInput": x(kernelIn(t, OpReturn, cfg.Bytes(), rb)),
+		"result": resOut(rr), "kernelOutput": x(kernelOut(t, true, rr)), "recipient": x(recip[:]), "maxReferenceTime": maxT}
+	ret["envelope"] = composed(t, d, OpReturn, rb, rr, maxT+5)
+	g["return"] = ret
+
+	// A conflicting burn of the same token (same lock, another recipient): a second certified history.
+	rh2, _, err := d.Backed(1, amt, []*secp256k1.PrivateKey{owner0, owner1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recip2 [20]byte
+	copy(recip2[:], []byte("recipient-address-02"))
+	f.AppendBurn(rh2, owner1, recip2, amt)
+	rb2 := rh2.Bytes()
+	rr2, err := VerifyReturn(cfg, rb2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxT2 uint64
+	for _, l := range rr2.Leaves {
+		if l.ReferenceTime > maxT2 {
+			maxT2 = l.ReferenceTime
+		}
+	}
+	g["returnConflicting"] = map[string]any{"history": x(rb2), "kernelInput": x(kernelIn(t, OpReturn, cfg.Bytes(), rb2)),
+		"result": resOut(rr2), "kernelOutput": x(kernelOut(t, true, rr2)), "recipient": x(recip2[:]), "maxReferenceTime": maxT2,
+		"envelope": composed(t, d, OpReturn, rb2, rr2, maxT2+5)}
+
+	out, _ := json.MarshalIndent(g, "", "  ")
+	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,5 @@
+{
+  "extends": "../../packages/native-bridge-plugin/tsconfig.test.json",
+  "compilerOptions": { "rootDir": "../.." },
+  "include": ["construct.ts"]
+}

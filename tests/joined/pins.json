@@ -1,0 +1,23 @@
+{
+  "profile": "fixed-base-unit-weight-sdk-3.0.1",
+  "sources": {
+    "plugins": "c70f2a76a1b250a98a0db0083d8b5fb6022acad4",
+    "ureth": "634bcc28b2e38b5f8caa435e41bc1cb0a66bf958",
+    "contracts": "7e49fe1142ba7aca02fc4a33a3fe75b15a643d3a",
+    "oracle": "66fc865e1db7c5ef1e5ebdad2a0e2623d2c331e3",
+    "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
+  },
+  "blocked": {
+    "private-one-shard-round-trip": "Requires a running SDK3 aggregator and the paired node lane. The native tier executes the real vault, verifier, registry and B1/B2 natives in-process only.",
+    "real-chain-lock-backing": "The lock backing inside the oracle histories is the oracle's synthetic EVM state proof, not an eth_getProof of the vault state the native tier executed.",
+    "paired-restart-reorg": "Requires the same joined deployment; wallet recovery, synthetic proof refresh and in-process execution do not establish chain restart/reorg safety.",
+    "native-budget-benchmarks": "Per-call native and transaction gas are measured in-process (native-report.json); production activation budgets, arm64 CPU, block/system-gas interaction and final deployment pins remain open."
+  },
+  "deferred": [
+    "arbitrary validator weights including (98,1,1)",
+    "epoch rotation and historical authority",
+    "trust-base append/fetch/interval closure",
+    "old-J validity across rotation",
+    "full B1/SDK seal-signature acceptance parity"
+  ]
+}

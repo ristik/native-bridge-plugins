@@ -1,0 +1,385 @@
+{
+  "schema": 1,
+  "profile": "fixed-base-unit-weight-sdk-3.0.1",
+  "status": "BLOCKED",
+  "host": {
+    "system": "Linux",
+    "machine": "x86_64"
+  },
+  "pins": {
+    "plugins": "c70f2a76a1b250a98a0db0083d8b5fb6022acad4",
+    "ureth": "7485a5cf13cd680f2b3b14dc42c405d0faa6457c",
+    "contracts": "7e49fe1142ba7aca02fc4a33a3fe75b15a643d3a",
+    "oracle": "66fc865e1db7c5ef1e5ebdad2a0e2623d2c331e3",
+    "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
+  },
+  "harnessHead": "c1936a7038b66df2df5460a520defcb1612ea97d",
+  "steps": [
+    {
+      "name": "toolchains",
+      "command": [
+        "python3",
+        "-c",
+        "import subprocess; [subprocess.run(c, check=True) for c in [[\"node\",\"--version\"],[\"npm\",\"--version\"],[\"go\",\"version\"],[\"cargo\",\"--version\"],[\"forge\",\"--version\"]]]"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 0.164,
+      "log": "toolchains.log",
+      "sha256": "a2ff9353210218092cf57bc1782ea287d0264326dd7378dd9c844ce8d7404f20"
+    },
+    {
+      "name": "corpus",
+      "command": [
+        "python3",
+        "tools/vectors.py",
+        "check"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 0.064,
+      "log": "corpus.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "protocol",
+      "command": [
+        "python3",
+        "tools/check_protocol.py"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 0.315,
+      "log": "protocol.log",
+      "sha256": "5c92d4f2de2fbd04a328aea8b81bad79b3c55d51bfd97b768ac9c5c1c2cec446"
+    },
+    {
+      "name": "ts-build",
+      "command": [
+        "npm",
+        "run",
+        "build"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 1.971,
+      "log": "ts-build.log",
+      "sha256": "36cafad4eaa2bf5ea421f7ca61f3a23c4ba69b8b06d760470da9a578e700e096"
+    },
+    {
+      "name": "ts-typecheck",
+      "command": [
+        "npm",
+        "run",
+        "typecheck"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 3.75,
+      "log": "ts-typecheck.log",
+      "sha256": "b6cc4a9be61606fe79e5a8fb8ea3b971a249fe2d433c7e46e2d41b565a859c7d"
+    },
+    {
+      "name": "joined-typecheck",
+      "command": [
+        "node_modules/.bin/tsc",
+        "-p",
+        "tests/joined/tsconfig.json"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 1.624,
+      "log": "joined-typecheck.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "ts-facade",
+      "command": [
+        "node",
+        "--test",
+        "tests/interop/package.test.mjs"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 0.215,
+      "log": "ts-facade.log",
+      "sha256": "7f73f3de6ee8ff9ee494a777930f2ddd422a1c69cb6a200001c28d1a6764b6d4"
+    },
+    {
+      "name": "ts-plugin",
+      "command": [
+        "npm",
+        "test",
+        "--workspace",
+        "@unicitylabs/native-bridge-plugin"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 9.686,
+      "log": "ts-plugin.log",
+      "sha256": "402d61b3ee4779a3c2bb477dba73af1adde63664b19504192aa6f38e36003ee4"
+    },
+    {
+      "name": "construct",
+      "command": [
+        "node_modules/.bin/tsx",
+        "tests/joined/construct.ts",
+        "/tmp/joined-evidence/joined.json"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 1.019,
+      "log": "construct.log",
+      "sha256": "bf58f281b9f4fe23b755b1b7b509fabd648a319cc3680f1f3cfe92316e59de64"
+    },
+    {
+      "name": "aggregator-join",
+      "command": [
+        "go",
+        "run",
+        "/home/runner/work/native-bridge-plugins/native-bridge-plugins/tests/joined/aggregator.go",
+        "/tmp/joined-evidence/joined.json"
+      ],
+      "cwd": "/home/runner/work/_temp/joined-sources/nbp-pr6-aggregator",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 19.478,
+      "log": "aggregator-join.log",
+      "sha256": "5c8780318352aa05c253511e9c6ffe04c898748488b20f2670a670363fb0953c"
+    },
+    {
+      "name": "oracle",
+      "command": [
+        "go",
+        "test",
+        "-p",
+        "1",
+        "./bridgeprofile",
+        "./b1ref",
+        "-count=1"
+      ],
+      "cwd": "/home/runner/work/_temp/joined-sources/nbp-pr6-oracle",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 76.201,
+      "log": "oracle.log",
+      "sha256": "d151153e8b40f0b1197da884a329a19a5ca7819201b5e5d756ad51e6068880e6"
+    },
+    {
+      "name": "corpus-regenerate",
+      "command": [
+        "python3",
+        "tools/vectors.py",
+        "regenerate",
+        "--oracle",
+        "/home/runner/work/_temp/joined-sources/nbp-pr6-oracle"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 54.833,
+      "log": "corpus-regenerate.log",
+      "sha256": "e7f6c0b87e4af6965e388c1b9dc3026661c5d393a9e9b62b938050d11b28bdd9"
+    },
+    {
+      "name": "driver-fmt",
+      "command": [
+        "rustfmt",
+        "--edition",
+        "2021",
+        "--check",
+        "/home/runner/work/native-bridge-plugins/native-bridge-plugins/tests/joined/b2/src/main.rs"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 0.016,
+      "log": "driver-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "rust-fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 0.214,
+      "log": "rust-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "rust-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 7.935,
+      "log": "rust-clippy.log",
+      "sha256": "e95873206d275dbc92cc0b74637a81166ffdfcbd1cd1cfd03787e02a9c14e7a5"
+    },
+    {
+      "name": "rust-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 14.721,
+      "log": "rust-tests.log",
+      "sha256": "0dde74702e2c6b062bcab0b79f02096de875382029f1f210307fc2a64815b805"
+    },
+    {
+      "name": "rust-alloc",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 1.919,
+      "log": "rust-alloc.log",
+      "sha256": "c9a1103b518e961601c71a93bde682b65651209aa0d89e10f10370eafe9e7f7d"
+    },
+    {
+      "name": "b2-join",
+      "command": [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/tmp/nbp-pr6-cache-ui3lqgqt/b2/Cargo.toml",
+        "--",
+        "/tmp/joined-evidence/joined.json"
+      ],
+      "cwd": "/home/runner/work/native-bridge-plugins/native-bridge-plugins",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 32.824,
+      "log": "b2-join.log",
+      "sha256": "9aac497222b74a5f039291631014295b98475690031111cc7cbd6c21ef91da45"
+    },
+    {
+      "name": "contracts-regenerate",
+      "command": [
+        "go",
+        "test",
+        "-p",
+        "1",
+        "-overlay",
+        "/tmp/nbp-pr6-cache-ui3lqgqt/overlay.json",
+        "./bridgeprofile",
+        "-run",
+        "^TestGenPR5Golden$",
+        "-count=1"
+      ],
+      "cwd": "/home/runner/work/_temp/joined-sources/nbp-pr6-oracle",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 2.47,
+      "log": "contracts-regenerate.log",
+      "sha256": "2ac7aaec689e36147aefb28e2d73e2831cd0283fa2ddf7a7630c91624cbf6242"
+    },
+    {
+      "name": "contracts-doubles",
+      "command": [
+        "forge",
+        "test",
+        "--threads",
+        "2",
+        "--match-path",
+        "test/bridge/*.t.sol"
+      ],
+      "cwd": "/home/runner/work/_temp/joined-sources/nbp-pr6-contracts",
+      "status": "PASS",
+      "exit": 0,
+      "seconds": 127.931,
+      "log": "contracts-doubles.log",
+      "sha256": "6a545b16c1ae72d1d0b94efecd98a4e1a291000dc2ca6bd4f3d07d03f08b4027"
+    }
+  ],
+  "blocked": {
+    "vault-real-B1-B2": "B1 PR4 system integration is not merged; the pinned node factories do not install B1/B2. No vault real-call acceptance yet.",
+    "private-one-shard-round-trip": "Requires the integrated B1 node, authenticated registry genesis, deployed vault and a running SDK3 aggregator.",
+    "paired-restart-reorg": "Requires the same joined deployment; wallet recovery and synthetic proof refresh do not establish chain restart/reorg safety.",
+    "native-budget-benchmarks": "Requires integrated client gas/resource measurements, runtime/deployment pins and the B1 system budget. Component OOG checks are insufficient."
+  },
+  "deferred": [
+    "arbitrary validator weights including (98,1,1)",
+    "epoch rotation and historical authority",
+    "trust-base append/fetch/interval closure",
+    "old-J validity across rotation",
+    "full B1/SDK seal-signature acceptance parity"
+  ],
+  "evidenceClass": "component-only; synthetic certificates; no running aggregator or native vault calls",
+  "inputs": {
+    "tests/joined/README.md": "acaac30af37a79390ec28791e94b49c08264e33126170ef7e13e70507648f5dd",
+    "tests/joined/aggregator.go": "a0e8dd9def919df202064811e01da26b4c4847fa6fe39ec489f68bed0e476936",
+    "tests/joined/b2/Cargo.toml.in": "bae9935f99d9a693be1d66c18177cc09048cba53cfc7df502b9d7ffb3754c9ae",
+    "tests/joined/b2/src/main.rs": "87bff0d86936ec6b19acd7602cc4dbafee45cdd34885a3079f5cefbb54883692",
+    "tests/joined/construct.ts": "73dcf04625c1cc378376c539353b7374edfcd8e4dbbb73e6260c283e6c1da7ce",
+    "tests/joined/mutate.py": "adc91517b52e6d89246ec4205a8efe58873becb02d11e29797c8a9fa0a77f44c",
+    "tests/joined/pins.json": "bbc1d5641bdc72710dbeb129358c613d82b6c03d8b4c6556299ed8a0ce9dbc3c",
+    "tests/joined/run.py": "fe94d37b13dd2c7948ba90e3d6fea80ae581179884b1a1a4888317db0af7c0ef",
+    "tests/joined/test_harness.py": "3741a715f1e2a82b8e2902a2f897311630589a65b25502e7e35853181646f7c0",
+    "tests/joined/tsconfig.json": "903f85dffc2887ebacac21efd29e269aa59317165773ad42ef760a41ae3af1f8"
+  },
+  "contractsComparison": {
+    "goldenSha256": "0ad73f3382f841ed1f5c04d644a87980b076d0255dd7ab6a05866daa1bae37be",
+    "sharedValues": 68,
+    "mergedCorpusDigest": "1e924fc33ae47e7625bd030d5b067bfc786810a4d32570f4cdc8acd040014286",
+    "note": "contracts retain pre-merge provenance pins; compared to merged bytes and regenerated oracle here"
+  },
+  "artifacts": {
+    "joined-typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rust-tests.log": "0dde74702e2c6b062bcab0b79f02096de875382029f1f210307fc2a64815b805",
+    "contracts-regenerate.log": "2ac7aaec689e36147aefb28e2d73e2831cd0283fa2ddf7a7630c91624cbf6242",
+    "contracts-golden.json": "0ad73f3382f841ed1f5c04d644a87980b076d0255dd7ab6a05866daa1bae37be",
+    "ts-plugin.log": "402d61b3ee4779a3c2bb477dba73af1adde63664b19504192aa6f38e36003ee4",
+    "ts-build.log": "36cafad4eaa2bf5ea421f7ca61f3a23c4ba69b8b06d760470da9a578e700e096",
+    "b2-join.log": "9aac497222b74a5f039291631014295b98475690031111cc7cbd6c21ef91da45",
+    "corpus.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "aggregator-join.log": "5c8780318352aa05c253511e9c6ffe04c898748488b20f2670a670363fb0953c",
+    "ts-typecheck.log": "b6cc4a9be61606fe79e5a8fb8ea3b971a249fe2d433c7e46e2d41b565a859c7d",
+    "rust-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "corpus-regenerate.log": "e7f6c0b87e4af6965e388c1b9dc3026661c5d393a9e9b62b938050d11b28bdd9",
+    "ts-facade.log": "7f73f3de6ee8ff9ee494a777930f2ddd422a1c69cb6a200001c28d1a6764b6d4",
+    "oracle.log": "d151153e8b40f0b1197da884a329a19a5ca7819201b5e5d756ad51e6068880e6",
+    "joined.json": "1e34fcc05d7a851e353c6e8b4b46b2a5114672e4330fb16a9a5e6b42d434a7df",
+    "rust-alloc.log": "c9a1103b518e961601c71a93bde682b65651209aa0d89e10f10370eafe9e7f7d",
+    "toolchains.log": "a2ff9353210218092cf57bc1782ea287d0264326dd7378dd9c844ce8d7404f20",
+    "protocol.log": "5c92d4f2de2fbd04a328aea8b81bad79b3c55d51bfd97b768ac9c5c1c2cec446",
+    "rust-clippy.log": "e95873206d275dbc92cc0b74637a81166ffdfcbd1cd1cfd03787e02a9c14e7a5",
+    "construct.log": "bf58f281b9f4fe23b755b1b7b509fabd648a319cc3680f1f3cfe92316e59de64",
+    "driver-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "b2-Cargo.lock": "99359aaf5f306559147d2995001aaf6140a3d10b28d6f55231f724808194c4b0",
+    "contracts-doubles.log": "6a545b16c1ae72d1d0b94efecd98a4e1a291000dc2ca6bd4f3d07d03f08b4027"
+  }
+}
