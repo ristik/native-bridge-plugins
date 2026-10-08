@@ -75,7 +75,14 @@ def compare_contracts(contracts, generated):
             'note': 'contracts retain pre-merge provenance pins; compared to merged bytes and regenerated oracle here'}
 
 
-NATIVE_TARGETS = {'B1 UC_V1 0x0100', 'B1 RSMT_MEMBER_V1 0x0102', 'B2 kernel 0x0104'}
+NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER = 'B2 kernel 0x0104', 'B1 UC_V1 0x0100', 'B1 RSMT_MEMBER_V1 0x0102'
+NATIVE_TARGETS = {NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER}
+# Minimum native calls per step (redeem proves three leaves). Coverage is per step, never a union over the report.
+NATIVE_STEP_CALLS = {
+    'lock': {NATIVE_KERNEL: 1},
+    'verifyMint': {NATIVE_KERNEL: 1, NATIVE_UC: 1, NATIVE_MEMBER: 1},
+    'redeem (third-party submitter)': {NATIVE_KERNEL: 1, NATIVE_UC: 1, NATIVE_MEMBER: 3},
+}
 NATIVE_REQUIRED = ['lock', 'verifyMint', 'redeem (third-party submitter)', 'claim', 'redeem again (duplicate burn)',
                    'conflicting burn (other recipient) after the first redeem',
                    'claim to a reverting payee (credit and P roll back)',
@@ -84,27 +91,35 @@ NATIVE_REQUIRED = ['lock', 'verifyMint', 'redeem (third-party submitter)', 'clai
 
 
 def check_native_report(path):
-    """Re-checks the native driver's own report: every required step, every recorded native call native."""
+    """Re-checks the native driver's own report: every required step, every required native call per step."""
     report = json.loads(Path(path).read_text())
     steps = {s['step']: s for s in report['steps']}
     missing = [n for n in NATIVE_REQUIRED if n not in steps]
     if missing:
         raise ValueError(f'native report lacks steps: {missing}')
-    seen = set()
-    for s in report['steps']:
-        for c in s.get('nativeCalls', []):
-            if c.get('nativePrecompile') is False:
-                raise ValueError(f'{s["step"]}: {c["target"]} did not execute as a native precompile')
-            seen.add(c['target'])
-    if seen != NATIVE_TARGETS:
-        raise ValueError(f'native report does not cover every native address: {sorted(seen)}')
     for name in ('lock', 'verifyMint', 'redeem (third-party submitter)', 'claim'):
         if not steps[name]['success']:
             raise ValueError(f'{name} did not succeed')
+    for name, wanted in NATIVE_STEP_CALLS.items():
+        for target, n in wanted.items():
+            calls = [c for c in steps[name].get('nativeCalls', []) if c['target'] == target]
+            if len(calls) < n:
+                raise ValueError(f'{name}: expected {n} call(s) to {target}, recorded {len(calls)}')
+            for c in calls:
+                if c.get('nativePrecompile') is not True:
+                    raise ValueError(f'{name}: {target} did not execute as a native precompile')
+                if c.get('ok') is not True:
+                    raise ValueError(f'{name}: {target} call did not succeed')
+    for s in report['steps']:
+        for c in s.get('nativeCalls', []):
+            if c.get('nativePrecompile') is False:
+                raise ValueError(f'{s["step"]}: {c["target"]} was not a native precompile')
     refusals = [s for s in report['steps'] if s.get('expectedRefusal') is not None]
-    if not refusals or any(s['success'] for s in refusals):
-        raise ValueError('a refusal step succeeded or none was recorded')
-    return {'steps': len(report['steps']), 'refusals': len(refusals), 'addresses': sorted(seen),
+    if not refusals:
+        raise ValueError('no refusal step was recorded')
+    if any(s['success'] for s in refusals):
+        raise ValueError('a refusal step succeeded')
+    return {'steps': len(report['steps']), 'refusals': len(refusals), 'addresses': sorted(NATIVE_TARGETS),
             'gas': {n: steps[n]['gasUsed'] for n in NATIVE_REQUIRED[:4]}}
 
 
@@ -235,6 +250,7 @@ def main():
                 step('native-golden', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './bridgeprofile',
                                        '-run', '^TestNBPPR6NativeGolden$', '-count=1'], sources['oracle'],
                      dict(env, NBP_PR6_NATIVE_GOLDEN=str(out / 'native-golden.json'),
+                          NBP_PR6_NATIVE_GENESIS=str(out / 'native-genesis.json'),
                           NBP_PR6_VERIFIER_ARTIFACT=str(sources['contracts'] / 'out/TokenVerifier.sol/TokenVerifier.json')))
                 step('native-fmt', ['rustfmt', '--edition', '2021', '--check', str(HERE / 'native/src/main.rs')], env=env)
                 native = scratch / 'native'

@@ -5,8 +5,9 @@ package bridgeprofile
 //
 // The contracts' golden.json pins a fixture verifier code hash. A real vault deployed with the real
 // compiled TokenVerifier has a different cfg, so its kernel inputs and proofs differ. This test
-// runs the oracle's own deployment, overrides ONLY the verifier code hash with the real compiled
-// runtime hash (NBP_PR6_VERIFIER_CODEHASH) and regenerates prepare / mint / return with the same
+// runs the oracle's own deployment, overrides the verifier code hash with the real compiled
+// runtime hash and the root genesis, execution genesis and B1 profile hash with those of the executed
+// genesis (NBP_PR6_NATIVE_GENESIS, so ty/aid change too), and regenerates prepare / mint / return with the same
 // code path as TestGenPR5Golden. Anchors are real certificates of the one-member root authority at
 // root round 100, authenticated by the oracle's reference B1; the lock backing is the oracle's
 // synthetic EVM state proof, not state of the chain the native test executes.
@@ -25,8 +26,8 @@ import (
 
 func TestNBPPR6NativeGolden(t *testing.T) {
 	path, artifact := os.Getenv("NBP_PR6_NATIVE_GOLDEN"), os.Getenv("NBP_PR6_VERIFIER_ARTIFACT")
-	if path == "" || artifact == "" {
-		t.Skip("NBP_PR6_NATIVE_GOLDEN / NBP_PR6_VERIFIER_ARTIFACT not set")
+	if path == "" || artifact == "" || os.Getenv("NBP_PR6_NATIVE_GENESIS") == "" {
+		t.Skip("NBP_PR6_NATIVE_GOLDEN / NBP_PR6_VERIFIER_ARTIFACT / NBP_PR6_NATIVE_GENESIS not set")
 	}
 	d, err := NewDeployment()
 	if err != nil {
@@ -52,6 +53,32 @@ func TestNBPPR6NativeGolden(t *testing.T) {
 		t.Fatal("verifier artifact has no runtime", err)
 	}
 	cfg.TokenVerifierCodeHash = [32]byte(crypto.Keccak256(runtime))
+
+	// The deployment identities are those of the executed genesis (written by TestNBPPR6NativeGenesis),
+	// not the oracle fixture's: root genesis, execution genesis and B1 profile hash, and with them ty/aid.
+	var gen struct {
+		RootGenesisID  string `json:"rootGenesisId"`
+		EVMGenesisHash string `json:"evmGenesisHash"`
+		ProfileHash    string `json:"profileHash"`
+	}
+	graw, err := os.ReadFile(os.Getenv("NBP_PR6_NATIVE_GENESIS"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(graw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	word := func(s string) (out [32]byte) {
+		b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
+		if err != nil || len(b) != 32 {
+			t.Fatalf("bad 32-byte identity %q", s)
+		}
+		copy(out[:], b)
+		return
+	}
+	cfg.RootGenesis, cfg.ExecutionGenesis, cfg.B1ProfileHash = word(gen.RootGenesisID), word(gen.EVMGenesisHash), word(gen.ProfileHash)
+	cfg.Ty = DeriveType(cfg.Network, cfg.RootGenesis, cfg.ExecutionGenesis, cfg.ChainID)
+	cfg.Aid = DeriveAsset(cfg.Network, cfg.RootGenesis, cfg.ExecutionGenesis, cfg.ChainID)
 	ch := cfg.Hash()
 	g := map[string]any{}
 	g["cfg"] = map[string]any{

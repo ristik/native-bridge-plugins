@@ -63,10 +63,12 @@ class EvidenceGuards(unittest.TestCase):
                 joined.validate_source(p, pin)
 
     def native_report(self, mutate=lambda r: None):
-        def call(target, native=True):
-            return {'target': target, 'nativePrecompile': native}
-        steps = [{'step': n, 'success': True, 'gasUsed': 1, 'nativeCalls': []} for n in joined.NATIVE_REQUIRED]
-        steps[0]['nativeCalls'] = [call(t) for t in sorted(joined.NATIVE_TARGETS)]
+        def calls(step):
+            out = []
+            for target, n in joined.NATIVE_STEP_CALLS.get(step, {}).items():
+                out += [{'target': target, 'nativePrecompile': True, 'ok': True} for _ in range(n)]
+            return out
+        steps = [{'step': n, 'success': True, 'gasUsed': 1, 'nativeCalls': calls(n)} for n in joined.NATIVE_REQUIRED]
         steps[4].update(success=False, expectedRefusal='AlreadyRedeemed')
         report = {'steps': steps}
         mutate(report)
@@ -75,24 +77,64 @@ class EvidenceGuards(unittest.TestCase):
         path.write_text(__import__('json').dumps(report))
         return path
 
+    def step(self, report, name):
+        return next(s for s in report['steps'] if s['step'] == name)
+
     def test_native_report_accepts_a_complete_native_run(self):
         self.assertEqual(joined.check_native_report(self.native_report())['addresses'], sorted(joined.NATIVE_TARGETS))
 
     def test_native_report_refuses_a_double_in_place_of_a_native_call(self):
         def mutate(r):
-            r['steps'][0]['nativeCalls'][0]['nativePrecompile'] = False
+            self.step(r, 'verifyMint')['nativeCalls'][0]['nativePrecompile'] = False
         with self.assertRaisesRegex(ValueError, 'did not execute as a native precompile'):
             joined.check_native_report(self.native_report(mutate))
 
-    def test_native_report_refuses_missing_address_or_step(self):
-        with self.assertRaisesRegex(ValueError, 'every native address'):
-            joined.check_native_report(self.native_report(lambda r: r['steps'][0].update(nativeCalls=r['steps'][0]['nativeCalls'][:2])))
-        with self.assertRaisesRegex(ValueError, 'lacks steps'):
+    def test_native_report_refuses_a_failed_native_call(self):
+        def mutate(r):
+            self.step(r, 'redeem (third-party submitter)')['nativeCalls'][0]['ok'] = False
+        with self.assertRaisesRegex(ValueError, 'call did not succeed'):
+            joined.check_native_report(self.native_report(mutate))
+
+    def test_native_coverage_is_per_step_not_a_union(self):
+        # verifyMint loses its 0x0100 call; redeem still supplies that address elsewhere in the report.
+        def mutate(r):
+            calls = self.step(r, 'verifyMint')['nativeCalls']
+            calls[:] = [c for c in calls if c['target'] != joined.NATIVE_UC]
+        with self.assertRaisesRegex(ValueError, 'verifyMint: expected 1 call.*0x0100'):
+            joined.check_native_report(self.native_report(mutate))
+
+    def test_native_report_refuses_an_empty_or_short_call_list(self):
+        with self.assertRaisesRegex(ValueError, 'lock: expected 1 call'):
+            joined.check_native_report(self.native_report(lambda r: self.step(r, 'lock').update(nativeCalls=[])))
+        def short(r):
+            calls = self.step(r, 'redeem (third-party submitter)')['nativeCalls']
+            calls.remove(next(c for c in calls if c['target'] == joined.NATIVE_MEMBER))
+        with self.assertRaisesRegex(ValueError, 'expected 3 call'):
+            joined.check_native_report(self.native_report(short))
+
+    def test_native_report_refuses_a_missing_step(self):
+        # Any exception is caught so that a bypassed guard (a KeyError further down) fails the assertions
+        # below rather than erroring.
+        with self.assertRaises(Exception) as caught:
             joined.check_native_report(self.native_report(lambda r: r['steps'].pop(1)))
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertIn('lacks steps', str(caught.exception))
+
+    def test_native_report_refuses_a_failed_happy_path_step(self):
+        for name in ('lock', 'verifyMint', 'redeem (third-party submitter)', 'claim'):
+            with self.assertRaisesRegex(ValueError, f'{__import__("re").escape(name)} did not succeed'):
+                joined.check_native_report(self.native_report(lambda r, n=name: self.step(r, n).update(success=False)))
 
     def test_native_report_refuses_a_succeeding_refusal(self):
         with self.assertRaisesRegex(ValueError, 'refusal step succeeded'):
             joined.check_native_report(self.native_report(lambda r: r['steps'][4].update(success=True)))
+
+    def test_native_report_refuses_a_report_without_refusals(self):
+        def mutate(r):
+            for s in r['steps']:
+                s.pop('expectedRefusal', None)
+        with self.assertRaisesRegex(ValueError, 'no refusal step'):
+            joined.check_native_report(self.native_report(mutate))
 
 
 if __name__ == '__main__':

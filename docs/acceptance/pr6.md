@@ -83,7 +83,7 @@ explicitly classified as doubles; reference verdicts are not native calls.
 
 Entry: `tests/joined/run.py` steps `native-contracts-build` .. `native-driver`; the driver is
 `tests/joined/native/`. The raw report is [`pr6-native.json`](pr6-native.json) (sha256 of the run's
-files: report `e5b5c2a9…`, genesis `9aea0e24…`, golden `33c8fdd8…`). The harness run passed all 25 steps
+files: report `28f0ac57…`, genesis `9aea0e24…`, golden `124a3213…`). The harness run passed all 25 steps
 (exit 2, BLOCKED).
 
 What is real: the compiled `BridgeVault` and `TokenVerifier` at the contracts pin; the SealRegistry
@@ -96,8 +96,8 @@ whose inspector records each call to 0x0100, 0x0102 and 0x0104 with `was_precomp
 | Step | Result | Gas (tx) / native calls |
 | --- | --- | --- |
 | lock (1 token, 1e18 wei) | stored lock digest equals the oracle's; kernel request equals the oracle's prepare request | 292,064; 0x0104 38,160 |
-| verifyMint | returns nonce 1 | 1,615,825; 0x0104 89,920, 0x0100 1,258,052, 0x0102 5,950 |
-| redeem by a third party | credits the certified recipient; nullifier equals the oracle's | 1,798,775; 0x0104 132,000, 0x0100 1,258,052, 0x0102 5,950 + 2 x 6,712 |
+| verifyMint | returns nonce 1 | 1,615,801; 0x0104 89,920, 0x0100 1,258,052, 0x0102 5,950 |
+| redeem by a third party | credits the certified recipient; nullifier equals the oracle's | 1,798,799; 0x0104 132,000, 0x0100 1,258,052, 0x0102 5,950 + 2 x 6,712 |
 | claim | L = D = P = 1e18, vault balance 0, payee paid | 107,779 |
 
 Refusals, each leaving vault state unchanged: duplicate burn and a conflicting burn (other recipient) after
@@ -110,19 +110,35 @@ malformed -> B1 halts and the call burns its forwarded gas, ~6.4M gas), **1 acce
 the signature recovery id**. B1 verifies against the registered key, so that byte is not authenticated;
 this is the disclosed seal-signature difference below, not a new defect claim.
 
-Measured minimal gas limits (bisected): lock 294,250; verifyMint 1,635,008; redeem 1,800,961; claim
+Measured minimal gas limits (bisected): lock 294,250; verifyMint 1,634,984; redeem 1,800,985; claim
 109,980, against the profile's 7,000,000 ordinary capacity. A malformed certificate or a duplicate burn
 still costs the submitter 6.4M / 1.73M gas respectively. These are in-process revm figures, not a node
 benchmark or an activation price.
 
-Deviations from the merged contracts' golden, all by construction of the oracle code path: the golden
-pins a fixture verifier code hash, so `golden.json` cannot drive a real vault. The harness reruns the
-oracle's own golden generator with only `tokenVerifierCodeHash` replaced by the compiled runtime hash and
-regenerates prepare / mint / return and a conflicting burn. The vault and verifier constructors run in
-place at the oracle's fixed addresses (so `address(this)` and CREATE addresses equal a real deployment
-there). The genesis' EVM partition description uses the production parameter name `chain_id` where the
-oracle fixture says `chainId`. The lock backing inside the histories is the oracle's synthetic EVM state
-proof, not an `eth_getProof` of the state executed here.
+Each step must show its own native calls, not just somewhere in the report: lock -> 0x0104; verifyMint
+and redeem -> 0x0104, 0x0100 and 0x0102 (redeem three times, one per leaf), every call a native precompile
+call that succeeded. The driver and `check_native_report` both enforce this per step, and the recorded
+kernel requests and results, the UC request and the RSMT requests equal the oracle's bytes. The certificate
+refusal case asserts `UCRejected` (a verdict), using an authenticated offset.
+
+Deviations from the merged contracts' golden: its `golden.json` pins fixture identities (verifier code
+hash, root genesis, execution genesis, B1 profile hash), so it cannot drive a real vault. The harness
+reruns the oracle's own golden generator with the verifier code hash replaced by the compiled runtime
+hash and the **root genesis, execution genesis and B1 profile hash taken from the executed genesis**
+(`rootGenesisId`, genesis hash, profile hash; `ty`/`aid` follow), and regenerates prepare / mint /
+return and a conflicting burn; the driver asserts the three identities equal the registry's. The vault
+and verifier constructors run in place at the oracle's fixed addresses (so `address(this)` and CREATE
+addresses equal a real deployment there; `extcodesize(this)` is non-zero during the constructor, which
+these contracts do not observe). The genesis' EVM partition description uses the production parameter
+name `chain_id` where the oracle fixture says `chainId`. The lock backing inside the histories is the
+oracle's synthetic EVM state proof, not an `eth_getProof` of the state executed here.
+
+Open questions this tier cannot answer (contracts / B1 owners): (1) neither the vault nor the verifier
+checks `cfg.rootGenesis` or `cfg.b1ProfileHash` against the registry's root genesis or `b1.profileHash`;
+the identities above agree by construction of this run, but a vault configured with other values would
+pass the same tier. (2) B1 does not authenticate the certificate's signature recovery-id byte, so two
+encodings of one certificate verify; the vault keys on the nullifier, so there is no double credit, but
+the owner should confirm that is intended or canonicalize it.
 
 ## Outstanding acceptance gates
 
@@ -131,7 +147,7 @@ proof, not an `eth_getProof` of the state executed here.
 | Vault -> real B1 0x0100/0x0102 and B2 0x0104 | **CLOSED in-process** (above). Not yet through a running node: RPC/Engine API routes, block build/import. |
 | SDK3 running aggregator, private one-shard round trip | BLOCKED; run actual lock/mint/transfer/burn/redeem/claim on a live lane with real lock backing from the executed chain |
 | Paired refresh/restart/replay/reorg | BLOCKED; prove canonical settlement state and no duplicate credit after interruption/reorg |
-| Native gas/resource budgets and final deployment pins | PARTIAL: per-call and transaction gas measured in-process; production budgets, arm64 CPU, block/system-gas interaction and final pins remain |
+| Native gas/resource budgets and final deployment pins | PARTIAL: per-call and transaction gas measured in-process; production budgets, arm64 CPU, block/system-gas interaction and final pins remain. Carry in: a malformed certificate halts B1 and burns ~6.4M of the 7M ordinary capacity |
 
 The merged B2 kernel previously had no factory (ureth `7485a5cf`, `b2/src/lib.rs`); ureth#58 registers it
 next to B1 in `UnicityEvmFactory`, with the same inactivity (only the Unicity node builds that factory).

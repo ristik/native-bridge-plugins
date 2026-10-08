@@ -400,6 +400,71 @@ fn snapshot(w: &World, at: Address) -> (U256, BTreeMap<U256, U256>) {
         })
 }
 
+const KERNEL: &str = "B2 kernel 0x0104";
+const UC: &str = "B1 UC_V1 0x0100";
+const MEMBER: &str = "B1 RSMT_MEMBER_V1 0x0102";
+
+/// A step must have made at least `n` calls to each named native address, each a native precompile
+/// call that succeeded; an empty or partial call list fails here instead of passing vacuously.
+fn require_native(step: &str, o: &Out, want: &[(&str, usize)]) {
+    for (target, n) in want {
+        let calls: Vec<&Value> = o.native.iter().filter(|c| c["target"] == *target).collect();
+        assert!(
+            calls.len() >= *n,
+            "{step}: expected {n} call(s) to {target}, saw {}",
+            calls.len()
+        );
+        for c in calls {
+            assert_eq!(
+                c["nativePrecompile"], true,
+                "{step}: {target} was not a native precompile"
+            );
+            assert_eq!(c["ok"], true, "{step}: {target} call failed");
+        }
+    }
+}
+
+/// The recorded native calls carry exactly the oracle's kernel request/result, UC request and RSMT requests.
+fn matches_oracle(step: &str, o: &Out, kernel: &Value, envelope: Option<&Value>) {
+    let k = o
+        .native
+        .iter()
+        .find(|c| c["target"] == KERNEL)
+        .expect("kernel call");
+    assert_eq!(
+        k["input"],
+        kernel["kernelInput"].as_str().unwrap().to_lowercase(),
+        "{step}: kernel request"
+    );
+    assert_eq!(
+        k["output"],
+        kernel["kernelOutput"].as_str().unwrap().to_lowercase(),
+        "{step}: kernel result"
+    );
+    if let Some(e) = envelope {
+        let uc = o
+            .native
+            .iter()
+            .find(|c| c["target"] == UC)
+            .expect("UC call");
+        assert_eq!(
+            uc["input"],
+            e["ucRequest"].as_str().unwrap().to_lowercase(),
+            "{step}: UC request"
+        );
+        let members: Vec<&Value> = o.native.iter().filter(|c| c["target"] == MEMBER).collect();
+        let want = e["members"].as_array().unwrap();
+        assert_eq!(members.len(), want.len(), "{step}: RSMT call count");
+        for (got, want) in members.iter().zip(want) {
+            assert_eq!(
+                got["input"],
+                want["request"].as_str().unwrap().to_lowercase(),
+                "{step}: RSMT request"
+            );
+        }
+    }
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> usize {
     let hits: Vec<usize> = hay
         .windows(needle.len())
@@ -423,6 +488,22 @@ fn main() {
     let cfg = &golden["cfg"];
     let (verifier_addr, vault_addr) = (adr(&cfg["tokenVerifier"]), adr(&cfg["vault"]));
     let ordinary = genesis["ordinaryCapacity"].as_u64().unwrap();
+    // The vault's deployment identities are those of the executed registry genesis.
+    assert_eq!(
+        h32(&cfg["rootGenesis"]),
+        h32(&genesis["rootGenesisId"]),
+        "cfg.rootGenesis is the registry's root genesis"
+    );
+    assert_eq!(
+        h32(&cfg["executionGenesis"]),
+        h32(&genesis["evmGenesisHash"]),
+        "cfg.executionGenesis is the executed genesis hash"
+    );
+    assert_eq!(
+        h32(&cfg["b1ProfileHash"]),
+        h32(&genesis["profileHash"]),
+        "cfg.b1ProfileHash is the registry profile hash"
+    );
 
     let (vault_init, vault_abi) = artifact(contracts, "BridgeVault");
     let (verifier_init, verifier_abi) = artifact(contracts, "TokenVerifier");
@@ -669,14 +750,15 @@ fn main() {
             .to_lowercase(),
         "kernel request equals the oracle's prepare request"
     );
-    assert_eq!(prep["nativePrecompile"], true);
+    require_native("lock", &o, &[(KERNEL, 1)]);
+    matches_oracle("lock", &o, &golden["prepare"], None);
     let digest = w.view_b(vault_addr, lockDigestCall { n: U256::from(1) }.abi_encode());
     assert_eq!(
         digest,
         h32(&golden["prepare"]["result"]["lockDigest"]),
         "stored lock digest equals the oracle's"
     );
-    steps.push(tx_json(&w, "lock", &o, json!({"lockDigest": h(digest.as_slice()), "kernelOutputMatchesOracleAbi": prep["output"].as_str().unwrap().len() > 2, "minGasLimit": bisect_min_gas(&w0, &t(DEPOSITOR, lockCall { p0: p0.clone().into() }.abi_encode(), WEI), false)})));
+    steps.push(tx_json(&w, "lock", &o, json!({"lockDigest": h(digest.as_slice()), "kernelRequestAndResultEqualOracle": true, "minGasLimit": bisect_min_gas(&w0, &t(DEPOSITOR, lockCall { p0: p0.clone().into() }.abi_encode(), WEI), false)})));
     let w1 = w.clone();
 
     // ---- verifyMint (native 0x0100, 0x0102, 0x0104) ----
@@ -691,9 +773,13 @@ fn main() {
     let o = w.run(&vm, false);
     assert!(o.ok, "verifyMint: {}", w.revert_name(&o));
     assert_eq!(U256::from_be_slice(&o.output), U256::from(1));
-    for c in &o.native {
-        assert_eq!(c["nativePrecompile"], true, "{c}");
-    }
+    require_native("verifyMint", &o, &[(KERNEL, 1), (UC, 1), (MEMBER, 1)]);
+    matches_oracle(
+        "verifyMint",
+        &o,
+        &golden["mint"],
+        Some(&golden["mint"]["envelope"]),
+    );
     let min = bisect_min_gas(&w, &vm, false);
     steps.push(tx_json(
         &w,
@@ -713,10 +799,13 @@ fn main() {
     );
     let o = w.run(&rd, true);
     assert!(o.ok, "redeem: {}", w.revert_name(&o));
-    for c in &o.native {
-        assert_eq!(c["nativePrecompile"], true, "{c}");
-        assert_eq!(c["ok"], true);
-    }
+    require_native("redeem", &o, &[(KERNEL, 1), (UC, 1), (MEMBER, 3)]);
+    matches_oracle(
+        "redeem",
+        &o,
+        &golden["return"],
+        Some(&golden["return"]["envelope"]),
+    );
     let min = bisect_min_gas(&w1, &rd, false);
     let credit = w.view_u(vault_addr, claimableCall { a: recipient }.abi_encode());
     assert_eq!(credit, amount);
@@ -907,6 +996,7 @@ fn main() {
     // Flip every byte of the submitted certificate in turn: report how many flips B1 still accepts
     // (bytes its authentication does not cover) and use the first refused flip as the refusal case.
     let base = find(&return_proof, &uc);
+    let mut ucrejected_at = None;
     let (mut accepted, mut accepted_offsets, mut refused_at, mut reasons) =
         (0usize, vec![], None, BTreeMap::<String, usize>::new());
     for k in 0..uc.len() {
@@ -927,12 +1017,16 @@ fn main() {
         } else {
             refused_at.get_or_insert(k);
             let name = x.revert_name(&o);
+            if name.starts_with("UCRejected") {
+                ucrejected_at.get_or_insert(k);
+            }
             *reasons
                 .entry(name.split(' ').next().unwrap_or("").to_string())
                 .or_default() += 1;
         }
     }
-    let k = refused_at.expect("some certificate byte is authenticated");
+    let _ = refused_at;
+    let k = ucrejected_at.expect("some certificate byte flip is a UCRejected verdict");
     let mut bad = return_proof.clone();
     bad[base + k] ^= 1;
     refuse(
@@ -944,7 +1038,7 @@ fn main() {
             redeemCall { proof: bad.into() }.abi_encode(),
             0,
         ),
-        "",
+        "UCRejected",
     );
     steps.push(json!({"step": "certificate single-byte flip scan", "certificateBytes": uc.len(), "flipsStillAccepted": accepted, "acceptedOffsets": accepted_offsets, "flipsRefused": uc.len() - accepted, "refusalReasons": reasons, "firstRefusedOffset": k}));
     let sib = &hx(&ret["members"][0]["request"])[hx(&ret["members"][0]["request"]).len() - 32..];
@@ -976,7 +1070,7 @@ fn main() {
         "profile": "native-vault-calls (in-process node EVM factory; no devnet, no aggregator service)",
         "registryAdvance": registry_advance,
         "registry": {"codeHash": h(registry_hash.as_slice()), "genesisWords": registry_words, "rootGenesisId": genesis["rootGenesisId"], "profileHash": genesis["profileHash"], "shardConfHash": genesis["shardConfHash"], "systemGas": genesis["systemGas"], "maxGas": genesis["maxGas"], "ordinaryCapacity": ordinary},
-        "deployment": {"vault": h(vault_addr.as_slice()), "vaultRuntimeKeccak": h(keccak256(&vault_runtime).as_slice()), "vaultRuntimeBytes": vault_runtime.len(), "tokenVerifier": h(verifier_addr.as_slice()), "tokenVerifierRuntimeKeccak": h(verifier_hash.as_slice()), "cfgHash": h(cfg_hash.as_slice()), "chainId": w.chain_id, "deploymentMethod": "constructor executed in place at the golden deployment's addresses"},
+        "deployment": {"vault": h(vault_addr.as_slice()), "vaultRuntimeKeccak": h(keccak256(&vault_runtime).as_slice()), "vaultRuntimeBytes": vault_runtime.len(), "tokenVerifier": h(verifier_addr.as_slice()), "tokenVerifierRuntimeKeccak": h(verifier_hash.as_slice()), "cfgHash": h(cfg_hash.as_slice()), "chainId": w.chain_id, "identitiesFromExecutedGenesis": true, "deploymentMethod": "constructor executed in place at the golden deployment's addresses"},
         "steps": steps,
     });
     fs::write(
