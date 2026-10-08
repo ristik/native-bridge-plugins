@@ -40,7 +40,7 @@ def wait_for_compilers():
     deadline = time.monotonic() + 3600
     while True:
         rows = subprocess.check_output(['ps', '-axo', 'args='], text=True).splitlines()
-        active = [r for r in rows if Path(r.split()[0]).name in ('cargo', 'rustc', 'solc')
+        active = [r for r in rows if Path(r.split()[0]).name in ('cargo', 'rustc', 'solc', 'forge')
                   or (Path(r.split()[0]).name == 'go' and any(x in r for x in (' test ', ' build ', ' run ')))]
         if not active:
             return
@@ -75,6 +75,39 @@ def compare_contracts(contracts, generated):
             'note': 'contracts retain pre-merge provenance pins; compared to merged bytes and regenerated oracle here'}
 
 
+NATIVE_TARGETS = {'B1 UC_V1 0x0100', 'B1 RSMT_MEMBER_V1 0x0102', 'B2 kernel 0x0104'}
+NATIVE_REQUIRED = ['lock', 'verifyMint', 'redeem (third-party submitter)', 'claim', 'redeem again (duplicate burn)',
+                   'conflicting burn (other recipient) after the first redeem',
+                   'claim to a reverting payee (credit and P roll back)',
+                   'redeem with a flipped membership sibling',
+                   'redeem with the authority registry absent (fail closed)']
+
+
+def check_native_report(path):
+    """Re-checks the native driver's own report: every required step, every recorded native call native."""
+    report = json.loads(Path(path).read_text())
+    steps = {s['step']: s for s in report['steps']}
+    missing = [n for n in NATIVE_REQUIRED if n not in steps]
+    if missing:
+        raise ValueError(f'native report lacks steps: {missing}')
+    seen = set()
+    for s in report['steps']:
+        for c in s.get('nativeCalls', []):
+            if c.get('nativePrecompile') is False:
+                raise ValueError(f'{s["step"]}: {c["target"]} did not execute as a native precompile')
+            seen.add(c['target'])
+    if seen != NATIVE_TARGETS:
+        raise ValueError(f'native report does not cover every native address: {sorted(seen)}')
+    for name in ('lock', 'verifyMint', 'redeem (third-party submitter)', 'claim'):
+        if not steps[name]['success']:
+            raise ValueError(f'{name} did not succeed')
+    refusals = [s for s in report['steps'] if s.get('expectedRefusal') is not None]
+    if not refusals or any(s['success'] for s in refusals):
+        raise ValueError('a refusal step succeeded or none was recorded')
+    return {'steps': len(report['steps']), 'refusals': len(refusals), 'addresses': sorted(seen),
+            'gas': {n: steps[n]['gasUsed'] for n in NATIVE_REQUIRED[:4]}}
+
+
 def acceptance_status(steps):
     if any(s['status'] == 'FAIL' for s in steps):
         return 'FAIL', 1
@@ -97,7 +130,7 @@ def main():
               'host': {'system': platform.system(), 'machine': platform.machine()},
               'pins': PINS['sources'], 'harnessHead': git(ROOT, 'rev-parse', 'HEAD'),
               'steps': [], 'blocked': PINS['blocked'], 'deferred': PINS['deferred'],
-              'evidenceClass': 'component-only; synthetic certificates; no running aggregator or native vault calls'}
+              'evidenceClass': 'component + in-process native vault calls (node EVM factory); no running aggregator, no devnet'}
     report['inputs'] = {str(p.relative_to(ROOT)): digest(p) for p in sorted(HERE.rglob('*'))
                         if p.is_file() and '__pycache__' not in p.parts}
 
@@ -147,7 +180,8 @@ def main():
         with tempfile.TemporaryDirectory(prefix='nbp-pr6-cache-') as scratch:
             scratch = Path(scratch)
             env['GOCACHE'] = str(scratch / 'go-cache')
-            env['CARGO_TARGET_DIR'] = str(scratch / 'rust-target')
+            # NBP_PR6_CARGO_TARGET_DIR lets one persistent target serve a 16 GB host; default is a private scratch target.
+            env['CARGO_TARGET_DIR'] = os.environ.get('NBP_PR6_CARGO_TARGET_DIR', str(scratch / 'rust-target'))
             step('toolchains', ['python3', '-c',
                  'import subprocess; [subprocess.run(c, check=True) for c in '
                  '[["node","--version"],["npm","--version"],["go","version"],["cargo","--version"],["forge","--version"]]]'])
@@ -187,6 +221,34 @@ def main():
                                               '-run', '^TestGenPR5Golden$', '-count=1'], sources['oracle'], golden_env)
                 report['contractsComparison'] = compare_contracts(sources['contracts'], out / 'contracts-golden.json')
                 step('contracts-doubles', ['forge', 'test', '--threads', '2', '--match-path', 'test/bridge/*.t.sol'], sources['contracts'], env)
+                # Native-call tier: real vault/verifier runtimes, the production B1 genesis path and the node EVM factory.
+                step('native-contracts-build', ['forge', 'build', '--threads', '2', 'src/bridge/BridgeVault.sol', 'src/bridge/TokenVerifier.sol'], sources['contracts'], env)
+                native_overlay = scratch / 'native-overlay.json'
+                native_overlay.write_text(json.dumps({'Replace': {
+                    str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_golden_test.go'):
+                    str(sources['contracts'] / 'script/bridge-golden/golden_pr5_test.go.txt'),
+                    str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_native_golden_test.go'): str(HERE / 'native/golden_test.go.txt'),
+                    str(sources['oracle'] / 'registrygenesis/zz_nbp_pr6_native_genesis_test.go'): str(HERE / 'native/genesis_test.go.txt')}}))
+                step('native-genesis', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './registrygenesis',
+                                        '-run', '^TestNBPPR6NativeGenesis$', '-count=1'], sources['oracle'],
+                     dict(env, NBP_PR6_NATIVE_OUT=str(out / 'native-genesis.json')))
+                step('native-golden', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './bridgeprofile',
+                                       '-run', '^TestNBPPR6NativeGolden$', '-count=1'], sources['oracle'],
+                     dict(env, NBP_PR6_NATIVE_GOLDEN=str(out / 'native-golden.json'),
+                          NBP_PR6_VERIFIER_ARTIFACT=str(sources['contracts'] / 'out/TokenVerifier.sol/TokenVerifier.json')))
+                step('native-fmt', ['rustfmt', '--edition', '2021', '--check', str(HERE / 'native/src/main.rs')], env=env)
+                native = scratch / 'native'
+                shutil.copytree(HERE / 'native', native, ignore=shutil.ignore_patterns('*.txt'))
+                template = (native / 'Cargo.toml.in').read_text()
+                (native / 'Cargo.toml').write_text(template
+                    .replace('@EXECUTION_PATH@', json.dumps(str(sources['ureth'] / 'crates/unicity/execution')))
+                    .replace('@B1_PATH@', json.dumps(str(sources['ureth'] / 'crates/unicity/b1'))))
+                shutil.copyfile(sources['ureth'] / 'Cargo.lock', native / 'Cargo.lock')
+                step('native-driver', ['cargo', 'run', '--manifest-path', str(native / 'Cargo.toml'), '--',
+                                       str(out / 'native-genesis.json'), str(out / 'native-golden.json'),
+                                       str(sources['contracts']), str(out / 'native-report.json')], env=env)
+                shutil.copyfile(native / 'Cargo.lock', out / 'native-Cargo.lock')
+                report['nativeCalls'] = check_native_report(out / 'native-report.json')
         # Refuse evidence from sources modified while commands ran.
         for key, path in sources.items():
             validate_source(path, PINS['sources'][key])

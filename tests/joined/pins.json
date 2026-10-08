@@ -2,16 +2,16 @@
   "profile": "fixed-base-unit-weight-sdk-3.0.1",
   "sources": {
     "plugins": "c70f2a76a1b250a98a0db0083d8b5fb6022acad4",
-    "ureth": "7485a5cf13cd680f2b3b14dc42c405d0faa6457c",
+    "ureth": "7e9a8ae0f6ed855f400b76e314b1c66ca0133295",
     "contracts": "7e49fe1142ba7aca02fc4a33a3fe75b15a643d3a",
     "oracle": "66fc865e1db7c5ef1e5ebdad2a0e2623d2c331e3",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
-    "vault-real-B1-B2": "B1 PR4 system integration is not merged; the pinned node factories do not install B1/B2. No vault real-call acceptance yet.",
-    "private-one-shard-round-trip": "Requires the integrated B1 node, authenticated registry genesis, deployed vault and a running SDK3 aggregator.",
-    "paired-restart-reorg": "Requires the same joined deployment; wallet recovery and synthetic proof refresh do not establish chain restart/reorg safety.",
-    "native-budget-benchmarks": "Requires integrated client gas/resource measurements, runtime/deployment pins and the B1 system budget. Component OOG checks are insufficient."
+    "private-one-shard-round-trip": "Requires a running SDK3 aggregator and the paired node lane. The native tier executes the real vault, verifier, registry and B1/B2 natives in-process only.",
+    "real-chain-lock-backing": "The lock backing inside the oracle histories is the oracle's synthetic EVM state proof, not an eth_getProof of the vault state the native tier executed.",
+    "paired-restart-reorg": "Requires the same joined deployment; wallet recovery, synthetic proof refresh and in-process execution do not establish chain restart/reorg safety.",
+    "native-budget-benchmarks": "Per-call native and transaction gas are measured in-process (native-report.json); production activation budgets, arm64 CPU, block/system-gas interaction and final deployment pins remain open."
   },
   "deferred": [
     "arbitrary validator weights including (98,1,1)",
