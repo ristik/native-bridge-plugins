@@ -1,8 +1,9 @@
 # Joined native bridge acceptance
 
-The current pins deliver **component evidence only**. Full acceptance is BLOCKED
-on B1 PR4 integration. The harness never reports PASS for a private round trip.
-It neither starts a devnet nor deploys, activates or publishes anything.
+The current pins deliver **component evidence and in-process native vault-call evidence**.
+Full acceptance stays BLOCKED on a live lane (running node, SDK3 aggregator, restart/reorg). The harness
+never reports PASS for a private round trip. It neither starts a devnet nor deploys, activates or
+publishes anything.
 
 `pins.json` records full merged commits, supported fixed-base/unit-weight scope,
 blocked live scenarios and explicitly deferred SDK trust work. Source validation
@@ -54,6 +55,11 @@ The executable checks are:
   merged oracle. Its bytes must match the pinned contracts, and all 68 listed
   shared values must occur in the merged corpus. This explicitly handles the
   contracts' stale pre-merge provenance without changing either corpus.
+* Native tier (`native/`): compiled vault and verifier, the production B1 genesis path (Go overlay on the
+  oracle) and the oracle golden regenerated with the real verifier hash, executed through ureth's
+  `UnicityEvmFactory` with B1/B2 natives; an inspector records every native call. `run.py` re-checks the
+  driver's report (`check_native_report`: required steps, every native call native, every address covered,
+  refusals refused). Set `NBP_PR6_CARGO_TARGET_DIR` to reuse one Cargo target.
 * The pinned Foundry bridge suite checks accounting, replay, claim failures,
   reentrancy, authenticated IR-opening composition and limits using **labelled
   B1/B2 doubles**. These tests do not satisfy the deferred native-call gate.
