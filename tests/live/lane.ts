@@ -260,9 +260,13 @@ if (process.env.DNB_REPO) {
   const heightsOf = async (): Promise<number[]> => Promise.all(lane.ethUrls.map(async (u) => parseInt(await rpc(u, 'eth_blockNumber', []), 16)));
   const before = await heightsOf();
   run('bash', [`${process.env.DNB_REPO}/scripts/dnb-devnet.sh`, 'restart-all'], {});
-  const after = await until('all four clients to advance past their old heads', 300_000, async () => {
+  // An idle chain builds no blocks, so liveness after the restart is shown by a transaction: it must be included and all four clients agree on the new head.
+  await until('all four clients to answer at their old heads', 300_000, async () => (await heightsOf()).every((x, i) => x >= before[i]) || undefined);
+  const live = await sendAll(RECIPIENT, '', [], DEPLOYER_KEY, '100000', '1');
+  assert.equal(live.status, '0x1');
+  const after = await until('all four clients to reach the new head', 120_000, async () => {
     const h = await heightsOf();
-    return h.every((x, i) => x > before[i] + 1) && Math.max(...h) - Math.min(...h) <= 1 ? h : undefined;
+    return h.every((x) => x >= parseInt(live.blockNumber, 16)) && Math.max(...h) - Math.min(...h) <= 1 ? h : undefined;
   });
   const stillCredited = BigInt(cast('call', lane.vault, 'claimable(address)(uint256)', RECIPIENT).split(' ')[0]);
   const nullifierKept = unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString()));
