@@ -12,13 +12,13 @@ production deployment, merge or B4/B2 closure is claimed.
 | Component | Exact merged/source revision |
 | --- | --- |
 | Plug-ins (PRs 1/2) | `c70f2a76a1b250a98a0db0083d8b5fb6022acad4` |
-| ureth node factory with B1 and B2 (#57 + #58 head; B1 PR4 is open, **re-pin after merge**) | `7e9a8ae0f6ed855f400b76e314b1c66ca0133295` |
+| ureth node factory with B1 and B2 (#57 = `c10a2dfd`, merged; #58 merge commit) | `634bcc28b2e38b5f8caa435e41bc1cb0a66bf958` |
 | Vault/registry (contracts PRs 8/6) | `7e49fe1142ba7aca02fc4a33a3fe75b15a643d3a` |
 | Go oracle (PRs 422/442) | `66fc865e1db7c5ef1e5ebdad2a0e2623d2c331e3` |
 | SDK3 aggregator implementation | `ae081651ac7443496b5397baa8748e0b4280ba72` |
 
-The ureth pin is the head of ristik/ureth#58 (B2 registration at 0x0104, stacked on #57 = B1 PR4, which
-is itself under review); it contains the previously pinned B2 kernel (`7485a5cf`) unchanged. The corpus retains its own generator pin (`52fe1934…`) and is regenerated from
+The ureth pin is the merge commit of ristik/ureth#58 (B2 registration at 0x0104), which contains #57
+(B1 PR4b, `c10a2dfd`) and the previously pinned B2 kernel (`7485a5cf`) unchanged. The corpus retains its own generator pin (`52fe1934…`) and is regenerated from
 that exact commit. The current oracle pin additionally includes consumption of
 the merged corpus. No consumer fixtures or protocol bytes were edited.
 Full pins and unsupported/deferred scenarios are machine-readable in

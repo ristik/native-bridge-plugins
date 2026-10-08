@@ -2,7 +2,7 @@
   "profile": "fixed-base-unit-weight-sdk-3.0.1",
   "sources": {
     "plugins": "c70f2a76a1b250a98a0db0083d8b5fb6022acad4",
-    "ureth": "7e9a8ae0f6ed855f400b76e314b1c66ca0133295",
+    "ureth": "634bcc28b2e38b5f8caa435e41bc1cb0a66bf958",
     "contracts": "7e49fe1142ba7aca02fc4a33a3fe75b15a643d3a",
     "oracle": "66fc865e1db7c5ef1e5ebdad2a0e2623d2c331e3",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
