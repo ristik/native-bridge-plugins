@@ -1,5 +1,5 @@
 /**
- * DN-B live lane driver (stage: lock -> mint). Runs against the running B1/B2 paired devnet (bft-core scripts/dnb-devnet.sh) and the
+ * DN-B live lane driver: lock -> mint -> transfer -> burn -> redeem -> claim, refusals, interruption and budget probes. Runs against the running B1/B2 paired devnet (bft-core scripts/dnb-devnet.sh) and the
  * aggregator-go BFT shard. Every component is real: the vault executes on ureth with the native B1/B2 precompiles, the lock backing is an
  * eth_getProof of the executed chain bound to the archived certificate of its block, the mint is certified by the live aggregator.
  */
@@ -101,7 +101,7 @@ const payeeAddr = '0x000000000000000000000000000000000000bEEF';
 const RECIPIENT_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const THIRD_PARTY_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a'; // account 2 submits the redemption
 // The genesis funds only the deployer: fund the redeemer and the third-party submitter for gas.
-for (const a of [RECIPIENT, '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC']) {
+for (const a of [RECIPIENT, THIRD_PARTY_ADDR]) {
   await sendAll(a, '', [], DEPLOYER_KEY, '100000', '1000000000000000000');
 }
 // ---- lock ------------------------------------------------------------------------------------------------------------------------------
@@ -121,14 +121,18 @@ step('lock executed on the running chain', { nonce, blockHash: lockBlock, blockN
 
 // ---- lock proof: archived certificate + eth_getProof of the executed chain -------------------------------------------------------------
 const proofPath = `${lane.dir}/lockproof-${nonce}.cbor`;
+let lockProofError = '';
 await until('the lock block to be certified and archived', 120_000, async () => {
   try {
     run(DNB_TOOL, ['lockproof', '--archive', lane.archive, '--block-hash', lockBlock, '--eth-url', eth, '--vault', lane.vault, '--nonce', nonce.toString(),
       '--full-shard-conf', `${lane.dir}/evm-full-shard-conf.json`, '--trust-doc', `${lane.dir}/sdk-trust-base.json`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
     return true;
-  } catch {
+  } catch (e) {
+    lockProofError = String((e as { stderr?: string }).stderr ?? e).trim().slice(0, 300);
     return false;
   }
+}).catch((e: Error) => {
+  throw new Error(`${e.message}; last dnb-tool lockproof error: ${lockProofError}`);
 });
 const lockProof = Uint8Array.from(readFileSync(proofPath));
 step('lock proof assembled', { bytes: lockProof.length, sha256: hex(sha256(lockProof)) });
@@ -217,11 +221,13 @@ step('registry clock reached the anchor', { anchorRound, registryClock: await re
 {
   const clockNow = await registryClock();
   const verdict = await rpc(eth, 'eth_call', [{ to: '0x0000000000000000000000000000000000000100', data: `0x${hex(readFileSync(`${lane.dir}/uc-request.bin`))}` }, 'latest']);
-  step('native UC_V1 verdict on the anchor request', { registryClock: clockNow, returndata: verdict, valid: verdict.endsWith('0000000000000000000000000000000000000000000000000000000000000001') && verdict.slice(66).replace(/^0x/, '').includes('1') });
+  // B1 returns abi.encode(uint256 version = 1, bool valid).
+  const valid = BigInt(`0x${verdict.slice(2 + 64, 2 + 128)}`) === 1n && BigInt(`0x${verdict.slice(2, 2 + 64)}`) === 1n;
+  assert.ok(valid, `the native UC_V1 verdict on the anchor must be true at clock ${clockNow}: ${verdict}`);
+  step('native UC_V1 verdict on the anchor request', { registryClock: clockNow, returndata: verdict, valid });
 }
 
 // ---- redeem by a third party, then claim by the credited recipient --------------------------------------------------------------------
-const gasPaid = async (hash: string): Promise<bigint> => BigInt((await rpc(eth, 'eth_getTransactionReceipt', [hash])).gasUsed);
 const vaultBefore = BigInt(await rpc(eth, 'eth_getBalance', [lane.vault, 'latest']));
 const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, '2500000');
 const redeemClock = BigInt(await rpc(eth, 'eth_getStorageAt', ['0xff00000000000000000000000000000000000002', clockSlot, redeemTx.blockNumber]));
@@ -246,9 +252,9 @@ const selector = (sig: string): string => run('cast', ['sig', sig]);
   assert.ok(at > 0, 'the anchor certificate is embedded in the envelope');
   const flipped = Uint8Array.from(ret.encoded);
   flipped[at + (uc.length >> 1)] ^= 1;
-  const r = callRevert('0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC', 'redeem(bytes)(uint256)', [`0x${hex(flipped)}`]);
-  assert.notEqual(r, 'NO REVERT', 'a certificate with a flipped byte is not redeemable');
-  step('control: flipped certificate byte refused', { revertData: r, ucRejected: r === selector('UCRejected()') });
+  const r = callRevert(THIRD_PARTY_ADDR, 'redeem(bytes)(uint256)', [`0x${hex(flipped)}`]);
+  assert.equal(r, selector('UCRejected()'), 'a certificate with a flipped byte is refused by the native UC check, not for another reason');
+  step('control: flipped certificate byte refused (UCRejected)', { revertData: r });
   const c = callRevert(THIRD_PARTY_ADDR, 'claim(uint256,address)', [amountWei.toString(), payeeAddr]);
   assert.equal(c, selector('InsufficientCredit(uint256,uint256)'), 'an uncredited account cannot claim');
   step('control: claim by an uncredited account refused', { revertData: c });
@@ -257,7 +263,8 @@ const selector = (sig: string): string => run('cast', ['sig', sig]);
 {
   // Within the same window the same proof again is a duplicate burn: the vault keys on the nullifier.
   const d = callRevert(THIRD_PARTY_ADDR, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`]);
-  step('control: the same burn redeemed twice is refused', { revertData: d, alreadyRedeemed: d === selector('AlreadyRedeemed(uint256)') });
+  assert.equal(d, selector('AlreadyRedeemed(uint256)'), 'the same burn is refused as already redeemed (inside the B1 window; a stale anchor would show UCRejected)');
+  step('control: the same burn redeemed twice is refused (AlreadyRedeemed)', { revertData: d });
 }
 if (process.env.DNB_REPO) {
   // Interruption between redeem and claim: every shard validator and ureth is stopped at once and started again from its own state.
@@ -277,8 +284,14 @@ if (process.env.DNB_REPO) {
   assert.equal(stillCredited, amountWei, 'the credit survived the interruption exactly once');
   assert.equal(hex(nullifierKept), hex(ret.verified.outcome.nullifier), 'the recorded nullifier survived');
   const again = callRevert(THIRD_PARTY_ADDR, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`]);
-  assert.notEqual(again, 'NO REVERT', 'the old proof cannot credit twice');
+  // The restart took longer than the window, so the old anchor is stale and the native check refuses it before the nullifier is consulted;
+  // that the credit and the recorded nullifier are unchanged is asserted above.
+  assert.equal(again, selector('UCRejected()'), 'the old proof is refused (stale anchor)');
   step('interruption: all validators and clients restarted between redeem and claim', { heightsBefore: before, heightsAfter: after, credit: stillCredited, replayedProofRefusedWith: again });
+}
+if (!process.env.DNB_REPO) {
+  console.log('SKIP interruption phase: DNB_REPO is not set');
+  step('interruption phase SKIPPED (DNB_REPO unset)', { skipped: true });
 }
 const payee = payeeAddr;
 const before = BigInt(await rpc(eth, 'eth_getBalance', [payee, 'latest']));
@@ -287,7 +300,6 @@ assert.equal(claimTx.status, '0x1');
 const after = BigInt(await rpc(eth, 'eth_getBalance', [payee, 'latest']));
 assert.equal(after - before, amountWei, 'the payee received the locked amount');
 step('claim paid', { gasUsed: BigInt(claimTx.gasUsed), paid: after - before, vaultBefore, vaultAfter: BigInt(await rpc(eth, 'eth_getBalance', [lane.vault, 'latest'])) });
-void gasPaid;
 
 writeFileSync(`${lane.dir}/lane-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
 
@@ -298,6 +310,7 @@ for (const [name, at] of [['first byte of the certificate (malformed CBOR head)'
   bad[base + at] ^= 0xff;
   const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(bad)}`], THIRD_PARTY_KEY, '7000000');
   assert.equal(rc.status, '0x0');
+  assert.ok(BigInt(rc.gasUsed) < 7_000_000n, 'the probe reverted inside its gas limit (not an out-of-gas)');
   step(`budget: redemption with a corrupted ${name} reverts`, { gasUsed: BigInt(rc.gasUsed), gasLimit: 7_000_000n });
 }
 writeFileSync(`${lane.dir}/lane-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
