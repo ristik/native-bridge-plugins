@@ -365,9 +365,10 @@ The parser ceilings do not promise that every admitted bundle passes the gate;
 the gate admits or refuses each bundle. At the maximum sizes (L=16, UC 8192
 bytes with 64 signatures and 33 steps, 32-sibling paths, history 16384,
 envelope 65536 bytes) two anchors price 6,976,692 and pass, three do not. Real
-DN-B certificates (4 signatures, about 1.5 KB, one shard sibling) price about
-1.3M each, so up to four anchors pass for small histories; five can never pass
-(five minimal certificates alone exceed the budget with the reserve). A typical
+DN-B certificates (4 signatures, one shard sibling) are 811 bytes and price 1,282,702 each
+(`compose-anchors-max-dnb`): four such anchors with four leaves price 6,429,792 and pass, while the same four
+anchors with sixteen leaves and deep paths (185 path steps) price 7,024,626 and do not
+(`compose-anchors-max-dnb-load-over-budget`); five can never pass (five minimal certificates alone exceed the budget with the reserve). A typical
 bundle (4 KiB UC, 5 signatures, 8 steps, 8-sibling paths, 2 KiB history, 8 KiB
 envelope) with two anchors is about 4.3M. Anything refused by the gate or above
 a ceiling is BudgetExceeded or an input-size refusal before any native call.
