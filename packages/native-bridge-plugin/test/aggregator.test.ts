@@ -14,7 +14,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { checkAnchors, checkPolicyBody, decodeEnvelope, encodeEnvelope, parseInputRecord, planAnchors } from '../src/envelope.js';
 import { computeGate, kernelRequestBytes, scanAnchor } from '../src/gas.js';
 import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../src/limits.js';
-import { buildReturnProof, preflightBurn, refreshToken } from '../src/proof.js';
+import { buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../src/proof.js';
 import { cfgBytes, shardId, shardRow } from '../src/profile.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS } from '../src/wallet.js';
 import { DeploymentRegistry } from '../src/deployment.js';
@@ -214,6 +214,11 @@ test('depth 1: one anchor per distinct UC in first-use order, each leaf under it
   assert.throws(() => scanAnchor(envelope.anchors[0], 0), { reason: 'ErrAnchorAuth' });
   assert.ok(gate.total <= TX_GAS_BUDGET);
   assert.deepEqual(decodeEnvelope(encoded), envelope);
+  // routing: every leaf is served by the row of its own shard, and the anchors agree
+  const routes = await leafRoutes(w.bridge, out.token);
+  assert.deepEqual(routes.map((r) => r.row), rows);
+  assert.deepEqual(routes.map((r) => r.sid), verified.outcome.leaves.map((l) => l.sid));
+  routes.forEach((r, i) => assert.deepEqual(r.shard, envelope.anchors[envelope.leafProofs[i].anchorIndex].shard));
   // a leaf under the other shard's anchor is refused
   const swapped = structuredClone(envelope);
   swapped.leafProofs.forEach((l) => { l.anchorIndex = 1 - l.anchorIndex; });

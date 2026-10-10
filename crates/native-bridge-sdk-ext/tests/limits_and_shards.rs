@@ -7,7 +7,7 @@ use common::*;
 use native_bridge_sdk_ext::envelope::*;
 use native_bridge_sdk_ext::gas::*;
 use native_bridge_sdk_ext::limits::*;
-use native_bridge_sdk_ext::proof::{build_return_proof, preflight_burn};
+use native_bridge_sdk_ext::proof::{build_return_proof, leaf_routes, preflight_burn};
 use native_bridge_sdk_ext::NativeError as E;
 
 const T0: u64 = 1_700_000_040;
@@ -133,6 +133,16 @@ fn depth_one_one_anchor_per_distinct_uc_in_first_use_order_each_leaf_under_its_o
     assert_eq!(scan_anchor(&env.anchors[0], 0).unwrap_err(), E::AnchorAuth);
     assert!(gate.total <= TX_GAS_BUDGET);
     assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
+    // routing: every leaf is served by the row of its own shard, and the anchors agree
+    let routes = leaf_routes(&w.bridge, &out.token).unwrap();
+    assert_eq!(routes.iter().map(|r| r.row).collect::<Vec<_>>(), rows);
+    for (i, r) in routes.iter().enumerate() {
+        assert_eq!(r.sid, sids[i]);
+        assert_eq!(
+            r.shard,
+            env.anchors[usize::from(env.leaf_proofs[i].anchor_index)].shard
+        );
+    }
     // a leaf under the other shard's anchor is refused
     let mut swapped = env.clone();
     for l in &mut swapped.leaf_proofs {

@@ -18,6 +18,8 @@ import { fail } from './errors.js';
 import { projectToken } from './history.js';
 import { MAX_ENVELOPE_BYTES, MAX_LEAVES, MAX_SEMANTIC_BYTES, TX_GAS_BUDGET } from './limits.js';
 import { parseJustification } from './lockproof.js';
+import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
+import type { Deployment } from './deployment.js';
 import { H, arr, cfgBytes, policyBytes, shardId, shardRow, u } from './profile.js';
 import type { NativeBridge, VerifiedToken } from './verifier.js';
 
@@ -112,9 +114,7 @@ export const BURN_HISTORY_BYTES = 1024;
 export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array): Promise<Gate> {
   preflightToken(tokenBytes);
   const token = await Token.fromCBOR(tokenBytes);
-  const j = token.genesis.justification ?? fail('ErrMintJustif');
-  const parsed = parseJustification(j);
-  const dep = bridge.registry.find(token.genesis.networkId.id, parsed.chainId, parsed.vault);
+  const dep = deploymentOf(bridge, token);
   const leaves = token.transactions.length + 2; // the mint, every transfer and the burn
   if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
   const history = projectToken(token).length + BURN_HISTORY_BYTES;
@@ -123,4 +123,38 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   if (gate.total > TX_GAS_BUDGET) fail('ErrGasBudget');
   return gate;
+}
+
+function deploymentOf(bridge: NativeBridge, token: Token): Deployment {
+  const j = token.genesis.justification ?? fail('ErrMintJustif');
+  const parsed = parseJustification(j);
+  return bridge.registry.find(token.genesis.networkId.id, parsed.chainId, parsed.vault);
+}
+
+/** Where one history leaf's aggregator proof is served: the policy row of its own shard. */
+export interface LeafRoute {
+  /** The leaf's position in the history (genesis first). */
+  index: number;
+  /** The raw 32-byte state ID `get_inclusion_proof.v2` is asked for. */
+  sid: Uint8Array;
+  /** The policy row of the leaf's shard: the top `depth` bits of the state ID. */
+  row: number;
+  /** The native shard ID of that row. */
+  shard: Uint8Array;
+}
+
+/**
+ * Route every leaf of `token` to its shard. The host maps rows to its aggregator endpoints (installation
+ * metadata, never a verification input) and fetches `get_inclusion_proof.v2` per leaf, concurrently if it
+ * likes; whatever certificate each response carries is kept with its path. Nothing is re-queried to make
+ * certificates converge.
+ */
+export async function leafRoutes(bridge: NativeBridge, token: Token): Promise<LeafRoute[]> {
+  const dep = deploymentOf(bridge, token);
+  const all = [token.genesis, ...token.transactions];
+  return Promise.all(all.map(async (c, index) => {
+    const sid = (await StateId.fromCertificationData(c.inclusionProof.certificationData)).data;
+    const row = shardRow(dep.policy, sid);
+    return { index, sid, row, shard: shardId(dep.policy, row) };
+  }));
 }

@@ -162,14 +162,7 @@ pub const BURN_HISTORY_BYTES: usize = 1024;
 /// bounds the answer is `GasBudget`/`TooManyTx`/`InputTooLarge` (BudgetExceeded), never a truncated
 /// history or a partial redemption. `token` is the held receipt the burn would spend.
 pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
-    let mint = token.genesis().transaction();
-    let j = mint.justification().ok_or(E::MintJustif)?;
-    let parsed = crate::lockproof::parse_justification(j)?;
-    let dep = bridge.registry.find(
-        token.genesis().transaction().network_id().id(),
-        parsed.chain_id,
-        &parsed.vault,
-    )?;
+    let dep = deployment_of(bridge, token)?;
     let leaves = token.transactions().len() + 2; // the mint, every transfer and the burn
     if leaves > MAX_LEAVES {
         return Err(E::TooManyTx);
@@ -210,4 +203,47 @@ pub fn leaf_transactions(token: &Token) -> Vec<(Vec<u8>, [u8; 32])> {
         ));
     }
     out
+}
+
+fn deployment_of<'a>(bridge: &'a NativeBridge, token: &Token) -> Result<&'a Deployment> {
+    let mint = token.genesis().transaction();
+    let j = mint.justification().ok_or(E::MintJustif)?;
+    let parsed = crate::lockproof::parse_justification(j)?;
+    bridge
+        .registry
+        .find(mint.network_id().id(), parsed.chain_id, &parsed.vault)
+}
+
+/// Where one history leaf's aggregator proof is served: the policy row of its own shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafRoute {
+    /// The leaf's position in the history (genesis first).
+    pub index: usize,
+    /// The raw 32-byte state ID `get_inclusion_proof.v2` is asked for.
+    pub sid: [u8; 32],
+    /// The policy row of the leaf's shard: the top `depth` bits of the state ID.
+    pub row: usize,
+    /// The native shard ID of that row.
+    pub shard: Vec<u8>,
+}
+
+/// Route every leaf of `token` to its shard. The host maps rows to its aggregator endpoints
+/// (installation metadata, never a verification input) and fetches `get_inclusion_proof.v2` per leaf;
+/// whatever certificate each response carries is kept with its path. Nothing is re-queried to make
+/// certificates converge.
+pub fn leaf_routes(bridge: &NativeBridge, token: &Token) -> Result<Vec<LeafRoute>> {
+    let dep = deployment_of(bridge, token)?;
+    Ok(leaf_transactions(token)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, sid))| {
+            let row = dep.policy.shard_row(&sid);
+            LeafRoute {
+                index,
+                sid,
+                row,
+                shard: dep.policy.shard_id(row).to_vec(),
+            }
+        })
+        .collect())
 }
