@@ -1,9 +1,10 @@
 /** Failure family: malformed encoding, relation outside the profile or wrong, or a budget. */
-export type NativeFamily = 'malformed' | 'invalid' | 'budget';
+export type NativeFamily = 'malformed' | 'invalid' | 'budget' | 'unavailable';
 
 const M = 'malformed' as const;
 const B = 'budget' as const;
 const I = 'invalid' as const;
+const U = 'unavailable' as const;
 
 /**
  * Sentinel names shared with the Rust crate and the Go oracle (`Err` + name). Every identity a test
@@ -21,7 +22,7 @@ const FAMILY = {
   ErrRepeatedSID: I, ErrNoTransfers: I, ErrHasTransfers: I, ErrBurnNotFinal: I, ErrNotBurn: I,
   ErrBurnReason: I, ErrReturnData: I, ErrReturnAmount: I, ErrReturnRecip: I, ErrLockInput: I,
   ErrZeroDigest: I, ErrDeadlineExpired: I, ErrReferenceTimeFuture: I, ErrInputRecordMismatch: I,
-  ErrUnexpectedBurn: I, ErrRefreshMismatch: I, ErrProofUnavailable: I,
+  ErrUnexpectedBurn: I, ErrRefreshMismatch: I, ErrProofUnavailable: U,
   ErrIssuanceReason: I, ErrIssuanceData: I, ErrIssuanceSplit: I, ErrUnknownDeployment: I,
   ErrAmbiguousDeployment: I, ErrNetworkMismatch: I,
   ErrTrustBase: I, ErrSdkVerification: I, ErrEpochMismatch: I, ErrRoundBeforeEpochStart: I,

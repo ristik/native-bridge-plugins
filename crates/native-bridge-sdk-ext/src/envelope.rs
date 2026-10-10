@@ -280,7 +280,10 @@ pub fn check_policy_body(cfg: &Cfg, env: &Envelope) -> Result<Policy> {
     if pol.partition == cfg.evm_partition {
         return Err(E::PolicyPartition);
     }
-    if env.anchors.is_empty() || env.anchors.len() > MAX_ANCHORS {
+    if env.anchors.len() > MAX_ANCHORS {
+        return Err(E::TooManyPaths);
+    }
+    if env.anchors.is_empty() {
         return Err(E::PolicyAnchors);
     }
     Ok(pol)
@@ -303,7 +306,10 @@ pub fn plan_anchors(pol: &Policy, env: &Envelope, sids: &[[u8; 32]]) -> Result<A
     if env.leaf_proofs.len() != sids.len() {
         return Err(E::PolicyLeafCount);
     }
-    if env.anchors.is_empty() || env.anchors.len() > MAX_ANCHORS || env.anchors.len() > sids.len() {
+    if env.anchors.len() > MAX_ANCHORS {
+        return Err(E::TooManyPaths);
+    }
+    if env.anchors.is_empty() || env.anchors.len() > sids.len() {
         return Err(E::PolicyAnchors);
     }
     let mut row_of = Vec::new();

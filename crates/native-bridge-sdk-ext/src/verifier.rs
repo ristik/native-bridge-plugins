@@ -28,7 +28,7 @@ fn map_error(e: E, malformed: VerificationError) -> VerificationError {
     match e.family() {
         Family::Malformed => malformed,
         Family::Budget => VerificationError::VerificationLimitExceeded("native lock proof"),
-        Family::Invalid => VerificationError::UnsupportedMintJustification,
+        Family::Invalid | Family::Unavailable => VerificationError::UnsupportedMintJustification,
     }
 }
 

@@ -225,7 +225,7 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
     assert_eq!(five.ucs.len(), MAX_ANCHORS + 1);
     assert_eq!(
         build_return_proof(&w.bridge, &five.token).unwrap_err(),
-        E::PolicyAnchors
+        E::TooManyPaths
     );
 }
 

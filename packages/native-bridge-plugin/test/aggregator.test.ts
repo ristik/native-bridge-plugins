@@ -14,7 +14,10 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { checkAnchors, checkPolicyBody, decodeEnvelope, encodeEnvelope, parseInputRecord, planAnchors } from '../src/envelope.js';
 import { computeGate, kernelRequestBytes, scanAnchor } from '../src/gas.js';
 import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../src/limits.js';
-import { buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../src/proof.js';
+import { BURN_HISTORY_BYTES, buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../src/proof.js';
+import { projectToken } from '../src/history.js';
+import { NativeError, RETRYABLE } from '../src/errors.js';
+import { BEST_UC_BYTES } from '../src/gas.js';
 import { cfgBytes, shardId, shardRow } from '../src/profile.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS } from '../src/wallet.js';
 import { DeploymentRegistry } from '../src/deployment.js';
@@ -165,7 +168,7 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   // one more than the ceiling is refused, never truncated
   const five = await perLeaf(MAX_ANCHORS);
   assert.equal(five.ucs.length, MAX_ANCHORS + 1);
-  await rejects(buildReturnProof(w.bridge, five.token), 'ErrPolicyAnchors');
+  await rejects(buildReturnProof(w.bridge, five.token), 'ErrTooManyPaths');
 });
 
 async function aggErr(f: (o: { uc: Parameters<typeof makeUc>[1] }) => void): Promise<unknown> {
@@ -267,6 +270,22 @@ test('burn-time preflight admits a redeemable history and refuses one leaf more 
   await rejects(preflightBurn(w.bridge, tooLong.bytes), 'ErrTooManyTx');
 });
 
+test('a real burn leaf adds no more history than BURN_HISTORY_BYTES, and the best-case certificate is no larger than any real one', async () => {
+  const w = makeWorld();
+  const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
+  const burned = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
+  const added = projectToken(burned.token).length - projectToken(held.token).length;
+  assert.ok(added > 0 && added <= BURN_HISTORY_BYTES, `the burn leaf adds ${added} bytes, bound ${BURN_HISTORY_BYTES}`);
+  for (const uc of burned.ucs) assert.ok(uc.toCBOR().length >= BEST_UC_BYTES, `a real certificate of ${uc.toCBOR().length} bytes is below the best case`);
+});
+
+test('the retryable unavailability is its own family, not an invalid token', () => {
+  assert.equal(new NativeError('ErrProofUnavailable').family, 'unavailable');
+  assert.deepEqual([...RETRYABLE], ['ErrProofUnavailable']);
+  assert.equal(new NativeError('ErrPolicyAnchors').family, 'invalid');
+  assert.equal(new NativeError('ErrTooManyPaths').family, 'budget');
+});
+
 test('a racing (path, UC) pair is retried a bounded number of times, then retryable unavailability', async () => {
   const w = makeWorld();
   const out = await ret(w);
@@ -290,6 +309,6 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   calls = 0;
   const three = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), txStep(3, 8, T0 + 12n), txStep(4, 9, T0 + 14n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
   const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [three.token.genesis, ...three.token.transactions].map((c) => c.inclusionProof); };
-  await rejects(buildNativeReturnProof(plugin, three.bytes, overBound), 'ErrPolicyAnchors');
+  await rejects(buildNativeReturnProof(plugin, three.bytes, overBound), 'ErrTooManyPaths');
   assert.equal(calls, 1);
 });

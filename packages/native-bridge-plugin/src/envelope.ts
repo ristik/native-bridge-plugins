@@ -193,7 +193,8 @@ export function checkPolicyBody(cfg: Cfg, e: Envelope): Policy {
   const pol = decodePolicy(e.policyBody);
   if (!eq(policyBytes(pol), e.policyBody)) fail('ErrNonCanonical');
   if (pol.partition === cfg.evmPartition) fail('ErrPolicyPartition');
-  if (e.anchors.length === 0 || e.anchors.length > MAX_ANCHORS) fail('ErrPolicyAnchors');
+  if (e.anchors.length > MAX_ANCHORS) fail('ErrTooManyPaths');
+  if (e.anchors.length === 0) fail('ErrPolicyAnchors');
   return pol;
 }
 
@@ -213,7 +214,8 @@ export interface AnchorPlan {
  */
 export function planAnchors(pol: Policy, e: Envelope, sids: Uint8Array[]): AnchorPlan {
   if (e.leafProofs.length !== sids.length) fail('ErrPolicyLeafCount');
-  if (e.anchors.length === 0 || e.anchors.length > MAX_ANCHORS || e.anchors.length > sids.length) fail('ErrPolicyAnchors');
+  if (e.anchors.length > MAX_ANCHORS) fail('ErrTooManyPaths');
+  if (e.anchors.length === 0 || e.anchors.length > sids.length) fail('ErrPolicyAnchors');
   const rowOf: number[] = [];
   const seen = new Set<string>();
   e.anchors.forEach((a) => {

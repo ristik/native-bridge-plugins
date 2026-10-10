@@ -7,7 +7,7 @@
 import { fail } from './errors.js';
 import type { Anchor, Envelope, LeafProof } from './envelope.js';
 import {
-  MAX_ANCHOR_UC_BYTES, MAX_INPUT_RECORD_BYTES, MAX_PATH_STEPS, MAX_RSMT_SIBLINGS, MAX_SIGNATURES, MAX_UNICITY_STEPS, GAS_RESERVE, TX_GAS_BUDGET,
+  MAX_ANCHOR_UC_BYTES, MAX_PATH_STEPS, MAX_RSMT_SIBLINGS, MAX_SIGNATURES, MAX_UNICITY_STEPS, GAS_RESERVE, TX_GAS_BUDGET,
 } from './limits.js';
 import type { Policy } from './profile.js';
 import { eq } from './bytes.js';
@@ -206,8 +206,13 @@ export function computeGate(envelopeBytes: number, kernelRequest: number, e: Env
   return g;
 }
 
-/** The smallest certificate a real aggregator is assumed to produce, for the best-case projection: 1 KiB, one signature (the measured DN-B certificate is 811 bytes with four signatures, the one-signature fixture 445). */
-export const BEST_UC_BYTES = 1024;
+/**
+ * Lower bounds for the best-case projection, each at most what a real bundle can cost: the smallest
+ * certificate in the corpus (the one-signature fixture, 445 bytes; the DN-B committee's is 811), one
+ * signature, and an input record of no bytes (a structural minimum; a real one is larger).
+ */
+export const BEST_UC_BYTES = 445;
+export const BEST_IR_BYTES = 0;
 export const BEST_SIGNATURES = 1;
 
 /**
@@ -223,7 +228,7 @@ export function projectedGate(cfgBytes: number, policyBytes: number, depth: numb
   const uc = ucGas(1, BEST_UC_BYTES, BEST_SIGNATURES, depth);
   // abi.encode(bytes policy, bytes history, Anchor[] anchors, LeafProof[] leaves), best-case sizes.
   const bytesField = (n: number): number => word + pad32(n);
-  const anchorBytes = 7 * word + bytesField(1) + bytesField(BEST_UC_BYTES) + bytesField(MAX_INPUT_RECORD_BYTES / 2);
+  const anchorBytes = 7 * word + bytesField(1) + bytesField(BEST_UC_BYTES) + bytesField(BEST_IR_BYTES);
   const leafBytes = 3 * word + word;
   const envelope = 4 * word + bytesField(policyBytes) + bytesField(historyBytes) +
     word + anchors * (word + anchorBytes) + word + leaves * (word + leafBytes);

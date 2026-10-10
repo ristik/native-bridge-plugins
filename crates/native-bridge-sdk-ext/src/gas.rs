@@ -283,8 +283,11 @@ pub fn compute_gate(
     Ok(g)
 }
 
-/// The smallest certificate a real aggregator is assumed to produce, for the best-case projection: 1 KiB, one signature (the measured DN-B certificate is 811 bytes with four signatures, the one-signature fixture 445).
-pub const BEST_UC_BYTES: u64 = 1024;
+/// Lower bounds for the best-case projection, each at most what a real bundle can cost: the smallest
+/// certificate in the corpus (the one-signature fixture, 445 bytes; the DN-B committee's is 811), one
+/// signature, and an input record of no bytes (a structural minimum; a real one is larger).
+pub const BEST_UC_BYTES: u64 = 445;
+pub const BEST_IR_BYTES: u64 = 0;
 pub const BEST_SIGNATURES: u64 = 1;
 
 /// The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves
@@ -304,10 +307,8 @@ pub fn projected_gate(
 ) -> (Gate, u64) {
     let word = 32u64;
     let bytes_field = |n: u64| word + pad32(n);
-    let anchor_bytes = 7 * word
-        + bytes_field(1)
-        + bytes_field(BEST_UC_BYTES)
-        + bytes_field(MAX_INPUT_RECORD_BYTES as u64 / 2);
+    let anchor_bytes =
+        7 * word + bytes_field(1) + bytes_field(BEST_UC_BYTES) + bytes_field(BEST_IR_BYTES);
     let leaf_bytes = 3 * word + word;
     let envelope = 4 * word
         + bytes_field(policy_bytes)

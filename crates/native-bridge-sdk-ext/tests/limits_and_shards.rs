@@ -183,3 +183,28 @@ fn burn_time_preflight_admits_a_redeemable_history_and_refuses_one_leaf_more_tha
         E::TooManyTx
     );
 }
+
+#[test]
+fn a_real_burn_leaf_adds_no_more_history_than_the_bound_and_the_best_case_is_a_lower_bound() {
+    use native_bridge_sdk_ext::error::Family;
+    use native_bridge_sdk_ext::history::project;
+    use native_bridge_sdk_ext::proof::BURN_HISTORY_BYTES;
+    let w = make_world(20);
+    let held = build_token(&w, &spec(1), &[tx_step(2, 7, T0 + 10)], T0, UC_TS);
+    let burned = build_token(
+        &w,
+        &spec(1),
+        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
+        T0,
+        UC_TS,
+    );
+    let added = project(&burned.token).len() - project(&held.token).len();
+    assert!(added > 0 && added <= BURN_HISTORY_BYTES, "{added}");
+    for uc in &burned.ucs {
+        assert!(uc.to_cbor().len() as u64 >= BEST_UC_BYTES);
+    }
+    // the retryable unavailability is its own family; the bound and relation failures keep theirs
+    assert_eq!(E::ProofUnavailable.family(), Family::Unavailable);
+    assert_eq!(E::PolicyAnchors.family(), Family::Invalid);
+    assert_eq!(E::TooManyPaths.family(), Family::Budget);
+}

@@ -51,7 +51,7 @@ export async function refreshToken(token: Token, fresh: InclusionProof[]): Promi
  * anchor), in first-use leaf order, each claim derived from its UC and the pinned policy row of its
  * shard. Nothing here re-queries to make certificates converge: the pairs are used as fetched, and an
  * envelope that needs more anchors than the profile bound, or does not fit the shared gas gate, is
- * `ErrPolicyAnchors` or `ErrGasBudget` (BudgetExceeded), never truncated or split.
+ * `ErrTooManyPaths` or `ErrGasBudget` (BudgetExceeded), never truncated or split.
  */
 export async function buildReturnProof(bridge: NativeBridge, token: Token): Promise<{ envelope: Envelope; encoded: Uint8Array; verified: VerifiedToken; gate: Gate }> {
   const verified = await bridge.verifyNativeToken(token, 'return');
@@ -99,7 +99,7 @@ export async function buildReturnProof(bridge: NativeBridge, token: Token): Prom
 }
 
 /**
- * A conservative size of the burn leaf's contribution to the history projection (the transfer, its
+ * An upper bound on the size of the burn leaf's contribution to the history projection (the transfer, its
  * certification data with its unlock script and the terminal return reason).
  */
 export const BURN_HISTORY_BYTES = 1024;
@@ -119,8 +119,10 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
   // the fewest anchors the known leaves can need: one per shard they occupy
   const minAnchors = new Set((await leafRoutes(bridge, token)).map((r) => r.row)).size;
-  const history = projectToken(token).length + BURN_HISTORY_BYTES;
-  if (history > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
+  // The history bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to add
+  // up to `BURN_HISTORY_BYTES`. The gate projection uses the known history only, a lower bound.
+  const history = projectToken(token).length;
+  if (history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
   const { gate, envelopeBytes } = projectedGate(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, dep.policy.depth, minAnchors, leaves, history);
   if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   if (gate.total > TX_GAS_BUDGET) fail('ErrGasBudget');

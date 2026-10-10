@@ -7,6 +7,8 @@ pub enum Family {
     Malformed,
     Invalid,
     Budget,
+    /// Retryable: a racing (path, certificate) pair that survived the bounded retries; not a failure of the token or the bounds.
+    Unavailable,
 }
 
 macro_rules! errors {
@@ -41,7 +43,7 @@ errors! {
     // profile relation
     CfgMismatch => Invalid, PolicyHash => Invalid, PolicyTuple => Invalid, PolicyAnchors => Invalid,
     PolicyLeafIndex => Invalid, PolicyLeafCount => Invalid, PolicyPartition => Invalid,
-    PathBitmap => Invalid, AnchorAuth => Invalid, ProofUnavailable => Invalid,
+    PathBitmap => Invalid, AnchorAuth => Invalid, ProofUnavailable => Unavailable,
     Predicate => Invalid, MintShape => Invalid, MintJustif => Invalid, MintSalt => Invalid,
     MintType => Invalid, MintData => Invalid, TransferData => Invalid, CDMismatch => Invalid,
     Unlock => Invalid, UnlockLength => Invalid, UnlockScalars => Invalid, UnlockRecovery => Invalid,

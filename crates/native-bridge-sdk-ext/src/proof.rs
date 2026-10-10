@@ -152,7 +152,7 @@ pub fn build_return_proof(
     Ok((env, verified, gate))
 }
 
-/// A conservative size of the burn leaf's contribution to the history projection (the transfer, its
+/// An upper bound on the size of the burn leaf's contribution to the history projection (the transfer, its
 /// certification data with its unlock script and the terminal return reason).
 pub const BURN_HISTORY_BYTES: usize = 1024;
 
@@ -167,8 +167,10 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
     if leaves > MAX_LEAVES {
         return Err(E::TooManyTx);
     }
-    let history = history::project(token).len() + BURN_HISTORY_BYTES;
-    if history > MAX_SEMANTIC_BYTES {
+    // The history bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to
+    // add up to `BURN_HISTORY_BYTES`. The gate projection uses the known history only, a lower bound.
+    let history = history::project(token).len();
+    if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
         return Err(E::InputTooLarge);
     }
     // the fewest anchors the known leaves can need: one per shard they occupy
