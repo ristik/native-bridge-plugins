@@ -13,3 +13,13 @@ nothing synthetic in the loop. Component evidence (`tests/joined`) is unchanged;
 
 Requires Foundry 1.8.1 (`cast`), Node ≥ 22 (`npm ci --ignore-scripts`), the devnet lock (`briefs/devnet-lock.sh`), and `DNB_TOOL` (built `dnb-tool`).
 Timing matters: B1 authenticates a certificate only within `W_cert` root rounds of the registry clock, and refuses one newer than the clock.
+
+## Two-shard acceptance rows (B3)
+
+`rows.ts <lane-config.json>` runs the DN-B two-shard rows against `DNB_AGG_SHARDS=2 scripts/dnb-devnet.sh all` (aggregator-go in `bft-shard`
+mode, shards `40` and `c0`; `lane-config.json` carries `aggUrls`). Rows: anchors 1, 2, 2 on one shard, 3, 4 (several on one shard), the 5th refused
+(by the plug-in and by the chain for the same bundle), 16 leaves (worst real bundle, gas against the gate and the 7M budget), 17 leaves refused,
+malformed final anchor (flipped byte, bad CBOR head), gas-1 / gas+headroom, and restart/recovery of a pending redemption (aggregators, then every
+validator, between redeem and claim). Needs `DNB_REPO` (bft-core checkout), `AGG_BIN`, `DNB_TOOL`. Evidence: `rows-evidence.json`.
+Not yet run (needs a unicity-reth binary). Known limits: the exact minimum gas limit is not searched (one `U-1` and one `U+U/32+50k` attempt per
+token, the B1 window allows no more); the forged 64-signature worst certificate is covered by the oracle corpus and the contract tests, not live.
