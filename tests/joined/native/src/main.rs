@@ -447,16 +447,17 @@ fn matches_oracle(step: &str, o: &Out, kernel: &Value, envelope: Option<&Value>)
         "{step}: kernel result"
     );
     if let Some(e) = envelope {
-        let uc = o
-            .native
-            .iter()
-            .find(|c| c["target"] == UC)
-            .expect("UC call");
-        assert_eq!(
-            uc["input"],
-            e["ucRequest"].as_str().unwrap().to_lowercase(),
-            "{step}: UC request"
-        );
+        // One 0x0100 call per anchor, in the envelope's first-use order, each with its own request.
+        let ucs: Vec<&Value> = o.native.iter().filter(|c| c["target"] == UC).collect();
+        let anchors = e["anchors"].as_array().unwrap();
+        assert_eq!(ucs.len(), anchors.len(), "{step}: UC call count");
+        for (got, want) in ucs.iter().zip(anchors) {
+            assert_eq!(
+                got["input"],
+                want["ucRequest"].as_str().unwrap().to_lowercase(),
+                "{step}: UC request"
+            );
+        }
         let members: Vec<&Value> = o.native.iter().filter(|c| c["target"] == MEMBER).collect();
         let want = e["members"].as_array().unwrap();
         assert_eq!(members.len(), want.len(), "{step}: RSMT call count");
