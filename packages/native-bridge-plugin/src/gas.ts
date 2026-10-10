@@ -206,29 +206,33 @@ export function computeGate(envelopeBytes: number, kernelRequest: number, e: Env
   return g;
 }
 
+/** The smallest certificate a real aggregator produces, for the best-case projection: ~1 KiB, one signature. */
+export const BEST_UC_BYTES = 1024;
+export const BEST_SIGNATURES = 1;
+
 /**
- * The burn-time projection: the gate of the redemption envelope a token with `leaves` leaves (the burn
- * included) and a `historyBytes` history would need, with every size the burn cannot yet know taken at
- * its bound (a proof of `MAX_RSMT_SIBLINGS` siblings per leaf; one UC of the largest admitted size, 64
- * signatures and 33 steps, per shard row, which is the most anchors a fetch of one certificate per
- * shard produces). The burn is refused, before any wallet burn is made, when this does not fit.
+ * The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves
+ * (the burn included) and a `historyBytes` history would need if everything the burn cannot yet know turns
+ * out as small as it can: the fewest anchors (`anchors`, the distinct shards the known leaves occupy),
+ * the smallest certificates (`BEST_UC_BYTES`, one signature, only the depth-many shard siblings as steps)
+ * and empty paths. The burn is refused, before any wallet burn is made, only when even this cannot pass the
+ * gas gate; whether the bundle that is actually fetched passes is the gate's decision at redemption.
  */
-export function projectedGate(cfgBytes: number, policyBytes: number, rows: number, leaves: number, historyBytes: number): { gate: Gate; envelopeBytes: number } {
-  const anchors = Math.min(rows, leaves);
+export function projectedGate(cfgBytes: number, policyBytes: number, depth: number, anchors: number, leaves: number, historyBytes: number): { gate: Gate; envelopeBytes: number } {
   const word = 32;
-  const uc = ucGas(1, MAX_ANCHOR_UC_BYTES, MAX_SIGNATURES, 1 + MAX_UNICITY_STEPS);
-  // abi.encode(bytes policy, bytes history, Anchor[] anchors, LeafProof[] leaves), proofs at their bound.
+  const uc = ucGas(1, BEST_UC_BYTES, BEST_SIGNATURES, depth);
+  // abi.encode(bytes policy, bytes history, Anchor[] anchors, LeafProof[] leaves), best-case sizes.
   const bytesField = (n: number): number => word + pad32(n);
-  const anchorBytes = 7 * word + bytesField(1) + bytesField(MAX_ANCHOR_UC_BYTES) + bytesField(MAX_INPUT_RECORD_BYTES);
-  const leafBytes = 3 * word + word + MAX_RSMT_SIBLINGS * word;
+  const anchorBytes = 7 * word + bytesField(1) + bytesField(BEST_UC_BYTES) + bytesField(MAX_INPUT_RECORD_BYTES / 2);
+  const leafBytes = 3 * word + word;
   const envelope = 4 * word + bytesField(policyBytes) + bytesField(historyBytes) +
     word + anchors * (word + anchorBytes) + word + leaves * (word + leafBytes);
   const g: Gate = {
     intrinsic: intrinsicGas(envelope),
     b2: b2Gas(kernelRequestBytes(cfgBytes, historyBytes), leaves),
     uc: anchors * uc,
-    rsmt: leaves * rsmtGas(MAX_RSMT_SIBLINGS),
-    steps: anchors * (1 + MAX_UNICITY_STEPS) + leaves * MAX_RSMT_SIBLINGS,
+    rsmt: leaves * rsmtGas(0),
+    steps: anchors * depth,
     total: 0,
   };
   g.total = g.intrinsic + g.b2 + g.uc + g.rsmt + GAS_RESERVE;

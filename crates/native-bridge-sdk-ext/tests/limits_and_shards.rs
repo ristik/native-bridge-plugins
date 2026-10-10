@@ -60,11 +60,23 @@ fn the_shared_gate_prices_the_worst_admitted_bundle_as_the_oracle_and_the_contra
     assert_eq!(b2, 908_560);
     let worst = intrinsic_gas(MAX_ENVELOPE_BYTES as u64)
         + b2
-        + MAX_ANCHORS as u64 * uc
+        + 2 * uc
         + MAX_LEAVES as u64 * rsmt_gas(MAX_RSMT_SIBLINGS as u64)
         + GAS_RESERVE;
     assert_eq!(worst, 6_976_692);
     assert!(worst <= TX_GAS_BUDGET);
+    // The gate decides each bundle: a third maximum-size certificate does not pass, four real-size ones do,
+    // five do not.
+    assert!(worst + uc > TX_GAS_BUDGET);
+    let real = |a: u64| {
+        intrinsic_gas(12 << 10)
+            + b2_gas(kernel_request_bytes(4 << 10, 4 << 10), MAX_LEAVES as u64)
+            + a * uc_gas(1, 1536, 4, 1)
+            + MAX_LEAVES as u64 * rsmt_gas(8)
+            + GAS_RESERVE
+    };
+    assert!(real(MAX_ANCHORS as u64) <= TX_GAS_BUDGET);
+    assert!(real(MAX_ANCHORS as u64 + 1) > TX_GAS_BUDGET);
 }
 
 /// The cumulative step bound cannot bind: the anchor, leaf and sibling bounds already imply it.

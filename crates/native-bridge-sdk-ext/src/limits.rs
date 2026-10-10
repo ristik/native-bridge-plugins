@@ -6,8 +6,8 @@
 //! additive entitlements: every cumulative bound is checked before allocation or cryptography.
 
 // ---- profile parameters (profile-v3.json `limits`) ----------------------------------------------
-/// Distinct UC anchors of one redemption (one per distinct complete UC).
-pub const MAX_ANCHORS: usize = 2;
+/// Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle.
+pub const MAX_ANCHORS: usize = 4;
 /// B2 leaves of one redemption: the mint, every transfer and the final burn.
 pub const MAX_LEAVES: usize = 16;
 pub const MAX_TRANSFERS: usize = MAX_LEAVES - 1;

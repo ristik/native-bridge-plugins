@@ -283,26 +283,32 @@ pub fn compute_gate(
     Ok(g)
 }
 
-/// The burn-time projection: the gate of the redemption envelope a token with `leaves` leaves (the burn
-/// included) and a `history_bytes` history would need, with every size the burn cannot yet know taken
-/// at its bound (a proof of `MAX_RSMT_SIBLINGS` siblings per leaf; one UC of the largest admitted size,
-/// 64 signatures and 33 steps, per shard row, the most anchors a fetch of one certificate per shard
-/// produces). Returns the gate and the projected envelope bytes.
+/// The smallest certificate a real aggregator produces, for the best-case projection: ~1 KiB, one signature.
+pub const BEST_UC_BYTES: u64 = 1024;
+pub const BEST_SIGNATURES: u64 = 1;
+
+/// The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves
+/// (the burn included) and a `history_bytes` history would need if everything the burn cannot yet know
+/// turns out as small as it can: the fewest anchors (`anchors`, the distinct shards the known leaves
+/// occupy), the smallest certificates (`BEST_UC_BYTES`, one signature, only the depth-many shard
+/// siblings as steps) and empty paths. The burn is refused only when even this cannot pass the gas gate;
+/// whether the bundle actually fetched passes is the gate's decision at redemption. Returns the gate and
+/// the projected envelope bytes.
 pub fn projected_gate(
     cfg_bytes: u64,
     policy_bytes: u64,
-    rows: u64,
+    depth: u64,
+    anchors: u64,
     leaves: u64,
     history_bytes: u64,
 ) -> (Gate, u64) {
-    let anchors = rows.min(leaves);
     let word = 32u64;
     let bytes_field = |n: u64| word + pad32(n);
     let anchor_bytes = 7 * word
         + bytes_field(1)
-        + bytes_field(MAX_ANCHOR_UC_BYTES as u64)
-        + bytes_field(MAX_INPUT_RECORD_BYTES as u64);
-    let leaf_bytes = 3 * word + word + MAX_RSMT_SIBLINGS as u64 * word;
+        + bytes_field(BEST_UC_BYTES)
+        + bytes_field(MAX_INPUT_RECORD_BYTES as u64 / 2);
+    let leaf_bytes = 3 * word + word;
     let envelope = 4 * word
         + bytes_field(policy_bytes)
         + bytes_field(history_bytes)
@@ -310,18 +316,12 @@ pub fn projected_gate(
         + anchors * (word + anchor_bytes)
         + word
         + leaves * (word + leaf_bytes);
-    let uc = uc_gas(
-        1,
-        MAX_ANCHOR_UC_BYTES as u64,
-        MAX_SIGNATURES as u64,
-        1 + MAX_UNICITY_STEPS as u64,
-    );
     let mut g = Gate {
         intrinsic: intrinsic_gas(envelope),
         b2: b2_gas(kernel_request_bytes(cfg_bytes, history_bytes), leaves),
-        uc: anchors * uc,
-        rsmt: leaves * rsmt_gas(MAX_RSMT_SIBLINGS as u64),
-        steps: anchors * (1 + MAX_UNICITY_STEPS as u64) + leaves * MAX_RSMT_SIBLINGS as u64,
+        uc: anchors * uc_gas(1, BEST_UC_BYTES, BEST_SIGNATURES, depth),
+        rsmt: leaves * rsmt_gas(0),
+        steps: anchors * depth,
         total: 0,
     };
     g.total = g.intrinsic + g.b2 + g.uc + g.rsmt + GAS_RESERVE;

@@ -34,14 +34,23 @@ test('the shared gate prices the worst admitted bundle exactly as the oracle and
   assert.equal(intrinsicGas(L.MAX_ENVELOPE_BYTES), 1_069_576);
   assert.equal(b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES), 908_560);
   const worst = intrinsicGas(L.MAX_ENVELOPE_BYTES) + b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES) +
-    L.MAX_ANCHORS * ucGas(1, L.MAX_ANCHOR_UC_BYTES, L.MAX_SIGNATURES, 1 + L.MAX_UNICITY_STEPS) + L.MAX_LEAVES * rsmtGas(L.MAX_RSMT_SIBLINGS) + L.GAS_RESERVE;
+    2 * ucGas(1, L.MAX_ANCHOR_UC_BYTES, L.MAX_SIGNATURES, 1 + L.MAX_UNICITY_STEPS) + L.MAX_LEAVES * rsmtGas(L.MAX_RSMT_SIBLINGS) + L.GAS_RESERVE;
   assert.equal(worst, 6_976_692);
   assert.ok(worst <= L.TX_GAS_BUDGET);
   assert.ok(L.MAX_ANCHORS * (1 + L.MAX_UNICITY_STEPS) + L.MAX_LEAVES * L.MAX_RSMT_SIBLINGS <= L.MAX_PATH_STEPS, 'the cumulative step bound cannot bind');
 });
 
-test('a burn-time projection at the bounds fits, and one leaf more does not exist', () => {
-  const fit = projectedGate(300, 150, 2, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES);
+test('the gate decides each bundle under the parser ceilings; the best-case projection fits at the bounds', () => {
+  const sigs = L.MAX_SIGNATURES, steps = 1 + L.MAX_UNICITY_STEPS;
+  const total = (a: number, uc: number, sg: number, st: number, sib: number): number =>
+    intrinsicGas(L.MAX_ENVELOPE_BYTES) + b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES) + a * ucGas(1, uc, sg, st) + L.MAX_LEAVES * rsmtGas(sib) + L.GAS_RESERVE;
+  assert.equal(L.MAX_ANCHORS, 4);
+  assert.ok(total(2, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) <= L.TX_GAS_BUDGET);
+  assert.ok(total(3, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) > L.TX_GAS_BUDGET);
+  const real = (a: number): number => intrinsicGas(12 << 10) + b2Gas(kernelRequestBytes(4 << 10, 4 << 10), L.MAX_LEAVES) + a * ucGas(1, 1536, 4, 1) + L.MAX_LEAVES * rsmtGas(8) + L.GAS_RESERVE;
+  assert.ok(real(L.MAX_ANCHORS) <= L.TX_GAS_BUDGET, 'four real-size certificates pass');
+  assert.ok(real(L.MAX_ANCHORS + 1) > L.TX_GAS_BUDGET, 'five real-size certificates do not');
+  const fit = projectedGate(300, 150, 1, 2, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES);
   assert.ok(fit.gate.total <= L.TX_GAS_BUDGET, String(fit.gate.total));
   assert.ok(fit.envelopeBytes <= L.MAX_ENVELOPE_BYTES, String(fit.envelopeBytes));
 });

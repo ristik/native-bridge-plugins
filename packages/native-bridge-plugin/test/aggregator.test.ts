@@ -152,11 +152,20 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   assert.equal(two.envelope.anchors.length, 2);
   assert.deepEqual(two.envelope.leafProofs.map((l) => l.anchorIndex), [0, 1, 1]);
   assert.notDeepEqual(two.envelope.anchors[0].uc, two.envelope.anchors[1].uc);
-  // one certificate per leaf: three anchors are over the bound, refused, never truncated
-  assert.equal(MAX_ANCHORS, 2);
-  const three = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
-  assert.equal(three.ucs.length, 3);
-  await rejects(buildReturnProof(w.bridge, three.token), 'ErrPolicyAnchors');
+  // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
+  assert.equal(MAX_ANCHORS, 4);
+  const perLeaf = (n: number) => buildToken(w, spec(1), Array.from({ length: n }, (_, i) => (i === n - 1 ? burnStep(T0 + 20n) : txStep(i + 2, 7, T0 + 10n + BigInt(i)))), T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
+  for (const n of [1, 2]) {
+    const out = await perLeaf(n);
+    assert.equal(out.ucs.length, n + 1);
+    const ok = await buildReturnProof(w.bridge, out.token);
+    assert.equal(ok.envelope.anchors.length, n + 1);
+    assert.ok(ok.gate.total <= TX_GAS_BUDGET);
+  }
+  // one more than the ceiling is refused, never truncated
+  const five = await perLeaf(MAX_ANCHORS);
+  assert.equal(five.ucs.length, MAX_ANCHORS + 1);
+  await rejects(buildReturnProof(w.bridge, five.token), 'ErrPolicyAnchors');
 });
 
 async function aggErr(f: (o: { uc: Parameters<typeof makeUc>[1] }) => void): Promise<unknown> {
@@ -279,7 +288,7 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   assert.equal(calls, MAX_PROOF_ATTEMPTS, 'no more than the bound, and no re-query to make certificates converge');
   // a bound or profile failure is not retried
   calls = 0;
-  const three = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
+  const three = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), txStep(3, 8, T0 + 12n), txStep(4, 9, T0 + 14n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
   const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [three.token.genesis, ...three.token.transactions].map((c) => c.inclusionProof); };
   await rejects(buildNativeReturnProof(plugin, three.bytes, overBound), 'ErrPolicyAnchors');
   assert.equal(calls, 1);

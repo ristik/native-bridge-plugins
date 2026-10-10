@@ -107,7 +107,7 @@ export const BURN_HISTORY_BYTES = 1024;
 /**
  * The burn-time preflight. A burn that could never be redeemed under the profile bounds and the shared
  * gas gate is refused before the wallet burns anything: more leaves than the profile admits, a history or
- * envelope over its bound, or a worst-case envelope over the transaction budget. Beyond the bounds the
+ * envelope over its bound, or an envelope that cannot pass the gas gate (`txGasBudget`) even in the best case. Beyond the bounds the
  * answer is `ErrGasBudget`/`ErrTooManyTx`/`ErrInputTooLarge` (BudgetExceeded), never a truncated history
  * or a partial redemption. `tokenBytes` is the held receipt the burn would spend.
  */
@@ -117,9 +117,11 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   const dep = deploymentOf(bridge, token);
   const leaves = token.transactions.length + 2; // the mint, every transfer and the burn
   if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
+  // the fewest anchors the known leaves can need: one per shard they occupy
+  const minAnchors = new Set((await leafRoutes(bridge, token)).map((r) => r.row)).size;
   const history = projectToken(token).length + BURN_HISTORY_BYTES;
   if (history > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
-  const { gate, envelopeBytes } = projectedGate(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, dep.policy.shardConfs.length, leaves, history);
+  const { gate, envelopeBytes } = projectedGate(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, dep.policy.depth, minAnchors, leaves, history);
   if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   if (gate.total > TX_GAS_BUDGET) fail('ErrGasBudget');
   return gate;

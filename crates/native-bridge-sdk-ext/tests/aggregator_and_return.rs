@@ -199,25 +199,32 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
         vec![0, 1, 1]
     );
     assert_ne!(env.anchors[0].uc, env.anchors[1].uc);
-    // one certificate per leaf: three anchors are over the bound, refused, never truncated
-    assert_eq!(MAX_ANCHORS, 2);
-    let tw = Tweaks {
-        uc_round: Some(Box::new(|i| 900 + i as u64)),
-        ..Tweaks::default()
+    // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
+    assert_eq!(MAX_ANCHORS, 4);
+    let per_leaf = |n: usize| {
+        let tw = Tweaks {
+            uc_round: Some(Box::new(|i| 900 + i as u64)),
+            ..Tweaks::default()
+        };
+        let parts = lock_parts(&w, &spec(1));
+        let mut steps: Vec<Step> = (0..n - 1)
+            .map(|i| tx_step(i as u8 + 2, 7, T0 + 10 + i as u64))
+            .collect();
+        steps.push(burn_step(T0 + 20));
+        build_token_with(&w, &spec(1), &parts, &tw, &steps, T0, UC_TS)
     };
-    let parts = lock_parts(&w, &spec(1));
-    let three = build_token_with(
-        &w,
-        &spec(1),
-        &parts,
-        &tw,
-        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
-        T0,
-        UC_TS,
-    );
-    assert_eq!(three.ucs.len(), 3);
+    for n in [1usize, 2] {
+        let out = per_leaf(n);
+        assert_eq!(out.ucs.len(), n + 1);
+        let (env, _, gate) = build_return_proof(&w.bridge, &out.token).unwrap();
+        assert_eq!(env.anchors.len(), n + 1);
+        assert!(gate.total <= TX_GAS_BUDGET);
+    }
+    // one more than the ceiling is refused, never truncated
+    let five = per_leaf(MAX_ANCHORS);
+    assert_eq!(five.ucs.len(), MAX_ANCHORS + 1);
     assert_eq!(
-        build_return_proof(&w.bridge, &three.token).unwrap_err(),
+        build_return_proof(&w.bridge, &five.token).unwrap_err(),
         E::PolicyAnchors
     );
 }

@@ -8,8 +8,8 @@
 export const NATIVE_BRIDGE_PROTO_VERSION = 3 as const;
 
 // ---- profile parameters (profile-v3.json `limits`) -------------------------------------------------
-/** Distinct UC anchors of one redemption (one per distinct complete UC). */
-export const MAX_ANCHORS = 2;
+/** Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle. */
+export const MAX_ANCHORS = 4;
 /** B2 leaves of one redemption: the mint, every transfer and the final burn. */
 export const MAX_LEAVES = 16;
 export const MAX_TRANSFERS = MAX_LEAVES - 1;

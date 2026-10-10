@@ -171,10 +171,15 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
     if history > MAX_SEMANTIC_BYTES {
         return Err(E::InputTooLarge);
     }
+    // the fewest anchors the known leaves can need: one per shard they occupy
+    let mut rows: Vec<usize> = leaf_routes(bridge, token)?.iter().map(|r| r.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
     let (gate, envelope) = projected_gate(
         dep.cfg.to_bytes().len() as u64,
         dep.policy.to_bytes().len() as u64,
-        dep.policy.shard_confs.len() as u64,
+        u64::from(dep.policy.depth),
+        rows.len() as u64,
         leaves as u64,
         history as u64,
     );
