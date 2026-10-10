@@ -55,7 +55,10 @@ const W_CERT = Number(process.env.DNB_W_CERT ?? 15);
 const REDEEM_GAS = '7000000';
 assert.ok(lane.aggUrls && lane.aggUrls.length === 2, 'rows.ts needs the two-shard lane (lane-config aggUrls from DNB_AGG_SHARDS=2)');
 
-const evidence: { rows: Record<string, unknown>[] } = { rows: [] };
+// The attested ureth binary (sha256 and reported commit) checked by `dnb-devnet.sh up`; a lane without it is not evidence.
+const attestation = JSON.parse(readFileSync(`${lane.dir}/ureth-attestation.json`, 'utf8')) as { sha256: string; commit: string };
+assert.ok(/^[0-9a-f]{64}$/.test(attestation.sha256) && /^[0-9a-f]{40}$/.test(attestation.commit), 'ureth attestation is complete');
+const evidence: { ureth: unknown; rows: Record<string, unknown>[] } = { ureth: attestation, rows: [] };
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const json = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x));
 const record = (row: string, ok: boolean, data: Record<string, unknown>): void => {
