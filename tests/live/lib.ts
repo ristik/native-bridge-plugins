@@ -6,6 +6,8 @@ export interface LaneConfig {
   dir: string;
   ethUrls: string[];
   aggUrl: string;
+  /** One aggregator endpoint per policy row (shard), in row order; absent for a single-shard lane. */
+  aggUrls?: string[];
   vault: string;
   verifier: string;
   rootRpc: string;
