@@ -7,7 +7,7 @@ publication is disabled.
 
 | Path | Responsibility |
 | --- | --- |
-| `protocol/interop.md` | Sole normative native byte contract, protocol v2 |
+| `protocol/interop.md` | Sole normative native byte contract, protocol v3 |
 | `protocol/manifest.schema.json` | Strict deployment registry schema v1 |
 | `protocol/abi.json` | Frozen cross-stack ABI layout |
 | `protocol/vectors/` | Sole released corpus, pinned to the merged oracle |
