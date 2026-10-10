@@ -5,6 +5,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 import { decodeHistory, projectToken, prepareLock, verifyHistory } from '../src/history.js';
 import { burnId, nullifier, returnReason, valueEnvelope } from '../src/profile.js';
+import { MAX_TRANSFERS } from '../src/limits.js';
 import { rejects } from './util.js';
 import {
   CHAIN_ID, VAULT, ZERO20, buildToken, burnStep, digestOf, encodeParts, lockParts, makeWorld, ownerPredicate, recipient20, signer,
@@ -197,10 +198,10 @@ test('nullifier excludes time, paths and unlock representation', async () => {
   assert.deepEqual(a.outcome.nullifier, b.outcome.nullifier);
 });
 
-test('transfer count budget: 64 verify, 65 is a budget failure', async () => {
+test('transfer count budget: MAX_TRANSFERS verify, one more is a budget failure', async () => {
   const steps = (n: number): ReturnType<typeof txStep>[] => Array.from({ length: n }, (_, i) => txStep(2 + (i % 2), i, T0 + 1n));
-  await w0.bridge.verifyNativeToken((await buildToken(w0, spec(1), steps(64), T0, UC_TS)).token, 'receipt');
-  await rejects(rec(w0, {}, spec(1), steps(65)), 'ErrTooManyTx');
+  await w0.bridge.verifyNativeToken((await buildToken(w0, spec(1), steps(MAX_TRANSFERS), T0, UC_TS)).token, 'receipt');
+  await rejects(rec(w0, {}, spec(1), steps(MAX_TRANSFERS + 1)), 'ErrTooManyTx');
 });
 
 // ---- compact history ---------------------------------------------------------------------------

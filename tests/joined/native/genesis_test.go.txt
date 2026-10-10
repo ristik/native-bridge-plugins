@@ -33,8 +33,8 @@ func TestNBPPR6NativeGenesis(t *testing.T) {
 	const w = 1
 	p := b1state.Profile{Network: 3, RootGenesisID: h.Genesis(), ExecutionChainID: 31337,
 		RuntimeHash: [32]byte(common.HexToHash(b1registry.CodeHashHex)), CompilerHash: b1registry.CompilerHash(),
-		WCert: w, DeltaEV: w + 1, DeltaHold: w + 2, RestGas: 1096500 + 1141500*(w+1),
-		CompanionBytes: 1 << 20, OtherCompanionBytes: 65536, OrdinaryCapacity: 7000000}
+		WCert: w, DeltaEV: w + 1, DeltaHold: w + 2, RestGas: b1registry.MinRestGas(w),
+		CompanionBytes: 1 << 20, OtherCompanionBytes: 65536, OrdinaryCapacity: 7000000, GenesisUCTime: 1000}
 	p.SystemGas, err = p.RequiredSystemGas()
 	require.NoError(t, err)
 	p.MaxGas = p.SystemGas + p.OrdinaryCapacity

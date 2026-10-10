@@ -5,7 +5,7 @@ import { eq } from '../src/bytes.js';
 import { makeDeployment } from '../src/deployment.js';
 import { decodeHeader } from '../src/header.js';
 import { verifyProof } from '../src/mpt.js';
-import { decodeCfg, cfgBytes, decodePolicy, deriveAsset, deriveType, identityDomain, keccak256, policyBytes, valueEnvelope } from '../src/profile.js';
+import { decodeCfg, cfgBytes, decodePolicy, deriveAsset, deriveType, identityDomain, keccak256, makePolicy, policyBytes, valueEnvelope } from '../src/profile.js';
 import { decode, encodeBytes, encodeList, encodeU64, u64Of } from '../src/rlp.js';
 import { throwsReason } from './util.js';
 import { CHAIN_ID, EXEC_GENESIS, NETWORK, ROOT_GENESIS, headerRlp, makeWorld, sha, text, trie } from './world.js';
@@ -93,7 +93,7 @@ test('cfg and policy round trip; deployment construction rejects forged identity
   assert.deepEqual(decodeCfg(cfgBytes(w.dep.cfg)), w.dep.cfg);
   throwsReason(() => decodeCfg(Uint8Array.of(...cfgBytes(w.dep.cfg), 0)), 'ErrTrailing');
   assert.deepEqual(decodePolicy(policyBytes(w.policy)), w.policy);
-  throwsReason(() => decodePolicy(new Uint8Array(129)), 'ErrInputTooLarge');
+  throwsReason(() => decodePolicy(new Uint8Array(513)), 'ErrInputTooLarge');
   const hp = { fields: 20 as const };
   const bad = (f: (c: typeof w.dep.cfg) => void, policy = w.policy) => {
     const c = structuredClone(w.dep.cfg);
@@ -102,7 +102,7 @@ test('cfg and policy round trip; deployment construction rejects forged identity
   };
   throwsReason(bad((c) => void (c.ty[0] ^= 1)), 'ErrCfgMismatch');
   throwsReason(bad((c) => void (c.aggregatorPolicyHash[0] ^= 1)), 'ErrPolicyHash');
-  const p = { partition: 7, shardConf: w.aggConf };
+  const p = makePolicy(7, w.aggConf);
   throwsReason(bad((c) => void (c.aggregatorPolicyHash = sha(policyBytes(p))), p), 'ErrPolicyPartition');
   throwsReason(() => makeDeployment(w.dep.cfg, new Uint8Array(32), new Uint8Array(32), { fields: 19 as never }, w.policy), 'ErrCfgMismatch');
 });

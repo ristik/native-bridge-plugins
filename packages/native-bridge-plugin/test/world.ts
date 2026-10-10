@@ -35,7 +35,7 @@ import { EMPTY_TRIE_ROOT, EMPTY_UNCLE_HASH } from '../src/header.js';
 import { encodeJustification, encodeLockProof, type LockProof } from '../src/lockproof.js';
 import {
   H, accountTrieKey, arr, bs, deriveAsset, deriveSalt, deriveTokenId, deriveType, keccak256, leafValue, lockDigest,
-  lockDigestSlot, lockRecord, policyHash, returnReason, storageTrieKey, u, valueEnvelope, type Policy,
+  lockDigestSlot, lockRecord, makePolicy, policyHash, returnReason, shardId, shardRow, storageTrieKey, u, valueEnvelope, type Policy,
 } from '../src/profile.js';
 import { encodeBytes, encodeList, encodeU64 } from '../src/rlp.js';
 import { TrustInput } from '../src/trust.js';
@@ -226,14 +226,19 @@ export interface World {
   dep: Deployment;
   bridge: NativeBridge;
   policy: Policy;
+  /** The configuration hash of the first policy row (the only one at depth 0). */
   aggConf: Uint8Array;
+  /** The configuration hash of every policy row. */
+  aggConfs: Uint8Array[];
 }
 
-export function makeWorld(headerFields: 20 | 21 = 20): World {
+export function makeWorld(headerFields: 20 | 21 = 20, depth: 0 | 1 = 0): World {
   const agg = makeRoot(2, 4, 10);
   const evm = makeRoot(2, 4, 10);
-  const aggConf = sha(text('aggregator shard configuration'));
-  const policy: Policy = { partition: AGG_PARTITION, shardConf: aggConf };
+  const aggConfs = Array.from({ length: 1 << depth }, (_, i) => sha(text(`aggregator shard configuration ${i}`)));
+  if (depth === 0) aggConfs[0] = sha(text('aggregator shard configuration'));
+  const aggConf = aggConfs[0];
+  const policy: Policy = makePolicy(AGG_PARTITION, ...aggConfs);
   const cfg = {
     network: NETWORK, rootGenesis: ROOT_GENESIS, chainId: CHAIN_ID, executionGenesis: EXEC_GENESIS, evmPartition: EVM_PARTITION,
     evmShard: Uint8Array.of(0x80), vault: VAULT, zeroAddress: ZERO20,
@@ -244,7 +249,7 @@ export function makeWorld(headerFields: 20 | 21 = 20): World {
   };
   const dep = makeDeployment(cfg, sha(text('vault runtime')), pdrConfigHash(), { fields: headerFields }, policy);
   const bridge = new NativeBridge(new DeploymentRegistry([dep]), agg.trust);
-  return { agg, evm, dep, bridge, policy, aggConf };
+  return { agg, evm, dep, bridge, policy, aggConf, aggConfs };
 }
 
 export interface EvmSpec {
@@ -330,12 +335,17 @@ export interface Tweaks {
   transferData?: [number, Uint8Array | null][];
   minterOverride?: SigningService;
   proofTime?: [number, bigint][];
+  /** The root round of the certificate of leaf `i`; leaves of one shard in different rounds get different UCs. */
+  ucRound?: (i: number) => bigint;
 }
 
 export interface TokenOut {
   token: Token;
   bytes: Uint8Array;
+  /** The first certificate (the only one when every leaf is in one shard and round). */
   uc: UnicityCertificate;
+  /** Every distinct certificate, in first-use leaf order. */
+  ucs: UnicityCertificate[];
   leaves: [Uint8Array, Uint8Array][];
 }
 
@@ -408,21 +418,41 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
   void state;
   const values = items.map((it) => leafValue(it.txHash, it.t));
   const factory = new DataHasherFactory(HashAlgorithm.SHA256, NodeDataHasher);
-  const smt = new SparseMerkleTree(factory);
-  for (let i = 0; i < items.length; i++) await smt.addLeaf(items[i].sid, values[i]);
-  const rootNode = await smt.calculateRoot();
-  const uc = await makeUc(w.agg, {
-    partition: AGG_PARTITION, conf: w.aggConf, epochIr: 1n, rootEpoch: 2n, round: 900n, timestamp: ucTs, stateHash: rootNode.hash.data, blockHash: null, signers: 4,
+  // One tree and one certificate per (shard row, root round): leaves of a shard certified in different
+  // rounds are separate anchors even when every other field is equal.
+  const groups = new Map<string, { row: number; round: bigint; members: number[] }>();
+  items.forEach((it, i) => {
+    const row = shardRow(w.policy, it.sid);
+    const round = tw.ucRound ? tw.ucRound(i) : 900n;
+    const key = `${row}:${round}`;
+    const g = groups.get(key) ?? { row, round, members: [] };
+    g.members.push(i);
+    groups.set(key, g);
   });
+  const certOf: { root: Awaited<ReturnType<SparseMerkleTree['calculateRoot']>>; uc: UnicityCertificate }[] = new Array(items.length);
+  const ucs: UnicityCertificate[] = [];
+  for (const g of groups.values()) {
+    const smt = new SparseMerkleTree(factory);
+    for (const i of g.members) await smt.addLeaf(items[i].sid, values[i]);
+    const root = await smt.calculateRoot();
+    const uc = await makeUc(w.agg, {
+      partition: AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
+      blockHash: null, signers: 4,
+      shard: { bytes: shardId(w.policy, g.row), siblings: w.policy.depth === 0 ? [] : [sha(text(`sibling of shard ${g.row}`))] },
+    });
+    for (const i of g.members) certOf[i] = { root, uc };
+  }
+  // Certificates in first-use leaf order.
+  for (let i = 0; i < items.length; i++) if (!ucs.includes(certOf[i].uc)) ucs.push(certOf[i].uc);
   const proofs = items.map((it, i) => {
     const t = (tw.proofTime ?? []).find(([k]) => k === i)?.[1] ?? it.t;
-    const cert = InclusionCertificate.create(rootNode, it.sid);
-    return C.encodeTag(39033, arr(u(1), it.cd, u(t), bs(cert.encode()), uc.toCBOR()));
+    const cert = InclusionCertificate.create(certOf[i].root, it.sid);
+    return C.encodeTag(39033, arr(u(1), it.cd, u(t), bs(cert.encode()), certOf[i].uc.toCBOR()));
   });
   const certified = items.map((it, i) => arr(it.txBytes, proofs[i]));
   const bytes = C.encodeTag(39040, arr(u(2), certified[0], arr(...certified.slice(1))));
   const token = await Token.fromCBOR(bytes);
-  return { token, bytes, uc, leaves: items.map((it, i) => [it.sid, values[i]]) };
+  return { token, bytes, uc: ucs[0], ucs, leaves: items.map((it, i) => [it.sid, values[i]]) };
 }
 
 // The signer service for a SigningService key owner (identity).

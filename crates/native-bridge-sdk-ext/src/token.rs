@@ -228,13 +228,15 @@ pub fn check_leaf(
         return Err(E::CDMismatch);
     }
     trust.check_guards(uc)?;
-    // Aggregator admission against the pinned one-shard policy, never the certificate's own tuple.
+    // Aggregator admission against the pinned policy row of the leaf's own shard, never the
+    // certificate's own tuple: the shard is the top `depth` bits of the leaf's state ID.
+    let row = dep.policy.shard_row(&leaf.sid);
     if uc.unicity_tree_certificate.partition_identifier != dep.policy.partition
-        || uc.shard_configuration_hash.as_slice() != dep.policy.shard_conf.as_slice()
+        || uc.shard_configuration_hash.as_slice() != dep.policy.shard_confs[row].as_slice()
     {
         return Err(E::NotAdmitted);
     }
-    if uc.shard_tree_certificate.shard.length() != 0 {
+    if uc.shard_tree_certificate.shard.encode().as_slice() != dep.policy.shard_id(row) {
         return Err(E::ShardMismatch);
     }
     let encoded = proof.inclusion_certificate.encode();

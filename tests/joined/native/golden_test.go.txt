@@ -89,7 +89,14 @@ func TestNBPPR6NativeGolden(t *testing.T) {
 		"b1ProfileHash": x32(cfg.B1ProfileHash), "aggregatorPolicyHash": x32(cfg.AggregatorPolicyHash),
 		"bytes": x(cfg.Bytes()), "hash": x32(ch),
 	}
-	g["policy"] = map[string]any{"partition": f.Policy.Partition, "conf": x32(f.Policy.ShardConf), "bytes": x(f.Policy.Bytes()), "hash": x32(f.Policy.Hash())}
+	confs := []string{}
+	shards := []string{}
+	for _, r := range f.Policy.Shards {
+		confs = append(confs, x32(r.Conf))
+		shards = append(shards, x(r.ID))
+	}
+	g["policy"] = map[string]any{"partition": f.Policy.Partition, "depth": f.Policy.Depth, "shards": shards, "confs": confs,
+		"bytes": x(f.Policy.Bytes()), "hash": x32(f.Policy.Hash())}
 	g["ucRootRound"] = 100
 
 	owner0 := KeyFromSeed("owner0")

@@ -18,7 +18,7 @@ pub struct Deployment {
     /// Genesis `ConfigHash` of the EVM partition description (all non-membership settings).
     pub evm_config_hash: [u8; 32],
     pub header: HeaderProfile,
-    /// The sole admitted one-shard aggregator policy.
+    /// The sole admitted sharded aggregator policy (depth 0 or 1).
     pub policy: Policy,
 }
 
