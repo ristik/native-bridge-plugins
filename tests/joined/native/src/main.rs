@@ -1012,7 +1012,7 @@ fn main() {
     let _ = o;
     // tampered certificate / path / missing authority
     let ret = golden["return"]["envelope"].clone();
-    let uc = hx(&ret["anchor"]["uc"]);
+    let uc = hx(&ret["anchors"][0]["uc"]);
     // Flip every byte of the submitted certificate in turn: report how many flips B1 still accepts
     // (bytes its authentication does not cover) and use the first refused flip as the refusal case.
     let base = find(&return_proof, &uc);
