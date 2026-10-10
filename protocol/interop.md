@@ -328,7 +328,7 @@ CBOR/RLP depth<=16, CBOR items<=32768; semantic history<=16384;
 direct envelope<=65536; <=15 transfers including burn, <=16 leaves;
 anchor UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity
 steps and exactly `depth` shard-tree siblings per UC (the shard certificate
-must name the policy shard); A<=A_max=2 distinct UC anchors; A<=L.
+must name the policy shard); A<=A_max=4 distinct UC anchors (a parser ceiling: the gas gate below decides each bundle); A<=L.
 These bounds are the named parameters of `profile-v3.json` `limits`
 (the single source for contract, oracle and plug-ins); a later profile version
 may raise them, e.g. when multi-proof services land. The initial testnet
@@ -361,12 +361,16 @@ a latest UC or splits a redemption, and means "direct exit unavailable", not
 "token invalid". The 7,000,000 transaction budget is the DN-B ordinary transaction capacity
 (`maxGas` minus the system gas reserved for certificate transactions); it is
 never raised implicitly (a larger ordinary capacity is a later profile version).
-The bounds are chosen so that every admitted bundle fits it: at A=2, L=16, UC
-8192 bytes with 64 signatures and 33 steps, 32-sibling paths, history 16384 and
-envelope 65536 bytes the gate is 6,976,692; a typical bundle (4 KiB UC, 5
-signatures, 8 steps, 8-sibling paths, 2 KiB history, 8 KiB envelope) is about
-4.3M. Anything above the bounds is BudgetExceeded or an input-size refusal
-before any native call.
+The parser ceilings do not promise that every admitted bundle passes the gate;
+the gate admits or refuses each bundle. At the maximum sizes (L=16, UC 8192
+bytes with 64 signatures and 33 steps, 32-sibling paths, history 16384,
+envelope 65536 bytes) two anchors price 6,976,692 and pass, three do not. Real
+DN-B certificates (4 signatures, about 1.5 KB, one shard sibling) price about
+1.3M each, so up to four anchors pass for small histories; five can never pass
+(five minimal certificates alone exceed the budget with the reserve). A typical
+bundle (4 KiB UC, 5 signatures, 8 steps, 8-sibling paths, 2 KiB history, 8 KiB
+envelope) with two anchors is about 4.3M. Anything refused by the gate or above
+a ceiling is BudgetExceeded or an input-size refusal before any native call.
 Bounds are not additive entitlements or measured activation
 prices. Freeze in canonical semantic profile/vectors before activation; native
 x86-64/arm64 full-transaction measurements and final gas gates remain required.
@@ -385,8 +389,11 @@ mismatched (path, UC) pair gets a bounded retry, then retryable unavailability
 (never BudgetExceeded). The plug-in validates the complete envelope (including
 the gas gate and the windows against one observed EVM origin) before
 submission, and runs the same gate BEFORE creating a burn, refusing a burn
-whose envelope cannot fit the configured block gas limit (BudgetExceeded for an
-over-limit bundle; no truncation or partial credit). Pending history and bundle
+that cannot pass the gas gate (`txGasBudget`) even in the best case (fewest
+anchors, smallest certificates, shortest paths): it does not project one
+anchor per shard as the only case, and the redemption path accepts up to
+A_max distinct UCs whenever the gate passes (BudgetExceeded for an over-limit
+bundle; no truncation or partial credit). Pending history and bundle
 are persisted atomically for restart, aged pairs are revalidated or refetched.
 There is no common cut, cross-shard synchronization or guarantee that fresh
 proofs become available. Offline receipt verification is network-free and
