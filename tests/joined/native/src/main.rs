@@ -7,7 +7,9 @@ use alloy_primitives::{address, hex, keccak256, Address, TxKind, B256, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use reth_unicity_execution::{
     evm_factory::UnicityEvmFactory,
-    execute_registry_transition, technical_record_hash,
+    execute_registry_transition,
+    records::RecordImport,
+    technical_record_hash,
     testing::{self, Members, Tail},
     update::B1Context,
     ExecutionConfig, InputRecordV2, RootInputV2, RootOriginV2, TechnicalRecordV2, UpdateInput,
@@ -23,6 +25,9 @@ use revm::{
     DatabaseRef, Inspector,
 };
 use serde_json::{json, Value};
+
+/// `GenesisUCTime` of the profile built by `genesis_test.go.txt`.
+const GENESIS_UC_TIME: u64 = 1000;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs};
 
@@ -583,6 +588,7 @@ fn main() {
             &hex::decode(genesis["profileHash"].as_str().unwrap()).unwrap(),
         ),
         w_cert: genesis["wCert"].as_u64().unwrap(),
+        hook: Default::default(), // no custody: the profile has no records hook
     };
     let conf = h32(&genesis["shardConfHash"]);
     let technical = TechnicalRecordV2 {
@@ -622,6 +628,7 @@ fn main() {
         technical,
         transitions: vec![],
         b1_update_hash: B256::repeat_byte(0xb1),
+        root_records_hash: B256::repeat_byte(0xb2),
     };
     let update = testing::update_in(
         &context,
@@ -635,6 +642,17 @@ fn main() {
         "a quiet update inserts no entry"
     );
     input.b1_update_hash = update.hash();
+    // The mandatory root-record import of an empty source log at the profile's pinned genesis UC time
+    // (the genesis overlay's `GenesisUCTime`), committed by the input's thirteenth field.
+    let records = RecordImport {
+        progress: 0,
+        uc_time: GENESIS_UC_TIME,
+        target_count: 0,
+        target_tip: B256::ZERO,
+        entries: Vec::new(),
+    }
+    .to_bytes();
+    input.root_records_hash = B256::from_slice(&Sha256::digest(&records));
     let limit = context.required_system_gas().unwrap();
     let clock_before =
         w.db.storage_ref(
@@ -646,6 +664,7 @@ fn main() {
         &input,
         UpdateInput {
             bytes: &update.to_bytes(),
+            records: &records,
             parent_number: 0,
         },
         &w.db,
