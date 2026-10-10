@@ -7,7 +7,9 @@ use common::*;
 use native_bridge_sdk_ext::envelope::*;
 use native_bridge_sdk_ext::gas::*;
 use native_bridge_sdk_ext::limits::*;
-use native_bridge_sdk_ext::proof::{build_return_proof, leaf_routes, preflight_burn};
+use native_bridge_sdk_ext::proof::{
+    build_return_proof, check_burn_projection, leaf_routes, preflight_burn, BURN_HISTORY_BYTES,
+};
 use native_bridge_sdk_ext::NativeError as E;
 
 const T0: u64 = 1_700_000_040;
@@ -207,4 +209,21 @@ fn a_real_burn_leaf_adds_no_more_history_than_the_bound_and_the_best_case_is_a_l
     assert_eq!(E::ProofUnavailable.family(), Family::Unavailable);
     assert_eq!(E::PolicyAnchors.family(), Family::Invalid);
     assert_eq!(E::TooManyPaths.family(), Family::Budget);
+}
+
+#[test]
+fn the_burn_preflight_refuses_a_history_near_the_bound_and_a_best_case_the_gate_cannot_pass() {
+    let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
+    let ok = check_burn_projection(200, 300, 1, 2, MAX_LEAVES as u64, edge).unwrap();
+    assert!(ok.total <= TX_GAS_BUDGET, "exactly at the margin passes");
+    assert_eq!(
+        check_burn_projection(200, 300, 1, 2, MAX_LEAVES as u64, edge + 1).unwrap_err(),
+        E::InputTooLarge
+    );
+    // five occupied shards: five certificates cannot pass the gate even at the smallest sizes
+    assert_eq!(
+        check_burn_projection(200, 300, 2, 5, 5, 500).unwrap_err(),
+        E::GasBudget
+    );
+    assert!(check_burn_projection(200, 300, 2, 4, 5, 500).unwrap().total <= TX_GAS_BUDGET);
 }

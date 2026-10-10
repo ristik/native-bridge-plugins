@@ -119,11 +119,19 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
   // the fewest anchors the known leaves can need: one per shard they occupy
   const minAnchors = new Set((await leafRoutes(bridge, token)).map((r) => r.row)).size;
-  // The history bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to add
-  // up to `BURN_HISTORY_BYTES`. The gate projection uses the known history only, a lower bound.
-  const history = projectToken(token).length;
+  return checkBurnProjection(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, dep.policy.depth, minAnchors, leaves, projectToken(token).length);
+}
+
+/**
+ * The size and gate refusals of the preflight, on the projection's inputs. The history bound is hard and
+ * no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to `BURN_HISTORY_BYTES`. The
+ * gate projection uses the known history only, a lower bound. The envelope bound cannot fire at the
+ * best-case sizes (about 22 KB at the largest admitted shape against 65,536), so it is kept as a guard
+ * only.
+ */
+export function checkBurnProjection(cfgLen: number, policyLen: number, depth: number, minAnchors: number, leaves: number, history: number): Gate {
   if (history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
-  const { gate, envelopeBytes } = projectedGate(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, dep.policy.depth, minAnchors, leaves, history);
+  const { gate, envelopeBytes } = projectedGate(cfgLen, policyLen, depth, minAnchors, leaves, history);
   if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   if (gate.total > TX_GAS_BUDGET) fail('ErrGasBudget');
   return gate;

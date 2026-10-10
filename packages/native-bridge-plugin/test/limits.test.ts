@@ -4,6 +4,8 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { BURN_HISTORY_BYTES, checkBurnProjection } from '../src/proof.js';
+import { throwsReason } from './util.js';
 import { b2Gas, intrinsicGas, kernelRequestBytes, projectedGate, rsmtGas, ucGas } from '../src/gas.js';
 import * as L from '../src/limits.js';
 
@@ -53,4 +55,13 @@ test('the gate decides each bundle under the parser ceilings; the best-case proj
   const fit = projectedGate(300, 150, 1, 2, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES);
   assert.ok(fit.gate.total <= L.TX_GAS_BUDGET, String(fit.gate.total));
   assert.ok(fit.envelopeBytes <= L.MAX_ENVELOPE_BYTES, String(fit.envelopeBytes));
+});
+
+test('the burn preflight refuses a history within BURN_HISTORY_BYTES of the bound and a best case the gate cannot pass', () => {
+  const edge = L.MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
+  assert.ok(checkBurnProjection(200, 300, 1, 2, L.MAX_LEAVES, edge).total <= L.TX_GAS_BUDGET, 'exactly at the margin passes');
+  throwsReason(() => checkBurnProjection(200, 300, 1, 2, L.MAX_LEAVES, edge + 1), 'ErrInputTooLarge');
+  // five occupied shards: five certificates cannot pass the gate even at the smallest sizes
+  throwsReason(() => checkBurnProjection(200, 300, 2, 5, 5, 500), 'ErrGasBudget');
+  assert.ok(checkBurnProjection(200, 300, 2, 4, 5, 500).total <= L.TX_GAS_BUDGET, 'four such shards pass');
 });

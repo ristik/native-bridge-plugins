@@ -158,7 +158,7 @@ pub const BURN_HISTORY_BYTES: usize = 1024;
 
 /// The burn-time preflight. A burn that could never be redeemed under the profile bounds and the
 /// shared gas gate is refused before the wallet burns anything: more leaves than the profile admits, a
-/// history or envelope over its bound, or a worst-case envelope over the transaction budget. Beyond the
+/// history or envelope over its bound, or an envelope that cannot pass the gas gate (`txGasBudget`) even in the best case. Beyond the
 /// bounds the answer is `GasBudget`/`TooManyTx`/`InputTooLarge` (BudgetExceeded), never a truncated
 /// history or a partial redemption. `token` is the held receipt the burn would spend.
 pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
@@ -167,22 +167,42 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
     if leaves > MAX_LEAVES {
         return Err(E::TooManyTx);
     }
-    // The history bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to
-    // add up to `BURN_HISTORY_BYTES`. The gate projection uses the known history only, a lower bound.
-    let history = history::project(token).len();
-    if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
-        return Err(E::InputTooLarge);
-    }
     // the fewest anchors the known leaves can need: one per shard they occupy
     let mut rows: Vec<usize> = leaf_routes(bridge, token)?.iter().map(|r| r.row).collect();
     rows.sort_unstable();
     rows.dedup();
-    let (gate, envelope) = projected_gate(
+    check_burn_projection(
         dep.cfg.to_bytes().len() as u64,
         dep.policy.to_bytes().len() as u64,
         u64::from(dep.policy.depth),
         rows.len() as u64,
         leaves as u64,
+        history::project(token).len(),
+    )
+}
+
+/// The size and gate refusals of the preflight, on the projection's inputs. The history bound is hard and
+/// no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to `BURN_HISTORY_BYTES`. The
+/// gate projection uses the known history only, a lower bound. The envelope bound cannot fire at the
+/// best-case sizes (about 22 KB at the largest admitted shape against 65,536), so it is kept as a guard
+/// only.
+pub fn check_burn_projection(
+    cfg_len: u64,
+    policy_len: u64,
+    depth: u64,
+    min_anchors: u64,
+    leaves: u64,
+    history: usize,
+) -> Result<Gate> {
+    if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
+        return Err(E::InputTooLarge);
+    }
+    let (gate, envelope) = projected_gate(
+        cfg_len,
+        policy_len,
+        depth,
+        min_anchors,
+        leaves,
         history as u64,
     );
     if envelope > MAX_ENVELOPE_BYTES as u64 {
