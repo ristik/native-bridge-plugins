@@ -261,3 +261,38 @@ fn preflight_burn_on_a_held_token_refuses_a_history_within_the_burn_margin_of_th
         E::InputTooLarge
     );
 }
+
+#[test]
+fn preflight_burn_prices_a_held_token_exactly() {
+    let w = make_world(20);
+    let held = build_token(&w, &spec(1), &[tx_step(2, 7, T0 + 10)], T0, UC_TS);
+    let gate = preflight_burn(&w.bridge, &held.token).unwrap();
+    // best case: one 445-byte one-signature certificate (depth 0, no shard sibling), an empty input record, the known history only
+    assert_eq!(
+        [gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt],
+        [2_481_322, 1_258_596, 124_960, 84_488, 13_278]
+    );
+}
+
+#[test]
+fn plan_anchors_itself_refuses_more_than_the_ceiling_with_too_many_paths() {
+    let w = make_world(20);
+    let out = build_token(
+        &w,
+        &spec(1),
+        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
+        T0,
+        UC_TS,
+    );
+    let (env, v, _) = build_return_proof(&w.bridge, &out.token).unwrap();
+    let pol = check_policy_body(&w.dep.cfg, &env).unwrap();
+    let mut over = env.clone();
+    while over.anchors.len() <= MAX_ANCHORS {
+        over.anchors.push(over.anchors[0].clone());
+    }
+    let sids: Vec<[u8; 32]> = v.outcome.leaves.iter().map(|l| l.sid).collect();
+    assert_eq!(
+        plan_anchors(&pol, &over, &sids).unwrap_err(),
+        E::TooManyPaths
+    );
+}
