@@ -1,5 +1,5 @@
 {
-  "protocolVersion": 2,
+  "protocolVersion": 3,
   "kernelAddress": "0x0000000000000000000000000000000000000104",
   "reservedAddress": "0x0000000000000000000000000000000000000103",
   "input": [
@@ -81,5 +81,46 @@
   "b1Result": [
     "uint256(1)",
     "bool(true)"
-  ]
+  ],
+  "policy": {
+    "domain": "UNICITY_BR_AGG_SHARDED",
+    "version": 1,
+    "maxBytes": 512,
+    "depths": [
+      0,
+      1
+    ],
+    "shardIds": {
+      "0": [
+        "80"
+      ],
+      "1": [
+        "40",
+        "c0"
+      ]
+    },
+    "entry": [
+      "bytes shardId",
+      "bytes32 shardConfHash"
+    ]
+  },
+  "anchorRule": "one anchor per distinct complete UC (pairwise distinct UC bytes), ordered by first use in kernel leaf order; each leaf's anchorIndex is an already-used index or the next unused one and names an anchor of its own shard; no unused anchors",
+  "gas": {
+    "txBudget": 7000000,
+    "reserve": 1000000,
+    "ucBase": 1243700,
+    "ucPerByte": 16,
+    "ucPerSignature": 6000,
+    "ucPerStep": 250,
+    "rsmtBase": 2000,
+    "rsmtRequestFixed": 136,
+    "rsmtPerSibling": 32,
+    "rsmtPerByte": 16,
+    "rsmtPerStep": 250,
+    "b2Base": 26000,
+    "b2PerByte": 20,
+    "b2PerLeaf": 14000,
+    "intrinsicBase": 21000,
+    "intrinsicPerByte": 16
+  }
 }

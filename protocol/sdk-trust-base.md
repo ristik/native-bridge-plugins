@@ -1,4 +1,4 @@
-# Fixed SDK trust input (unreleased protocol v2)
+# Fixed SDK trust input (unreleased protocol v3)
 
 Use the existing SDK 3.0.1 verification model with one provisioned RootTrustBase
 for every ordinary inclusion UC and the embedded EVM UC. Every configured

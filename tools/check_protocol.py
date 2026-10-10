@@ -26,6 +26,35 @@ def validator():
     return Draft202012Validator(schema, format_checker=FormatChecker())
 
 
+def cbor_head(major, n):
+    if n < 24:
+        return bytes([major << 5 | n])
+    if n < 1 << 8:
+        return bytes([major << 5 | 24, n])
+    if n < 1 << 16:
+        return bytes([major << 5 | 25]) + n.to_bytes(2, 'big')
+    if n < 1 << 32:
+        return bytes([major << 5 | 26]) + n.to_bytes(4, 'big')
+    return bytes([major << 5 | 27]) + n.to_bytes(8, 'big')
+
+
+def cbor_bytes(b):
+    return cbor_head(2, len(b)) + b
+
+
+def policy_body(partition, depth, shards):
+    """Canonical C(b("UNICITY_BR_AGG_SHARDED"),1,partition,depth,[[b(shard),b(conf)]...])."""
+    rows = b''.join(cbor_head(4, 2) + cbor_bytes(bytes.fromhex(s['shardHex'])) + cbor_bytes(bytes.fromhex(s['configurationHash'])) for s in shards)
+    return cbor_head(4, 5) + cbor_bytes(b'UNICITY_BR_AGG_SHARDED') + cbor_head(0, 1) + cbor_head(0, partition) + cbor_head(0, depth) + cbor_head(4, len(shards)) + rows
+
+
+def validate_policy(policy):
+    """Policy shape: complete uniform MSB-first prefix topology, increasing shard bytes, canonical body."""
+    expected = {0: ['80'], 1: ['40', 'c0']}[policy['depth']]
+    assert [s['shardHex'] for s in policy['shards']] == expected, 'policy shards are not the complete topology in order'
+    assert policy_body(policy['partition'], policy['depth'], policy['shards']).hex() == policy['bodyHex'], 'policy body is not the canonical encoding'
+
+
 def validate_manifest(registry):
     """Schema plus cross-field identity checks; not full trust installation."""
     validator().validate(registry)
@@ -46,6 +75,7 @@ def validate_manifest(registry):
             vaults.add(vault)
             assert dep['tokenVerifierAddress'] != '0' * 40, 'zero verifier'
             assert dep['aggregatorPolicy']['partition'] != dep['evmBackingPolicy']['partition'], 'partition collision'
+            validate_policy(dep['aggregatorPolicy'])
             for data, expected in [(bytes.fromhex(dep['cfgHex']), dep['cfgHash']), (bytes.fromhex(dep['aggregatorPolicy']['bodyHex']), dep['aggregatorPolicy']['sha256'])]:
                 assert hashlib.sha256(data).hexdigest() == expected, 'canonical bytes digest mismatch'
     # Full Cfg/Policy parsing, fixed SDK document loading/authentication, unit
@@ -69,15 +99,15 @@ def validate_sdk_trust_document(data, expected_digest):
 def main():
     validator()
     abi = load('protocol/abi.json')
-    assert abi['protocolVersion'] == 2
+    assert abi['protocolVersion'] == 3
     assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
     assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v2.json')
-    assert profile['nativeBridgeProtocolVersion'] == 2 and profile['sdkVersion'] == '3.0.1'
-    assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
+    profile = load('protocol/profile-v3.json')
+    assert profile['nativeBridgeProtocolVersion'] == 3 and profile['sdkVersion'] == '3.0.1'
+    assert profile['limits']['semanticBytes'] == 16384 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'fixed-sdk-root-trust-base'
     assert profile['trustModel']['validatorStake'] == '1'
     assert profile['trustModel']['verification'] == 'existing-sdk-3.0.1'
@@ -92,7 +122,7 @@ def main():
     subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs')], check=True)
     if (ROOT / 'protocol/vectors/MANIFEST.sha256').exists():
         subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs'), '--corpus', str(ROOT / 'protocol/vectors')], check=True)
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=2' in (ROOT / 'protocol/interop.md').read_text()
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=3' in (ROOT / 'protocol/interop.md').read_text()
     assert JS_COMMIT in (ROOT / 'protocol/interop.md').read_text()
     assert RUST_COMMIT in (ROOT / 'protocol/interop.md').read_text()
     package = load('packages/native-bridge-plugin/package.json')

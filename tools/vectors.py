@@ -55,7 +55,7 @@ def inventory(root):
 
 def provenance_check(provenance):
     require(set(provenance) == {'protocolVersion', 'sdkVersion', 'semanticProfileSha256', 'generator'}, 'provenance fields')
-    require(provenance['protocolVersion'] == 2 and provenance['sdkVersion'] == '3.0.1', 'unexpected protocol/SDK version')
+    require(provenance['protocolVersion'] == 3 and provenance['sdkVersion'] == '3.0.1', 'unexpected protocol/SDK version')
     require(bool(HEX.fullmatch(provenance['semanticProfileSha256'])), 'invalid semantic profile digest')
     g = provenance['generator']
     require(set(g) == {'repository', 'commit', 'command'}, 'generator fields')
@@ -70,7 +70,7 @@ def provenance_check(provenance):
 
 def fixed_profile_check(files):
     """Reject abandoned trust drafts even if their own digest is consistent."""
-    expected_profile = json.loads((ROOT / 'protocol/profile-v2.json').read_bytes())
+    expected_profile = json.loads((ROOT / 'protocol/profile-v3.json').read_bytes())
     actual_profile = json.loads(files['config/semantic-profile.json'])
     require(actual_profile.get('trustModel') == expected_profile['trustModel'], 'unsupported trust model')
     require(actual_profile.get('normativeArtifactSha256') == expected_profile['normativeArtifactSha256'], 'normative artifact pins mismatch')

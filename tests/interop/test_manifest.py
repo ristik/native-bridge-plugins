@@ -12,15 +12,21 @@ p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 
 
+def synthetic_policy(partition, depth, h):
+    shards = [{'shardHex': s, 'configurationHash': h} for s in {0: ['80'], 1: ['40', 'c0']}[depth]]
+    body = p.policy_body(partition, depth, shards)
+    return {'bodyHex': body.hex(), 'sha256': hashlib.sha256(body).hexdigest(), 'partition': partition, 'depth': depth, 'shards': shards}
+
+
 def synthetic():
     # Schema/cross-field test data only: never an installable deployment.
     h, a = 'a'*64, '1'*40
     artifact = {'sha256': h}
-    dep = {'vaultAddress': a, 'vaultRuntimeHash': h, 'cfgHex': '00', 'cfgHash': hashlib.sha256(b'\0').hexdigest(), 'tokenVerifierAddress': '2'*40, 'tokenVerifierRuntimeHash': h, 'semanticProfile': artifact, 'b1': {'profile': artifact, 'registryAddress': a, 'registryRuntimeHash': h, 'registryLayout': artifact, 'genesis': artifact}, 'lockLayoutVersion': 1, 'aggregatorPolicy': {'bodyHex': '00', 'sha256': hashlib.sha256(b'\0').hexdigest(), 'partition': 1, 'shardHex': '80', 'configurationHash': h}, 'evmBackingPolicy': {'partition': 2, 'shardHex': '80', 'configurationHash': h, 'pdr': artifact, 'executionProfile': artifact}}
+    dep = {'vaultAddress': a, 'vaultRuntimeHash': h, 'cfgHex': '00', 'cfgHash': hashlib.sha256(b'\0').hexdigest(), 'tokenVerifierAddress': '2'*40, 'tokenVerifierRuntimeHash': h, 'semanticProfile': artifact, 'b1': {'profile': artifact, 'registryAddress': a, 'registryRuntimeHash': h, 'registryLayout': artifact, 'genesis': artifact}, 'lockLayoutVersion': 1, 'aggregatorPolicy': synthetic_policy(1, 1, h), 'evmBackingPolicy': {'partition': 2, 'shardHex': '80', 'configurationHash': h, 'pdr': artifact, 'executionProfile': artifact}}
     d = f'1:{h}:{h}:1:' + '0'*40
     ty = hashlib.sha256(('unicity-bridge:unicity-native:' + d).encode()).hexdigest()
     coin = hashlib.sha256(('unicity-bridge-coin:unicity-native:' + d).encode()).hexdigest()
-    e = {'schemaVersion': 1, 'protocolVersion': 2, 'family': 'unicity-native', 'sdkVersion': '3.0.1', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'document': artifact, 'format': 'sdk-root-trust-base-json-v1'}}
+    e = {'schemaVersion': 1, 'protocolVersion': 3, 'family': 'unicity-native', 'sdkVersion': '3.0.1', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'document': artifact, 'format': 'sdk-root-trust-base-json-v1'}}
     return {ty: e}
 
 
@@ -35,6 +41,26 @@ class ManifestTests(unittest.TestCase):
     def test_missing_embedded_policy_pin(self):
         del self.entry['activeDeployment']['evmBackingPolicy']['configurationHash']
         with self.assertRaises(ValidationError):
+            p.validate_manifest(self.registry)
+
+    def test_policy_depths_and_noncanonical(self):
+        h = 'a' * 64
+        for depth in (0, 1):
+            self.entry['activeDeployment']['aggregatorPolicy'] = synthetic_policy(1, depth, h)
+            p.validate_manifest(self.registry)
+        pol = self.entry['activeDeployment']['aggregatorPolicy']
+        for mutate in (lambda q: q.update(depth=2), lambda q: q.update(partition=0),
+                       lambda q: q['shards'].reverse(), lambda q: q['shards'].pop(),
+                       lambda q: q['shards'][0].update(shardHex='80'), lambda q: q.update(shardHex='80')):
+            self.entry['activeDeployment']['aggregatorPolicy'] = copy.deepcopy(pol)
+            mutate(self.entry['activeDeployment']['aggregatorPolicy'])
+            with self.assertRaises((ValidationError, AssertionError)):
+                p.validate_manifest(self.registry)
+        bad = copy.deepcopy(pol)
+        bad['bodyHex'] = bad['bodyHex'][:-2] + '00'
+        bad['sha256'] = hashlib.sha256(bytes.fromhex(bad['bodyHex'])).hexdigest()
+        self.entry['activeDeployment']['aggregatorPolicy'] = bad
+        with self.assertRaisesRegex(AssertionError, 'canonical'):
             p.validate_manifest(self.registry)
 
     def test_old_protocol(self):

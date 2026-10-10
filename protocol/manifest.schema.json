@@ -52,29 +52,54 @@
       "properties": {
         "bodyHex": {
           "type": "string",
-          "pattern": "^(?:[0-9a-f]{2}){1,128}$"
+          "pattern": "^(?:[0-9a-f]{2}){1,512}$"
         },
         "sha256": {
           "$ref": "#/$defs/hash"
         },
         "partition": {
           "type": "integer",
-          "minimum": 0,
+          "minimum": 1,
           "maximum": 4294967295
         },
-        "shardHex": {
-          "const": "80"
+        "depth": {
+          "enum": [
+            0,
+            1
+          ]
         },
-        "configurationHash": {
-          "$ref": "#/$defs/hash"
+        "shards": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "shardHex": {
+                "enum": [
+                  "80",
+                  "40",
+                  "c0"
+                ]
+              },
+              "configurationHash": {
+                "$ref": "#/$defs/hash"
+              }
+            },
+            "required": [
+              "shardHex",
+              "configurationHash"
+            ]
+          }
         }
       },
       "required": [
         "bodyHex",
         "sha256",
         "partition",
-        "shardHex",
-        "configurationHash"
+        "depth",
+        "shards"
       ]
     },
     "backing": {
@@ -257,7 +282,7 @@
           "const": 1
         },
         "protocolVersion": {
-          "const": 2
+          "const": 3
         },
         "family": {
           "const": "unicity-native"

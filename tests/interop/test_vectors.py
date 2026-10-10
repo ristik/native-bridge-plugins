@@ -20,11 +20,11 @@ class CorpusTests(unittest.TestCase):
         for family in v.FAMILIES:
             (self.root / family).mkdir()
             (self.root / family / 'synthetic.json').write_text('{"testOnly":true}\n')
-        profile = (ROOT / 'protocol/profile-v2.json').read_bytes()
+        profile = (ROOT / 'protocol/profile-v3.json').read_bytes()
         for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
             (self.root / 'config' / name).write_bytes((ROOT / 'protocol/vectors/config' / name).read_bytes())
         (self.root / 'config/semantic-profile.json').write_bytes(profile)
-        self.provenance = {'protocolVersion': 2, 'sdkVersion': '3.0.1', 'semanticProfileSha256': hashlib.sha256(profile).hexdigest(), 'generator': {'repository': v.REPOSITORY, 'commit': 'b'*40, 'command': ['go', 'run', './cmd/test-generator', '-out', '{output}']}}
+        self.provenance = {'protocolVersion': 3, 'sdkVersion': '3.0.1', 'semanticProfileSha256': hashlib.sha256(profile).hexdigest(), 'generator': {'repository': v.REPOSITORY, 'commit': 'b'*40, 'command': ['go', 'run', './cmd/test-generator', '-out', '{output}']}}
         self.pin = v.seal(self.root, self.provenance)
 
     def test_import_and_check(self):

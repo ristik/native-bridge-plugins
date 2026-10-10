@@ -20,7 +20,7 @@ class RegenerateTests(unittest.TestCase):
             oracle, corpus = tmp / 'oracle', tmp / 'corpus'
             (oracle / 'cmd/test-generator').mkdir(parents=True)
             (oracle / 'go.mod').write_text('module test.invalid/oracle\n\ngo 1.22\n')
-            profile = (ROOT / 'protocol/profile-v2.json').read_bytes()
+            profile = (ROOT / 'protocol/profile-v3.json').read_bytes()
             files = {f'{family}/synthetic.json': '{}\n' for family in v.FAMILIES}
             files['config/semantic-profile.json'] = profile.decode()
             for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
@@ -42,7 +42,7 @@ class RegenerateTests(unittest.TestCase):
             (corpus / 'config/semantic-profile.json').write_bytes(profile)
             for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
                 (corpus / 'config' / name).write_bytes((ROOT / 'protocol/vectors/config' / name).read_bytes())
-            provenance = {'protocolVersion': 2, 'sdkVersion': '3.0.1', 'semanticProfileSha256': v.digest(profile), 'generator': {'repository': v.REPOSITORY, 'commit': commit, 'command': ['go', 'run', './cmd/test-generator', '{output}']}}
+            provenance = {'protocolVersion': 3, 'sdkVersion': '3.0.1', 'semanticProfileSha256': v.digest(profile), 'generator': {'repository': v.REPOSITORY, 'commit': commit, 'command': ['go', 'run', './cmd/test-generator', '{output}']}}
             v.seal(corpus, provenance)
             # A dirty companion checkout must never be executed.
             (oracle / 'cmd/test-generator/main.go').write_text('broken uncommitted source')
