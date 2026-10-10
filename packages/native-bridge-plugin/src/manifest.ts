@@ -17,9 +17,9 @@ import { eq, fromHex, toHex } from './bytes.js';
 import { DeploymentRegistry, makeDeployment, type Deployment } from './deployment.js';
 import { fail } from './errors.js';
 import type { HeaderProfile } from './header.js';
-import { NATIVE_BRIDGE_FAMILY, NATIVE_BRIDGE_PROTO_VERSION, SDK_VERSION } from './limits.js';
+import { MAX_POLICY_BYTES, NATIVE_BRIDGE_FAMILY, NATIVE_BRIDGE_PROTO_VERSION, SDK_VERSION } from './limits.js';
 import { configHashOfPdr } from './lockproof.js';
-import { H, cfgBytes, cfgHash, decodeCfg, decodePolicy, deriveAsset, deriveType, policyBytes, policyHash } from './profile.js';
+import { H, cfgBytes, cfgHash, decodeCfg, decodePolicy, deriveAsset, deriveType, policyBytes, policyHash, shardId } from './profile.js';
 import { NativeBridge } from './verifier.js';
 import type { TrustInput } from './trust.js';
 
@@ -97,12 +97,19 @@ function deployment(c: Ctx, d: unknown, artifacts?: Artifacts): Deployment {
   const cfgRaw = hexVec(r.cfgHex, 2048);
   const cfg = decodeCfg(cfgRaw);
   if (!eq(cfgBytes(cfg), cfgRaw) || !eq(cfgHash(cfg), hexN(r.cfgHash, 32))) fail('ErrManifest');
-  const pol = obj(r.aggregatorPolicy, ['bodyHex', 'sha256', 'partition', 'shardHex', 'configurationHash']);
-  const polRaw = hexVec(pol.bodyHex, 128);
+  const pol = obj(r.aggregatorPolicy, ['bodyHex', 'sha256', 'partition', 'depth', 'shards']);
+  const polRaw = hexVec(pol.bodyHex, MAX_POLICY_BYTES);
   const policy = decodePolicy(polRaw);
-  if (!eq(policyBytes(policy), polRaw) || !eq(policyHash(policy), hexN(pol.sha256, 32)) || policy.partition !== int(pol.partition, 0xffffffff) || pol.shardHex !== '80' || !eq(policy.shardConf, hexN(pol.configurationHash, 32))) {
+  const shards = Array.isArray(pol.shards) ? pol.shards : fail('ErrManifest');
+  if (!eq(policyBytes(policy), polRaw) || !eq(policyHash(policy), hexN(pol.sha256, 32)) || policy.partition !== int(pol.partition, 0xffffffff) ||
+      policy.depth !== pol.depth || shards.length !== policy.shardConfs.length) {
     fail('ErrManifest');
   }
+  // The listed rows are the opened body's rows, in order, each shard in its single native encoding.
+  shards.forEach((row: unknown, i: number) => {
+    const r2 = obj(row, ['shardHex', 'configurationHash']);
+    if (r2.shardHex !== toHex(shardId(policy, i)) || !eq(policy.shardConfs[i], hexN(r2.configurationHash, 32))) fail('ErrManifest');
+  });
   const backing = obj(r.evmBackingPolicy, ['partition', 'shardHex', 'configurationHash', 'pdr', 'executionProfile']);
   const evmShard = hexVec(backing.shardHex, 33);
   const semantic = artifact(r.semanticProfile, artifacts).pin;

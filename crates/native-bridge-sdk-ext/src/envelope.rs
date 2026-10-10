@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use crate::error::{NativeError as E, Result};
 use crate::limits::*;
-use crate::profile::{h, Cfg, Policy, EMPTY_PREFIX_SHARD};
+use crate::profile::{h, Cfg, Policy};
 use crate::scan::{fixed, scan_one};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +232,17 @@ fn bound_counts(b: &[u8]) -> Result<()> {
     if na > MAX_ANCHORS as u64 {
         return Err(E::TooManyPaths);
     }
+    // Every anchor's UC is bounded from its declared length before anything is allocated.
+    for i in 0..na {
+        let t = (off_anchors + 32)
+            .checked_add(word(off_anchors + 32 + 32 * i).ok_or(E::ABIFraming)?)
+            .ok_or(E::ABIFraming)?;
+        let uc_rel = t.checked_add(5 * 32).and_then(word).ok_or(E::ABIFraming)?;
+        let uc_len = t.checked_add(uc_rel).and_then(word).ok_or(E::ABIFraming)?;
+        if uc_len > MAX_ANCHOR_UC_BYTES as u64 {
+            return Err(E::InputTooLarge);
+        }
+    }
     let nl = word(off_leaves).filter(|&v| v <= n).ok_or(E::ABIFraming)?;
     if nl > MAX_LEAVES as u64 {
         return Err(E::TooManyPaths);
@@ -243,7 +254,7 @@ fn bound_counts(b: &[u8]) -> Result<()> {
         let s_rel = t.checked_add(64).and_then(word).ok_or(E::ABIFraming)?;
         let s_off = t.checked_add(s_rel).ok_or(E::ABIFraming)?;
         let ns = word(s_off).ok_or(E::ABIFraming)?;
-        if ns > MAX_PATH_STEPS as u64 - steps {
+        if ns > MAX_RSMT_SIBLINGS as u64 || ns > MAX_PATH_STEPS as u64 - steps {
             return Err(E::TooManyPaths);
         }
         steps += ns;
@@ -251,8 +262,11 @@ fn bound_counts(b: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The composing verifier's opening and tuple check, run before any B1 call.
-pub fn check_policy(cfg: &Cfg, env: &Envelope, leaf_count: usize) -> Result<Policy> {
+/// The composing verifier's opening, run before the kernel and before any B1 call: the supplied body is
+/// hashed against `Cfg.aggregatorPolicyHash` before it is interpreted, decoded, the aggregator partition
+/// must differ from the EVM partition and the anchor count must be within the bound. A submitted anchor
+/// table never chooses its own admission.
+pub fn check_policy_body(cfg: &Cfg, env: &Envelope) -> Result<Policy> {
     if env.policy_body.len() > MAX_POLICY_BYTES {
         return Err(E::InputTooLarge);
     }
@@ -266,23 +280,64 @@ pub fn check_policy(cfg: &Cfg, env: &Envelope, leaf_count: usize) -> Result<Poli
     if pol.partition == cfg.evm_partition {
         return Err(E::PolicyPartition);
     }
-    if env.anchors.len() != 1 {
+    if env.anchors.is_empty() || env.anchors.len() > MAX_ANCHORS {
         return Err(E::PolicyAnchors);
     }
-    let a = &env.anchors[0];
-    if a.partition != pol.partition
-        || a.shard != EMPTY_PREFIX_SHARD
-        || a.shard_conf_hash != pol.shard_conf
-    {
-        return Err(E::PolicyTuple);
-    }
-    if env.leaf_proofs.len() != leaf_count {
+    Ok(pol)
+}
+
+/// The anchor each leaf is certified by: an index into the envelope's anchor table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorPlan {
+    pub leaf_anchor: Vec<usize>,
+}
+
+/// The envelope's anchor table must be exactly the function of the exported leaves the profile
+/// defines: one leaf proof per leaf in kernel order; every anchor's partition, shard and configuration
+/// equal to a policy row; anchors pairwise distinct by complete UC bytes (byte-identical UCs are one
+/// anchor, never two); anchors numbered by first use in leaf order with none unused; and each leaf's
+/// `anchorIndex` naming an anchor of the leaf's own shard (the top `depth` bits of its state ID).
+/// Different UCs of one shard, even of one root round, are separate anchors. The number of anchors is
+/// not tied to the number of shards.
+pub fn plan_anchors(pol: &Policy, env: &Envelope, sids: &[[u8; 32]]) -> Result<AnchorPlan> {
+    if env.leaf_proofs.len() != sids.len() {
         return Err(E::PolicyLeafCount);
     }
-    if env.leaf_proofs.iter().any(|l| l.anchor_index != 0) {
-        return Err(E::PolicyLeafIndex);
+    if env.anchors.is_empty() || env.anchors.len() > MAX_ANCHORS || env.anchors.len() > sids.len() {
+        return Err(E::PolicyAnchors);
     }
-    Ok(pol)
+    let mut row_of = Vec::new();
+    let mut seen: Vec<[u8; 32]> = Vec::new();
+    for a in &env.anchors {
+        let row = (0..pol.shard_confs.len())
+            .find(|&r| a.shard.as_slice() == pol.shard_id(r))
+            .ok_or(E::PolicyTuple)?;
+        if a.partition != pol.partition || a.shard_conf_hash != pol.shard_confs[row] {
+            return Err(E::PolicyTuple);
+        }
+        row_of.push(row);
+        let uc = h(&a.uc);
+        if seen.contains(&uc) {
+            return Err(E::PolicyAnchors);
+        }
+        seen.push(uc);
+    }
+    let mut leaf_anchor = Vec::new();
+    let mut next = 0usize;
+    for (i, sid) in sids.iter().enumerate() {
+        let idx = usize::from(env.leaf_proofs[i].anchor_index);
+        if idx >= env.anchors.len() || idx > next || row_of[idx] != pol.shard_row(sid) {
+            return Err(E::PolicyLeafIndex);
+        }
+        if idx == next {
+            next += 1;
+        }
+        leaf_anchor.push(idx);
+    }
+    if next != env.anchors.len() {
+        return Err(E::PolicyAnchors);
+    }
+    Ok(AnchorPlan { leaf_anchor })
 }
 
 /// The fields of the exact canonical native InputRecord opening (tag 39002, version 1, arity 10).
@@ -323,19 +378,30 @@ pub fn parse_input_record(raw: &[u8]) -> Result<InputRecordOpening> {
     })
 }
 
-/// The composing verifier's anchor check: `H(inputRecord) == expectedIRHash`, the opened state hash
-/// equals `expectedStateRoot`, and every leaf's reference time is at most the opened timestamp.
-/// Only after the B1 call authenticates that anchor does the opened timestamp authorise this.
-pub fn check_anchor(anchor: &Anchor, leaf_times: &[u64]) -> Result<InputRecordOpening> {
-    if h(&anchor.input_record) != anchor.expected_ir_hash {
-        return Err(E::InputRecordMismatch);
+/// Open every anchor and bound every leaf's reference time by the timestamp of the leaf's own anchor
+/// (`t <=` its own IR time, never another anchor's): `H(inputRecord) == expectedIRHash` and the opened
+/// state hash equals `expectedStateRoot`. Only after the B1 call authenticates an anchor does its
+/// opened timestamp authorise this.
+pub fn check_anchors(
+    env: &Envelope,
+    plan: &AnchorPlan,
+    leaf_times: &[u64],
+) -> Result<Vec<InputRecordOpening>> {
+    let mut opened = Vec::new();
+    for a in &env.anchors {
+        if h(&a.input_record) != a.expected_ir_hash {
+            return Err(E::InputRecordMismatch);
+        }
+        let ir = parse_input_record(&a.input_record)?;
+        if ir.state_hash != a.expected_state_root {
+            return Err(E::InputRecordMismatch);
+        }
+        opened.push(ir);
     }
-    let ir = parse_input_record(&anchor.input_record)?;
-    if ir.state_hash != anchor.expected_state_root {
-        return Err(E::InputRecordMismatch);
+    for (i, &t) in leaf_times.iter().enumerate() {
+        if t > opened[plan.leaf_anchor[i]].timestamp {
+            return Err(E::ReferenceTimeFuture);
+        }
     }
-    if leaf_times.iter().any(|&t| t > ir.timestamp) {
-        return Err(E::ReferenceTimeFuture);
-    }
-    Ok(ir)
+    Ok(opened)
 }

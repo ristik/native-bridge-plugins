@@ -32,10 +32,10 @@ import { keccak_256 } from '@noble/hashes/sha3.js';
 
 import { preflightToken } from './resources.js';
 import { concat, eq, toHex } from './bytes.js';
-import { NativeError, fail } from './errors.js';
+import { NativeError, fail, type NativeReason } from './errors.js';
 import { checkJustification, checkMintData } from './history.js';
 import { parseJustification, verifyLockProof } from './lockproof.js';
-import { buildReturnProof, refreshToken } from './proof.js';
+import { buildReturnProof, preflightBurn, refreshToken } from './proof.js';
 import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord, word } from './profile.js';
 import { BridgedTokenIssuancePolicy, NativeBridge, NativeLockJustificationVerifier, type Expect, type VerifiedToken } from './verifier.js';
 
@@ -160,6 +160,8 @@ export class NativeBridgePayments implements BridgePayments {
   public async burn(request: Parameters<BridgePayments['burn']>[0]): Promise<WalletBurnResult> {
     const bytes = (await this.backend.tokenBytes(request.tokenId)) ?? fail('ErrMissingBacking');
     await this.cache.verify(bytes, 'receipt');
+    // Refuse a burn whose redemption envelope could never fit the profile bounds and the gas gate.
+    await preflightBurn(this.plugin.bridge, bytes);
     const result = await this.backend.burn(request);
     if (!result.success || !result.burnedToken) return result;
     // Never trust a wallet success flag alone.
@@ -236,16 +238,34 @@ export function recoverPendingBurns(plugin: NativeBridgePlugin, payments: Native
 /** Source of fresh aggregator proofs for one token, in history order (host transport; untrusted). */
 export type ProofSource = (token: Token) => Promise<InclusionProof[]>;
 
+/** Attempts at fetching and assembling one return proof before it is reported unavailable. */
+export const MAX_PROOF_ATTEMPTS = 3;
+
+/**
+ * Failures that mean the fetched (path, UC) pair raced a certificate or does not belong together: the
+ * path does not verify under its own UC. They are retried a bounded number of times with a fresh fetch;
+ * nothing is re-queried to make certificates converge, and a pair that never verifies is `ErrProofUnavailable`.
+ */
+const PAIR_RACE: readonly NativeReason[] = ['ErrPathInvalid', 'ErrSdkVerification', 'ErrSealRoot'];
+
 /**
  * Assemble the return proof, refreshing the aggregator proofs first from the optional transport.
  * Refresh keeps J/M/T/CD and the original `t`; a proof for another epoch is rejected by verification.
+ * Every response keeps its own (path, UC) pair; assembly uses only what the transport returned.
  */
 export async function buildNativeReturnProof(plugin: NativeBridgePlugin, tokenBytes: Uint8Array, source?: ProofSource): Promise<{ encoded: Uint8Array; nullifier: Uint8Array }> {
   preflightToken(tokenBytes);
-  let token = await TokenClass.fromCBOR(tokenBytes);
-  if (source) token = await refreshToken(token, await source(token));
-  const { encoded, verified } = await buildReturnProof(plugin.bridge, token);
-  return { encoded, nullifier: verified.outcome.nullifier };
+  const held = await TokenClass.fromCBOR(tokenBytes);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const token = source ? await refreshToken(held, await source(held)) : held;
+      const { encoded, verified } = await buildReturnProof(plugin.bridge, token);
+      return { encoded, nullifier: verified.outcome.nullifier };
+    } catch (e) {
+      if (!(e instanceof NativeError) || !PAIR_RACE.includes(e.reason)) throw e;
+      if (!source || attempt >= MAX_PROOF_ATTEMPTS) return fail('ErrProofUnavailable');
+    }
+  }
 }
 
 /** `claim(uint256 amount, address to)`: the vault's guarded pull payment, as calldata. */

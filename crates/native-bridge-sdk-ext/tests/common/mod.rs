@@ -315,6 +315,16 @@ pub struct UcSpec {
 }
 
 pub fn make_uc(root: &Root, s: &UcSpec) -> UnicityCertificate {
+    make_uc_in_shard(root, s, &[0x80], &[])
+}
+
+/// A certificate naming the native shard `shard` with the given shard-tree siblings.
+pub fn make_uc_in_shard(
+    root: &Root,
+    s: &UcSpec,
+    shard: &[u8],
+    siblings: &[[u8; 32]],
+) -> UnicityCertificate {
     let ir = InputRecord {
         round_number: s.round,
         epoch: s.epoch_ir,
@@ -331,8 +341,8 @@ pub fn make_uc(root: &Root, s: &UcSpec) -> UnicityCertificate {
         technical_record_hash: None,
         shard_configuration_hash: s.conf.clone(),
         shard_tree_certificate: ShardTreeCertificate {
-            shard: ShardId::decode(&[0x80]).unwrap(),
-            sibling_hash_list: vec![],
+            shard: ShardId::decode(shard).unwrap(),
+            sibling_hash_list: siblings.iter().map(|x| x.to_vec()).collect(),
         },
         unicity_tree_certificate: UnicityTreeCertificate {
             partition_identifier: s.partition,
@@ -425,7 +435,10 @@ pub struct World {
     pub dep: Deployment,
     pub bridge: NativeBridge,
     pub policy: Policy,
+    /// The configuration hash of the first policy row (the only one at depth 0).
     pub agg_conf: [u8; 32],
+    /// The configuration hash of every policy row.
+    pub agg_confs: Vec<[u8; 32]>,
 }
 
 pub fn identity() -> (u16, [u8; 32], [u8; 32], u64) {
@@ -433,14 +446,23 @@ pub fn identity() -> (u16, [u8; 32], [u8; 32], u64) {
 }
 
 pub fn make_world(header_fields: u8) -> World {
+    make_world_depth(header_fields, 0)
+}
+
+/// The world with an aggregator policy of the given depth: 0 is one shard `80`, 1 the DN-B topology
+/// (shards `40` and `c0`).
+pub fn make_world_depth(header_fields: u8, depth: u8) -> World {
     // One root-chain epoch authenticates both the EVM and the aggregator partitions.
     let agg = make_root(2, 4, 10);
     let evm_root = make_root(2, 4, 10);
-    let agg_conf = sha(b"aggregator shard configuration");
-    let policy = Policy {
-        partition: AGG_PARTITION,
-        shard_conf: agg_conf,
-    };
+    let mut agg_confs: Vec<[u8; 32]> = (0..(1u8 << depth))
+        .map(|i| sha(format!("aggregator shard configuration {i}").as_bytes()))
+        .collect();
+    if depth == 0 {
+        agg_confs[0] = sha(b"aggregator shard configuration");
+    }
+    let agg_conf = agg_confs[0];
+    let policy = Policy::new(AGG_PARTITION, &agg_confs).unwrap();
     let (n, rg, eg, c) = identity();
     let cfg = Cfg {
         network: n,
@@ -466,7 +488,7 @@ pub fn make_world(header_fields: u8) -> World {
         HeaderProfile {
             fields: header_fields,
         },
-        policy,
+        policy.clone(),
     )
     .unwrap();
     let bridge = NativeBridge::new(
@@ -481,6 +503,7 @@ pub fn make_world(header_fields: u8) -> World {
         bridge,
         policy,
         agg_conf,
+        agg_confs,
     }
 }
 
@@ -706,11 +729,17 @@ pub struct Tweaks {
     pub minter_override: Option<Secp256k1Signer>,
     /// Skip the aggregator proof's reference-time override: `(index, t)` changes proof.reference_time only.
     pub proof_time: Vec<(usize, u64)>,
+    /// The root round of the certificate of leaf `i`; leaves of one shard in different rounds get
+    /// different UCs.
+    pub uc_round: Option<Box<dyn Fn(usize) -> u64>>,
 }
 
 pub struct TokenOut {
     pub token: Token,
+    /// The first certificate (the only one when every leaf is in one shard and round).
     pub uc: UnicityCertificate,
+    /// Every distinct certificate, in first-use leaf order.
+    pub ucs: Vec<UnicityCertificate>,
     pub leaves: Vec<([u8; 32], [u8; 32])>,
 }
 
@@ -915,32 +944,75 @@ pub fn assemble_token(
             )
         })
         .collect();
-    let (root, _) = tree(&leaves, &leaves[0].0);
-    let uc = make_uc(
-        &w.agg,
-        &UcSpec {
-            partition: AGG_PARTITION,
-            conf: w.agg_conf.to_vec(),
-            epoch_ir: 1,
-            root_epoch: 2,
-            round: 900,
-            timestamp: uc_ts,
-            state_hash: root.to_vec(),
-            block_hash: None,
-            signers: 4,
-        },
-    );
-    let proof = |i: usize| InclusionProof {
-        certification_data: items[i].cd.clone(),
-        reference_time: tw
-            .proof_time
-            .iter()
-            .find(|(idx, _)| *idx == i)
-            .map(|(_, t)| *t)
-            .unwrap_or(items[i].t),
-        inclusion_certificate: InclusionCertificate::decode(&tree(&leaves, &leaves[i].0).1)
+    // One tree and one certificate per (shard row, root round): leaves of a shard certified in
+    // different rounds are separate anchors even when every other field is equal.
+    let mut groups: Vec<(usize, u64, Vec<usize>)> = Vec::new();
+    for (i, l) in leaves.iter().enumerate() {
+        let row = w.policy.shard_row(&l.0);
+        let round = tw.uc_round.as_ref().map(|f| f(i)).unwrap_or(900);
+        match groups.iter_mut().find(|g| g.0 == row && g.1 == round) {
+            Some(g) => g.2.push(i),
+            None => groups.push((row, round, vec![i])),
+        }
+    }
+    let mut cert_of: Vec<Option<(usize, usize)>> = vec![None; leaves.len()]; // (group, leaf-in-group)
+    let mut group_certs: Vec<(Vec<([u8; 32], [u8; 32])>, UnicityCertificate)> = Vec::new();
+    for (gi, (row, round, members)) in groups.iter().enumerate() {
+        let group_leaves: Vec<_> = members.iter().map(|&i| leaves[i]).collect();
+        let (root, _) = tree(&group_leaves, &group_leaves[0].0);
+        let sibling = if w.policy.depth == 0 {
+            vec![]
+        } else {
+            vec![sha(format!("sibling of shard {row}").as_bytes())]
+        };
+        let uc = make_uc_in_shard(
+            &w.agg,
+            &UcSpec {
+                partition: AGG_PARTITION,
+                conf: w.agg_confs[*row].to_vec(),
+                epoch_ir: 1,
+                root_epoch: 2,
+                round: *round,
+                timestamp: uc_ts,
+                state_hash: root.to_vec(),
+                block_hash: None,
+                signers: 4,
+            },
+            w.policy.shard_id(*row),
+            &sibling,
+        );
+        for (k, &i) in members.iter().enumerate() {
+            cert_of[i] = Some((gi, k));
+        }
+        group_certs.push((group_leaves, uc));
+    }
+    // Certificates in first-use leaf order.
+    let mut ucs: Vec<UnicityCertificate> = Vec::new();
+    let mut seen_groups: Vec<usize> = Vec::new();
+    for c in cert_of.iter() {
+        let gi = c.unwrap().0;
+        if !seen_groups.contains(&gi) {
+            seen_groups.push(gi);
+            ucs.push(group_certs[gi].1.clone());
+        }
+    }
+    let proof = |i: usize| {
+        let (gi, k) = cert_of[i].unwrap();
+        let (group_leaves, uc) = &group_certs[gi];
+        InclusionProof {
+            certification_data: items[i].cd.clone(),
+            reference_time: tw
+                .proof_time
+                .iter()
+                .find(|(idx, _)| *idx == i)
+                .map(|(_, t)| *t)
+                .unwrap_or(items[i].t),
+            inclusion_certificate: InclusionCertificate::decode(
+                &tree(group_leaves, &group_leaves[k].0).1,
+            )
             .unwrap(),
-        unicity_certificate: uc.clone(),
+            unicity_certificate: uc.clone(),
+        }
     };
     let genesis = CertifiedMintTransaction::new(mint, proof(0));
     let transfers = txs
@@ -951,7 +1023,8 @@ pub fn assemble_token(
     let _ = lock;
     TokenOut {
         token: Token::new(genesis, transfers),
-        uc,
+        uc: ucs[0].clone(),
+        ucs,
         leaves,
     }
 }

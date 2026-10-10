@@ -5,7 +5,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { concat, eq, toHex } from './bytes.js';
 import { fail } from './errors.js';
 import { MAX_POLICY_BYTES, MAX_SEMANTIC_BYTES, TAG_RETURN_REASON, TAG_WALLET_VALUE } from './limits.js';
-import { arrayOf, bytesAny, bytesN, scanOne, uint, uintMax } from './scan.js';
+import { arrayOf, bytesAny, bytesN, scanOne, uint, uintMax, version } from './scan.js';
 
 export const H = (b: Uint8Array): Uint8Array => sha256(b);
 export const keccak256 = (...parts: Uint8Array[]): Uint8Array => keccak_256(concat(...parts));
@@ -19,7 +19,9 @@ const dom = (s: string): Uint8Array => bs(enc.encode(s));
 /** The one-byte native encoding of the empty shard prefix (not the empty bstr). */
 export const EMPTY_PREFIX_SHARD = new Uint8Array([0x80]);
 const CFG_DOMAIN = enc.encode('UNICITY_BR_CFG');
-const POLICY_DOMAIN = enc.encode('UNICITY_BR_AGG_ONE');
+const POLICY_DOMAIN = enc.encode('UNICITY_BR_AGG_SHARDED');
+/** The literal version field of the sharded policy body. */
+const POLICY_VERSION = 1n;
 
 /** The immutable bridge configuration. Integers are bigint; widths follow the Go oracle. */
 export interface Cfg {
@@ -90,24 +92,64 @@ export const deriveAsset = (n: number, rg: Uint8Array, eg: Uint8Array, c: bigint
 export const valueEnvelope = (aid: Uint8Array, amount: Uint8Array): Uint8Array =>
   C.encodeTag(TAG_WALLET_VALUE, arr(u(1), arr(arr(bs(aid), bs(amount))), C.encodeNull()));
 
-/** The sole admitted aggregator policy body. */
+/**
+ * The complete uniform MSB-first prefix topology of each admitted depth, in increasing shard byte
+ * order. A native shard ID is the prefix bits, one set terminator bit and zero padding.
+ */
+export const SHARD_TOPOLOGY: readonly (readonly Uint8Array[])[] = [
+  [EMPTY_PREFIX_SHARD],
+  [Uint8Array.of(0x40), Uint8Array.of(0xc0)],
+];
+export const MAX_POLICY_DEPTH = 1;
+
+/**
+ * The sole admitted aggregator policy body
+ * `C("UNICITY_BR_AGG_SHARDED", 1, partition, depth, [[b(shardID), b(shardConfHash)], ...])` with exactly
+ * `2^depth` rows in increasing shard byte order.
+ */
 export interface Policy {
   partition: number;
-  shardConf: Uint8Array;
+  depth: number;
+  /** The native configuration hash of every row, in row order. */
+  shardConfs: Uint8Array[];
 }
 
+/** The policy of a complete topology of depth `log2(confs.length)`. */
+export function makePolicy(partition: number, ...confs: Uint8Array[]): Policy {
+  const depth = confs.length === 1 ? 0 : confs.length === 2 ? 1 : -1;
+  if (depth < 0) fail('ErrShape');
+  return { partition, depth, shardConfs: confs };
+}
+
+/** The shard ID bytes of row `row`. */
+export const shardId = (p: Policy, row: number): Uint8Array => SHARD_TOPOLOGY[p.depth][row];
+
+/** The row (shard) a state ID belongs to: the top `depth` bits of the raw 32-byte SID. */
+export const shardRow = (p: Policy, sid: Uint8Array): number => (p.depth === 0 ? 0 : sid[0] >> 7);
+
 export const policyBytes = (p: Policy): Uint8Array =>
-  arr(bs(POLICY_DOMAIN), u(p.partition), bs(EMPTY_PREFIX_SHARD), bs(p.shardConf));
+  arr(bs(POLICY_DOMAIN), u(POLICY_VERSION), u(p.partition), u(p.depth), arr(...p.shardConfs.map((c, i) => arr(bs(shardId(p, i)), bs(c)))));
 
 export const policyHash = (p: Policy): Uint8Array => H(policyBytes(p));
 
 export function decodePolicy(b: Uint8Array): Policy {
   if (b.length > MAX_POLICY_BYTES) fail('ErrInputTooLarge');
-  const k = arrayOf(scanOne(b), 4) ?? fail('ErrShape');
+  const k = arrayOf(scanOne(b), 5) ?? fail('ErrShape');
   if (!eq(bytesAny(k[0]), POLICY_DOMAIN)) fail('ErrShape');
-  const partition = Number(uintMax(k[1], 0xffffffffn));
-  if (!eq(bytesAny(k[2]), EMPTY_PREFIX_SHARD)) fail('ErrShape');
-  return { partition, shardConf: bytesN(k[3], 32) };
+  version(k[1], POLICY_VERSION);
+  const partition = Number(uintMax(k[2], 0xffffffffn));
+  if (partition === 0) fail('ErrIntRange');
+  const depthItem = uint(k[3]);
+  if (depthItem > BigInt(MAX_POLICY_DEPTH)) fail('ErrShape');
+  const depth = Number(depthItem);
+  const topo = SHARD_TOPOLOGY[depth];
+  const rows = arrayOf(k[4], topo.length) ?? fail('ErrShape');
+  const shardConfs = rows.map((r, i) => {
+    const row = arrayOf(r, 2) ?? fail('ErrShape');
+    if (!eq(bytesAny(row[0]), topo[i])) fail('ErrShape');
+    return bytesN(row[1], 32);
+  });
+  return { partition, depth, shardConfs };
 }
 
 export const deriveSalt = (cfg: Uint8Array, n: bigint): Uint8Array => H(arr(dom('UNICITY_BR_SALT'), bs(cfg), u(n)));

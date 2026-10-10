@@ -5,6 +5,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { CborMap } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborMap.js';
 import { CborMapEntry } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborMapEntry.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
+import { MAX_TRANSFERS } from '../src/limits.js';
 import { arr, bs, u } from '../src/profile.js';
 import { preflightToken, preflightUc } from '../src/resources.js';
 import { rejects } from './util.js';
@@ -73,11 +74,14 @@ test('native UC sublimits apply equally to ordinary and standalone embedded UCs'
 
 test('UC tree paths and RSMT paths share the full-token cumulative budget', async () => {
   const w = makeWorld();
-  const out = await buildToken(w, spec(1), Array.from({length: 64}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
+  // MAX_TRANSFERS transfers: MAX_LEAVES certificates of 32 unicity steps and 100 shard-tree siblings each.
+  const out = await buildToken(w, spec(1), Array.from({length: MAX_TRANSFERS}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
   const token = body(out.bytes);
   const certs = [token[1], ...D.decodeArray(token[2])].map(c => {
-    const cert = D.decodeArray(c), proof = body(cert[1]), uc = body(proof[4]), ut = body(uc[5]);
+    const cert = D.decodeArray(c), proof = body(cert[1]), uc = body(proof[4]), ut = body(uc[5]), st = body(uc[4]);
     ut[2] = arr(...Array.from({length:32}, () => arr(u(1), bs(new Uint8Array(32)))));
+    st[2] = arr(...Array.from({length:100}, () => bs(new Uint8Array(32))));
+    uc[4] = tagged(39003, st);
     uc[5] = tagged(39004, ut); proof[4] = tagged(39001, uc); cert[1] = tagged(39033, proof); return arr(...cert);
   });
   token[1] = certs[0]; token[2] = arr(...certs.slice(1)); const bytes = tagged(39040, token);
@@ -123,7 +127,7 @@ test('an otherwise valid receipt cannot hide an oversized ordinary UC in unknown
 
 test('the cumulative path boundary includes the immutable embedded certificate', async () => {
   const w = makeWorld();
-  const out = await buildToken(w, spec(1), Array.from({length:64}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
+  const out = await buildToken(w, spec(1), Array.from({length: MAX_TRANSFERS}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
   const make = (extra: number): Uint8Array => {
     const token = body(out.bytes);
     const certs = [token[1], ...D.decodeArray(token[2])].map(c => D.decodeArray(c));
@@ -136,9 +140,12 @@ test('the cumulative path boundary includes the immutable embedded certificate',
     const rsmt = certs.reduce((sum, c) => sum + (D.decodeByteString(body(c[1])[3]).length - 32) / 32, 0);
     let remaining = 2048 - 32 - rsmt + extra;
     for (const c of certs) {
-      const proof = body(c[1]), uc = body(proof[4]), ut = body(uc[5]);
-      const n = Math.min(32, remaining); remaining -= n;
-      ut[2] = arr(...Array.from({length:n}, () => arr(u(1), bs(new Uint8Array(32)))));
+      const proof = body(c[1]), uc = body(proof[4]), ut = body(uc[5]), st = body(uc[4]);
+      const n = Math.min(288, remaining); remaining -= n;
+      const steps = Math.min(32, n);
+      ut[2] = arr(...Array.from({length:steps}, () => arr(u(1), bs(new Uint8Array(32)))));
+      st[2] = arr(...Array.from({length:n - steps}, () => bs(new Uint8Array(32))));
+      uc[4] = tagged(39003, st);
       uc[5] = tagged(39004, ut); proof[4] = tagged(39001, uc); c[1] = tagged(39033, proof);
     }
     assert.equal(remaining, 0);

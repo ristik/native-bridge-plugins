@@ -37,10 +37,11 @@ errors! {
     RlpMalformed => Malformed, MptMalformed => Malformed, SdkDecode => Malformed,
     // budgets
     InputTooLarge => Budget, TooManyTx => Budget, TooManyItems => Budget, TooDeep => Budget,
-    TooManyPaths => Budget, ProofTooLarge => Budget,
+    TooManyPaths => Budget, ProofTooLarge => Budget, GasBudget => Budget,
     // profile relation
     CfgMismatch => Invalid, PolicyHash => Invalid, PolicyTuple => Invalid, PolicyAnchors => Invalid,
     PolicyLeafIndex => Invalid, PolicyLeafCount => Invalid, PolicyPartition => Invalid,
+    PathBitmap => Invalid, AnchorAuth => Invalid, ProofUnavailable => Invalid,
     Predicate => Invalid, MintShape => Invalid, MintJustif => Invalid, MintSalt => Invalid,
     MintType => Invalid, MintData => Invalid, TransferData => Invalid, CDMismatch => Invalid,
     Unlock => Invalid, UnlockLength => Invalid, UnlockScalars => Invalid, UnlockRecovery => Invalid,

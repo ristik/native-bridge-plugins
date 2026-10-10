@@ -200,7 +200,7 @@ fn cfg_and_policy_round_trip_and_reject_noncanonical_input() {
     assert_eq!(Cfg::from_bytes(&t).unwrap_err(), E::Trailing);
     assert_eq!(Policy::from_bytes(&w.policy.to_bytes()).unwrap(), w.policy);
     assert_eq!(
-        Policy::from_bytes(&[0u8; 129]).unwrap_err(),
+        Policy::from_bytes(&[0u8; 513]).unwrap_err(),
         E::InputTooLarge
     );
 }
@@ -214,19 +214,16 @@ fn deployment_construction_rejects_forged_identity_and_policy() {
     let mut c = w.dep.cfg.clone();
     c.ty[0] ^= 1;
     assert_eq!(
-        Deployment::new(c, [0; 32], [0; 32], hp, w.policy).unwrap_err(),
+        Deployment::new(c, [0; 32], [0; 32], hp, w.policy.clone()).unwrap_err(),
         E::CfgMismatch
     );
     let mut c = w.dep.cfg.clone();
     c.aggregator_policy_hash[0] ^= 1;
     assert_eq!(
-        Deployment::new(c, [0; 32], [0; 32], hp, w.policy).unwrap_err(),
+        Deployment::new(c, [0; 32], [0; 32], hp, w.policy.clone()).unwrap_err(),
         E::PolicyHash
     );
-    let p = native_bridge_sdk_ext::profile::Policy {
-        partition: EVM_PARTITION,
-        shard_conf: w.agg_conf,
-    };
+    let p = native_bridge_sdk_ext::profile::Policy::new(EVM_PARTITION, &[w.agg_conf]).unwrap();
     let mut c = w.dep.cfg.clone();
     c.aggregator_policy_hash = p.hash();
     assert_eq!(
@@ -239,7 +236,7 @@ fn deployment_construction_rejects_forged_identity_and_policy() {
             [0; 32],
             [0; 32],
             HeaderProfile { fields: 19 },
-            w.policy
+            w.policy.clone()
         )
         .unwrap_err(),
         E::CfgMismatch

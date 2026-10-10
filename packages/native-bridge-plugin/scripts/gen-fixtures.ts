@@ -56,7 +56,7 @@ export async function generate(): Promise<unknown> {
   await add('neg_wrong_envelope_amount', 'receipt', spec(1), [], { tw: { mintData: valueEnvelope(w.dep.cfg.aid, Uint8Array.of(3, 233)) } });
   void signer;
   return {
-    description: 'provisional cross-stack fixtures for native-bridge-plugins PR3 (SDK 3.0.1, protocol v2); not the normative corpus',
+    description: 'provisional cross-stack fixtures for native-bridge-plugins PR3 (SDK 3.0.1, protocol v3); not the normative corpus',
     trustDocument: toHex(w.agg.doc),
     deployment: {
       cfg: toHex(cfgBytes(w.dep.cfg)),

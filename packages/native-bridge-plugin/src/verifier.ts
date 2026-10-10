@@ -32,7 +32,7 @@ import { NativeError, fail, type NativeReason } from './errors.js';
 import { decodeHistory, checkJustification, checkMintData, projectToken, verifyHistory, type Leaf, type Outcome } from './history.js';
 import { MAX_PATH_STEPS, MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
 import { parseJustification, verifyLockProof, type Justification, type VerifiedLock } from './lockproof.js';
-import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord } from './profile.js';
+import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord, shardId, shardRow } from './profile.js';
 import type { TrustInput } from './trust.js';
 
 export type Expect = 'receipt' | 'return';
@@ -169,11 +169,13 @@ export class NativeBridge {
     const sid = await StateId.fromCertificationData(proof.certificationData);
     if (!eq(sid.data, leaf.sid) || !eq(proof.certificationData.transactionHash.data, leaf.txHash)) fail('ErrCDMismatch');
     this.trust.checkGuards(uc);
-    // Aggregator admission against the pinned one-shard policy, never the certificate's own tuple.
-    if (uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.policy.partition) || !eq(uc.shardConfigurationHash, dep.policy.shardConf)) {
+    // Aggregator admission against the pinned policy row of the leaf's own shard, never the certificate's
+    // own tuple: the shard is the top `depth` bits of the leaf's state ID.
+    const row = shardRow(dep.policy, leaf.sid);
+    if (uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.policy.partition) || !eq(uc.shardConfigurationHash, dep.policy.shardConfs[row])) {
       fail('ErrNotAdmitted');
     }
-    if (uc.shardTreeCertificate.shard.length !== 0) fail('ErrShardMismatch');
+    if (!eq(uc.shardTreeCertificate.shard.encode(), shardId(dep.policy, row))) fail('ErrShardMismatch');
     steps.n += (proof.inclusionCertificate.encode().length - 32) / 32;
     if (steps.n > MAX_PATH_STEPS) fail('ErrTooManyPaths');
     if (leaf.referenceTime > uc.inputRecord.timestamp) fail('ErrReferenceTimeFuture');
