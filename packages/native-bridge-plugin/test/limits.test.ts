@@ -47,9 +47,9 @@ test('the gate decides each bundle under the parser ceilings; the best-case proj
   assert.equal(L.MAX_ANCHORS, 4);
   assert.ok(total(2, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) <= L.TX_GAS_BUDGET);
   assert.ok(total(3, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) > L.TX_GAS_BUDGET);
-  const real = (a: number): number => intrinsicGas(12 << 10) + b2Gas(kernelRequestBytes(4 << 10, 4 << 10), L.MAX_LEAVES) + a * ucGas(1, 1536, 4, 1) + L.MAX_LEAVES * rsmtGas(8) + L.GAS_RESERVE;
-  assert.ok(real(L.MAX_ANCHORS) <= L.TX_GAS_BUDGET, 'four real-size certificates pass');
-  assert.ok(real(L.MAX_ANCHORS + 1) > L.TX_GAS_BUDGET, 'five real-size certificates do not');
+  const real = (a: number): number => intrinsicGas(12 << 10) + b2Gas(kernelRequestBytes(4 << 10, 4 << 10), L.MAX_LEAVES) + a * ucGas(1, 811, 4, 1) + L.MAX_LEAVES * rsmtGas(8) + L.GAS_RESERVE;
+  assert.ok(real(L.MAX_ANCHORS) <= L.TX_GAS_BUDGET, 'four DN-B-shape certificates pass');
+  assert.ok(real(L.MAX_ANCHORS + 1) > L.TX_GAS_BUDGET, 'five DN-B-shape certificates do not');
   const fit = projectedGate(300, 150, 1, 2, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES);
   assert.ok(fit.gate.total <= L.TX_GAS_BUDGET, String(fit.gate.total));
   assert.ok(fit.envelopeBytes <= L.MAX_ENVELOPE_BYTES, String(fit.envelopeBytes));

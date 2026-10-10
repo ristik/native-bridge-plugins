@@ -65,13 +65,13 @@ fn the_shared_gate_prices_the_worst_admitted_bundle_as_the_oracle_and_the_contra
         + GAS_RESERVE;
     assert_eq!(worst, 6_976_692);
     assert!(worst <= TX_GAS_BUDGET);
-    // The gate decides each bundle: a third maximum-size certificate does not pass, four real-size ones do,
+    // The gate decides each bundle: a third maximum-size certificate does not pass, four DN-B-shape ones (811 bytes, four signatures) do,
     // five do not.
     assert!(worst + uc > TX_GAS_BUDGET);
     let real = |a: u64| {
         intrinsic_gas(12 << 10)
             + b2_gas(kernel_request_bytes(4 << 10, 4 << 10), MAX_LEAVES as u64)
-            + a * uc_gas(1, 1536, 4, 1)
+            + a * uc_gas(1, 811, 4, 1)
             + MAX_LEAVES as u64 * rsmt_gas(8)
             + GAS_RESERVE
     };

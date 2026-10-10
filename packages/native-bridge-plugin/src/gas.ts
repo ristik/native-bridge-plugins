@@ -206,7 +206,7 @@ export function computeGate(envelopeBytes: number, kernelRequest: number, e: Env
   return g;
 }
 
-/** The smallest certificate a real aggregator produces, for the best-case projection: ~1 KiB, one signature. */
+/** The smallest certificate a real aggregator is assumed to produce, for the best-case projection: 1 KiB, one signature (the measured DN-B certificate is 811 bytes with four signatures, the one-signature fixture 445). */
 export const BEST_UC_BYTES = 1024;
 export const BEST_SIGNATURES = 1;
 
