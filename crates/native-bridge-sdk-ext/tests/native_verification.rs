@@ -13,6 +13,7 @@
 mod common;
 use common::*;
 use native_bridge_sdk_ext::history::{self, History};
+use native_bridge_sdk_ext::limits::MAX_TRANSFERS;
 use native_bridge_sdk_ext::lockproof::parse_justification;
 use native_bridge_sdk_ext::profile::*;
 use native_bridge_sdk_ext::token::{Expect, VerifiedToken};
@@ -791,7 +792,7 @@ fn nullifier_excludes_time_paths_and_unlock_representation() {
 #[test]
 fn too_many_transfers_is_a_budget_failure() {
     let w = make_world(20);
-    let steps: Vec<Step> = (0..65)
+    let steps: Vec<Step> = (0..=MAX_TRANSFERS)
         .map(|i| tx_step(2 + (i % 2) as u8, i as u8, T0 + 1))
         .collect();
     let out = build_token(&w, &spec(1), &steps, T0, UC_TS);
@@ -799,9 +800,9 @@ fn too_many_transfers_is_a_budget_failure() {
 }
 
 #[test]
-fn sixty_four_transfers_verify() {
+fn max_transfers_verify() {
     let w = make_world(20);
-    let steps: Vec<Step> = (0..64)
+    let steps: Vec<Step> = (0..MAX_TRANSFERS)
         .map(|i| tx_step(2 + (i % 2) as u8, i as u8, T0 + 1))
         .collect();
     let out = build_token(&w, &spec(1), &steps, T0, UC_TS);

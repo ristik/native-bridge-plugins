@@ -46,7 +46,8 @@ fn rec(w: &World) -> Value {
       "lockLayoutVersion": 1,
       "aggregatorPolicy": {
         "bodyHex": hex_lower(&w.policy.to_bytes()), "sha256": hex_lower(&w.policy.hash()),
-        "partition": w.policy.partition, "shardHex": "80", "configurationHash": hex_lower(&w.policy.shard_conf),
+        "partition": w.policy.partition, "depth": w.policy.depth,
+        "shards": (0..w.policy.shard_confs.len()).map(|i| serde_json::json!({ "shardHex": hex_lower(w.policy.shard_id(i)), "configurationHash": hex_lower(&w.policy.shard_confs[i]) })).collect::<Vec<_>>(),
       },
       "evmBackingPolicy": {
         "partition": c.evm_partition, "shardHex": hex_lower(&c.evm_shard),
@@ -59,7 +60,7 @@ fn rec(w: &World) -> Value {
 fn entry(w: &World) -> Value {
     let (n, rg, eg, c) = identity();
     json!({
-      "schemaVersion": 1, "protocolVersion": 2, "family": "unicity-native", "sdkVersion": "3.0.1",
+      "schemaVersion": 1, "protocolVersion": 3, "family": "unicity-native", "sdkVersion": "3.0.1",
       "tokenTypeHex": hex_lower(&derive_type(n, &rg, &eg, c)),
       "coinIdHex": hex_lower(&derive_asset(n, &rg, &eg, c)),
       "symbol": "UCT", "decimals": 18,

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 
 import { toHex } from '../src/bytes.js';
 import { loadManifests, manifestTrustBaseId, validateManifest } from '../src/manifest.js';
-import { cfgBytes, cfgHash, deriveAsset, deriveType, policyBytes, policyHash } from '../src/profile.js';
+import { cfgBytes, cfgHash, deriveAsset, deriveType, policyBytes, policyHash, shardId } from '../src/profile.js';
 import { throwsReason } from './util.js';
 import { CHAIN_ID, EXEC_GENESIS, NETWORK, ROOT_GENESIS, makeWorld, pdrBytes, sha, text, type World } from './world.js';
 
@@ -29,12 +29,12 @@ const rec = (w: World): Record<string, any> => ({
     genesis: art(text('b1 genesis')),
   },
   lockLayoutVersion: 1,
-  aggregatorPolicy: { bodyHex: toHex(policyBytes(w.policy)), sha256: toHex(policyHash(w.policy)), partition: w.policy.partition, shardHex: '80', configurationHash: toHex(w.policy.shardConf) },
+  aggregatorPolicy: { bodyHex: toHex(policyBytes(w.policy)), sha256: toHex(policyHash(w.policy)), partition: w.policy.partition, depth: w.policy.depth, shards: w.policy.shardConfs.map((c, i) => ({ shardHex: toHex(shardId(w.policy, i)), configurationHash: toHex(c) })) },
   evmBackingPolicy: { partition: w.dep.cfg.evmPartition, shardHex: toHex(w.dep.cfg.evmShard), configurationHash: toHex(w.dep.evmConfigHash), pdr: art(pdr), executionProfile: art(execProfile) },
 });
 
 const entry = (w: World): Record<string, any> => ({
-  schemaVersion: 1, protocolVersion: 2, family: 'unicity-native', sdkVersion: '3.0.1',
+  schemaVersion: 1, protocolVersion: 3, family: 'unicity-native', sdkVersion: '3.0.1',
   tokenTypeHex: toHex(deriveType(NETWORK, ROOT_GENESIS, EXEC_GENESIS, CHAIN_ID)),
   coinIdHex: toHex(deriveAsset(NETWORK, ROOT_GENESIS, EXEC_GENESIS, CHAIN_ID)),
   symbol: 'UCT', decimals: 18,
@@ -81,8 +81,10 @@ test('every identity and profile field is recomputed or rejected', () => {
     ['semantic profile', (d) => void (d.activeDeployment.semanticProfile.sha256 = toHex(new Uint8Array(32).fill(1)))],
     ['b1 profile', (d) => void (d.activeDeployment.b1.profile.sha256 = toHex(new Uint8Array(32).fill(1)))],
     ['policy partition', (d) => void (d.activeDeployment.aggregatorPolicy.partition = 99)],
-    ['policy shard', (d) => void (d.activeDeployment.aggregatorPolicy.shardHex = '00')],
-    ['policy configuration', (d) => void (d.activeDeployment.aggregatorPolicy.configurationHash = toHex(new Uint8Array(32).fill(1)))],
+    ['policy shard', (d) => void (d.activeDeployment.aggregatorPolicy.shards[0].shardHex = '00')],
+    ['policy depth', (d) => void (d.activeDeployment.aggregatorPolicy.depth = 1)],
+    ['policy rows', (d) => void d.activeDeployment.aggregatorPolicy.shards.push({ shardHex: 'c0', configurationHash: toHex(new Uint8Array(32).fill(3)) })],
+    ['policy configuration', (d) => void (d.activeDeployment.aggregatorPolicy.shards[0].configurationHash = toHex(new Uint8Array(32).fill(1)))],
     ['evm partition', (d) => void (d.activeDeployment.evmBackingPolicy.partition = 99)],
     ['evm configuration pin', (d) => void (d.activeDeployment.evmBackingPolicy.configurationHash = toHex(new Uint8Array(32).fill(1)))],
     ['execution profile missing', (d) => void (d.activeDeployment.evmBackingPolicy.executionProfile.sha256 = toHex(new Uint8Array(32).fill(2)))],

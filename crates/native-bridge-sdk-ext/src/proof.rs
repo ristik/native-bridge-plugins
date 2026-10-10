@@ -14,8 +14,11 @@ use unicity_token::transaction::{
 use unicity_token::Token;
 
 use crate::deployment::Deployment;
-use crate::envelope::{check_anchor, check_policy, Anchor, Envelope, LeafProof};
+use crate::envelope::{
+    check_anchors, check_policy_body, plan_anchors, Anchor, Envelope, LeafProof,
+};
 use crate::error::{NativeError as E, Result};
+use crate::gas::{compute_gate, kernel_request_bytes, projected_gate, Gate};
 use crate::history::{self, History};
 use crate::limits::*;
 use crate::profile::h;
@@ -51,12 +54,18 @@ pub fn refresh_token(token: &Token, fresh: &[InclusionProof]) -> Result<Token> {
     Ok(refreshed)
 }
 
-/// Assemble the return envelope from a token whose every aggregator proof is anchored at one
-/// unicity certificate. The token is verified in full as a return first.
+/// Assemble the return envelope from a token whose every aggregator proof carries its own (path, UC)
+/// pair. The token is verified in full as a return first.
+///
+/// The anchor table is the profile's: one anchor per distinct complete UC (byte-identical UCs are one
+/// anchor), in first-use leaf order, each claim derived from its UC and the pinned policy row of its
+/// shard. Nothing here re-queries to make certificates converge: the pairs are used as fetched, and an
+/// envelope that needs more anchors than the profile bound, or does not fit the shared gas gate, is
+/// `PolicyAnchors` or `GasBudget` (BudgetExceeded), never truncated or split.
 pub fn build_return_proof(
     bridge: &NativeBridge,
     token: &Token,
-) -> Result<(Envelope, VerifiedToken)> {
+) -> Result<(Envelope, VerifiedToken, Gate)> {
     let verified = bridge.verify_native_token(token, Expect::Return)?;
     let dep: &Deployment = &bridge.registry.deployments()[verified.deployment];
     let history_bytes = history::project(token);
@@ -68,33 +77,36 @@ pub fn build_return_proof(
     for t in token.transactions() {
         proofs.push(t.inclusion_proof());
     }
-    let uc = &proofs[0].unicity_certificate;
-    let uc_bytes = uc.to_cbor();
-    if proofs
-        .iter()
-        .any(|p| p.unicity_certificate.to_cbor() != uc_bytes)
-    {
-        // Proofs span different roots: refresh them to one current root first.
-        return Err(E::PolicyAnchors);
-    }
-    let ir = uc.input_record.to_cbor();
-    let state_root: [u8; 32] = uc
-        .input_record
-        .hash
-        .as_slice()
-        .try_into()
-        .map_err(|_| E::PathInvalid)?;
-    let anchor = Anchor {
-        partition: dep.policy.partition,
-        shard: crate::profile::EMPTY_PREFIX_SHARD.to_vec(),
-        shard_conf_hash: dep.policy.shard_conf,
-        expected_state_root: state_root,
-        expected_ir_hash: h(&ir),
-        uc: uc_bytes,
-        input_record: ir,
-    };
+    let mut anchors: Vec<Anchor> = Vec::new();
+    let mut ucs: Vec<Vec<u8>> = Vec::new();
     let mut leaf_proofs = Vec::new();
-    for p in &proofs {
+    for (i, p) in proofs.iter().enumerate() {
+        let uc_bytes = p.unicity_certificate.to_cbor();
+        let idx = match ucs.iter().position(|u| *u == uc_bytes) {
+            Some(idx) => idx,
+            None => {
+                let row = dep.policy.shard_row(&verified.outcome.leaves[i].sid);
+                let ir = p.unicity_certificate.input_record.to_cbor();
+                let state_root: [u8; 32] = p
+                    .unicity_certificate
+                    .input_record
+                    .hash
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| E::PathInvalid)?;
+                anchors.push(Anchor {
+                    partition: dep.policy.partition,
+                    shard: dep.policy.shard_id(row).to_vec(),
+                    shard_conf_hash: dep.policy.shard_confs[row],
+                    expected_state_root: state_root,
+                    expected_ir_hash: h(&ir),
+                    uc: uc_bytes.clone(),
+                    input_record: ir,
+                });
+                ucs.push(uc_bytes);
+                ucs.len() - 1
+            }
+        };
         let enc = p.inclusion_certificate.encode();
         let mut bitmap = [0u8; 32];
         bitmap.copy_from_slice(&enc[..32]);
@@ -103,7 +115,7 @@ pub fn build_return_proof(
             .map(|c| <[u8; 32]>::try_from(c).expect("32"))
             .collect();
         leaf_proofs.push(LeafProof {
-            anchor_index: 0,
+            anchor_index: idx as u16,
             bitmap,
             siblings,
         });
@@ -111,22 +123,75 @@ pub fn build_return_proof(
     let env = Envelope {
         policy_body: dep.policy.to_bytes(),
         history: history_bytes,
-        anchors: alloc::vec![anchor],
+        anchors,
         leaf_proofs,
     };
-    if env.encode().len() > MAX_ENVELOPE_BYTES {
+    let encoded = env.encode();
+    if encoded.len() > MAX_ENVELOPE_BYTES {
         return Err(E::InputTooLarge);
     }
-    // The composing verifier's own tuple and opening checks must pass on what we assembled.
-    check_policy(&dep.cfg, &env, 1 + token.transactions().len())?;
+    // The composing verifier's own checks must pass on what we assembled, in its order: policy opening,
+    // anchor table, the shared gas gate, then every anchor's opening and every leaf's own anchor time.
+    let sids: Vec<[u8; 32]> = verified.outcome.leaves.iter().map(|l| l.sid).collect();
+    let pol = check_policy_body(&dep.cfg, &env)?;
+    let plan = plan_anchors(&pol, &env, &sids)?;
+    let gate = compute_gate(
+        encoded.len(),
+        kernel_request_bytes(dep.cfg.to_bytes().len() as u64, env.history.len() as u64),
+        &env,
+        &pol,
+        TX_GAS_BUDGET,
+    )?;
     let times: Vec<u64> = verified
         .outcome
         .leaves
         .iter()
         .map(|l| l.reference_time)
         .collect();
-    check_anchor(&env.anchors[0], &times)?;
-    Ok((env, verified))
+    check_anchors(&env, &plan, &times)?;
+    Ok((env, verified, gate))
+}
+
+/// An upper bound on the size of the burn leaf's contribution to the history projection (the transfer, its
+/// certification data with its unlock script and the terminal return reason).
+pub const BURN_HISTORY_BYTES: usize = 1024;
+
+/// The burn-time preflight. A burn that could never be redeemed under the profile bounds and the
+/// shared gas gate is refused before the wallet burns anything: more leaves than the profile admits, a
+/// history or envelope over its bound, or a worst-case envelope over the transaction budget. Beyond the
+/// bounds the answer is `GasBudget`/`TooManyTx`/`InputTooLarge` (BudgetExceeded), never a truncated
+/// history or a partial redemption. `token` is the held receipt the burn would spend.
+pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
+    let dep = deployment_of(bridge, token)?;
+    let leaves = token.transactions().len() + 2; // the mint, every transfer and the burn
+    if leaves > MAX_LEAVES {
+        return Err(E::TooManyTx);
+    }
+    // The history bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to
+    // add up to `BURN_HISTORY_BYTES`. The gate projection uses the known history only, a lower bound.
+    let history = history::project(token).len();
+    if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
+        return Err(E::InputTooLarge);
+    }
+    // the fewest anchors the known leaves can need: one per shard they occupy
+    let mut rows: Vec<usize> = leaf_routes(bridge, token)?.iter().map(|r| r.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let (gate, envelope) = projected_gate(
+        dep.cfg.to_bytes().len() as u64,
+        dep.policy.to_bytes().len() as u64,
+        u64::from(dep.policy.depth),
+        rows.len() as u64,
+        leaves as u64,
+        history as u64,
+    );
+    if envelope > MAX_ENVELOPE_BYTES as u64 {
+        return Err(E::InputTooLarge);
+    }
+    if gate.total > TX_GAS_BUDGET {
+        return Err(E::GasBudget);
+    }
+    Ok(gate)
 }
 
 /// All transaction objects of a token in history order, for callers that fetch proofs per leaf.
@@ -145,4 +210,47 @@ pub fn leaf_transactions(token: &Token) -> Vec<(Vec<u8>, [u8; 32])> {
         ));
     }
     out
+}
+
+fn deployment_of<'a>(bridge: &'a NativeBridge, token: &Token) -> Result<&'a Deployment> {
+    let mint = token.genesis().transaction();
+    let j = mint.justification().ok_or(E::MintJustif)?;
+    let parsed = crate::lockproof::parse_justification(j)?;
+    bridge
+        .registry
+        .find(mint.network_id().id(), parsed.chain_id, &parsed.vault)
+}
+
+/// Where one history leaf's aggregator proof is served: the policy row of its own shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafRoute {
+    /// The leaf's position in the history (genesis first).
+    pub index: usize,
+    /// The raw 32-byte state ID `get_inclusion_proof.v2` is asked for.
+    pub sid: [u8; 32],
+    /// The policy row of the leaf's shard: the top `depth` bits of the state ID.
+    pub row: usize,
+    /// The native shard ID of that row.
+    pub shard: Vec<u8>,
+}
+
+/// Route every leaf of `token` to its shard. The host maps rows to its aggregator endpoints
+/// (installation metadata, never a verification input) and fetches `get_inclusion_proof.v2` per leaf;
+/// whatever certificate each response carries is kept with its path. Nothing is re-queried to make
+/// certificates converge.
+pub fn leaf_routes(bridge: &NativeBridge, token: &Token) -> Result<Vec<LeafRoute>> {
+    let dep = deployment_of(bridge, token)?;
+    Ok(leaf_transactions(token)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, sid))| {
+            let row = dep.policy.shard_row(&sid);
+            LeafRoute {
+                index,
+                sid,
+                row,
+                shard: dep.policy.shard_id(row).to_vec(),
+            }
+        })
+        .collect())
 }

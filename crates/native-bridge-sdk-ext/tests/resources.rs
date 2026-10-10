@@ -7,6 +7,7 @@
 )]
 mod common;
 use common::*;
+use native_bridge_sdk_ext::limits::MAX_TRANSFERS;
 use native_bridge_sdk_ext::resources::{preflight_token, preflight_uc};
 use native_bridge_sdk_ext::token::Expect;
 use native_bridge_sdk_ext::NativeError as E;
@@ -154,7 +155,8 @@ fn native_uc_sublimits_on_ordinary_and_standalone_embedded_certificates() {
 #[test]
 fn uc_and_rsmt_paths_share_the_full_token_cumulative_budget() {
     let w = make_world(20);
-    let steps: Vec<_> = (0..64)
+    // MAX_TRANSFERS transfers: MAX_LEAVES certificates of 32 unicity steps and 100 shard-tree siblings.
+    let steps: Vec<_> = (0..MAX_TRANSFERS as u8)
         .map(|i| tx_step(i + 2, i + 1, (i + 2) as u64))
         .collect();
     let out = build_token(&w, &spec(1), &steps, 1, 100);
@@ -165,7 +167,8 @@ fn uc_and_rsmt_paths_share_the_full_token_cumulative_budget() {
                 hash: vec![0; 32]
             };
             32
-        ]
+        ];
+        uc.shard_tree_certificate.sibling_hash_list = vec![vec![0; 32]; 100];
     });
     rejects(&w, &token, E::TooManyPaths);
 }
@@ -250,7 +253,7 @@ fn nested_payloads_share_depth_and_item_budgets_with_the_outer_token() {
 #[test]
 fn cumulative_path_boundary_includes_the_immutable_embedded_certificate() {
     let w = make_world(20);
-    let steps: Vec<_> = (0..64)
+    let steps: Vec<_> = (0..MAX_TRANSFERS as u8)
         .map(|i| tx_step(i + 2, i + 1, (i + 2) as u64))
         .collect();
     let mut parts = lock_parts(&w, &spec(1));
@@ -269,15 +272,17 @@ fn cumulative_path_boundary_includes_the_immutable_embedded_certificate() {
     let make = |extra: usize| {
         let mut remaining = 2048 - 32 - rsmt + extra;
         let token = change_uc(&out.token, |uc| {
-            let n = remaining.min(32);
+            let n = remaining.min(288);
             remaining -= n;
+            let steps = n.min(32);
             uc.unicity_tree_certificate.steps = vec![
                 HashStep {
                     key: 1,
                     hash: vec![0; 32]
                 };
-                n
+                steps
             ];
+            uc.shard_tree_certificate.sibling_hash_list = vec![vec![0; 32]; n - steps];
         });
         assert_eq!(remaining, 0);
         token

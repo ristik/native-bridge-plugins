@@ -12,7 +12,9 @@
 mod common;
 use common::*;
 use native_bridge_sdk_ext::envelope::*;
-use native_bridge_sdk_ext::proof::{build_return_proof, refresh_token};
+use native_bridge_sdk_ext::gas::{compute_gate, kernel_request_bytes, scan_anchor};
+use native_bridge_sdk_ext::limits::{MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET};
+use native_bridge_sdk_ext::proof::{build_return_proof, preflight_burn, refresh_token};
 use native_bridge_sdk_ext::token::Expect;
 use native_bridge_sdk_ext::NativeError as E;
 use unicity_token::api::{InclusionCertificate, InclusionProof};
@@ -32,24 +34,44 @@ fn ret(w: &World) -> TokenOut {
 }
 
 #[test]
-fn return_envelope_round_trips_and_passes_policy_and_anchor_checks() {
+fn return_envelope_round_trips_and_passes_policy_anchor_and_gate_checks() {
     let w = make_world(20);
     let out = ret(&w);
-    let (env, v) = build_return_proof(&w.bridge, &out.token).unwrap();
+    let (env, v, gate) = build_return_proof(&w.bridge, &out.token).unwrap();
     let bytes = env.encode();
     let back = Envelope::decode(&bytes).unwrap();
     assert_eq!(back, env);
     assert_eq!(env.leaf_proofs.len(), 3);
-    check_policy(&w.dep.cfg, &back, 3).unwrap();
+    assert_eq!(
+        env.anchors.len(),
+        1,
+        "byte-identical certificates are one anchor"
+    );
+    let sids: Vec<[u8; 32]> = v.outcome.leaves.iter().map(|l| l.sid).collect();
+    let pol = check_policy_body(&w.dep.cfg, &back).unwrap();
+    let plan = plan_anchors(&pol, &back, &sids).unwrap();
+    assert_eq!(plan.leaf_anchor, vec![0, 0, 0]);
     let times: Vec<u64> = v.outcome.leaves.iter().map(|l| l.reference_time).collect();
-    let ir = check_anchor(&back.anchors[0], &times).unwrap();
-    assert_eq!(ir.timestamp, UC_TS);
+    let ir = check_anchors(&back, &plan, &times).unwrap();
+    assert_eq!(ir[0].timestamp, UC_TS);
+    assert!(gate.total <= TX_GAS_BUDGET);
+    assert_eq!(
+        compute_gate(
+            bytes.len(),
+            kernel_request_bytes(w.dep.cfg.to_bytes().len() as u64, back.history.len() as u64),
+            &back,
+            &pol,
+            TX_GAS_BUDGET
+        )
+        .unwrap(),
+        gate
+    );
 }
 
 #[test]
 fn envelope_framing_is_canonical() {
     let w = make_world(20);
-    let (env, _) = build_return_proof(&w.bridge, &ret(&w).token).unwrap();
+    let (env, _, _) = build_return_proof(&w.bridge, &ret(&w).token).unwrap();
     let good = env.encode();
     let mut trailing = good.clone();
     trailing.extend([0u8; 32]);
@@ -65,51 +87,78 @@ fn envelope_framing_is_canonical() {
 }
 
 #[test]
-fn policy_check_names_each_tuple_mismatch() {
+fn policy_and_anchor_table_checks_name_each_mismatch() {
     let w = make_world(20);
-    let (env, _) = build_return_proof(&w.bridge, &ret(&w).token).unwrap();
+    let (env, v, _) = build_return_proof(&w.bridge, &ret(&w).token).unwrap();
     let cfg = &w.dep.cfg;
+    let sids: Vec<[u8; 32]> = v.outcome.leaves.iter().map(|l| l.sid).collect();
+    let plan = |e: &Envelope, ids: &[[u8; 32]]| {
+        let pol = check_policy_body(cfg, e)?;
+        plan_anchors(&pol, e, ids)
+    };
     let mut e = env.clone();
     e.policy_body[3] ^= 1;
-    assert_eq!(check_policy(cfg, &e, 3).unwrap_err(), E::PolicyHash);
+    assert_eq!(check_policy_body(cfg, &e).unwrap_err(), E::PolicyHash);
+    let mut e = env.clone();
+    e.anchors.clear();
+    assert_eq!(check_policy_body(cfg, &e).unwrap_err(), E::PolicyAnchors);
     let mut e = env.clone();
     e.anchors.push(e.anchors[0].clone());
-    assert_eq!(check_policy(cfg, &e, 3).unwrap_err(), E::PolicyAnchors);
+    assert_eq!(
+        plan(&e, &sids).unwrap_err(),
+        E::PolicyAnchors,
+        "identical UC bytes are one anchor, never two"
+    );
     let mut e = env.clone();
     e.anchors[0].shard = vec![0x40];
-    assert_eq!(check_policy(cfg, &e, 3).unwrap_err(), E::PolicyTuple);
+    assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyTuple);
     let mut e = env.clone();
     e.anchors[0].partition += 1;
-    assert_eq!(check_policy(cfg, &e, 3).unwrap_err(), E::PolicyTuple);
-    assert_eq!(check_policy(cfg, &env, 2).unwrap_err(), E::PolicyLeafCount);
+    assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyTuple);
+    let mut e = env.clone();
+    e.anchors[0].shard_conf_hash[0] ^= 1;
+    assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyTuple);
+    assert_eq!(plan(&env, &sids[..2]).unwrap_err(), E::PolicyLeafCount);
     let mut e = env.clone();
     e.leaf_proofs[1].anchor_index = 1;
-    assert_eq!(check_policy(cfg, &e, 3).unwrap_err(), E::PolicyLeafIndex);
+    assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyLeafIndex);
+    let mut e = env.clone();
+    let mut spare = e.anchors[0].clone();
+    spare.uc.push(0);
+    e.anchors.push(spare);
+    assert_eq!(
+        plan(&e, &sids).unwrap_err(),
+        E::PolicyAnchors,
+        "an anchor no leaf uses"
+    );
 }
 
 #[test]
 fn input_record_opening_is_bound_to_the_anchor() {
     let w = make_world(20);
-    let (env, v) = build_return_proof(&w.bridge, &ret(&w).token).unwrap();
+    let (env, v, _) = build_return_proof(&w.bridge, &ret(&w).token).unwrap();
     let times: Vec<u64> = v.outcome.leaves.iter().map(|l| l.reference_time).collect();
-    let mut a = env.anchors[0].clone();
-    a.input_record[10] ^= 1; // false opening: hash no longer equals expectedIRHash
+    let one = AnchorPlan {
+        leaf_anchor: vec![0, 0, 0],
+    };
+    let mut e = env.clone();
+    e.anchors[0].input_record[10] ^= 1; // false opening: hash no longer equals expectedIRHash
     assert_eq!(
-        check_anchor(&a, &times).unwrap_err(),
+        check_anchors(&e, &one, &times).unwrap_err(),
         E::InputRecordMismatch
     );
-    let mut a = env.anchors[0].clone();
-    a.expected_state_root[0] ^= 1;
+    let mut e = env.clone();
+    e.anchors[0].expected_state_root[0] ^= 1;
     assert_eq!(
-        check_anchor(&a, &times).unwrap_err(),
+        check_anchors(&e, &one, &times).unwrap_err(),
         E::InputRecordMismatch
     );
     // A time later than the authenticated timestamp.
     assert_eq!(
-        check_anchor(&env.anchors[0], &[UC_TS + 1]).unwrap_err(),
+        check_anchors(&env, &one, &[UC_TS + 1, UC_TS, UC_TS]).unwrap_err(),
         E::ReferenceTimeFuture
     );
-    assert!(check_anchor(&env.anchors[0], &[UC_TS]).is_ok());
+    assert!(check_anchors(&env, &one, &[UC_TS, UC_TS, UC_TS]).is_ok());
 }
 
 #[test]
@@ -121,14 +170,15 @@ fn input_record_opening_rejects_wrong_shape() {
     let ir = encode_tag(39002, &encode_array(&[two.as_slice(); 10]));
     assert_eq!(parse_input_record(&ir).unwrap_err(), E::Version);
     assert_eq!(
-        parse_input_record(&vec![0u8; 1025]).unwrap_err(),
+        parse_input_record(&vec![0u8; 513]).unwrap_err(),
         E::InputTooLarge
     );
 }
 
 #[test]
-fn mixed_anchors_cannot_be_assembled() {
+fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
     let w = make_world(20);
+    // genesis certified in one round, the transfers in another: two UCs, two anchors, first-use order
     let a = ret(&w);
     let b = build_token(
         &w,
@@ -139,8 +189,44 @@ fn mixed_anchors_cannot_be_assembled() {
     );
     let mixed =
         unicity_token::Token::new(a.token.genesis().clone(), b.token.transactions().to_vec());
-    // Same leaves, different roots: assembly refuses and asks for a refresh to one root.
-    assert!(build_return_proof(&w.bridge, &mixed).is_err());
+    let (env, _, _) = build_return_proof(&w.bridge, &mixed).unwrap();
+    assert_eq!(env.anchors.len(), 2);
+    assert_eq!(
+        env.leaf_proofs
+            .iter()
+            .map(|l| l.anchor_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1]
+    );
+    assert_ne!(env.anchors[0].uc, env.anchors[1].uc);
+    // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
+    assert_eq!(MAX_ANCHORS, 4);
+    let per_leaf = |n: usize| {
+        let tw = Tweaks {
+            uc_round: Some(Box::new(|i| 900 + i as u64)),
+            ..Tweaks::default()
+        };
+        let parts = lock_parts(&w, &spec(1));
+        let mut steps: Vec<Step> = (0..n - 1)
+            .map(|i| tx_step(i as u8 + 2, 7, T0 + 10 + i as u64))
+            .collect();
+        steps.push(burn_step(T0 + 20));
+        build_token_with(&w, &spec(1), &parts, &tw, &steps, T0, UC_TS)
+    };
+    for n in [1usize, 2] {
+        let out = per_leaf(n);
+        assert_eq!(out.ucs.len(), n + 1);
+        let (env, _, gate) = build_return_proof(&w.bridge, &out.token).unwrap();
+        assert_eq!(env.anchors.len(), n + 1);
+        assert!(gate.total <= TX_GAS_BUDGET);
+    }
+    // one more than the ceiling is refused, never truncated
+    let five = per_leaf(MAX_ANCHORS);
+    assert_eq!(five.ucs.len(), MAX_ANCHORS + 1);
+    assert_eq!(
+        build_return_proof(&w.bridge, &five.token).unwrap_err(),
+        E::TooManyPaths
+    );
 }
 
 fn fresh_proofs(w: &World, out: &TokenOut, extra: usize, ts: u64) -> Vec<InclusionProof> {
@@ -196,7 +282,7 @@ fn refresh_to_a_later_anchor_preserves_t_and_j_and_verifies() {
         .verify_native_token(&refreshed, Expect::Return)
         .unwrap();
     assert_eq!(v.outcome.leaves[1].reference_time, T0 + 10);
-    let (env, _) = build_return_proof(&w.bridge, &refreshed).unwrap();
+    let (env, _, _) = build_return_proof(&w.bridge, &refreshed).unwrap();
     assert_eq!(
         parse_input_record(&env.anchors[0].input_record)
             .unwrap()

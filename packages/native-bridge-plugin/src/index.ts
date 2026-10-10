@@ -4,6 +4,7 @@ export * from './limits.js';
 export * from './profile.js';
 export * from './deployment.js';
 export * from './envelope.js';
+export * from './gas.js';
 export * from './header.js';
 export * from './history.js';
 export * from './lockproof.js';
@@ -31,5 +32,5 @@ export function bridgeTokenPlugin(bridge: NativeBridge, revision = 'native-bridg
 
 import { createNativeBridgePlugin } from './wallet.js';
 function createNativeBridgePluginInternal(bridge: NativeBridge, revision: string): import('@unicitylabs/bridge-core').WalletTokenPlugin {
-  return createNativeBridgePlugin(bridge, { manifestRevision: revision, profileRevision: 'v2' }).walletPlugin;
+  return createNativeBridgePlugin(bridge, { manifestRevision: revision, profileRevision: 'v3' }).walletPlugin;
 }

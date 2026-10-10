@@ -1,21 +1,35 @@
-//! Provisional DEV bounds and fixed protocol bytes of the native profile (protocol version 2).
+//! Named profile-v3 bounds and fixed protocol bytes of the native profile (protocol version 3).
 //!
-//! Limits are intersected, not additive entitlements: every cumulative bound is checked before
-//! allocation or cryptography.
+//! The numbers of the first block are the `limits` of `protocol/profile-v3.json`, the single source
+//! shared with the oracle, the contract and the TypeScript plug-in (`tests/limits.rs` pins them). A
+//! later profile version raises them together with the gas budget. Limits are intersected, not
+//! additive entitlements: every cumulative bound is checked before allocation or cryptography.
 
-pub const MAX_TRANSFERS: usize = 64;
-pub const MAX_LEAVES: usize = MAX_TRANSFERS + 1;
-/// Semantic-history input: J plus the compact history (raised from 64 KiB to 128 KiB).
-pub const MAX_SEMANTIC_BYTES: usize = 128 << 10;
-pub const MAX_ENVELOPE_BYTES: usize = 256 << 10;
+// ---- profile parameters (profile-v3.json `limits`) ----------------------------------------------
+/// Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle.
+pub const MAX_ANCHORS: usize = 4;
+/// B2 leaves of one redemption: the mint, every transfer and the final burn.
+pub const MAX_LEAVES: usize = 16;
+pub const MAX_TRANSFERS: usize = MAX_LEAVES - 1;
+pub const MAX_SEMANTIC_BYTES: usize = 16 << 10;
+pub const MAX_ENVELOPE_BYTES: usize = 64 << 10;
+pub const MAX_ANCHOR_UC_BYTES: usize = 8 << 10;
+pub const MAX_RSMT_SIBLINGS: usize = 32;
+pub const MAX_PATH_STEPS: usize = 2048;
+pub const MAX_POLICY_BYTES: usize = 512;
+/// B1's own sublimits, which the gate prices.
+pub const MAX_UNICITY_STEPS: usize = 32;
+pub const MAX_SIGNATURES: usize = 64;
+
+// ---- the shared gas gate (interop.md "Direct-call gas gate") ------------------------------------
+/// DN-B ordinary transaction capacity.
+pub const TX_GAS_BUDGET: u64 = 7_000_000;
+pub const GAS_RESERVE: u64 = 1_000_000;
+
 pub const MAX_CBOR_DEPTH: usize = 16;
 pub const MAX_CBOR_ITEMS: usize = 32768;
 pub const MAX_RLP_DEPTH: usize = 16;
-pub const MAX_PATH_STEPS: usize = 2048;
-pub const MAX_POLICY_BYTES: usize = 128;
 pub const MAX_AMOUNT_BYTES: usize = 32;
-/// Exactly one admitted aggregator tuple (profile `aggregatorAnchors`).
-pub const MAX_ANCHORS: usize = 1;
 
 /// The mint justification J as carried in the SDK mint.
 pub const MAX_JUSTIFICATION_BYTES: usize = 64 << 10;
@@ -26,7 +40,7 @@ pub const MAX_MPT_NODES: usize = 65;
 pub const MAX_MPT_NODE_BYTES: usize = 1 << 10;
 pub const MAX_MPT_TOTAL_BYTES: usize = 24 << 10;
 /// The native InputRecord opening is small and fixed in shape.
-pub const MAX_INPUT_RECORD_BYTES: usize = 1 << 10;
+pub const MAX_INPUT_RECORD_BYTES: usize = 512;
 
 pub const TAG_PREDICATE: u64 = 39032;
 pub const TAG_MINT: u64 = 39041;
