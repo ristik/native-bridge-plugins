@@ -227,3 +227,72 @@ fn the_burn_preflight_refuses_a_history_near_the_bound_and_a_best_case_the_gate_
     );
     assert!(check_burn_projection(200, 300, 2, 4, 5, 500).unwrap().total <= TX_GAS_BUDGET);
 }
+
+#[test]
+fn preflight_burn_on_a_held_token_refuses_a_history_within_the_burn_margin_of_the_bound() {
+    use native_bridge_sdk_ext::history::project;
+    let w = make_world(20);
+    let held = |n: usize| {
+        let tw = Tweaks {
+            mint_data: Some(Some(vec![7u8; n])),
+            ..Tweaks::default()
+        };
+        let parts = lock_parts(&w, &spec(1));
+        build_token_with(
+            &w,
+            &spec(1),
+            &parts,
+            &tw,
+            &[tx_step(2, 7, T0 + 10)],
+            T0,
+            UC_TS,
+        )
+    };
+    let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
+    // the projection grows one byte per data byte once the byte-string header width is fixed
+    let probe = 4096usize;
+    let base = project(&held(probe).token).len();
+    let n = probe + (edge - base);
+    let fits = held(n);
+    assert_eq!(project(&fits.token).len(), edge, "exactly at the margin");
+    assert!(preflight_burn(&w.bridge, &fits.token).unwrap().total <= TX_GAS_BUDGET);
+    assert_eq!(
+        preflight_burn(&w.bridge, &held(n + 1).token).unwrap_err(),
+        E::InputTooLarge
+    );
+}
+
+#[test]
+fn preflight_burn_prices_a_held_token_exactly() {
+    let w = make_world(20);
+    let held = build_token(&w, &spec(1), &[tx_step(2, 7, T0 + 10)], T0, UC_TS);
+    let gate = preflight_burn(&w.bridge, &held.token).unwrap();
+    // best case: one 445-byte one-signature certificate (depth 0, no shard sibling), an empty input record, the known history only
+    assert_eq!(
+        [gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt],
+        [2_481_322, 1_258_596, 124_960, 84_488, 13_278]
+    );
+}
+
+#[test]
+fn plan_anchors_itself_refuses_more_than_the_ceiling_with_too_many_paths() {
+    let w = make_world(20);
+    let out = build_token(
+        &w,
+        &spec(1),
+        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
+        T0,
+        UC_TS,
+    );
+    let (env, v, _) = build_return_proof(&w.bridge, &out.token).unwrap();
+    let pol = check_policy_body(&w.dep.cfg, &env).unwrap();
+    let mut over = env.clone();
+    while over.anchors.len() <= MAX_ANCHORS {
+        over.anchors.push(over.anchors[0].clone());
+    }
+    let sids: Vec<[u8; 32]> = v.outcome.leaves.iter().map(|l| l.sid).collect();
+    assert_eq!(
+        plan_anchors(&pol, &over, &sids).unwrap_err(),
+        E::TooManyPaths
+    );
+}

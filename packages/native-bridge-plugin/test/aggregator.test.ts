@@ -18,6 +18,7 @@ import { BURN_HISTORY_BYTES, buildReturnProof, leafRoutes, preflightBurn, refres
 import { projectToken } from '../src/history.js';
 import { NativeError, RETRYABLE } from '../src/errors.js';
 import { BEST_UC_BYTES } from '../src/gas.js';
+import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
 import { cfgBytes, shardId, shardRow } from '../src/profile.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS } from '../src/wallet.js';
 import { DeploymentRegistry } from '../src/deployment.js';
@@ -268,6 +269,38 @@ test('burn-time preflight admits a redeemable history and refuses one leaf more 
   assert.ok(gate.total <= TX_GAS_BUDGET, String(gate.total));
   const tooLong = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 1 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
   await rejects(preflightBurn(w.bridge, tooLong.bytes), 'ErrTooManyTx');
+});
+
+test('preflightBurn on a held token: a history within BURN_HISTORY_BYTES of the bound is refused, one byte less passes', async () => {
+  const w = makeWorld();
+  const held = (n: number) => buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS, { mintData: new Uint8Array(n).fill(7) });
+  const edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
+  // the projection grows one byte per data byte once the byte-string header width is fixed
+  const probe = 4096;
+  const base = projectToken((await held(probe)).token).length;
+  const n = probe + (edge - base);
+  const fits = await held(n);
+  assert.equal(projectToken(fits.token).length, edge, 'the held history is exactly at the margin');
+  const gate = await preflightBurn(w.bridge, fits.bytes);
+  assert.ok(gate.total <= TX_GAS_BUDGET);
+  await rejects(preflightBurn(w.bridge, (await held(n + 1)).bytes), 'ErrInputTooLarge');
+});
+
+test('preflightBurn prices a held token exactly (pins the best-case constants and the known-history rule)', async () => {
+  const w = makeWorld();
+  const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
+  const gate = await preflightBurn(w.bridge, held.bytes);
+  // best case: one 445-byte one-signature certificate (depth 0, no shard sibling), an empty input record, the known history only
+  assert.deepEqual([gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt], [2_481_322, 1_258_596, 124_960, 84_488, 13_278]);
+});
+
+test('planAnchors itself refuses more than MAX_ANCHORS anchors with ErrTooManyPaths (not shadowed by checkPolicyBody)', async () => {
+  const w = makeWorld();
+  const { envelope, verified } = await buildReturnProof(w.bridge, (await ret(w)).token);
+  const pol = checkPolicyBody(w.dep.cfg, envelope);
+  const over = structuredClone(envelope);
+  while (over.anchors.length <= MAX_ANCHORS) over.anchors.push(structuredClone(over.anchors[0]));
+  throwsReason(() => planAnchors(pol, over, verified.outcome.leaves.map((l) => l.sid)), 'ErrTooManyPaths');
 });
 
 test('a real burn leaf adds no more history than BURN_HISTORY_BYTES, and the best-case certificate is no larger than any real one', async () => {

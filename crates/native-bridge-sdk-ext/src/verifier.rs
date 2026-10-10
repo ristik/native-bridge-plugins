@@ -28,7 +28,10 @@ fn map_error(e: E, malformed: VerificationError) -> VerificationError {
     match e.family() {
         Family::Malformed => malformed,
         Family::Budget => VerificationError::VerificationLimitExceeded("native lock proof"),
-        Family::Invalid | Family::Unavailable => VerificationError::UnsupportedMintJustification,
+        Family::Invalid => VerificationError::UnsupportedMintJustification,
+        // `ProofUnavailable` is raised only by the TypeScript retry wrapper and never reaches the lock-proof
+        // checks that call this mapping; it is mapped like an invalid proof should it ever be returned.
+        Family::Unavailable => VerificationError::UnsupportedMintJustification,
     }
 }
 
