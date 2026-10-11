@@ -27,3 +27,14 @@ test('the search stays logarithmic at the redemption scale', async () => {
   assert.equal(r.min, 3_112_345n);
   assert.ok(r.calls <= 20);
 });
+
+import { gasOneHolds, type GasOneFacts } from './gassearch.js';
+// the one B3 evidence run (14:31-14:47, rows-evidence.json): M-1 failed, status 0x0, 3,075,844 of 3,122,231 gas used, anchors in window, M searched with eth_call, high send status 0x1
+// (the credits were not recorded in that run's evidence; the row now asserts them)
+const run: GasOneFacts = { lowStatus: '0x0', lowAnchorsInWindowAtExecution: true, creditedLow: 0n, mSucceeds: true, mMinusOneFails: true, highStatus: '0x1', creditedHigh: 10n ** 18n, amount: 10n ** 18n };
+test('gas-1 verdict: the recorded run holds, each missing condition fails it', () => {
+  assert.equal(gasOneHolds(run), true);
+  for (const bad of [{ lowStatus: '0x1' }, { lowAnchorsInWindowAtExecution: false }, { creditedLow: 1n }, { mSucceeds: false }, { mMinusOneFails: false }, { highStatus: '0x0' }, { creditedHigh: 0n }] as Partial<GasOneFacts>[]) {
+    assert.equal(gasOneHolds({ ...run, ...bad }), false, JSON.stringify(bad, (_k, v) => (typeof v === 'bigint' ? String(v) : v)));
+  }
+});

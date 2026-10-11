@@ -38,7 +38,7 @@ import { projectToken } from '../../packages/native-bridge-plugin/src/history.js
 import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../../packages/native-bridge-plugin/src/limits.js';
 import { DEFAULT_REDEEM, redeemReturn, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../../packages/native-bridge-plugin/src/freshness.js';
 import { createNativeBridgePlugin, type ProofSource } from '../../packages/native-bridge-plugin/src/wallet.js';
-import { minimalGas } from './gassearch.js';
+import { gasOneHolds, minimalGas } from './gassearch.js';
 import { buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
 import { arr, bs, returnReason, decodeCfg, decodePolicy, shardId, shardRow, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, policyBytes, u, valueEnvelope, H } from '../../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
@@ -535,8 +535,13 @@ if (on('gas')) try {
   const highLimit = M + M / 32n + 50_000n;
   const beforeHigh = claimable();
   const high = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p2.built.encoded)}`], THIRD_PARTY_KEY, String(highLimit));
-  record('gas-1 fails for gas, gas+headroom succeeds (one token)', low.status === '0x0' && lowOutOfGas && lowInWindow && creditedLow === 0n && high.status === '0x1' && claimable() - beforeHigh === amountWei,
-    { referenceGasUsed: oa.gasUsed, estimateGas: N, minimumGasM: M, searchCalls, pinnedBlock: pinned, clockOverride: clockAtExecution, lowLimit, lowStatus: low.status, lowGasUsed: BigInt(low.gasUsed), lowConsumedWholeLimit: lowOutOfGas, lowAnchorsInWindowAtExecution: lowInWindow, highLimit, highStatus: high.status, highGasUsed: BigInt(high.gasUsed) });
+  const mSucceeds = await callSucceeds(M);
+  const mMinusOneFails = !(await callSucceeds(M - 1n));
+  const creditedHigh = claimable() - beforeHigh;
+  // lowConsumedWholeLimit is recorded, not asserted: below M the starved frame is an inner native/RSMT call (63/64 forwarding), its caller reverts
+  // and the outer frame's unused gas comes back, so a failing send uses less than its limit (run 11: 3,075,844 of 3,122,231).
+  record('gas-1 fails for gas, gas+headroom succeeds (one token)', gasOneHolds({ lowStatus: low.status, lowAnchorsInWindowAtExecution: lowInWindow, creditedLow, mSucceeds, mMinusOneFails, highStatus: high.status, creditedHigh, amount: amountWei }),
+    { referenceGasUsed: oa.gasUsed, estimateGas: N, minimumGasM: M, searchCalls, pinnedBlock: pinned, clockOverride: clockAtExecution, lowLimit, lowStatus: low.status, lowGasUsed: BigInt(low.gasUsed), lowConsumedWholeLimit: lowOutOfGas, lowAnchorsInWindowAtExecution: lowInWindow, lowDiag, mSucceedsAtPinnedBlock: mSucceeds, mMinusOneFailsAtPinnedBlock: mMinusOneFails, highLimit, highStatus: high.status, highGasUsed: BigInt(high.gasUsed) });
 } catch (e) { groupFailed('gas', e); }
 // =====================================================================================================================================
 // Wallet-path rows (issue #9). These use the plug-ins' own host freshness contract (buildFreshReturnProof / redeemReturn) against the live chain and

@@ -26,14 +26,9 @@ shards; 16 leaves with two anchors (gas against the gate and the 7M budget); the
 `BudgetExceeded()`); 17 leaves refused; malformed final anchor, asserted by revert selector and trace; restart/recovery of a pending redemption; and the wallet rows, which use the plug-in's host freshness contract on the same burned token
 (already-old token refreshed then redeemed, delayed send expired then same-token retry, future-origin wait). A wallet row that does not redeem is a FAIL.
 
-**Not yet passed live: gas-1 / gas+headroom on one token** (the minimum M is bisected with `eth_call` at a pinned block and clock override, then `M-1` must run out of gas and `M + M/32 + 50k` redeem; `gassearch.test.ts` covers the search offline). This line moves into the list above only when a run passes it.
+**gas-1 / gas+headroom on one token.** In the evidence run (rows commit `9409f7e`) the minimum limit M (bisected with `eth_call` at a pinned block and clock override; `eth_estimateGas` is not the minimum) was 3,122,232 against an estimate of 3,135,110. The send at M-1 failed (status 0x0, anchors in the window at its execution block, 3,075,844 of 3,122,231 gas used: the starved frame is an inner call under the 63/64 rule, so a failing send does not consume its whole limit) and the same token's refetched proofs redeemed at M + M/32 + 50k. The row's assertion was revised after that run (the "consumed the whole limit" condition was wrong for this shape and is now recorded, not asserted; `gassearch.test.ts` checks the verdict). It has not been re-run in its final form.
 
-**NOT passed live: A=3 and A=4.** No live row redeems a bundle with more than one certificate per shard or with three or four anchors. On this
-devnet each shard certifies a new round only every 3-4 root rounds and a redemption executes 8-9 rounds after it is sent, so three or four
-distinct certificates cannot all be inside the window; the same-shard two-round, A=3 and A=4 rows (own-round proofs, and the wallet rows with
-concurrent shard writes) are recorded as measured limits in `rows-limits.json` and do not fail the run. A=3/4 is covered by the oracle corpus and the
-contract/plug-in tests only. The explicit gap carried to testnet is: A=3/4 needs three or four shards certifying about the same root round (or a longer
-W_cert); this devnet has two shards.
+**A=3 passed live** (wallet row, concurrent shard writes, three anchors in the sent bundle, 4,463,064 gas, margin 8, per-fetch spread 6-8 rounds). **A=4 is not passed live: it remains a measured limit** (spread 10-11 rounds over three fetches against 7 allowed). The same-shard two-round and own-round A=3/A=4 shapes are also measured limits. A=4 is covered by the oracle corpus and the contract/plug-in tests only; the explicit gap carried to testnet is that A=4 needs four shards certifying about the same root round (or a longer W_cert); this devnet has two shards. A measured limit does not fail the run.
 
 Other limits: the forged 64-signature worst certificate is covered by the oracle corpus and the contract tests, not live. The `inWindow` helper
 rebuilds tokens (fresh lock and mint) and is a test-shape device, not wallet evidence; wallet evidence is only the rows named `wallet:`.
