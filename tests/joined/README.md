@@ -8,7 +8,10 @@ publishes anything.
 `pins.json` records full merged commits, supported fixed-base/unit-weight scope,
 blocked live scenarios and explicitly deferred SDK trust work. Source validation
 requires exact clean checkouts; the plug-in implementation and released corpus
-must match the accepted baseline. Harness changes do not alter protocol bytes.
+must match the accepted baseline, identified by `pluginsTree` (a hash of the blob
+listing of `packages`, `crates`, `protocol` and `package-lock.json`; recompute with
+`python3 tests/joined/run.py --print-plugin-tree`), so a squash merge, which keeps the
+content and loses the commit, does not turn main red. `sources.plugins` is recorded provenance only. Harness changes do not alter protocol bytes.
 
 Prepare clean worktrees named `nbp-pr6-{ureth,contracts,oracle,aggregator}` under
 a source directory outside this repository at the commits in `pins.json`. Initialize the contracts'
