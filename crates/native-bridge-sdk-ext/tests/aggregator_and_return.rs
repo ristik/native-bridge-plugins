@@ -177,13 +177,13 @@ fn input_record_opening_rejects_wrong_shape() {
     let ir_with = |summary: usize| {
         let one = encode_uint(1);
         let null = encode_null();
-        let hash = encode_bytes(&[0u8; 32]);
-        let sum = encode_bytes(&vec![0u8; summary]);
+        let hash = encode_byte_string(&[0u8; 32]);
+        let sum = encode_byte_string(&vec![0u8; summary]);
         let zero = encode_uint(0);
         let parts: [&[u8]; 10] = [&one, &one, &one, &null, &hash, &sum, &zero, &null, &zero, &null];
         encode_tag(39002, &encode_array(&parts))
     };
-    assert_eq!(parse_input_record(&ir_with(256)).unwrap().state_hash, vec![0u8; 32]);
+    assert_eq!(parse_input_record(&ir_with(256)).unwrap().state_hash, [0u8; 32]);
     assert_eq!(parse_input_record(&ir_with(257)).unwrap_err(), E::ProofTooLarge);
 }
 
