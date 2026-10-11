@@ -63,11 +63,12 @@ assert.ok(/^[0-9a-f]{64}$/.test(attestation.sha256) && /^[0-9a-f]{40}$/.test(att
 const evidence: { ureth: unknown; rows: Record<string, unknown>[] } = { ureth: attestation, rows: [] };
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const json = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x));
+const failedRows: string[] = [];
 const record = (row: string, ok: boolean, data: Record<string, unknown>): void => {
   evidence.rows.push({ row, ok, ...data });
   console.log(`${ok ? 'PASS' : 'FAIL'} ${row}`, json(data));
   writeFileSync(`${lane.dir}/rows-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
-  assert.ok(ok, row);
+  if (!ok) failedRows.push(row);
 };
 const eth = lane.ethUrls[0];
 const cast = (...a: string[]): string => {
@@ -200,7 +201,7 @@ async function mix(token: Token, fresh: boolean[]): Promise<Token> {
   return refreshToken(token, proofs);
 }
 
-interface Outcome { receipt: Receipt; anchors: number; leaves: number; gasUsed: bigint; credited: bigint; calls: { uc: number; rsmt: number } | null; gate: number }
+interface Outcome { receipt: Receipt; anchors: number; leaves: number; gasUsed: bigint; credited: bigint; calls: { uc: number; rsmt: number } | null; gate: number; diag: Record<string, unknown> }
 
 async function countCalls(txHash: string): Promise<{ uc: number; rsmt: number } | null> {
   try {
@@ -232,7 +233,8 @@ async function waitWindow(token: Token): Promise<{ min: bigint; max: bigint; clo
 
 
 /**
- * Rows with several own-round UCs need every anchor young enough to still be inside B1's window when the redeem executes. Build the token again
+ * TEST-SHAPE HELPER ONLY, not wallet recovery and not evidence that an old token can be redeemed: a wallet refreshes the SAME burned token
+ * (issue #9). Rows with several own-round UCs need every anchor young enough to still be inside B1's window when the redeem executes. Build the token again
  * (a fresh lock and mint) until the oldest anchor is within W_cert - EXEC_MARGIN of the registry clock once the newest one has landed.
  */
 async function inWindow(what: string, build: () => Promise<Token>): Promise<Token> {
@@ -247,15 +249,54 @@ async function inWindow(what: string, build: () => Promise<Token>): Promise<Toke
   throw new Error(`${what}: no token fit inside the certificate window in 6 attempts (a faster run is needed)`);
 }
 
+/**
+ * Why a redemption was or was not accepted, from the chain: every anchor's seal round r_a, the registry origin O at the transaction's own
+ * execution block, W_cert, each anchor classified (stale: O - r > W_cert, future: r > O, in-window), the B1 verdict for each anchor's UC_V1
+ * request evaluated at that block (state after the block, origin O), and the UC / RSMT calls the transaction really made with their outputs.
+ */
+async function diagnose(token: Token, built: { envelope: Envelope }, receipt: Receipt, sentClock: bigint): Promise<Record<string, unknown>> {
+  const block = receipt.blockNumber;
+  const O = BigInt(await rpc(eth, 'eth_getStorageAt', [REGISTRY, clockSlot, block]));
+  const O1 = BigInt(await rpc(eth, 'eth_getStorageAt', [REGISTRY, clockSlot, `0x${(BigInt(block) - 1n).toString(16)}`]));
+  const roundOfUc = new Map<string, bigint>();
+  for (const c of [token.genesis, ...token.transactions]) roundOfUc.set(hex(c.inclusionProof.unicityCertificate.toCBOR()), c.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber);
+  const u16 = (n: number): Uint8Array => Uint8Array.of(n >> 8, n & 255);
+  const u32 = (n: number): Uint8Array => Uint8Array.of((n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255);
+  const anchors = [];
+  for (const a of built.envelope.anchors) {
+    const r = roundOfUc.get(hex(a.uc)) ?? -1n;
+    const req = Buffer.concat([Uint8Array.of(1, 0), u16(1), u32(a.partition), u16(a.shard.length), a.shard, a.shardConfHash, a.expectedStateRoot, a.expectedIRHash, u32(a.uc.length), a.uc]);
+    let verdict = 'n/a';
+    try {
+      const v = await rpc(eth, 'eth_call', [{ to: '0x0000000000000000000000000000000000000100', data: `0x${hex(req)}` }, block]);
+      verdict = `${BigInt(`0x${v.slice(2, 66)}`)}/${BigInt(`0x${v.slice(66, 130)}`) === 1n ? 'valid' : 'invalid'}`;
+    } catch (e) { verdict = `error ${String(e).slice(0, 120)}`; }
+    anchors.push({ shard: hex(a.shard), r, class: r > O ? 'future' : O - r > BigInt(W_CERT) ? 'stale' : 'in-window', age: O - r, verdictAtBlock: verdict });
+  }
+  const ucCalls: Record<string, unknown>[] = [];
+  try {
+    const t = await rpc(eth, 'debug_traceTransaction', [receipt.transactionHash, { tracer: 'callTracer' }]);
+    const walk = (c: { to?: string; output?: string; error?: string; revertReason?: string; gasUsed?: string; calls?: unknown[] }): void => {
+      const to = c.to?.toLowerCase();
+      if (to === '0x0000000000000000000000000000000000000100' || to === '0x0000000000000000000000000000000000000102') {
+        ucCalls.push({ to: to.slice(-3), output: (c.output ?? '').slice(0, 140), error: c.error, revertReason: c.revertReason, gasUsed: c.gasUsed });
+      }
+      (c.calls ?? []).forEach((x) => walk(x as never));
+    };
+    walk(t);
+  } catch (e) { ucCalls.push({ traceError: String(e).slice(0, 120) }); }
+  return { W_CERT, M: EXEC_MARGIN, originAtSend: sentClock, originAtBlock: O, originBeforeBlock: O1, originAdvanceSinceSend: O - sentClock, block, anchors, nativeCalls: ucCalls };
+}
+
 async function redeem(token: Token, gas = REDEEM_GAS, tamper?: (e: Uint8Array, env: Envelope) => Uint8Array): Promise<Outcome & { encoded: Uint8Array }> {
   const built = await buildReturnProof(bridge, token);
-  await waitWindow(token);
+  const win = await waitWindow(token);
   const before = claimable();
   const data = tamper ? tamper(built.encoded, built.envelope) : built.encoded;
   const receipt = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(data)}`], THIRD_PARTY_KEY, gas);
   return {
     receipt, anchors: built.envelope.anchors.length, leaves: built.envelope.leafProofs.length, gasUsed: BigInt(receipt.gasUsed),
-    credited: claimable() - before, calls: await countCalls(receipt.transactionHash), gate: built.gate.total, encoded: built.encoded,
+    credited: claimable() - before, calls: await countCalls(receipt.transactionHash), gate: built.gate.total, encoded: built.encoded, diag: await diagnose(token, built, receipt, win.clock),
   };
 }
 const flipIn = (encoded: Uint8Array, uc: Uint8Array, at: number): Uint8Array => {
@@ -299,7 +340,7 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
   const o = await redeem(token);
   const ok = o.receipt.status === '0x1' && o.anchors === wantAnchors && o.credited === amountWei && o.gasUsed < BigInt(TX_GAS_BUDGET) &&
     (o.calls === null || (o.calls.uc === wantAnchors && o.calls.rsmt === o.leaves));
-  record(name, ok, { anchors: o.anchors, leaves: o.leaves, gasUsed: o.gasUsed, gateTotal: o.gate, credited: o.credited, nativeCalls: o.calls, tx: o.receipt.transactionHash });
+  record(name, ok, { anchors: o.anchors, leaves: o.leaves, gasUsed: o.gasUsed, gateTotal: o.gate, credited: o.credited, nativeCalls: o.calls, tx: o.receipt.transactionHash, diag: o.diag });
   return o;
 }
 
@@ -430,4 +471,5 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
   record('restart: pending redemption recovered, redeem/claim state preserved', urlsUp === true && o.credited === amountWei && stillCredited && claim.status === '0x1' && pa - pb === amountWei,
     { redeemGas: o.gasUsed, creditedOnce: o.credited, paid: pa - pb });
 }
-console.log(`ROWS COMPLETE: ${evidence.rows.length} rows, evidence ${lane.dir}/rows-evidence.json`);
+console.log(`ROWS COMPLETE: ${evidence.rows.length} rows, ${failedRows.length} failed${failedRows.length ? ` (${failedRows.join('; ')})` : ''}, evidence ${lane.dir}/rows-evidence.json`);
+if (failedRows.length) process.exit(1);
