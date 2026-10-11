@@ -41,6 +41,8 @@ pub const MAX_MPT_NODE_BYTES: usize = 1 << 10;
 pub const MAX_MPT_TOTAL_BYTES: usize = 24 << 10;
 /// The native InputRecord opening is small and fixed in shape.
 pub const MAX_INPUT_RECORD_BYTES: usize = 512;
+/// The native sublimit of the certified input record's summary value (`InputRecord._scan`).
+pub const MAX_IR_SUMMARY_BYTES: usize = 256;
 
 pub const TAG_PREDICATE: u64 = 39032;
 pub const TAG_MINT: u64 = 39041;

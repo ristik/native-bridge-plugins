@@ -19,5 +19,6 @@
     "trust-base append/fetch/interval closure",
     "old-J validity across rotation",
     "full B1/SDK seal-signature acceptance parity"
-  ]
+  ],
+  "pluginsTree": "29fab9f59d64d44d6cf823873e1cf669a25d634aed0ffe832242ce9370ab37e6"
 }

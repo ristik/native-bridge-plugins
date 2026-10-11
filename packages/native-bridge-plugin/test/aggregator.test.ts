@@ -20,10 +20,10 @@ import { NativeError, RETRYABLE } from '../src/errors.js';
 import { BEST_UC_BYTES } from '../src/gas.js';
 import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
 import { cfgBytes, shardId, shardRow } from '../src/profile.js';
-import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS } from '../src/wallet.js';
+import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, PAIR_RACE } from '../src/wallet.js';
 import { DeploymentRegistry } from '../src/deployment.js';
 import { rejects, throwsReason } from './util.js';
-import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, sha, spec, txStep, type World } from './world.js';
+import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, sha, signer, spec, txStep, type World } from './world.js';
 
 const T0 = 1_700_000_040n;
 const UC_TS = 1_700_000_900n;
@@ -107,6 +107,35 @@ test('input record opening is bound to the anchor', async () => {
   checkAnchors(envelope, one, [UC_TS, UC_TS, UC_TS]);
   throwsReason(() => parseInputRecord(C.encodeTag(39002, C.encodeArray(C.encodeUnsignedInteger(1)))), 'ErrShape');
   throwsReason(() => parseInputRecord(new Uint8Array(513)), 'ErrInputTooLarge');
+  // the summary value is bounded by the native sublimit the chain enforces (256 bytes), so a received envelope cannot open what the chain refuses
+  const ir = (summary: number): Uint8Array => C.encodeTag(39002, C.encodeArray(
+    C.encodeUnsignedInteger(1), C.encodeUnsignedInteger(7), C.encodeUnsignedInteger(1), C.encodeNull(), C.encodeByteString(new Uint8Array(32)),
+    C.encodeByteString(new Uint8Array(summary)), C.encodeUnsignedInteger(5), C.encodeNull(), C.encodeUnsignedInteger(0), C.encodeNull()));
+  assert.equal(parseInputRecord(ir(256)).round, 7n);
+  throwsReason(() => parseInputRecord(ir(257)), 'ErrProofTooLarge');
+});
+
+test('an over-bound certificate is a budget refusal, any other shape failure is an invalid certificate', async () => {
+  const w = makeWorld();
+  const out = await ret(w);
+  const { envelope } = await buildReturnProof(w.bridge, out.token);
+  const a = envelope.anchors[0];
+  const sealed = async (signers: number): Promise<Uint8Array> => {
+    const old = out.token.genesis.inclusionProof.unicityCertificate;
+    const extra: [string, ReturnType<typeof signer>][] = Array.from({ length: signers - 4 }, (_, i) => [`extra${i}`, signer(100 + (i % 100))]);
+    return (await makeUc(w.agg, { partition: AGG_PARTITION, conf: w.aggConf, epochIr: 1n, rootEpoch: 2n, round: BigInt(old.unicitySeal.rootChainRoundNumber), timestamp: UC_TS, stateHash: old.inputRecord.hash!, blockHash: null, signers: 4, extra })).toCBOR();
+  };
+  assert.equal(scanAnchor({ ...a, uc: await sealed(64) }, 0).sigs, 64);
+  const over = await sealed(65);
+  assert.throws(() => scanAnchor({ ...a, uc: over }, 0), { reason: 'ErrTooManyItems', family: 'budget' });
+  assert.throws(() => scanAnchor({ ...a, uc: a.uc.slice(0, 20) }, 0), { reason: 'ErrAnchorAuth' });
+  // 33 unicity steps (the bound is 32), spliced into the certificate's empty step list
+  const at = Buffer.from(a.uc).indexOf(Buffer.from([0xd9, 0x98, 0x5c, 0x83]));
+  assert.ok(at > 0, 'the unicity tree certificate');
+  const head = at + 4 + 1 + 1; // tag, array(3), version, partition (one byte each here)
+  assert.equal(a.uc[head], 0x80, 'an empty step list');
+  const steps = Uint8Array.from([...a.uc.slice(0, head), 0x98, 33, ...new Array<number>(33).fill(0xf6), ...a.uc.slice(head + 1)]);
+  assert.throws(() => scanAnchor({ ...a, uc: steps }, 0), { reason: 'ErrTooManyItems', family: 'budget' });
 });
 
 async function freshProofs(w: World, out: Awaited<ReturnType<typeof ret>>, extra: number, ts: bigint): Promise<InclusionProof[]> {
@@ -336,7 +365,12 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   assert.ok(built.encoded.length > 0);
   calls = 0;
   const never = async (): Promise<InclusionProof[]> => (++calls, racing());
-  await rejects(buildNativeReturnProof(plugin, out.bytes, never), 'ErrProofUnavailable');
+  const gone = await buildNativeReturnProof(plugin, out.bytes, never).then(() => undefined, (e: unknown) => e);
+  assert.ok(gone instanceof NativeError && gone.reason === 'ErrProofUnavailable' && /last: Err\w+/.test(gone.detail ?? ''), String((gone as NativeError).detail));
+  // without a source nothing was refetched, so nothing raced: a held token that does not verify is reported as what it is, not as an outage
+  const tampered = (await refreshToken(out.token, await racing())).toCBOR();
+  const bad = await buildNativeReturnProof(plugin, tampered).then(() => undefined, (e: unknown) => e);
+  assert.ok(bad instanceof NativeError && PAIR_RACE.includes(bad.reason), String(bad));
   assert.equal(calls, MAX_PROOF_ATTEMPTS, 'no more than the bound, and no re-query to make certificates converge');
   // a bound or profile failure is not retried
   calls = 0;

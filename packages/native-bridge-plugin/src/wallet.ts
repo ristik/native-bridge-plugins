@@ -96,15 +96,37 @@ export class VerdictCache {
   }
 }
 
-/** A pending-redemption journal entry; burn acknowledgement is durable handoff, not vault payout. */
+/**
+ * A redemption journal entry; burn acknowledgement is durable handoff, not vault payout. The states in order:
+ * `burned` (the certified blob is durably handed off), `submitted` (a `redeem` was sent; every hash is kept in `redeemTxs`, an
+ * unknown outcome is never forgotten), `redeemed` (the vault credited `amount` to `releaseTo`), `settled` (the claim of that credit
+ * was confirmed by its receipt and by the `claimable` balance falling by the claimed amount: the native funds are paid).
+ */
 export interface RedemptionEntry {
   burnId: string;
   tokenId: string;
   burnedToken: Uint8Array;
   nullifier: Uint8Array;
+  /** The lock nonce of the token: the vault keys its spent state by it (`spentNullifier(nonce)` holds the nullifier). */
+  nonce: bigint;
+  /** The redeemable native amount, in wei. */
+  amount: bigint;
   releaseTo: Uint8Array;
-  status: 'burned' | 'submitted' | 'settled';
+  status: 'burned' | 'submitted' | 'redeemed' | 'settled';
+  /** Every `redeem` transaction hash sent for this burn, oldest first. */
+  redeemTxs: string[];
+  /** A claim send was started (journalled BEFORE the send): without `claimTx` its hash may be lost, and no second claim is sent until the host decides (`abandonAttempt`). */
+  claimStarted?: boolean;
+  /** The claim transaction hash (`settled` once it is confirmed). */
+  claimTx?: string;
 }
+
+/** The big-endian unsigned integer of a fixed-width byte string. */
+export const uintOf = (b: Uint8Array): bigint => (b.length === 0 ? 0n : BigInt(`0x${toHex(b)}`));
+
+/** A fresh `burned` entry for a verified return token. */
+const burnedEntry = (burnId: string, tokenId: string, blob: Uint8Array, o: { nullifier: Uint8Array; nonce: bigint; amount: Uint8Array; releaseTo: Uint8Array }): RedemptionEntry =>
+  ({ burnId, tokenId, burnedToken: blob, nullifier: o.nullifier, nonce: o.nonce, amount: uintOf(o.amount), releaseTo: o.releaseTo, status: 'burned', redeemTxs: [] });
 
 export interface RedemptionJournal {
   put(entry: RedemptionEntry): Promise<void>;
@@ -215,7 +237,7 @@ export async function burnForReturn(
     reasonBytes: args.reasonBytes,
     persist: async (blob, burnId) => {
       const v = await plugin.verifyNativeToken(blob, 'return');
-      await payments.journal.put({ burnId, tokenId: args.tokenId, burnedToken: blob, nullifier: v.outcome.nullifier, releaseTo: v.outcome.releaseTo, status: 'burned' });
+      await payments.journal.put(burnedEntry(burnId, args.tokenId, blob, v.outcome));
       await args.persist(blob, burnId);
     },
   });
@@ -230,7 +252,9 @@ export function recoverPendingBurns(plugin: NativeBridgePlugin, payments: Native
     const token = await TokenClass.fromCBOR(blob);
     const data = token.transactions.at(-1)?.data;
     if (!data || !eq(data, pending.reasonBytes)) fail('ErrBurnReason');
-    await payments.journal.put({ burnId, tokenId: pending.tokenId, burnedToken: blob, nullifier: v.outcome.nullifier, releaseTo: v.outcome.releaseTo, status: 'burned' });
+    // an interrupted burn that was already journalled keeps its later state (a redemption may be under way)
+    const known = await payments.journal.get(burnId);
+    if (!known) await payments.journal.put(burnedEntry(burnId, pending.tokenId, blob, v.outcome));
     await persist(blob, burnId);
   });
 }
@@ -263,14 +287,20 @@ export async function buildNativeReturnProof(plugin: NativeBridgePlugin, tokenBy
       return { encoded, nullifier: verified.outcome.nullifier };
     } catch (e) {
       if (!(e instanceof NativeError) || !PAIR_RACE.includes(e.reason)) throw e;
-      if (!source || attempt >= MAX_PROOF_ATTEMPTS) return fail('ErrProofUnavailable');
+      // without a source nothing was refetched, so nothing raced: the held token's own failure stands. With one, the last reason is the cause.
+      if (!source) throw e;
+      if (attempt >= MAX_PROOF_ATTEMPTS) return fail('ErrProofUnavailable', `the fetched (path, certificate) pairs did not verify in ${MAX_PROOF_ATTEMPTS} fetches (last: ${e.reason})`);
     }
   }
 }
 
-/** `claim(uint256 amount, address to)`: the vault's guarded pull payment, as calldata. */
-export function claimCalldata(amount: bigint, to: Uint8Array): Uint8Array {
-  if (to.length !== 20 || amount <= 0n) fail('ErrLockInput');
+/**
+ * `claim(uint256 amount, address to)`: the vault's guarded pull payment, as calldata. An amount that does not fit a word, the zero address
+ * and the vault itself are refused before any gas is paid (the vault would refuse the last two with `BadRecipient`).
+ */
+export function claimCalldata(amount: bigint, to: Uint8Array, vault: Uint8Array): Uint8Array {
+  if (to.length !== 20 || vault.length !== 20 || amount <= 0n || amount >= 1n << 256n) fail('ErrLockInput');
+  if (to.every((b) => b === 0) || eq(to, vault)) fail('ErrLockInput', 'the claim destination is the zero address or the vault');
   const sel = keccak_256(new TextEncoder().encode('claim(uint256,address)')).slice(0, 4);
   const addr = new Uint8Array(32);
   addr.set(to, 12);
@@ -278,8 +308,9 @@ export function claimCalldata(amount: bigint, to: Uint8Array): Uint8Array {
 }
 
 /**
- * Submit `claim`: only the credited recipient can redirect. Settlement is confirmed from the claim
- * receipt and on-chain spent/credit state, never from the wallet burn acknowledgement.
+ * Submit `claim` and return the transaction hash. This only SENDS: it does not wait for the receipt or read `claimable`. Use `claimCredited`
+ * (`lifecycle.ts`) for the journalled path whose settlement is confirmed from the receipt and the balance, never from this call or the burn acknowledgement.
+ * Only the credited recipient can redirect.
  */
 export async function claim(
   send: (tx: { to: Uint8Array; data: Uint8Array }) => Promise<string>,
@@ -287,7 +318,7 @@ export async function claim(
   amount: bigint,
   to: Uint8Array,
 ): Promise<string> {
-  return send({ to: vault, data: claimCalldata(amount, to) });
+  return send({ to: vault, data: claimCalldata(amount, to, vault) });
 }
 
 export { NativeError };

@@ -172,6 +172,30 @@ test('recoverPendingBurns re-journals a settled burn after interruption', async 
   assert.equal((await recoverPendingBurns(plugin, pay, async () => {})).length, 0);
 });
 
+test('recovery after a restart keeps a journalled redemption: state and sent hashes survive, nothing is reset to burned', async () => {
+  const w = makeWorld();
+  const plugin = createNativeBridgePlugin(w.bridge, rev);
+  const be = new Backend(signer(2));
+  const journal = new MemoryRedemptionJournal();
+  const pay = new NativeBridgePayments(plugin, be, journal);
+  const burned = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
+  const pending = { burnId: 'b9', tokenId: 't9', reasonBytes: returnReason(CHAIN_ID, VAULT, ZERO20, w.dep.cfg.ty, w.dep.cfg.aid, recipient20(), spec(1).amount), burnedToken: burned.bytes, settled: true };
+  be.pending = [pending];
+  await recoverPendingBurns(plugin, pay, async () => {});
+  const first = (await journal.get('b9'))!;
+  assert.equal(first.status, 'burned');
+  assert.equal(first.amount, 1000n);
+  assert.deepEqual(first.redeemTxs, []);
+  // a redeem was sent and the process died before the burn was acknowledged again: the burn is pending once more at the next start
+  await journal.put({ ...first, status: 'submitted', redeemTxs: ['0xaa', '0xbb'] });
+  be.pending = [pending];
+  await recoverPendingBurns(plugin, pay, async () => {});
+  const after = (await journal.get('b9'))!;
+  assert.equal(after.status, 'submitted', 'not reset to burned');
+  assert.deepEqual(after.redeemTxs, ['0xaa', '0xbb'], 'the hashes of the sends survive');
+  assert.deepEqual(be.acked, ['b9', 'b9']);
+});
+
 test('mint pre-check verifies the certified EVM lock before submission', async () => {
   const w = makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
@@ -248,7 +272,7 @@ test('SDK context registers the justification verifier and one issuance policy p
 });
 
 test('claim calldata is the guarded pull payment selector and arguments', async () => {
-  const data = claimCalldata(1000n, recipient20());
+  const data = claimCalldata(1000n, recipient20(), VAULT);
   assert.deepEqual(data.slice(0, 4), keccak_256(new TextEncoder().encode('claim(uint256,address)')).slice(0, 4));
   assert.equal(data.length, 4 + 64);
   assert.equal(data[4 + 30], 3);
@@ -256,8 +280,13 @@ test('claim calldata is the guarded pull payment selector and arguments', async 
   let sent: { to: Uint8Array; data: Uint8Array } | null = null;
   await claim((tx) => { sent = tx; return Promise.resolve('0xhash'); }, VAULT, 1000n, recipient20());
   assert.deepEqual(sent!.to, VAULT);
-  assert.throws(() => claimCalldata(0n, recipient20()));
-  assert.throws(() => claimCalldata(1n, new Uint8Array(19)));
+  assert.throws(() => claimCalldata(0n, recipient20(), VAULT));
+  assert.throws(() => claimCalldata(1n, new Uint8Array(19), VAULT));
+  // the amount must fit the word, the destination must be an account the vault will pay
+  assert.deepEqual(claimCalldata((1n << 256n) - 1n, recipient20(), VAULT).slice(4, 36), new Uint8Array(32).fill(255));
+  for (const bad of [1n << 256n, (1n << 256n) + 5n, -1n]) assert.throws(() => claimCalldata(bad, recipient20(), VAULT), /ErrLockInput/);
+  assert.throws(() => claimCalldata(1n, new Uint8Array(20), VAULT), /zero address or the vault/);
+  assert.throws(() => claimCalldata(1n, VAULT, VAULT), /zero address or the vault/);
   void H; void returnReason; void ({} as BridgePayments);
 });
 

@@ -101,3 +101,29 @@ transaction hash; the caller passes it back as `pending` and its receipt is chec
 repeated. A revert is retried up to `maxSends` whatever its cause, so a deterministic refusal (a closed authority interval, bad backing) costs
 `maxSends` transactions. A proof service or chain reader that fails is retried within the attempt bound and reported as `ErrProofUnavailable` with
 the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a freshness or service guarantee.
+
+## From burn to claimed native funds (wallet lifecycle)
+
+The journal entry (`RedemptionEntry`) moves `burned` -> `submitted` -> `redeemed` -> `settled` and every step is written by the plug-in
+(`redeemBurned`, `claimCredited` in `lifecycle.ts`), never inferred from the wallet burn acknowledgement:
+
+- `redeemReturn` asks the vault, before any proof is fetched or the window is judged, whether the token's lock nonce is already credited, so an
+  already executed redemption (a third party's, or an earlier send whose hash was lost) is reported as such even while the proof service is down.
+  This holds with pending hashes too: a hash whose receipt is a success ends the call, a hash with no receipt is believed only when the vault does not
+  show the nonce credited (a dropped transaction never gets a receipt). The
+  vault keys spent state by the lock **nonce**, not the nullifier: `RedeemTransport.spentNullifier(nonce)` returns the burn nullifier the vault stored
+  (`spentNullifier(uint256)`; the nullifier is also an indexed topic of `RedemptionCredited`). A nonce credited to a different burn is `ErrUnexpectedBurn`.
+- The entry is `submitted` before each send and keeps every sent hash (`redeemTxs`); an unconfirmed send leaves it `submitted`, and a restart passes the
+  hashes back so their receipts are checked before any resend. The entry is `redeemed` once the vault credited `releaseTo`.
+- `claimCredited` claims the entry's amount to `to` (an amount that does not fit a word, the zero address and the vault itself are refused before any gas is
+  paid), journals the claim hash, waits for its receipt and reads `claimable(releaseTo)`: the entry is `settled` only when the receipt succeeded AND the
+  balance fell by exactly the claimed amount (a claim resumed from its journalled hash settles on its receipt alone: the balance before is gone). The attempt is
+  journalled before the send; one without a recorded hash (a crash in between) is never repeated automatically, because a second claim would take the same
+  recipient's other credit. A reverted claim leaves the entry `redeemed`; an unconfirmed one keeps its hash and is checked before any resend.
+- A send that is dropped and never mined blocks its entry; there is no inference. The host procedure: establish from its own evidence that the transaction is
+  dead (the sender's nonce was used by another transaction, or it was replaced) and call `abandonAttempt` (a redeem hash, or the claim attempt); the entry then
+  sends again. Wrongly abandoning a pending claim can pay twice, so this is the host's decision, not the plug-in's. The redeem side also recovers by itself once
+  anyone redeems the nonce.
+- A bundle over the anchor, gas or size bound is a budget refusal and is not retried; the refusal carries the measured distinct-anchor count (for the anchor ceiling
+  itself, "N distinct anchors fetched, ceiling 4").
+  Without a proof source a held token that does not verify is reported as the failure it is, not as an unavailable service.

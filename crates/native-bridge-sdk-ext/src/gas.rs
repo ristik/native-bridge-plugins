@@ -161,8 +161,15 @@ pub fn scan_anchor(a: &Anchor, depth: u8) -> Result<AnchorScan> {
     if a.uc.len() > MAX_ANCHOR_UC_BYTES {
         return Err(E::InputTooLarge);
     }
-    // Whatever the shape failure, B1 would not authenticate this certificate (oracle `ErrAnchorAuth`).
-    scan_uc(a, depth).map_err(|_| E::AnchorAuth)
+    // An over-bound certificate is the budget family (the chain says BudgetExceeded); whatever other shape failure, B1 would not
+    // authenticate this certificate (oracle `ErrAnchorAuth`).
+    scan_uc(a, depth).map_err(|e| {
+        if e == E::TooManyItems {
+            e
+        } else {
+            E::AnchorAuth
+        }
+    })
 }
 
 fn scan_uc(a: &Anchor, depth: u8) -> Result<AnchorScan> {
@@ -194,7 +201,7 @@ fn scan_uc(a: &Anchor, depth: u8) -> Result<AnchorScan> {
     pos = skip(b, pos)?; // partition
     let (steps, next) = count(b, pos, 4)?;
     if steps > MAX_UNICITY_STEPS {
-        return Err(E::Shape);
+        return Err(E::TooManyItems);
     }
     pos = next;
     for _ in 0..steps {
@@ -206,7 +213,7 @@ fn scan_uc(a: &Anchor, depth: u8) -> Result<AnchorScan> {
     }
     let (sigs, _) = count(b, pos, 5)?;
     if sigs > MAX_SIGNATURES {
-        return Err(E::Shape);
+        return Err(E::TooManyItems);
     }
     let steps_total = (siblings + steps) as u64;
     Ok(AnchorScan {

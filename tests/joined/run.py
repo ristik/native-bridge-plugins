@@ -28,6 +28,15 @@ def git(path, *args):
     return subprocess.check_output(['git', '-C', str(path), *args], text=True).strip()
 
 
+PLUGIN_PATHS = ('packages', 'crates', 'protocol', 'package-lock.json')
+
+
+def plugin_tree():
+    """sha256 of the blob listing of the plug-in implementation and corpus at HEAD (independent of commit ancestry)."""
+    listing = subprocess.check_output(['git', '-C', str(ROOT), 'ls-tree', '-r', 'HEAD', '--', *PLUGIN_PATHS], text=True)
+    return hashlib.sha256(listing.encode()).hexdigest()
+
+
 def validate_source(path, expected):
     if git(path, 'rev-parse', 'HEAD') != expected:
         raise ValueError(f'{path}: expected exact commit {expected}')
@@ -135,9 +144,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sources', type=Path, default=ROOT.parent,
                         help='parent of nbp-pr6-{ureth,contracts,oracle,aggregator} pinned clean worktrees')
-    parser.add_argument('--out', type=Path, required=True, help='new evidence directory (must not exist)')
+    parser.add_argument('--out', type=Path, help='new evidence directory (must not exist)')
+    parser.add_argument('--print-plugin-tree', action='store_true', help='print the pluginsTree value for pins.json and exit')
     parser.add_argument('--skip-native', action='store_true', help='record Rust/B2/Foundry as NOT RUN')
     args = parser.parse_args()
+    if args.print_plugin_tree:
+        print(plugin_tree())
+        return 0
+    if args.out is None:
+        parser.error('--out is required')
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     sources = {k: args.sources.resolve() / f'nbp-pr6-{k}' for k in PINS['sources'] if k != 'plugins'}
@@ -186,10 +201,10 @@ def main():
     try:
         for key, path in sources.items():
             validate_source(path, PINS['sources'][key])
-        if git(ROOT, 'merge-base', 'HEAD', PINS['sources']['plugins']) != PINS['sources']['plugins']:
-            raise ValueError('plug-in baseline must be an ancestor of this harness')
-        if git(ROOT, 'diff', PINS['sources']['plugins'], '--', 'packages', 'crates', 'protocol', 'package-lock.json'):
-            raise ValueError('plug-in implementation/corpus differs from the accepted baseline')
+        # The plug-in code under test is identified by the content of its paths (blob ids), not by a commit: a squash merge keeps the content and
+        # loses the commit, so a commit pin goes red on main the moment its PR is merged. `sources.plugins` stays as the recorded provenance only.
+        if plugin_tree() != PINS['pluginsTree']:
+            raise ValueError('plug-in implementation/corpus differs from the accepted baseline (pluginsTree); update tests/joined/pins.json with `python3 tests/joined/run.py --print-plugin-tree`')
         save()
         env = dict(os.environ, CARGO_BUILD_JOBS='2', GOMAXPROCS='2')
         with tempfile.TemporaryDirectory(prefix='nbp-pr6-cache-') as scratch:
