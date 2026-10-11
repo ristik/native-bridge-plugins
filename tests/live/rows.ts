@@ -65,6 +65,9 @@ assert.ok(/^[0-9a-f]{64}$/.test(attestation.sha256) && /^[0-9a-f]{40}$/.test(att
 const evidence: { ureth: unknown; rows: Record<string, unknown>[] } = { ureth: attestation, rows: [] };
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const json = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x));
+// ROWS_ONLY=anchors,refusals,bound,malformed,gas,wallet,restart runs just those groups (a resumed or focused run; the evidence run runs all)
+const ONLY = process.env.ROWS_ONLY ? new Set(process.env.ROWS_ONLY.split(',')) : null;
+const on = (g: string): boolean => ONLY === null || ONLY.has(g);
 const failedRows: string[] = [];
 /** Shapes this devnet cannot produce by construction (not failures): the measurement is the result. */
 const limitRows: Record<string, unknown>[] = [];
@@ -379,36 +382,36 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
 }
 
 // 1 anchor: every leaf in one shard, current proofs.
-{
+if (on('anchors')) {
   const b = await buildToken(3, 'same', ['same']);
   const t = await mix(b.token, [true, true, true]);
   await acceptedRow('anchors=1 (one shard, one UC)', t, 1);
 }
 // 2 anchors: leaves of both shards, current proofs: one UC per shard.
-{
+if (on('anchors')) {
   const b = await buildToken(3, 'same', ['other']);
   const t = await mix(b.token, [true, true, true]);
   await acceptedRow('anchors=2 (two shards, one UC each)', t, 2);
 }
 // several UCs on ONE shard: the mint's own round for leaf 0, a later round for the rest, all in one shard.
-{
+if (on('anchors')) {
   const w = await inWindow('anchors=2 one shard', async () => mix((await buildToken(3, 'same', ['same'])).token, [false, true, true]));
   if (w.token) await acceptedRow('anchors=2 (two different-round UCs of ONE shard)', w.token, 2);
   else infeasible('anchors=2 (two different-round UCs of ONE shard)', 'mint in its own round, later leaves in a later round, one shard', w.spans);
 }
 // 3 and 4 anchors: every leaf under the proof served when it was certified (its own round), mixed shards, several on one shard.
-{
+if (on('anchors')) {
   const w = await inWindow('anchors=3', async () => mix((await buildToken(3, 'same', ['other'])).token, [false, false, false]));
   if (w.token) await acceptedRow('anchors=3 (own-round proofs)', w.token, 3);
   else infeasible('anchors=3 (own-round proofs)', 'three leaves, each under the certificate of its own round', w.spans);
 }
-{
+if (on('anchors')) {
   const w = await inWindow('anchors=4', async () => mix((await buildToken(4, 'same', ['other', 'same'])).token, [false, false, false, false]));
   if (w.token) await acceptedRow('anchors=4 (own-round proofs, several on one shard)', w.token, 4);
   else infeasible('anchors=4 (own-round proofs, several on one shard)', 'four leaves, each under the certificate of its own round', w.spans);
 }
 // 5th anchor refused: by the plug-in before submission, and by the chain for the same bundle assembled without the plug-in's bounds.
-{
+if (on('refusals')) {
   // the anchor count is refused before any certificate is judged, so the proofs need not be inside the window
   const t = await mix((await buildToken(5, 'same', ['other', 'same', 'other'])).token, [false, false, false, false, false]);
   assert.equal(distinctUcs(t).length, MAX_ANCHORS + 1);
@@ -423,13 +426,13 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
     { plugin, chain: revert, gasUsed: BigInt(rc.gasUsed), creditUnchanged: claimable() === before });
 }
 // 16 leaves (the bound) redeem; 17 leaves are refused by the burn-time preflight and by the chain.
-{
+if (on('bound')) {
   const b = await buildToken(MAX_LEAVES, 'same', Array.from({ length: MAX_LEAVES - 3 }, (_, i) => (i % 2 ? 'same' : 'other')));
   const t = await mix(b.token, Array(MAX_LEAVES).fill(true));
   const o = await acceptedRow(`leaves=${MAX_LEAVES} (the bound, worst real bundle)`, t, 2);
   record('worst admitted real bundle: gas against the gate', o.gasUsed <= BigInt(o.gate), { gasUsed: o.gasUsed, gate: o.gate, budget: TX_GAS_BUDGET, reserveLeft: BigInt(o.gate) - o.gasUsed });
 }
-{
+if (on('bound')) {
   const b = await buildToken(MAX_LEAVES + 1, 'same', Array.from({ length: MAX_LEAVES - 2 }, (_, i) => (i % 2 ? 'same' : 'other')));
   let pre = 'NO REFUSAL';
   try { await preflightBurn(bridge, b.token.toCBOR()); } catch (e) { pre = (e as { reason?: string }).reason ?? String(e); }
@@ -462,7 +465,7 @@ const nativeCallsOf = async (txHash: string): Promise<{ to: string; valid: boole
   walk(t);
   return out;
 };
-{
+if (on('malformed')) {
   const b = await buildToken(3, 'same', ['other']);
   for (const [what, edit, want, nCalls] of [
     ['flipped byte', (uc: Uint8Array) => uc.length >> 1, 'UCRejected()', 2],
@@ -489,7 +492,7 @@ const nativeCallsOf = async (txHash: string): Promise<{ to: string; valid: boole
 // including the 63/64 forwarding rule), a send with N-1 must run out of gas (consume its whole limit, anchors in the window at its execution
 // block, nothing credited), and then the same token's refetched proofs are sent with N + headroom and must redeem. Envelope sizes are the same
 // for the same token, so N from the first envelope bounds the second to within the headroom.
-{
+if (on('gas')) {
   const a = await buildToken(3, 'same', ['other']);
   const oa = await acceptedRow('gas: reference redemption (two anchors)', await mix(a.token, [true, true, true]), 2);
   const b = await buildToken(3, 'same', ['other']);
@@ -499,7 +502,7 @@ const nativeCallsOf = async (txHash: string): Promise<{ to: string; valid: boole
     return { t, built };
   };
   const p1 = await prepare();
-  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data: cast('calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`) }, 'latest']));
+  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data: run('cast', ['calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`]) }, 'latest']));
   const win1 = await waitWindow(p1.t);
   const before = claimable();
   const lowLimit = N - 1n;
@@ -589,6 +592,7 @@ const liveTransport = (m: WalletMetrics, nonce: bigint, delayFirstSendMs = 0): R
 };
 const walletPolicy = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...DEFAULT_REDEEM, margin: BigInt(EXEC_MARGIN), receiptTimeoutMs: 60_000, ...over });
 async function walletRow(name: string, limitOk: boolean, body: (m: WalletMetrics) => Promise<{ ok: boolean; data: Record<string, unknown> }>): Promise<void> {
+  if (!on('wallet')) return;
   const m = newMetrics();
   try {
     const { ok, data } = await body(m);
@@ -676,7 +680,7 @@ for (const [want, rels] of [[3, ['same']], [4, ['same', 'same']]] as const) {
 
 // Restart and recovery of a pending redemption: burn certified and persisted, both aggregators restarted, proofs fetched again, redeem, then every
 // validator restarted between redeem and claim, and the claim paid.
-{
+if (on('restart')) {
   assert.ok(process.env.DNB_REPO, 'the restart row needs DNB_REPO (the bft-core checkout with scripts/dnb-devnet.sh)');
   const sh = `${process.env.DNB_REPO}/scripts/dnb-devnet.sh`;
   const b = await buildToken(3, 'same', ['other']);
