@@ -374,7 +374,12 @@ pub fn parse_input_record(raw: &[u8]) -> Result<InputRecordOpening> {
             }
         }
     }
-    k[5].nullable_bytes()?; // summary value: null or bytes
+    // summary value: null or bytes, at most the native sublimit (the chain refuses more)
+    if let Some(s) = k[5].nullable_bytes()? {
+        if s.len() > MAX_IR_SUMMARY_BYTES {
+            return Err(E::ProofTooLarge);
+        }
+    }
     k[8].uint()?; // fees
     Ok(InputRecordOpening {
         round: k[1].uint()?,

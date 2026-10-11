@@ -16,7 +16,13 @@ import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, sha, spec, txSt
 
 const T0 = 1_700_000_040n;
 const UC_TS = 1_700_000_900n;
-const ret = (w: World) => buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
+// the vault's stored nullifier for the token last built (the vault keys spent state by nonce and stores the nullifier)
+let currentNullifier: Uint8Array = new Uint8Array(32);
+const ret = async (w: World) => {
+  const out = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
+  currentNullifier = (await w.bridge.verifyNativeToken(out.token, 'return')).outcome.nullifier;
+  return out;
+};
 // the held token's anchors are in root round 900; a refetch answers in `round`
 async function proofsAt(w: World, out: Awaited<ReturnType<typeof ret>>, round: bigint, extra = 0): Promise<InclusionProof[]> {
   const old = [out.token.genesis, ...out.token.transactions].map((c) => c.inclusionProof);
@@ -118,6 +124,22 @@ test('a bound overflow is a budget refusal, never freshness, never retried', asy
   const source = async (): Promise<InclusionProof[]> => (++fetches, [three.token.genesis, ...three.token.transactions].map((c) => c.inclusionProof));
   await rejects(buildFreshReturnProof(plugin, three.bytes, source, chainAt([910n]), fast), 'ErrTooManyPaths');
   assert.equal(fetches, 1);
+  // the refusal says how far over the ceiling the fetched bundle was
+  const err = await buildFreshReturnProof(plugin, three.bytes, source, chainAt([910n]), fast).then(() => undefined, (e: unknown) => e);
+  assert.ok(err instanceof NativeError && err.family === 'budget' && err.detail === `${anchorRounds(three.token).length} distinct anchors fetched, ceiling 4; not retried`, String((err as NativeError).detail));
+});
+
+test('a bug or a bad policy in the pure classification is not reported as an unavailable origin and is not retried', async () => {
+  const w = makeWorld();
+  const out = await ret(w);
+  const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
+  let reads = 0;
+  // the policy passes the up-front check (two reads of the margin) and is invalid by the time the bundle is classified
+  const policy = { ...fast, get margin(): bigint { return ++reads <= 2 ? 6n : 99n; } };
+  let fetches = 0;
+  const err = await buildFreshReturnProof(plugin, out.bytes, async () => (++fetches, proofsAt(w, out, 950n)), chainAt([952n]), policy).then(() => undefined, (e: unknown) => e);
+  assert.ok(err instanceof RangeError, String(err));
+  assert.equal(fetches, 1);
 });
 
 class Vault implements RedeemTransport {
@@ -137,9 +159,32 @@ class Vault implements RedeemTransport {
     const step = this.script[Number(hash.slice(2)) - 1];
     return Promise.resolve(step === 'success' ? 'success' : step === 'reverted' ? 'reverted' : undefined);
   }
-  public redeemed(): Promise<boolean> { return Promise.resolve(this.spent); }
+  /** The nullifier the vault stored for the nonce (the token's own unless a test says another burn took it). */
+  public stored: Uint8Array | undefined;
+  public spentNullifier(): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent ? (this.stored ?? currentNullifier) : undefined); }
 }
 const rp = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...fast, maxSends: 3, receiptTimeoutMs: 10, now: (() => { let n = 0; return () => (n += 4); })(), ...over });
+
+test('redeem: a redemption the vault already credited is reported as such before any proof is fetched, whatever the proof service or the window say', async () => {
+  const w = makeWorld();
+  const out = await ret(w);
+  const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
+  const done = new Vault([]);
+  done.spent = true;
+  let fetches = 0;
+  const down = async (): Promise<InclusionProof[]> => { fetches++; throw new Error('proof service down'); };
+  const deadChain: ChainReader = { wCert: () => Promise.resolve(15n), origin: () => Promise.reject(new Error('rpc down')) };
+  const r = await redeemReturn(plugin, out.bytes, down, deadChain, done, rp());
+  assert.equal(r.status, 'already-redeemed');
+  assert.equal(fetches, 0);
+  assert.equal(done.sent.length, 0);
+  // a lock nonce the vault credited to a DIFFERENT burn is not this token's redemption
+  const other = new Vault([]);
+  other.spent = true;
+  other.stored = new Uint8Array(32).fill(7);
+  await rejects(redeemReturn(plugin, out.bytes, down, deadChain, other, rp()), 'ErrUnexpectedBurn');
+  assert.equal(fetches, 0);
+});
 
 test('redeem: a revert refetches the same token and resends; a settled redemption is never sent again', async () => {
   const w = makeWorld();

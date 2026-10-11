@@ -19,7 +19,8 @@ import { buildReturnProof, refreshToken } from './proof.js';
 import { preflightToken } from './resources.js';
 import { PAIR_RACE, type NativeBridgePlugin, type ProofSource } from './wallet.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
-import { toHex } from './bytes.js';
+import { eq, toHex } from './bytes.js';
+import { MAX_ANCHORS } from './limits.js';
 
 /** What the chain says about the window, read by the host from the registry and the pinned profile (`b1.wCert`). */
 export interface ChainReader {
@@ -133,7 +134,14 @@ export async function buildFreshReturnProof(
     }
     try {
       token = await refreshToken(held, fetched);
-      built = await buildReturnProof(plugin.bridge, token);
+      try {
+        built = await buildReturnProof(plugin.bridge, token);
+      } catch (e) {
+        // A bundle over the anchor, gas or size bound is a budget refusal, never retried (a refetch must not be used to make certificates converge or
+        // to obtain fewer anchors): report the measured count so the host can see how far over it was.
+        if (e instanceof NativeError && e.family === 'budget') throw new NativeError(e.reason, `${anchorRounds(token).length} distinct anchors fetched, ceiling ${MAX_ANCHORS}; not retried`);
+        throw e;
+      }
     } catch (e) {
       // a (path, UC) pair that raced a certificate: another fetch; any other failure (budget, invalid, mismatch) is the caller's
       if (e instanceof NativeError && PAIR_RACE.includes(e.reason)) {
@@ -144,21 +152,28 @@ export async function buildFreshReturnProof(
     }
     const rounds = anchorRounds(token);
     const deadline = now() + policy.maxOriginWaitMs;
-    let origin: bigint;
-    let verdict: Freshness;
-    try {
-      origin = await chain.origin();
-      verdict = classifyFreshness(rounds, origin, wCert, policy.margin);
-      while (verdict === 'future' && now() < deadline) {
-        await sleep(policy.pollMs);
-        origin = await chain.origin();
-        verdict = classifyFreshness(rounds, origin, wCert, policy.margin);
+    // only the host's own read is guarded: the classification is pure code, and a bug or a bad policy there must not read as an unavailable origin
+    const readOrigin = async (): Promise<bigint | undefined> => {
+      try {
+        return await chain.origin();
+      } catch (e) {
+        if (e instanceof NativeError) throw e;
+        cause = `origin unavailable (${String((e as Error)?.message ?? e).slice(0, 120)})`;
+        return undefined;
       }
-    } catch (e) {
-      if (e instanceof NativeError) throw e;
-      cause = `origin unavailable (${String((e as Error)?.message ?? e).slice(0, 120)})`;
-      continue;
+    };
+    let origin = await readOrigin();
+    if (origin === undefined) continue;
+    let verdict = classifyFreshness(rounds, origin, wCert, policy.margin);
+    let lost = false;
+    while (verdict === 'future' && now() < deadline) {
+      await sleep(policy.pollMs);
+      const again = await readOrigin();
+      if (again === undefined) { lost = true; break; }
+      origin = again;
+      verdict = classifyFreshness(rounds, origin, wCert, policy.margin);
     }
+    if (lost) continue;
     if (verdict === 'ok') return { encoded: built.encoded, nullifier: built.verified.outcome.nullifier, rounds, origin, wCert, attempts: attempt };
     cause = `${verdict} (rounds ${rounds.join(',')}, origin ${origin}, W_cert ${wCert}, margin ${policy.margin})`;
     if (verdict === 'future') break; // the registry has not imported the newest anchor within the wait: refetching cannot make it older
@@ -172,8 +187,18 @@ export interface RedeemTransport {
   send(data: Uint8Array): Promise<string>;
   /** The receipt of a sent transaction: undefined while it is not mined. */
   receipt(txHash: string): Promise<'success' | 'reverted' | undefined>;
-  /** The vault's spent / credit state for this nullifier: true once the redemption has been executed. */
-  redeemed(nullifier: Uint8Array): Promise<boolean>;
+  /**
+   * The vault's spent state for a lock nonce: `spentNullifier(nonce)`, the burn nullifier the vault stored when it credited that nonce. The
+   * vault keys spent state by NONCE and keeps the nullifier as the stored value (and as an indexed topic of `RedemptionCredited`); it has no
+   * nullifier-keyed lookup. `undefined` or an all-zero word: not redeemed. A host that only has the logs may answer from `RedemptionCredited`.
+   */
+  spentNullifier(nonce: bigint): Promise<Uint8Array | undefined>;
+}
+
+/** What `redeemReturn` tells the host's journal, in order: before every send, and with its hash (undefined when the send failed without one). */
+export interface RedeemObserver {
+  beforeSend?(): Promise<void>;
+  sent?(txHash: string | undefined): Promise<void>;
 }
 
 export interface RedeemPolicy extends FreshnessPolicy {
@@ -199,14 +224,30 @@ export class RedemptionUnconfirmed extends NativeError {
   }
 }
 
+/** The identity the vault knows a return token by: its lock nonce (the spent-state key) and its burn nullifier (the stored value). Needs no aggregator proof. */
+export async function returnIdentity(plugin: NativeBridgePlugin, tokenBytes: Uint8Array): Promise<{ nonce: bigint; nullifier: Uint8Array }> {
+  preflightToken(tokenBytes);
+  const v = await plugin.bridge.verifyNativeToken(await Token.fromCBOR(tokenBytes), 'return');
+  return { nonce: v.outcome.nonce, nullifier: v.outcome.nullifier };
+}
+
+/** Whether the vault has already credited this token's lock nonce. A nonce credited to ANOTHER burn can never be redeemed by this token: `ErrUnexpectedBurn`. */
+async function isRedeemed(transport: RedeemTransport, id: { nonce: bigint; nullifier: Uint8Array }): Promise<boolean> {
+  const stored = await transport.spentNullifier(id.nonce);
+  if (stored === undefined || stored.every((b) => b === 0)) return false;
+  if (!eq(stored, id.nullifier)) fail('ErrUnexpectedBurn', `lock nonce ${id.nonce} is already redeemed by a different burn`);
+  return true;
+}
+
 /**
- * Redeem a burned token. Before anything is built, every hash in `pending` (an earlier unconfirmed send) is checked: a success
- * ends the call, a transaction still pending leaves the call unconfirmed again with no new send, a revert is dropped. Before every
- * send the vault's state is read: an already executed redemption is not sent again. After a send the receipt and the vault state,
- * never the RPC's answer alone, decide the next step: an RPC timeout is not a revert. A revert refetches every proof for the same
- * token and sends again, within `maxSends`, whatever its cause: a deterministic refusal (a closed authority interval, bad backing)
- * therefore costs `maxSends` transactions. A send whose outcome is unknown is never repeated while it may still be pending (see
- * `RedemptionUnconfirmed`). The wallet burn is never repeated.
+ * Redeem a burned token. The vault is asked FIRST, before any proof is fetched and before the freshness window is judged: an already executed
+ * redemption (a third party's, or an earlier send of ours whose hash was lost) is reported as such even when the proof service is down or the
+ * window cannot be met. Then every hash in `pending` (an earlier unconfirmed send) is checked: a success ends the call, a transaction still
+ * pending leaves the call unconfirmed again with no new send, a revert is dropped. Before every send the vault's state is read again. After a send
+ * the receipt and the vault state, never the RPC's answer alone, decide the next step: an RPC timeout is not a revert. A revert refetches every
+ * proof for the same token and sends again, within `maxSends`, whatever its cause: a deterministic refusal (a closed authority interval, bad
+ * backing) therefore costs `maxSends` transactions. A send whose outcome is unknown is never repeated while it may still be pending (see
+ * `RedemptionUnconfirmed`). The wallet burn is never repeated. `observer` lets the host journal each step (`beforeSend`, `sent`).
  */
 export async function redeemReturn(
   plugin: NativeBridgePlugin,
@@ -216,39 +257,44 @@ export async function redeemReturn(
   transport: RedeemTransport,
   policy: RedeemPolicy = DEFAULT_REDEEM,
   pending: readonly string[] = [],
+  observer: RedeemObserver = {},
 ): Promise<RedeemResult> {
   const sleep = policy.sleep ?? realSleep;
   const now = policy.now ?? Date.now;
   checkPolicy(policy, await chain.wCert(), policy.maxSends);
+  const id = await returnIdentity(plugin, tokenBytes);
+  const nullifier = id.nullifier;
   for (const h of pending) {
     const r = await transport.receipt(h);
-    if (r === 'success') return { status: 'redeemed', txHash: h, nullifier: (await plugin.bridge.verifyNativeToken(await Token.fromCBOR(tokenBytes), 'return')).outcome.nullifier, sends: 0 };
+    if (r === 'success') return { status: 'redeemed', txHash: h, nullifier, sends: 0 };
     if (r === undefined) throw new RedemptionUnconfirmed(h);
   }
+  if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends: 0 };
   for (let sends = 0; sends < policy.maxSends; ) {
     const proof = await buildFreshReturnProof(plugin, tokenBytes, source, chain, policy, policy.maxSends);
-    const nullifier = proof.nullifier;
-    if (await transport.redeemed(nullifier)) return { status: 'already-redeemed', nullifier, sends };
+    if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends };
     sends++;
+    await observer.beforeSend?.();
     let txHash: string | undefined;
     try {
       txHash = await transport.send(proof.encoded);
     } catch {
       txHash = undefined; // unknown: it may have been accepted
     }
+    await observer.sent?.(txHash);
     const deadline = now() + policy.receiptTimeoutMs;
     let outcome: 'success' | 'reverted' | undefined;
     for (;;) {
       if (txHash !== undefined) outcome = await transport.receipt(txHash);
       if (outcome !== undefined) break;
-      if (await transport.redeemed(nullifier)) { outcome = 'success'; break; }
+      if (await isRedeemed(transport, id)) { outcome = 'success'; break; }
       if (now() >= deadline) break;
       await sleep(policy.pollMs);
     }
     if (outcome === 'success') return { status: 'redeemed', txHash, nullifier, sends };
     if (outcome === undefined) throw new RedemptionUnconfirmed(txHash); // it may still be pending: not sent again
     // reverted: someone else (or an earlier transaction of ours) may have redeemed it, otherwise the proofs were refused: refetch and send again
-    if (await transport.redeemed(nullifier)) return { status: 'already-redeemed', nullifier, sends };
+    if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends };
   }
   return fail('ErrProofUnavailable', `redemption reverted ${policy.maxSends} times`);
 }

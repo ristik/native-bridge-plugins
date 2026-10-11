@@ -586,7 +586,7 @@ const liveSource = (m: WalletMetrics, between?: (i: number) => Promise<void>, di
   m.fetches.push({ ms: Date.now() - t, rounds: roundsOfProofs(proofs) });
   return proofs;
 };
-const liveTransport = (m: WalletMetrics, nonce: bigint, delayFirstSendMs = 0): RedeemTransport => {
+const liveTransport = (m: WalletMetrics, _nonce: bigint, delayFirstSendMs = 0): RedeemTransport => {
   let n = 0;
   return {
     send: async (data) => {
@@ -611,7 +611,8 @@ const liveTransport = (m: WalletMetrics, nonce: bigint, delayFirstSendMs = 0): R
       }
       return r.status === '0x1' ? 'success' : 'reverted';
     },
-    redeemed: () => Promise.resolve(BigInt(`0x${hex(unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString())))}`) !== 0n),
+    // the vault keys spent state by the lock nonce the plug-in asks about and stores the burn nullifier as the value
+    spentNullifier: (n) => Promise.resolve(unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', n.toString()))),
   };
 };
 const walletPolicy = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...DEFAULT_REDEEM, margin: BigInt(EXEC_MARGIN), receiptTimeoutMs: 60_000, ...over });

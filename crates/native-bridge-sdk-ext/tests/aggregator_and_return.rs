@@ -173,6 +173,35 @@ fn input_record_opening_rejects_wrong_shape() {
         parse_input_record(&vec![0u8; 513]).unwrap_err(),
         E::InputTooLarge
     );
+    // the summary value is bounded by the native sublimit the chain enforces (256 bytes)
+    let ir_with = |summary: usize| {
+        let one = encode_uint(1);
+        let null = encode_null();
+        let hash = encode_bytes(&[0u8; 32]);
+        let sum = encode_bytes(&vec![0u8; summary]);
+        let zero = encode_uint(0);
+        let parts: [&[u8]; 10] = [&one, &one, &one, &null, &hash, &sum, &zero, &null, &zero, &null];
+        encode_tag(39002, &encode_array(&parts))
+    };
+    assert_eq!(parse_input_record(&ir_with(256)).unwrap().state_hash, vec![0u8; 32]);
+    assert_eq!(parse_input_record(&ir_with(257)).unwrap_err(), E::ProofTooLarge);
+}
+
+#[test]
+fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_an_invalid_one() {
+    let w = make_world(20);
+    let env = build_return_proof(&w.bridge, &ret(&w).token).unwrap().0;
+    let a = &env.anchors[0];
+    // 33 unicity steps (the bound is 32): spliced into the certificate's empty step list
+    let at = a.uc.windows(4).position(|x| x == [0xd9, 0x98, 0x5c, 0x83]).expect("the unicity tree certificate");
+    let head = at + 4 + 1 + 1; // tag, array(3), version, partition (both one byte here)
+    assert_eq!(a.uc[head], 0x80, "an empty step list");
+    let mut over = a.clone();
+    over.uc = [&a.uc[..head], &[0x98, 33], &[0xf6u8; 33], &a.uc[head + 1..]].concat();
+    assert_eq!(scan_anchor(&over, 0).unwrap_err(), E::TooManyItems);
+    let mut cut = a.clone();
+    cut.uc.truncate(20);
+    assert_eq!(scan_anchor(&cut, 0).unwrap_err(), E::AnchorAuth);
 }
 
 #[test]

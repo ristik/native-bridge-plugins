@@ -8,7 +8,7 @@
 import { concat, eq, toHex } from './bytes.js';
 import { fail } from './errors.js';
 import {
-  MAX_ANCHORS, MAX_ANCHOR_UC_BYTES, MAX_ENVELOPE_BYTES, MAX_INPUT_RECORD_BYTES, MAX_LEAVES, MAX_PATH_STEPS, MAX_POLICY_BYTES,
+  MAX_ANCHORS, MAX_ANCHOR_UC_BYTES, MAX_ENVELOPE_BYTES, MAX_INPUT_RECORD_BYTES, MAX_IR_SUMMARY_BYTES, MAX_LEAVES, MAX_PATH_STEPS, MAX_POLICY_BYTES,
   MAX_RSMT_SIBLINGS, TAG_INPUT_RECORD,
 } from './limits.js';
 import { H, decodePolicy, policyBytes, shardId, shardRow, type Cfg, type Policy } from './profile.js';
@@ -254,7 +254,8 @@ export function parseInputRecord(raw: Uint8Array): InputRecordOpening {
     const v = nullableBytes(k[i]);
     if (v !== null && v.length !== 32) fail('ErrLength');
   }
-  nullableBytes(k[5]); // summary value: null or bytes
+  const summary = nullableBytes(k[5]); // summary value: null or bytes, at most the native sublimit (the chain refuses more)
+  if (summary !== null && summary.length > MAX_IR_SUMMARY_BYTES) fail('ErrProofTooLarge');
   uint(k[8]);
   return { round: uint(k[1]), epoch: uint(k[2]), stateHash: bytesN(k[4], 32), timestamp: uint(k[6]) };
 }

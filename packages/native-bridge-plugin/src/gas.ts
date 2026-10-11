@@ -4,7 +4,7 @@
  * Every term is the native price of a call the composing verifier makes, computed from complete
  * bounded scans, never from caller-declared costs. It is an admission rule, not a measured fit.
  */
-import { fail } from './errors.js';
+import { NativeError, fail } from './errors.js';
 import type { Anchor, Envelope, LeafProof } from './envelope.js';
 import {
   MAX_ANCHOR_UC_BYTES, MAX_PATH_STEPS, MAX_RSMT_SIBLINGS, MAX_SIGNATURES, MAX_UNICITY_STEPS, GAS_RESERVE, TX_GAS_BUDGET,
@@ -126,8 +126,10 @@ export function scanAnchor(a: Anchor, depth: number): AnchorScan {
   if (a.uc.length > MAX_ANCHOR_UC_BYTES) fail('ErrInputTooLarge');
   try {
     return scanUc(a, depth);
-  } catch {
-    // Whatever the shape failure, B1 would not authenticate this certificate (oracle `ErrAnchorAuth`).
+  } catch (e) {
+    // an over-bound certificate is the budget family (the chain says BudgetExceeded), not an invalid one
+    if (e instanceof NativeError && e.family === 'budget') throw e;
+    // Whatever other shape failure, B1 would not authenticate this certificate (oracle `ErrAnchorAuth`).
     return fail('ErrAnchorAuth');
   }
 }
@@ -149,13 +151,13 @@ function scanUc(a: Anchor, depth: number): AnchorScan {
   pos = skip(b, pos); // version
   pos = skip(b, pos); // partition
   const steps = count(b, pos, 4);
-  if (steps.n > MAX_UNICITY_STEPS) fail('ErrShape');
+  if (steps.n > MAX_UNICITY_STEPS) fail('ErrTooManyItems');
   pos = steps.next;
   for (let i = 0; i < steps.n; i++) pos = skip(b, pos);
   pos = tagged(b, pos, TAG_SEAL, 8n);
   for (let i = 0; i < 7; i++) pos = skip(b, pos);
   const sigs = count(b, pos, 5);
-  if (sigs.n > MAX_SIGNATURES) fail('ErrShape');
+  if (sigs.n > MAX_SIGNATURES) fail('ErrTooManyItems');
   const request = UC_REQUEST_FIXED + a.shard.length + b.length;
   const stepsTotal = sib.n + steps.n;
   return { request, sigs: sigs.n, steps: stepsTotal, gas: ucGas(a.shard.length, b.length, sigs.n, stepsTotal) };

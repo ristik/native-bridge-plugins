@@ -41,6 +41,8 @@ export const MAX_MPT_NODES = 65;
 export const MAX_MPT_NODE_BYTES = 1 << 10;
 export const MAX_MPT_TOTAL_BYTES = 24 << 10;
 export const MAX_INPUT_RECORD_BYTES = 512;
+/** The native sublimit of the certified input record's summary value (`InputRecord._scan`, `resources.ts`). */
+export const MAX_IR_SUMMARY_BYTES = 256;
 export const MAX_TOKEN_BYTES = 2 << 20;
 
 export const TAG_PREDICATE = 39032n;
