@@ -38,6 +38,7 @@ import { projectToken } from '../../packages/native-bridge-plugin/src/history.js
 import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../../packages/native-bridge-plugin/src/limits.js';
 import { DEFAULT_REDEEM, redeemReturn, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../../packages/native-bridge-plugin/src/freshness.js';
 import { createNativeBridgePlugin, type ProofSource } from '../../packages/native-bridge-plugin/src/wallet.js';
+import { minimalGas } from './gassearch.js';
 import { buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
 import { arr, bs, returnReason, decodeCfg, decodePolicy, shardId, shardRow, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, policyBytes, u, valueEnvelope, H } from '../../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
@@ -62,7 +63,7 @@ assert.ok(lane.aggUrls && lane.aggUrls.length === 2, 'rows.ts needs the two-shar
 // The attested ureth binary (sha256 and reported commit) checked by `dnb-devnet.sh up`; a lane without it is not evidence.
 const attestation = JSON.parse(readFileSync(`${lane.dir}/ureth-attestation.json`, 'utf8')) as { sha256: string; commit: string };
 assert.ok(/^[0-9a-f]{64}$/.test(attestation.sha256) && /^[0-9a-f]{40}$/.test(attestation.commit), 'ureth attestation is complete');
-const evidence: { ureth: unknown; rows: Record<string, unknown>[] } = { ureth: attestation, rows: [] };
+const evidence: { ureth: unknown; groups: string; rows: Record<string, unknown>[] } = { ureth: attestation, groups: process.env.ROWS_ONLY ?? 'all', rows: [] };
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const json = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x));
 // ROWS_ONLY=anchors,refusals,bound,malformed,gas,wallet,restart runs just those groups (a resumed or focused run; the evidence run runs all)
@@ -73,6 +74,8 @@ const failedRows: string[] = [];
 const groupFailed = (group: string, e: unknown): void => {
   failedRows.push(`${group}: ${(e as { reason?: string }).reason ?? String(e).slice(0, 160)}`);
   console.log(`FAIL group ${group}`, String(e).slice(0, 600));
+  evidence.rows.push({ row: `group ${group}`, ok: false, error: String(e).slice(0, 600) });
+  writeFileSync(`${lane.dir}/rows-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
 };
 /** Shapes this devnet cannot produce by construction (not failures): the measurement is the result. */
 const limitRows: Record<string, unknown>[] = [];
@@ -493,10 +496,10 @@ if (on('malformed')) try {
       { gasUsed: BigInt(rc.gasUsed), expectedRevert: `${want} ${selector(want)}`, revert, anchorsInWindowAtExecution: inWin, uc100Calls: calls, diag });
   }
 } catch (e) { groupFailed('malformed', e); }
-// gas and gas-1 on ONE token. The needed gas N is measured for the very envelope under test (eth_estimateGas: the least limit that succeeds,
-// including the 63/64 forwarding rule), a send with N-1 must run out of gas (consume its whole limit, anchors in the window at its execution
-// block, nothing credited), and then the same token's refetched proofs are sent with N + headroom and must redeem. Envelope sizes are the same
-// for the same token, so N from the first envelope bounds the second to within the headroom.
+// gas and gas-1 on ONE token. The least limit M that succeeds is found for the very envelope under test (bisection on eth_call, the 63/64
+// forwarding rule included), a send with M-1 must run out of gas (consume its whole limit, anchors in the window at its execution
+// block, nothing credited), and then the same token's refetched proofs are sent with M + headroom and must redeem. Envelope sizes are the same
+// for the same token, so M from the first envelope bounds the second to within the headroom.
 if (on('gas')) try {
   const a = await buildToken(3, 'same', ['other']);
   const oa = await acceptedRow('gas: reference redemption (two anchors)', await mix(a.token, [true, true, true]), 2);
@@ -510,11 +513,18 @@ if (on('gas')) try {
   // estimateGas at 'latest' sees the registry clock of the last block, which lags the newest shard certificate (a "future" anchor: UCRejected()), so
   // the clock is overridden to what the sent transaction will see at its execution block: the newest anchor, or the origin plus the measured 8-9 rounds.
   const clockAtExecution = [anchorRoundOf(p1.t).max, (await registryClock()) + 9n].reduce((x, y) => (x > y ? x : y));
-  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data: run('cast', ['calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`]) }, 'latest',
-    { [REGISTRY]: { stateDiff: { [clockSlot]: `0x${clockAtExecution.toString(16).padStart(64, '0')}` } } }]));
+  const data = run('cast', ['calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`]);
+  const pinned = await rpc(eth, 'eth_blockNumber', []);
+  const overrides = { [REGISTRY]: { stateDiff: { [clockSlot]: `0x${clockAtExecution.toString(16).padStart(64, '0')}` } } };
+  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data }, pinned, overrides]));
+  // eth_estimateGas is NOT the minimum: reth stops its search under 1.5% of the upper bound and returns the upper bound, so N-1 would still succeed.
+  // The minimum M is bisected with eth_call on the same calldata, the same clock override and the same pinned block (read-only, no window pressure).
+  const callSucceeds = (gas: bigint): Promise<boolean> =>
+    rpc(eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data, gas: `0x${gas.toString(16)}` }, pinned, overrides]).then(() => true, () => false);
+  const { min: M, calls: searchCalls } = await minimalGas(oa.gasUsed * 9n / 10n, N, callSucceeds);
   const win1 = await waitWindow(p1.t);
   const before = claimable();
-  const lowLimit = N - 1n;
+  const lowLimit = M - 1n;
   const low = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p1.built.encoded)}`], THIRD_PARTY_KEY, String(lowLimit));
   const lowDiag = await diagnose(p1.t, p1.built, low, win1.clock) as { anchors: { class: string }[] };
   const lowInWindow = lowDiag.anchors.every((x) => x.class === 'in-window');
@@ -522,11 +532,11 @@ if (on('gas')) try {
   const creditedLow = claimable() - before;
   const p2 = await prepare();
   await waitWindow(p2.t);
-  const highLimit = N + N / 32n + 50_000n;
+  const highLimit = M + M / 32n + 50_000n;
   const beforeHigh = claimable();
   const high = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p2.built.encoded)}`], THIRD_PARTY_KEY, String(highLimit));
   record('gas-1 fails for gas, gas+headroom succeeds (one token)', low.status === '0x0' && lowOutOfGas && lowInWindow && creditedLow === 0n && high.status === '0x1' && claimable() - beforeHigh === amountWei,
-    { referenceGasUsed: oa.gasUsed, neededGasEstimate: N, lowLimit, lowStatus: low.status, lowGasUsed: BigInt(low.gasUsed), lowConsumedWholeLimit: lowOutOfGas, lowAnchorsInWindowAtExecution: lowInWindow, highLimit, highStatus: high.status, highGasUsed: BigInt(high.gasUsed) });
+    { referenceGasUsed: oa.gasUsed, estimateGas: N, minimumGasM: M, searchCalls, pinnedBlock: pinned, clockOverride: clockAtExecution, lowLimit, lowStatus: low.status, lowGasUsed: BigInt(low.gasUsed), lowConsumedWholeLimit: lowOutOfGas, lowAnchorsInWindowAtExecution: lowInWindow, highLimit, highStatus: high.status, highGasUsed: BigInt(high.gasUsed) });
 } catch (e) { groupFailed('gas', e); }
 // =====================================================================================================================================
 // Wallet-path rows (issue #9). These use the plug-ins' own host freshness contract (buildFreshReturnProof / redeemReturn) against the live chain and

@@ -23,9 +23,10 @@ The run's last line is `ROWS COMPLETE: ... N failed ... M measured limits`; the 
 
 **Passed live** (two shards, W_cert 15, measured send-to-execution latency 8-9 root rounds, so the margin is 10): one anchor; two anchors on two
 shards; 16 leaves with two anchors (gas against the gate and the 7M budget); the 5th anchor refused (plug-in `ErrTooManyPaths`, chain
-`BudgetExceeded()`); 17 leaves refused; malformed final anchor, asserted by revert selector and trace; gas-1 / gas+headroom on one token;
-restart/recovery of a pending redemption; and the wallet rows, which use the plug-in's host freshness contract on the same burned token
+`BudgetExceeded()`); 17 leaves refused; malformed final anchor, asserted by revert selector and trace; restart/recovery of a pending redemption; and the wallet rows, which use the plug-in's host freshness contract on the same burned token
 (already-old token refreshed then redeemed, delayed send expired then same-token retry, future-origin wait). A wallet row that does not redeem is a FAIL.
+
+**Not yet passed live: gas-1 / gas+headroom on one token** (the minimum M is bisected with `eth_call` at a pinned block and clock override, then `M-1` must run out of gas and `M + M/32 + 50k` redeem; `gassearch.test.ts` covers the search offline). This line moves into the list above only when a run passes it.
 
 **NOT passed live: A=3 and A=4.** No live row redeems a bundle with more than one certificate per shard or with three or four anchors. On this
 devnet each shard certifies a new round only every 3-4 root rounds and a redemption executes 8-9 rounds after it is sent, so three or four
