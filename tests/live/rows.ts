@@ -69,6 +69,11 @@ const json = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 
 const ONLY = process.env.ROWS_ONLY ? new Set(process.env.ROWS_ONLY.split(',')) : null;
 const on = (g: string): boolean => ONLY === null || ONLY.has(g);
 const failedRows: string[] = [];
+// an unexpected error in one row group is a FAIL row for that group; the other groups still run
+const groupFailed = (group: string, e: unknown): void => {
+  failedRows.push(`${group}: ${(e as { reason?: string }).reason ?? String(e).slice(0, 160)}`);
+  console.log(`FAIL group ${group}`, String(e).slice(0, 600));
+};
 /** Shapes this devnet cannot produce by construction (not failures): the measurement is the result. */
 const limitRows: Record<string, unknown>[] = [];
 const recordLimit = (row: string, data: Record<string, unknown>): void => {
@@ -382,36 +387,36 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
 }
 
 // 1 anchor: every leaf in one shard, current proofs.
-if (on('anchors')) {
+if (on('anchors')) try {
   const b = await buildToken(3, 'same', ['same']);
   const t = await mix(b.token, [true, true, true]);
   await acceptedRow('anchors=1 (one shard, one UC)', t, 1);
-}
+} catch (e) { groupFailed('anchors', e); }
 // 2 anchors: leaves of both shards, current proofs: one UC per shard.
-if (on('anchors')) {
+if (on('anchors')) try {
   const b = await buildToken(3, 'same', ['other']);
   const t = await mix(b.token, [true, true, true]);
   await acceptedRow('anchors=2 (two shards, one UC each)', t, 2);
-}
+} catch (e) { groupFailed('anchors', e); }
 // several UCs on ONE shard: the mint's own round for leaf 0, a later round for the rest, all in one shard.
-if (on('anchors')) {
+if (on('anchors')) try {
   const w = await inWindow('anchors=2 one shard', async () => mix((await buildToken(3, 'same', ['same'])).token, [false, true, true]));
   if (w.token) await acceptedRow('anchors=2 (two different-round UCs of ONE shard)', w.token, 2);
   else infeasible('anchors=2 (two different-round UCs of ONE shard)', 'mint in its own round, later leaves in a later round, one shard', w.spans);
-}
+} catch (e) { groupFailed('anchors', e); }
 // 3 and 4 anchors: every leaf under the proof served when it was certified (its own round), mixed shards, several on one shard.
-if (on('anchors')) {
+if (on('anchors')) try {
   const w = await inWindow('anchors=3', async () => mix((await buildToken(3, 'same', ['other'])).token, [false, false, false]));
   if (w.token) await acceptedRow('anchors=3 (own-round proofs)', w.token, 3);
   else infeasible('anchors=3 (own-round proofs)', 'three leaves, each under the certificate of its own round', w.spans);
-}
-if (on('anchors')) {
+} catch (e) { groupFailed('anchors', e); }
+if (on('anchors')) try {
   const w = await inWindow('anchors=4', async () => mix((await buildToken(4, 'same', ['other', 'same'])).token, [false, false, false, false]));
   if (w.token) await acceptedRow('anchors=4 (own-round proofs, several on one shard)', w.token, 4);
   else infeasible('anchors=4 (own-round proofs, several on one shard)', 'four leaves, each under the certificate of its own round', w.spans);
-}
+} catch (e) { groupFailed('anchors', e); }
 // 5th anchor refused: by the plug-in before submission, and by the chain for the same bundle assembled without the plug-in's bounds.
-if (on('refusals')) {
+if (on('refusals')) try {
   // the anchor count is refused before any certificate is judged, so the proofs need not be inside the window
   const t = await mix((await buildToken(5, 'same', ['other', 'same', 'other'])).token, [false, false, false, false, false]);
   assert.equal(distinctUcs(t).length, MAX_ANCHORS + 1);
@@ -424,15 +429,15 @@ if (on('refusals')) {
   const revert = callRevert(THIRD_PARTY_ADDR, env);
   record('anchors=5 refused', plugin === 'ErrTooManyPaths' && rc.status === '0x0' && revert === selector('BudgetExceeded()') && claimable() === before,
     { plugin, chain: revert, gasUsed: BigInt(rc.gasUsed), creditUnchanged: claimable() === before });
-}
+} catch (e) { groupFailed('refusals', e); }
 // 16 leaves (the bound) redeem; 17 leaves are refused by the burn-time preflight and by the chain.
-if (on('bound')) {
+if (on('bound')) try {
   const b = await buildToken(MAX_LEAVES, 'same', Array.from({ length: MAX_LEAVES - 3 }, (_, i) => (i % 2 ? 'same' : 'other')));
   const t = await mix(b.token, Array(MAX_LEAVES).fill(true));
   const o = await acceptedRow(`leaves=${MAX_LEAVES} (the bound, worst real bundle)`, t, 2);
   record('worst admitted real bundle: gas against the gate', o.gasUsed <= BigInt(o.gate), { gasUsed: o.gasUsed, gate: o.gate, budget: TX_GAS_BUDGET, reserveLeft: BigInt(o.gate) - o.gasUsed });
-}
-if (on('bound')) {
+} catch (e) { groupFailed('bound', e); }
+if (on('bound')) try {
   const b = await buildToken(MAX_LEAVES + 1, 'same', Array.from({ length: MAX_LEAVES - 2 }, (_, i) => (i % 2 ? 'same' : 'other')));
   let pre = 'NO REFUSAL';
   try { await preflightBurn(bridge, b.token.toCBOR()); } catch (e) { pre = (e as { reason?: string }).reason ?? String(e); }
@@ -448,7 +453,7 @@ if (on('bound')) {
   const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(env)}`], THIRD_PARTY_KEY, REDEEM_GAS);
   record('leaves=17 refused', pre2 === 'ErrTooManyTx' && rc.status === '0x0' && callRevert(THIRD_PARTY_ADDR, env) === selector('BudgetExceeded()') && claimable() === before,
     { preflightOnHeldReceipt: pre2, preflightOnBurned: pre, chain: callRevert(THIRD_PARTY_ADDR, env), gasUsed: BigInt(rc.gasUsed) });
-}
+} catch (e) { groupFailed('bound', e); }
 // Malformed FINAL anchor: the first anchor verifies, the last is corrupted (or truncated): the whole redemption reverts, inside 7M, nothing credited.
 // Each case refetches the same token's proofs and is judged by WHY it reverted: its error selector, the native calls it made (the trace) and
 // that every anchor was inside the window at the execution block (a stale first anchor also reverts, with the same UCRejected()).
@@ -465,7 +470,7 @@ const nativeCallsOf = async (txHash: string): Promise<{ to: string; valid: boole
   walk(t);
   return out;
 };
-if (on('malformed')) {
+if (on('malformed')) try {
   const b = await buildToken(3, 'same', ['other']);
   for (const [what, edit, want, nCalls] of [
     ['flipped byte', (uc: Uint8Array) => uc.length >> 1, 'UCRejected()', 2],
@@ -487,12 +492,12 @@ if (on('malformed')) {
     record(`malformed final anchor (${what})`, rc.status === '0x0' && BigInt(rc.gasUsed) < BigInt(TX_GAS_BUDGET) && claimable() === before && revert === selector(want) && inWin && callsOk,
       { gasUsed: BigInt(rc.gasUsed), expectedRevert: `${want} ${selector(want)}`, revert, anchorsInWindowAtExecution: inWin, uc100Calls: calls, diag });
   }
-}
+} catch (e) { groupFailed('malformed', e); }
 // gas and gas-1 on ONE token. The needed gas N is measured for the very envelope under test (eth_estimateGas: the least limit that succeeds,
 // including the 63/64 forwarding rule), a send with N-1 must run out of gas (consume its whole limit, anchors in the window at its execution
 // block, nothing credited), and then the same token's refetched proofs are sent with N + headroom and must redeem. Envelope sizes are the same
 // for the same token, so N from the first envelope bounds the second to within the headroom.
-if (on('gas')) {
+if (on('gas')) try {
   const a = await buildToken(3, 'same', ['other']);
   const oa = await acceptedRow('gas: reference redemption (two anchors)', await mix(a.token, [true, true, true]), 2);
   const b = await buildToken(3, 'same', ['other']);
@@ -502,7 +507,11 @@ if (on('gas')) {
     return { t, built };
   };
   const p1 = await prepare();
-  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data: run('cast', ['calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`]) }, 'latest']));
+  // estimateGas at 'latest' sees the registry clock of the last block, which lags the newest shard certificate (a "future" anchor: UCRejected()), so
+  // the clock is overridden to what the sent transaction will see at its execution block: the newest anchor, or the origin plus the measured 8-9 rounds.
+  const clockAtExecution = [anchorRoundOf(p1.t).max, (await registryClock()) + 9n].reduce((x, y) => (x > y ? x : y));
+  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data: run('cast', ['calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`]) }, 'latest',
+    { [REGISTRY]: { stateDiff: { [clockSlot]: `0x${clockAtExecution.toString(16).padStart(64, '0')}` } } }]));
   const win1 = await waitWindow(p1.t);
   const before = claimable();
   const lowLimit = N - 1n;
@@ -518,7 +527,7 @@ if (on('gas')) {
   const high = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p2.built.encoded)}`], THIRD_PARTY_KEY, String(highLimit));
   record('gas-1 fails for gas, gas+headroom succeeds (one token)', low.status === '0x0' && lowOutOfGas && lowInWindow && creditedLow === 0n && high.status === '0x1' && claimable() - beforeHigh === amountWei,
     { referenceGasUsed: oa.gasUsed, neededGasEstimate: N, lowLimit, lowStatus: low.status, lowGasUsed: BigInt(low.gasUsed), lowConsumedWholeLimit: lowOutOfGas, lowAnchorsInWindowAtExecution: lowInWindow, highLimit, highStatus: high.status, highGasUsed: BigInt(high.gasUsed) });
-}
+} catch (e) { groupFailed('gas', e); }
 // =====================================================================================================================================
 // Wallet-path rows (issue #9). These use the plug-ins' own host freshness contract (buildFreshReturnProof / redeemReturn) against the live chain and
 // shards: the proofs are refetched for the SAME burned token and nothing is rebuilt. They are the wallet evidence; the `inWindow` token rebuilding
@@ -680,7 +689,7 @@ for (const [want, rels] of [[3, ['same']], [4, ['same', 'same']]] as const) {
 
 // Restart and recovery of a pending redemption: burn certified and persisted, both aggregators restarted, proofs fetched again, redeem, then every
 // validator restarted between redeem and claim, and the claim paid.
-if (on('restart')) {
+if (on('restart')) try {
   assert.ok(process.env.DNB_REPO, 'the restart row needs DNB_REPO (the bft-core checkout with scripts/dnb-devnet.sh)');
   const sh = `${process.env.DNB_REPO}/scripts/dnb-devnet.sh`;
   const b = await buildToken(3, 'same', ['other']);
@@ -705,6 +714,6 @@ if (on('restart')) {
   const pa = BigInt(await rpc(eth, 'eth_getBalance', [payee, 'latest']));
   record('restart: pending redemption recovered, redeem/claim state preserved', urlsUp === true && o.credited === amountWei && stillCredited && claim.status === '0x1' && pa - pb === amountWei,
     { redeemGas: o.gasUsed, creditedOnce: o.credited, paid: pa - pb });
-}
+} catch (e) { groupFailed('restart', e); }
 console.log(`ROWS COMPLETE: ${evidence.rows.length} rows, ${failedRows.length} failed${failedRows.length ? ` (${failedRows.join('; ')})` : ''}, ${limitRows.length} measured limits, evidence ${lane.dir}/rows-evidence.json`);
 if (failedRows.length) process.exit(1);
