@@ -83,3 +83,21 @@ embedded UC has the 16 KiB limit, native summary/shard/path/signature/node-ID su
 supported 65-byte signature encoding. Embedded UC, ordinary UC-tree paths and RSMT paths share
 one cumulative 2048-step budget. The independent constructor fixtures are separate from the released Go corpus;
 corpus integrity/regeneration and joined component CI check their respective boundaries.
+
+## Host freshness contract for return proofs
+
+B1 accepts an anchor of seal round `r` only if `r <= O` and `O - r <= W_cert`, with `O` the registry `clock.rootRound` at the redemption's
+execution block (not the shard round, `t` or a wall clock); `W_cert` is the committed profile parameter `b1.wCert`. The executing block imports
+its own origin, so a read of the latest block is advisory and the host keeps an execution margin `M` (measured; not a protocol constant): send
+only when `max(r) <= O` and `O - min(r) <= W_cert - M`. If `max(r) - min(r) > W_cert - M` no origin admits the bundle.
+
+`buildFreshReturnProof` and `redeemReturn` (TypeScript; `freshness::classify_freshness` in Rust) refetch every leaf for the SAME burned token
+(never rebuilding or re-burning, never to obtain matching certificates or fewer anchors), wait a bounded time for an origin that has not imported
+the newest anchor, judge the oldest anchor again after the wait, and send within a bounded number of attempts. Exhausted freshness, stale pairs or
+temporary witness unavailability are `ErrProofUnavailable` with a diagnostic cause (the unavailable family, retryable, pending state kept); an
+over-limit anchor count, gas or size stays BudgetExceeded and is never retried. Before any resend the host checks the transaction's receipt and the
+vault's spent/credit state: an RPC timeout is not a revert, an unknown send is not repeated while it may be pending (`RedemptionUnconfirmed` carries the
+transaction hash; the caller passes it back as `pending` and its receipt is checked before any new send), and the wallet burn is never
+repeated. A revert is retried up to `maxSends` whatever its cause, so a deterministic refusal (a closed authority interval, bad backing) costs
+`maxSends` transactions. A proof service or chain reader that fails is retried within the attempt bound and reported as `ErrProofUnavailable` with
+the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a freshness or service guarantee.

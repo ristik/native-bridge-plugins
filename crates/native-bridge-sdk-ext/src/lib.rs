@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod deployment;
 pub mod envelope;
 pub mod error;
+pub mod freshness;
 pub mod gas;
 pub mod header;
 pub mod history;

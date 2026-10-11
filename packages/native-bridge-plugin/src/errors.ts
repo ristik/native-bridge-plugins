@@ -47,14 +47,15 @@ export const RETRYABLE: readonly NativeReason[] = ['ErrProofUnavailable'];
 export class NativeError extends Error {
   public readonly family: NativeFamily;
 
-  public constructor(public readonly reason: NativeReason) {
-    super(reason);
+  /** A diagnostic for a retryable refusal (for `ErrProofUnavailable`: why the proof could not be had in time); never a protocol input. */
+  public constructor(public readonly reason: NativeReason, public readonly detail?: string) {
+    super(detail ? `${reason}: ${detail}` : reason);
     this.name = 'NativeError';
     this.family = FAMILY[reason];
   }
 }
 
 /** Throw a profile error. */
-export function fail(reason: NativeReason): never {
-  throw new NativeError(reason);
+export function fail(reason: NativeReason, detail?: string): never {
+  throw new NativeError(reason, detail);
 }
