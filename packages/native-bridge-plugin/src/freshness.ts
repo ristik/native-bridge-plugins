@@ -139,7 +139,10 @@ export async function buildFreshReturnProof(
       } catch (e) {
         // A bundle over the anchor, gas or size bound is a budget refusal, never retried (a refetch must not be used to make certificates converge or
         // to obtain fewer anchors): report the measured count so the host can see how far over it was.
-        if (e instanceof NativeError && e.family === 'budget') throw new NativeError(e.reason, `${anchorRounds(token).length} distinct anchors fetched, ceiling ${MAX_ANCHORS}; not retried`);
+        if (e instanceof NativeError && e.family === 'budget') {
+          const n = anchorRounds(token).length;
+          throw new NativeError(e.reason, e.reason === 'ErrTooManyPaths' ? `${n} distinct anchors fetched, ceiling ${MAX_ANCHORS}; not retried` : `over the gas or size bound with ${n} distinct anchors fetched; not retried`);
+        }
         throw e;
       }
     } catch (e) {
@@ -240,10 +243,10 @@ async function isRedeemed(transport: RedeemTransport, id: { nonce: bigint; nulli
 }
 
 /**
- * Redeem a burned token. The vault is asked FIRST, before any proof is fetched and before the freshness window is judged: an already executed
+ * Redeem a burned token. The vault is asked FIRST (after the receipts of the hashes in `pending`), before any proof is fetched and before the freshness window is judged: an already executed
  * redemption (a third party's, or an earlier send of ours whose hash was lost) is reported as such even when the proof service is down or the
  * window cannot be met. Then every hash in `pending` (an earlier unconfirmed send) is checked: a success ends the call, a transaction still
- * pending leaves the call unconfirmed again with no new send, a revert is dropped. Before every send the vault's state is read again. After a send
+ * pending, with the vault still not showing the nonce credited, leaves the call unconfirmed again with no new send, a revert is dropped. Before every send the vault's state is read again. After a send
  * the receipt and the vault state, never the RPC's answer alone, decide the next step: an RPC timeout is not a revert. A revert refetches every
  * proof for the same token and sends again, within `maxSends`, whatever its cause: a deterministic refusal (a closed authority interval, bad
  * backing) therefore costs `maxSends` transactions. A send whose outcome is unknown is never repeated while it may still be pending (see
@@ -264,12 +267,16 @@ export async function redeemReturn(
   checkPolicy(policy, await chain.wCert(), policy.maxSends);
   const id = await returnIdentity(plugin, tokenBytes);
   const nullifier = id.nullifier;
+  // a pending hash that succeeded ends the call; one without a receipt does not end it yet: the vault is asked before it is believed (a dropped
+  // transaction never gets a receipt, and someone else's redemption of the same nonce must still settle this call)
+  let unconfirmed: string | undefined;
   for (const h of pending) {
     const r = await transport.receipt(h);
     if (r === 'success') return { status: 'redeemed', txHash: h, nullifier, sends: 0 };
-    if (r === undefined) throw new RedemptionUnconfirmed(h);
+    if (r === undefined) unconfirmed ??= h;
   }
   if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends: 0 };
+  if (unconfirmed !== undefined) throw new RedemptionUnconfirmed(unconfirmed);
   for (let sends = 0; sends < policy.maxSends; ) {
     const proof = await buildFreshReturnProof(plugin, tokenBytes, source, chain, policy, policy.maxSends);
     if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends };

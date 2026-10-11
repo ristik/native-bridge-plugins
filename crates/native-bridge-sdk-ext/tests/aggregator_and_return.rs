@@ -210,6 +210,27 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_an_i
     let mut over = a.clone();
     over.uc = [&a.uc[..head], &[0x98, 33], &[0xf6u8; 33], &a.uc[head + 1..]].concat();
     assert_eq!(scan_anchor(&over, 0).unwrap_err(), E::TooManyItems);
+    // 65 seal signatures (the bound is 64): the scan reads only the map's header, so patch the one map(4) header of the seal
+    let seal =
+        a.uc.windows(4)
+            .position(|x| x == [0xd9, 0x98, 0x5d, 0x88])
+            .expect("the seal");
+    let mut hit = false;
+    for i in seal..a.uc.len() {
+        if a.uc[i] != 0xa4 {
+            continue;
+        }
+        let mut sigs = a.clone();
+        sigs.uc = [&a.uc[..i], &[0xb8, 65], &a.uc[i + 1..]].concat();
+        if scan_anchor(&sigs, 0) == Err(E::TooManyItems) {
+            hit = true;
+            break;
+        }
+    }
+    assert!(
+        hit,
+        "a seal signature count over the bound is a budget refusal"
+    );
     let mut cut = a.clone();
     cut.uc.truncate(20);
     assert_eq!(scan_anchor(&cut, 0).unwrap_err(), E::AnchorAuth);

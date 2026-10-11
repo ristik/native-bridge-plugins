@@ -129,6 +129,13 @@ test('an over-bound certificate is a budget refusal, any other shape failure is 
   const over = await sealed(65);
   assert.throws(() => scanAnchor({ ...a, uc: over }, 0), { reason: 'ErrTooManyItems', family: 'budget' });
   assert.throws(() => scanAnchor({ ...a, uc: a.uc.slice(0, 20) }, 0), { reason: 'ErrAnchorAuth' });
+  // 33 unicity steps (the bound is 32), spliced into the certificate's empty step list
+  const at = Buffer.from(a.uc).indexOf(Buffer.from([0xd9, 0x98, 0x5c, 0x83]));
+  assert.ok(at > 0, 'the unicity tree certificate');
+  const head = at + 4 + 1 + 1; // tag, array(3), version, partition (one byte each here)
+  assert.equal(a.uc[head], 0x80, 'an empty step list');
+  const steps = Uint8Array.from([...a.uc.slice(0, head), 0x98, 33, ...new Array<number>(33).fill(0xf6), ...a.uc.slice(head + 1)]);
+  assert.throws(() => scanAnchor({ ...a, uc: steps }, 0), { reason: 'ErrTooManyItems', family: 'budget' });
 });
 
 async function freshProofs(w: World, out: Awaited<ReturnType<typeof ret>>, extra: number, ts: bigint): Promise<InclusionProof[]> {

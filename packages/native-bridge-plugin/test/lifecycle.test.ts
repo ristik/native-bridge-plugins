@@ -11,7 +11,7 @@ import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radi
 import { eq } from '../src/bytes.js';
 import { NativeError } from '../src/errors.js';
 import { RedemptionUnconfirmed, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../src/freshness.js';
-import { ClaimUnconfirmed, claimCredited, redeemBurned, type ClaimPolicy, type ClaimTransport } from '../src/lifecycle.js';
+import { ClaimUnconfirmed, abandonAttempt, claimCredited, redeemBurned, type ClaimPolicy, type ClaimTransport } from '../src/lifecycle.js';
 import { MemoryRedemptionJournal, NativeBridgePayments, createNativeBridgePlugin, uintOf, type NativeWalletBackend, type RedemptionEntry } from '../src/wallet.js';
 import { AGG_PARTITION, VAULT, buildToken, burnStep, makeUc, makeWorld, recipient20, sha, spec, txStep, type World } from './world.js';
 
@@ -84,7 +84,8 @@ class FakeVault implements RedeemTransport, ClaimTransport {
     return hash;
   }
   public receipt(h: string): Promise<'success' | 'reverted' | undefined> { return Promise.resolve(this.receipts.get(h)); }
-  public spentNullifier(nonce: bigint): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent.get(nonce)); }
+  /** The real vault answers `spentNullifier(nonce)` with a ZERO WORD for a nonce that was not redeemed. */
+  public spentNullifier(nonce: bigint): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent.get(nonce) ?? new Uint8Array(32)); }
   public claimable(r: Uint8Array): Promise<bigint> { return Promise.resolve(this.credit.get(this.key(r)) ?? 0n); }
 }
 
@@ -187,4 +188,73 @@ test('the claim refuses a burn that is not redeemed, an empty balance, a balance
   await assert.rejects(claimCredited(s.payments, 'b1', payee, VAULT, inert, cp()), /not down by the claimed/);
   assert.equal((await s.journal.get('b1'))!.status, 'redeemed', 'unverified: not settled');
 });
+test('a pending hash with no receipt does not hide a redemption the vault already shows (a dropped transaction, a third party\'s redeem)', async () => {
+  const s = await setup();
+  const vault = new FakeVault(s);
+  vault.next = 'pending';
+  await redeemBurned(s.plugin, s.payments, 'b1', s.source, chain, vault, rp()).then(() => undefined, () => undefined);
+  const stuck = (await s.journal.get('b1'))!;
+  assert.equal(stuck.status, 'submitted');
+  assert.deepEqual(stuck.redeemTxs, ['0x1']);
+  // our transaction is dropped and never gets a receipt; someone else redeems the same nonce
+  vault.spent.set(stuck.nonce, stuck.nullifier);
+  vault.credit.set(Buffer.from(stuck.releaseTo).toString('hex'), stuck.amount);
+  let fetches = 0;
+  const r = await redeemBurned(s.plugin, s.payments, 'b1', async () => { fetches++; throw new Error('proof service down'); }, chain, vault, rp());
+  assert.equal(r.status, 'already-redeemed');
+  assert.equal(fetches, 0);
+  assert.equal(vault.sentRedeems.length, 1);
+  assert.equal((await s.journal.get('b1'))!.status, 'redeemed', 'the entry can now be claimed');
+  vault.next = 'ok';
+  const c = await claimCredited(s.payments, 'b1', new Uint8Array(20).fill(0xbe), VAULT, vault, cp());
+  assert.equal(c.amount, stuck.amount);
+  assert.equal((await s.journal.get('b1'))!.status, 'settled');
+});
+
+test('the vault\'s real answer for an unredeemed nonce, a zero word, is "not redeemed"; a missing answer is the same', async () => {
+  const s = await setup();
+  const vault = new FakeVault(s);
+  assert.deepEqual(await vault.spentNullifier(s.entry.nonce), new Uint8Array(32));
+  assert.equal((await redeemBurned(s.plugin, s.payments, 'b1', s.source, chain, vault, rp())).status, 'redeemed');
+  assert.equal(vault.sentRedeems.length, 1, 'a zero word did not read as another burn\'s nullifier');
+  const t = await setup();
+  const v2 = new FakeVault(t);
+  v2.spentNullifier = () => Promise.resolve(undefined);
+  assert.equal((await redeemBurned(t.plugin, t.payments, 'b1', t.source, chain, v2, rp())).status, 'redeemed');
+});
+
+test('a claim attempt without a recorded hash is never repeated automatically; the host abandons it explicitly', async () => {
+  const s = await setup();
+  const vault = new FakeVault(s);
+  await redeemBurned(s.plugin, s.payments, 'b1', s.source, chain, vault, rp());
+  const payee = new Uint8Array(20).fill(0xbe);
+  const realSend = vault.send.bind(vault);
+  vault.send = (): Promise<string> => Promise.reject(new Error('crash between the send and the journalled hash'));
+  await assert.rejects(claimCredited(s.payments, 'b1', payee, VAULT, vault, cp()), /crash between/);
+  const e = (await s.journal.get('b1'))!;
+  assert.equal(e.claimStarted, true);
+  assert.equal(e.claimTx, undefined);
+  vault.send = realSend;
+  await assert.rejects(claimCredited(s.payments, 'b1', payee, VAULT, vault, cp()), /was started and its hash was not recorded/);
+  assert.equal(vault.sentClaims.length, 0, 'no second claim was sent');
+  await abandonAttempt(s.payments, 'b1', { claim: true });
+  assert.equal((await claimCredited(s.payments, 'b1', payee, VAULT, vault, cp())).amount, e.amount);
+  assert.equal((await s.journal.get('b1'))!.status, 'settled');
+  // a settled burn cannot be abandoned, and a resumed claim says it has no balance before
+  await assert.rejects(abandonAttempt(s.payments, 'b1', { claim: true }), /already settled/);
+});
+
+test('a redeem transaction the host knows is dead can be abandoned, and the entry then sends again', async () => {
+  const s = await setup();
+  const vault = new FakeVault(s);
+  vault.next = 'pending';
+  await redeemBurned(s.plugin, s.payments, 'b1', s.source, chain, vault, rp()).then(() => undefined, () => undefined);
+  await assert.rejects(abandonAttempt(s.payments, 'b1', { redeemTx: '0xnope' }), /no redeem transaction/);
+  await abandonAttempt(s.payments, 'b1', { redeemTx: '0x1' });
+  assert.deepEqual((await s.journal.get('b1'))!.redeemTxs, []);
+  vault.next = 'ok';
+  assert.equal((await redeemBurned(s.plugin, s.payments, 'b1', s.source, chain, vault, rp())).status, 'redeemed');
+  assert.equal(vault.sentRedeems.length, 2);
+});
+
 void recipient20; void sha; void burnStep; void txStep; void ({} as World);

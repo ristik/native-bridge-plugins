@@ -115,7 +115,9 @@ export interface RedemptionEntry {
   status: 'burned' | 'submitted' | 'redeemed' | 'settled';
   /** Every `redeem` transaction hash sent for this burn, oldest first. */
   redeemTxs: string[];
-  /** The confirmed claim transaction (status `settled`). */
+  /** A claim send was started (journalled BEFORE the send): without `claimTx` its hash may be lost, and no second claim is sent until the host decides (`abandonAttempt`). */
+  claimStarted?: boolean;
+  /** The claim transaction hash (`settled` once it is confirmed). */
   claimTx?: string;
 }
 

@@ -172,6 +172,30 @@ test('recoverPendingBurns re-journals a settled burn after interruption', async 
   assert.equal((await recoverPendingBurns(plugin, pay, async () => {})).length, 0);
 });
 
+test('recovery after a restart keeps a journalled redemption: state and sent hashes survive, nothing is reset to burned', async () => {
+  const w = makeWorld();
+  const plugin = createNativeBridgePlugin(w.bridge, rev);
+  const be = new Backend(signer(2));
+  const journal = new MemoryRedemptionJournal();
+  const pay = new NativeBridgePayments(plugin, be, journal);
+  const burned = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
+  const pending = { burnId: 'b9', tokenId: 't9', reasonBytes: returnReason(CHAIN_ID, VAULT, ZERO20, w.dep.cfg.ty, w.dep.cfg.aid, recipient20(), spec(1).amount), burnedToken: burned.bytes, settled: true };
+  be.pending = [pending];
+  await recoverPendingBurns(plugin, pay, async () => {});
+  const first = (await journal.get('b9'))!;
+  assert.equal(first.status, 'burned');
+  assert.equal(first.amount, 1000n);
+  assert.deepEqual(first.redeemTxs, []);
+  // a redeem was sent and the process died before the burn was acknowledged again: the burn is pending once more at the next start
+  await journal.put({ ...first, status: 'submitted', redeemTxs: ['0xaa', '0xbb'] });
+  be.pending = [pending];
+  await recoverPendingBurns(plugin, pay, async () => {});
+  const after = (await journal.get('b9'))!;
+  assert.equal(after.status, 'submitted', 'not reset to burned');
+  assert.deepEqual(after.redeemTxs, ['0xaa', '0xbb'], 'the hashes of the sends survive');
+  assert.deepEqual(be.acked, ['b9', 'b9']);
+});
+
 test('mint pre-check verifies the certified EVM lock before submission', async () => {
   const w = makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
