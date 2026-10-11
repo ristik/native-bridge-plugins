@@ -205,7 +205,7 @@ token = await refreshToken(token, fresh);
 const ret = await buildReturnProof(bridge, token);
 const clockSlot = `0x${hex(keccak256(text('unicity.seal-registry/clock.rootRound')))}`;
 const registryClock = async (): Promise<bigint> => BigInt(await rpc(eth, 'eth_getStorageAt', ['0xff00000000000000000000000000000000000002', clockSlot, 'latest']));
-step('return proof assembled', { anchorRootRound: token.genesis.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber, registryClock: await registryClock(), bytes: ret.encoded.length, nullifier: hex(ret.verified.outcome.nullifier), leaves: ret.verified.outcome.leaves.length });
+step('return proof assembled', { anchorRootRound: token.genesis.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber, registryClock: await registryClock(), bytes: ret.encoded.length, anchors: ret.envelope.anchors.length, gateTotal: ret.gate.total, nullifier: hex(ret.verified.outcome.nullifier), leaves: ret.verified.outcome.leaves.length });
 writeFileSync(`${lane.dir}/return-proof.bin`, ret.encoded);
 {
   // The exact B1 UC_V1 request the vault's verifier builds for the anchor (B1Calls.ucRequest), kept for off-chain diagnosis against the Go reference.
@@ -232,13 +232,13 @@ step('registry clock reached the anchor', { anchorRound, registryClock: await re
 
 // ---- redeem by a third party, then claim by the credited recipient --------------------------------------------------------------------
 const vaultBefore = BigInt(await rpc(eth, 'eth_getBalance', [lane.vault, 'latest']));
-const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, '2500000');
+const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, String(Math.min(7_000_000, ret.gate.total + 200_000))); // the plug-in's gate projection bounds the gas the vault needs; a constant below it ran out of gas (run 2)
 const redeemClock = BigInt(await rpc(eth, 'eth_getStorageAt', ['0xff00000000000000000000000000000000000002', clockSlot, redeemTx.blockNumber]));
 assert.equal(redeemTx.status, '0x1', `redeem reverted: ${JSON.stringify(redeemTx).slice(0, 400)}`);
 const credited = BigInt(cast('call', lane.vault, 'claimable(address)(uint256)', RECIPIENT).split(' ')[0]);
 assert.equal(credited, amountWei, 'the certified recipient is credited with the locked amount');
 assert.equal(`0x${hex(unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString())))}`, `0x${hex(ret.verified.outcome.nullifier)}`, 'the nullifier the vault recorded is the plug-in derivation');
-step('redeem executed (native B1 + B2 kernels)', { gasUsed: BigInt(redeemTx.gasUsed), credited, anchorRound, clockAtExecution: redeemClock });
+step('redeem executed (native B1 + B2 kernels)', { gasUsed: BigInt(redeemTx.gasUsed), gateTotal: ret.gate.total, credited, anchorRound, clockAtExecution: redeemClock });
 // Refusals, each by eth_call in the live window (state untouched): a flipped certificate byte, and a claim by an account with no credit.
 const callRevert = (from: string, sig: string, args: string[]): string => {
   try {

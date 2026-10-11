@@ -52,6 +52,8 @@ const THIRD_PARTY_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a
 const RECIPIENT_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const REGISTRY = '0xff00000000000000000000000000000000000002';
 const W_CERT = Number(process.env.DNB_W_CERT ?? 15);
+// A redeem lands in the next EVM block (a few root rounds after it is published), so the oldest anchor must be this many rounds younger than W_CERT when it is sent.
+const EXEC_MARGIN = Number(process.env.DNB_EXEC_MARGIN ?? 6);
 const REDEEM_GAS = '7000000';
 assert.ok(lane.aggUrls && lane.aggUrls.length === 2, 'rows.ts needs the two-shard lane (lane-config aggUrls from DNB_AGG_SHARDS=2)');
 
@@ -224,8 +226,25 @@ async function waitWindow(token: Token): Promise<{ min: bigint; max: bigint; clo
   const r = anchorRoundOf(token);
   await until('the registry clock to reach the newest anchor', 60_000, async () => (await registryClock()) >= r.max);
   const clock = await registryClock();
-  assert.ok(clock - r.min <= BigInt(W_CERT), `the oldest anchor (round ${r.min}) is outside the window at clock ${clock}: this row needs a faster run`);
+  assert.ok(clock - r.min <= BigInt(W_CERT - EXEC_MARGIN), `the oldest anchor (round ${r.min}) is too old at clock ${clock} to land inside W_cert=${W_CERT} (margin ${EXEC_MARGIN}): this row needs a faster run`);
   return { ...r, clock };
+}
+
+
+/**
+ * Rows with several own-round UCs need every anchor young enough to still be inside B1's window when the redeem executes. Build the token again
+ * (a fresh lock and mint) until the oldest anchor is within W_cert - EXEC_MARGIN of the registry clock once the newest one has landed.
+ */
+async function inWindow(what: string, build: () => Promise<Token>): Promise<Token> {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    const t = await build();
+    const r = anchorRoundOf(t);
+    await until('the registry clock to reach the newest anchor', 60_000, async () => (await registryClock()) >= r.max);
+    const clock = await registryClock();
+    if (clock - r.min <= BigInt(W_CERT - EXEC_MARGIN)) return t;
+    console.log(`  ${what}: attempt ${attempt} spans ${clock - r.min} rounds (limit ${W_CERT - EXEC_MARGIN}); building again`);
+  }
+  throw new Error(`${what}: no token fit inside the certificate window in 6 attempts (a faster run is needed)`);
 }
 
 async function redeem(token: Token, gas = REDEEM_GAS, tamper?: (e: Uint8Array, env: Envelope) => Uint8Array): Promise<Outcome & { encoded: Uint8Array }> {
@@ -298,23 +317,21 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
 }
 // several UCs on ONE shard: the mint's own round for leaf 0, a later round for the rest, all in one shard.
 {
-  const b = await buildToken(3, 'same', ['same']);
-  const t = await mix(b.token, [false, true, true]);
+  const t = await inWindow('anchors=2 one shard', async () => mix((await buildToken(3, 'same', ['same'])).token, [false, true, true]));
   await acceptedRow('anchors=2 (two different-round UCs of ONE shard)', t, 2);
 }
 // 3 and 4 anchors: every leaf under the proof served when it was certified (its own round), mixed shards, several on one shard.
 {
-  const b = await buildToken(3, 'same', ['other']);
-  await acceptedRow('anchors=3 (own-round proofs)', await mix(b.token, [false, false, false]), 3);
+  const t = await inWindow('anchors=3', async () => mix((await buildToken(3, 'same', ['other'])).token, [false, false, false]));
+  await acceptedRow('anchors=3 (own-round proofs)', t, 3);
 }
 {
-  const b = await buildToken(4, 'same', ['other', 'same']);
-  await acceptedRow('anchors=4 (own-round proofs, several on one shard)', await mix(b.token, [false, false, false, false]), 4);
+  const t = await inWindow('anchors=4', async () => mix((await buildToken(4, 'same', ['other', 'same'])).token, [false, false, false, false]));
+  await acceptedRow('anchors=4 (own-round proofs, several on one shard)', t, 4);
 }
 // 5th anchor refused: by the plug-in before submission, and by the chain for the same bundle assembled without the plug-in's bounds.
 {
-  const b = await buildToken(5, 'same', ['other', 'same', 'other']);
-  const t = await mix(b.token, [false, false, false, false, false]);
+  const t = await inWindow('anchors=5', async () => mix((await buildToken(5, 'same', ['other', 'same', 'other'])).token, [false, false, false, false, false]));
   assert.equal(distinctUcs(t).length, MAX_ANCHORS + 1);
   let plugin = 'NO REFUSAL';
   try { await buildReturnProof(bridge, t); } catch (e) { plugin = (e as { reason?: string }).reason ?? String(e); }
