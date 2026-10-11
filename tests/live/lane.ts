@@ -232,7 +232,7 @@ step('registry clock reached the anchor', { anchorRound, registryClock: await re
 
 // ---- redeem by a third party, then claim by the credited recipient --------------------------------------------------------------------
 const vaultBefore = BigInt(await rpc(eth, 'eth_getBalance', [lane.vault, 'latest']));
-const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, String(Math.min(7_000_000, ret.gate.total + 200_000))); // the plug-in's gate projection bounds the gas the vault needs; a constant below it ran out of gas (run 2)
+const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, String(Math.min(7_000_000, ret.gate.total + 200_000))); // the plug-in's gate projection bounds what the vault must have available (the gate is a bound, actual use is lower); the extra 200k covers the 63/64 forwarding to the native calls; a constant below the gate ran out of gas (run 2)
 const redeemClock = BigInt(await rpc(eth, 'eth_getStorageAt', ['0xff00000000000000000000000000000000000002', clockSlot, redeemTx.blockNumber]));
 assert.equal(redeemTx.status, '0x1', `redeem reverted: ${JSON.stringify(redeemTx).slice(0, 400)}`);
 const credited = BigInt(cast('call', lane.vault, 'claimable(address)(uint256)', RECIPIENT).split(' ')[0]);

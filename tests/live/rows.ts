@@ -53,7 +53,7 @@ const THIRD_PARTY_ADDR = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
 const THIRD_PARTY_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a';
 const RECIPIENT_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const REGISTRY = '0xff00000000000000000000000000000000000002';
-const W_CERT = Number(process.env.DNB_W_CERT ?? 15);
+const W_CERT = Number((JSON.parse(readFileSync(`${lane.dir}/b1-profile.json`, 'utf8')) as { wCert: number }).wCert); // the pinned B1 profile is the one source
 // A redeem lands in the next EVM block (a few root rounds after it is published), so the oldest anchor must be this many rounds younger than W_CERT when it is sent.
 const EXEC_MARGIN = Number(process.env.DNB_EXEC_MARGIN ?? 10); // run 5 measured 8-9 root rounds between a redeem's send and its execution block (origin 195 -> 203, 240 -> 249)
 const REDEEM_GAS = '7000000';
@@ -373,7 +373,7 @@ const distinctUcs = (token: Token): Uint8Array[] => {
 async function acceptedRow(name: string, token: Token, wantAnchors: number): Promise<Outcome> {
   const o = await redeem(token);
   const ok = o.receipt.status === '0x1' && o.anchors === wantAnchors && o.credited === amountWei && o.gasUsed < BigInt(TX_GAS_BUDGET) &&
-    (o.calls === null || (o.calls.uc === wantAnchors && o.calls.rsmt === o.leaves));
+    o.calls !== null && o.calls.uc === wantAnchors && o.calls.rsmt === o.leaves; // an unavailable trace fails the row: the native call counts are part of its claim
   record(name, ok, { anchors: o.anchors, leaves: o.leaves, gasUsed: o.gasUsed, gateTotal: o.gate, credited: o.credited, nativeCalls: o.calls, tx: o.receipt.transactionHash, diag: o.diag });
   return o;
 }
@@ -447,44 +447,74 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
     { preflightOnHeldReceipt: pre2, preflightOnBurned: pre, chain: callRevert(THIRD_PARTY_ADDR, env), gasUsed: BigInt(rc.gasUsed) });
 }
 // Malformed FINAL anchor: the first anchor verifies, the last is corrupted (or truncated): the whole redemption reverts, inside 7M, nothing credited.
+// Each case refetches the same token's proofs and is judged by WHY it reverted: its error selector, the native calls it made (the trace) and
+// that every anchor was inside the window at the execution block (a stale first anchor also reverts, with the same UCRejected()).
+const nativeCallsOf = async (txHash: string): Promise<{ to: string; valid: boolean | null; error?: string }[]> => {
+  const out: { to: string; valid: boolean | null; error?: string }[] = [];
+  const t = await rpc(eth, 'debug_traceTransaction', [txHash, { tracer: 'callTracer' }]);
+  const walk = (c: { to?: string; output?: string; error?: string; calls?: unknown[] }): void => {
+    if (c.to?.toLowerCase() === '0x0000000000000000000000000000000000000100') {
+      const o = c.output ?? '';
+      out.push({ to: '100', valid: o.length >= 130 ? BigInt(`0x${o.slice(66, 130)}`) === 1n : null, error: c.error });
+    }
+    (c.calls ?? []).forEach((x) => walk(x as never));
+  };
+  walk(t);
+  return out;
+};
 {
   const b = await buildToken(3, 'same', ['other']);
-  const t = await mix(b.token, [true, true, true]);
-  for (const [what, edit] of [['flipped byte', (uc: Uint8Array) => uc.length >> 1], ['malformed CBOR head', () => 0]] as const) {
+  for (const [what, edit, want, nCalls] of [
+    ['flipped byte', (uc: Uint8Array) => uc.length >> 1, 'UCRejected()', 2],
+    ['malformed CBOR head', () => 0, 'UCScanRejected()', null],
+  ] as const) {
+    const t = await mix(b.token, [true, true, true]);
     const before = claimable();
     const built = await buildReturnProof(bridge, t);
     const last = built.envelope.anchors[built.envelope.anchors.length - 1].uc;
     assert.ok(built.envelope.anchors.length === 2);
-    await waitWindow(t);
+    const win = await waitWindow(t);
     const bad = flipIn(built.encoded, last, edit(last));
     const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(bad)}`], THIRD_PARTY_KEY, REDEEM_GAS);
-    record(`malformed final anchor (${what})`, rc.status === '0x0' && BigInt(rc.gasUsed) < BigInt(TX_GAS_BUDGET) && claimable() === before,
-      { gasUsed: BigInt(rc.gasUsed), revert: callRevert(THIRD_PARTY_ADDR, bad) });
+    const revert = callRevert(THIRD_PARTY_ADDR, bad);
+    const diag = await diagnose(t, built, rc, win.clock) as { anchors: { class: string }[] };
+    const inWin = diag.anchors.every((x) => x.class === 'in-window');
+    const calls = await nativeCallsOf(rc.transactionHash).catch(() => null);
+    const callsOk = calls === null ? false : nCalls === null ? calls.every((c) => c.valid !== true) : calls.length === nCalls && calls[0].valid === true && calls[1].valid !== true;
+    record(`malformed final anchor (${what})`, rc.status === '0x0' && BigInt(rc.gasUsed) < BigInt(TX_GAS_BUDGET) && claimable() === before && revert === selector(want) && inWin && callsOk,
+      { gasUsed: BigInt(rc.gasUsed), expectedRevert: `${want} ${selector(want)}`, revert, anchorsInWindowAtExecution: inWin, uc100Calls: calls, diag });
   }
 }
-// gas and gas-1: the same two-anchor shape twice. Token A at a generous limit measures the gas used (U); token B is attempted with a limit one
-// below U (must fail with nothing credited) and then with the limit the native 63/64 forwarding needs above U (must succeed). The exact
-// minimum limit is not searched: the window allows a handful of attempts only.
+// gas and gas-1 on ONE token. The needed gas N is measured for the very envelope under test (eth_estimateGas: the least limit that succeeds,
+// including the 63/64 forwarding rule), a send with N-1 must run out of gas (consume its whole limit, anchors in the window at its execution
+// block, nothing credited), and then the same token's refetched proofs are sent with N + headroom and must redeem. Envelope sizes are the same
+// for the same token, so N from the first envelope bounds the second to within the headroom.
 {
   const a = await buildToken(3, 'same', ['other']);
   const oa = await acceptedRow('gas: reference redemption (two anchors)', await mix(a.token, [true, true, true]), 2);
-  const U = oa.gasUsed;
   const b = await buildToken(3, 'same', ['other']);
-  // Each send gets proofs refetched for the SAME token just before it: the first send executes 8-9 rounds later, so an envelope reused for the
-  // second send would be outside W_cert and revert for staleness (run 7: the "high" send used 1.77M gas against 3.1M for a success; inferred stale, status was not recorded).
-  const send = async (limit: bigint): Promise<{ rc: Receipt; credited: bigint; anchors: number }> => {
+  const prepare = async (): Promise<{ t: Token; built: Awaited<ReturnType<typeof buildReturnProof>> }> => {
     const t = await mix(b.token, [true, true, true]);
     const built = await buildReturnProof(bridge, t);
-    await waitWindow(t);
-    const before = claimable();
-    const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(built.encoded)}`], THIRD_PARTY_KEY, String(limit));
-    return { rc, credited: claimable() - before, anchors: built.envelope.anchors.length };
+    return { t, built };
   };
-  const low = await send(U - 1n);
-  const highLimit = U + U / 32n + 50_000n;
-  const high = await send(highLimit);
-  record('gas-1 fails, gas+headroom succeeds', low.rc.status === '0x0' && low.credited === 0n && low.anchors === 2 && high.anchors === 2 && high.rc.status === '0x1' && high.credited === amountWei,
-    { referenceGasUsed: U, lowLimit: U - 1n, lowStatus: low.rc.status, lowAnchors: low.anchors, highLimit, highStatus: high.rc.status, highAnchors: high.anchors, highGasUsed: BigInt(high.rc.gasUsed) });
+  const p1 = await prepare();
+  const N = BigInt(await rpc(eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: lane.vault, data: cast('calldata', 'redeem(bytes)', `0x${hex(p1.built.encoded)}`) }, 'latest']));
+  const win1 = await waitWindow(p1.t);
+  const before = claimable();
+  const lowLimit = N - 1n;
+  const low = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p1.built.encoded)}`], THIRD_PARTY_KEY, String(lowLimit));
+  const lowDiag = await diagnose(p1.t, p1.built, low, win1.clock) as { anchors: { class: string }[] };
+  const lowInWindow = lowDiag.anchors.every((x) => x.class === 'in-window');
+  const lowOutOfGas = BigInt(low.gasUsed) === lowLimit;
+  const creditedLow = claimable() - before;
+  const p2 = await prepare();
+  await waitWindow(p2.t);
+  const highLimit = N + N / 32n + 50_000n;
+  const beforeHigh = claimable();
+  const high = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p2.built.encoded)}`], THIRD_PARTY_KEY, String(highLimit));
+  record('gas-1 fails for gas, gas+headroom succeeds (one token)', low.status === '0x0' && lowOutOfGas && lowInWindow && creditedLow === 0n && high.status === '0x1' && claimable() - beforeHigh === amountWei,
+    { referenceGasUsed: oa.gasUsed, neededGasEstimate: N, lowLimit, lowStatus: low.status, lowGasUsed: BigInt(low.gasUsed), lowConsumedWholeLimit: lowOutOfGas, lowAnchorsInWindowAtExecution: lowInWindow, highLimit, highStatus: high.status, highGasUsed: BigInt(high.gasUsed) });
 }
 // =====================================================================================================================================
 // Wallet-path rows (issue #9). These use the plug-ins' own host freshness contract (buildFreshReturnProof / redeemReturn) against the live chain and
@@ -493,7 +523,7 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
 // polls, attempts, sends and the origin at each transaction's execution block.
 // =====================================================================================================================================
 const plugin = createNativeBridgePlugin(bridge, { manifestRevision: 'rows', profileRevision: 'v3' });
-const wCertPinned = BigInt((JSON.parse(readFileSync(`${lane.dir}/b1-profile.json`, 'utf8')) as { wCert: number }).wCert);
+const wCertPinned = BigInt(W_CERT);
 const roundsOfProofs = (ps: InclusionProof[]): bigint[] => [...new Map(ps.map((p) => [hex(p.unicityCertificate.toCBOR()), BigInt(p.unicityCertificate.unicitySeal.rootChainRoundNumber)])).values()];
 const maxOf = (xs: bigint[]): bigint => xs.reduce((a, b) => (a > b ? a : b));
 const minOf = (xs: bigint[]): bigint => xs.reduce((a, b) => (a < b ? a : b));
@@ -511,7 +541,7 @@ const liveSource = (m: WalletMetrics, between?: (i: number) => Promise<void>, di
   const one = async (c: (typeof all)[number]): Promise<InclusionProof> => {
     const sid = await StateId.fromCertificationData(c.inclusionProof.certificationData);
     const row = rowOfSid(sid.data);
-    // `distinct`: this leaf's proof is taken when its shard has certified a round no earlier-fetched leaf of that shard carries (what continuous writes make happen)
+    // `distinct` FORCES the shape instead of observing it: this leaf's proof is taken only when its shard has certified a round no earlier-fetched leaf of that shard carries (what continuous writes make happen)
     const p = await until('a current proof', 60_000, async () => {
       const r = (await aggOf(sid).getInclusionProof(sid)).inclusionProof ?? undefined;
       if (r && distinct && seen.get(row)?.has(hex(r.unicityCertificate.toCBOR()))) return undefined;
@@ -539,8 +569,9 @@ const liveTransport = (m: WalletMetrics, nonce: bigint, delayFirstSendMs = 0): R
       const raw = cast('mktx', lane.vault, 'redeem(bytes)(uint256)', `0x${hex(data)}`, '--private-key', THIRD_PARTY_KEY, '--gas-limit', REDEEM_GAS, '--nonce', txNonce, '--chain', String(lane.chainId), '--legacy', '--gas-price', '2000000000');
       const txHash = `0x${hex(keccak256(unhex(raw)))}`;
       const sentOrigin = await registryClock();
-      await Promise.all(lane.ethUrls.map((url) => rpc(url, 'eth_sendRawTransaction', [raw]).catch(() => undefined)));
-      m.sends.push({ txHash, sentAtMs: Date.now() - m.t0, originAtSend: sentOrigin, roundsFetched: m.fetches.at(-1)?.rounds });
+      const sendErrors: string[] = [];
+      await Promise.all(lane.ethUrls.map((url) => rpc(url, 'eth_sendRawTransaction', [raw]).catch((e) => { sendErrors.push(String(e).slice(0, 160)); })));
+      m.sends.push({ txHash, sentAtMs: Date.now() - m.t0, originAtSend: sentOrigin, roundsFetched: m.fetches.at(-1)?.rounds, ...(sendErrors.length ? { sendErrors } : {}) });
       return txHash;
     },
     receipt: async (h) => {
@@ -557,7 +588,7 @@ const liveTransport = (m: WalletMetrics, nonce: bigint, delayFirstSendMs = 0): R
   };
 };
 const walletPolicy = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...DEFAULT_REDEEM, margin: BigInt(EXEC_MARGIN), receiptTimeoutMs: 60_000, ...over });
-async function walletRow(name: string, body: (m: WalletMetrics) => Promise<{ ok: boolean; data: Record<string, unknown> }>): Promise<void> {
+async function walletRow(name: string, limitOk: boolean, body: (m: WalletMetrics) => Promise<{ ok: boolean; data: Record<string, unknown> }>): Promise<void> {
   const m = newMetrics();
   try {
     const { ok, data } = await body(m);
@@ -569,8 +600,8 @@ async function walletRow(name: string, body: (m: WalletMetrics) => Promise<{ ok:
     });
   } catch (e) {
     const detail = (e as { detail?: string }).detail ?? '';
-    if ((e as { reason?: string }).reason === 'ErrProofUnavailable' && /^(spread|stale|future) /.test(detail)) {
-      // the plug-in judged every fetch outside the window and said so: the shape does not fit this devnet's round timing (a measurement, not a failure)
+    if (limitOk && (e as { reason?: string }).reason === 'ErrProofUnavailable' && /^(spread|stale|future) /.test(detail)) {
+      // only for the rows whose point is to measure whether a shape fits: the plug-in judged every fetch outside the window and said so, so the shape does not fit this devnet's round timing
       recordLimit(name, { cause: detail, fetches: m.fetches.map((f) => ({ ms: f.ms, rounds: f.rounds, spread: maxOf(f.rounds) - minOf(f.rounds) })), originReads: m.origins.map((o) => o.origin), sends: m.sends.length });
       return;
     }
@@ -580,7 +611,7 @@ async function walletRow(name: string, body: (m: WalletMetrics) => Promise<{ ok:
 async function credit<T>(f: () => Promise<T>): Promise<{ result: T; credited: bigint }> { const before = claimable(); const result = await f(); return { result, credited: claimable() - before }; }
 
 // already-old token -> refresh all leaves -> redeem
-await walletRow('wallet: already-old token refreshed for the same burned token, then redeemed', async (m) => {
+await walletRow('wallet: already-old token refreshed for the same burned token, then redeemed', false, async (m) => {
   const b = await buildToken(3, 'same', ['other']);
   const rounds = anchorRoundOf(b.token);
   await until('the held proofs to be older than the window', 120_000, async () => (await registryClock()) - rounds.min > wCertPinned);
@@ -590,7 +621,7 @@ await walletRow('wallet: already-old token refreshed for the same burned token, 
 });
 
 // delayed sign/send: judged fresh, executed after the window, the same token is refetched and sent again
-await walletRow('wallet: delayed send expires on chain, same-token retry succeeds', async (m) => {
+await walletRow('wallet: delayed send expires on chain, same-token retry succeeds', false, async (m) => {
   const b = await buildToken(3, 'same', ['other']);
   const { result, credited } = await credit(() => redeemReturn(plugin, b.token.toCBOR(), liveSource(m), liveChain(m), liveTransport(m, b.nonce, 22_000), walletPolicy()));
   const first = m.sends[0];
@@ -598,7 +629,7 @@ await walletRow('wallet: delayed send expires on chain, same-token retry succeed
 });
 
 // future origin: the registry imports a shard certificate some rounds after the shard made it; the wallet path waits for it
-await walletRow('wallet: freshly certified burn, origin wait, redeem', async (m) => {
+await walletRow('wallet: freshly certified burn, origin wait, redeem', false, async (m) => {
   const b = await buildToken(3, 'same', ['other']);
   const { result, credited } = await credit(() => redeemReturn(plugin, b.token.toCBOR(), liveSource(m), liveChain(m), liveTransport(m, b.nonce), walletPolicy()));
   const first = m.origins[0];
@@ -630,7 +661,7 @@ function startNoise(proofFile: string): () => void {
   return () => { stop = true; };
 }
 for (const [want, rels] of [[3, ['same']], [4, ['same', 'same']]] as const) {
-  await walletRow(`wallet: concurrent shard writes, A=${want}`, async (m) => {
+  await walletRow(`wallet: concurrent shard writes, A=${want}`, true, async (m) => {
     const b = await buildToken(want, 'same', [...rels]);
     const proofFile = `${lane.dir}/rows-lockproof-${b.nonce}.cbor`;
     const policy = walletPolicy({ margin: BigInt(Math.max(EXEC_MARGIN - 2, 1)) });

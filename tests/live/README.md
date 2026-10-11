@@ -17,9 +17,22 @@ Timing matters: B1 authenticates a certificate only within `W_cert` root rounds 
 ## Two-shard acceptance rows (B3)
 
 `rows.ts <lane-config.json>` runs the DN-B two-shard rows against `DNB_AGG_SHARDS=2 scripts/dnb-devnet.sh all` (aggregator-go in `bft-shard`
-mode, shards `40` and `c0`; `lane-config.json` carries `aggUrls`). Rows: anchors 1, 2, 2 on one shard, 3, 4 (several on one shard), the 5th refused
-(by the plug-in and by the chain for the same bundle), 16 leaves (worst real bundle, gas against the gate and the 7M budget), 17 leaves refused,
-malformed final anchor (flipped byte, bad CBOR head), gas-1 / gas+headroom, and restart/recovery of a pending redemption (aggregators, then every
-validator, between redeem and claim). Needs `DNB_REPO` (bft-core checkout), `AGG_BIN`, `DNB_TOOL`. Evidence: `rows-evidence.json`.
-Not yet run (needs a unicity-reth binary). Known limits: the exact minimum gas limit is not searched (one `U-1` and one `U+U/32+50k` attempt per
-token, the B1 window allows no more); the forged 64-signature worst certificate is covered by the oracle corpus and the contract tests, not live.
+mode, shards `40` and `c0`; `lane-config.json` carries `aggUrls`). Needs `DNB_REPO` (bft-core checkout), `AGG_BIN`, `DNB_TOOL`, and an attested
+unicity-reth (`URETH_SHA256`, `URETH_COMMIT`, `URETH_PROVENANCE`). Evidence: `rows-evidence.json` (rows), `rows-limits.json` (measured limits).
+The run's last line is `ROWS COMPLETE: ... N failed ... M measured limits`; the exit code is 1 when any row FAILED. A measured limit does not fail the run.
+
+**Passed live** (two shards, W_cert 15, measured send-to-execution latency 8-9 root rounds, so the margin is 10): one anchor; two anchors on two
+shards; 16 leaves with two anchors (gas against the gate and the 7M budget); the 5th anchor refused (plug-in `ErrTooManyPaths`, chain
+`BudgetExceeded()`); 17 leaves refused; malformed final anchor, asserted by revert selector and trace; gas-1 / gas+headroom on one token;
+restart/recovery of a pending redemption; and the wallet rows, which use the plug-in's host freshness contract on the same burned token
+(already-old token refreshed then redeemed, delayed send expired then same-token retry, future-origin wait). A wallet row that does not redeem is a FAIL.
+
+**NOT passed live: A=3 and A=4.** No live row redeems a bundle with more than one certificate per shard or with three or four anchors. On this
+devnet each shard certifies a new round only every 3-4 root rounds and a redemption executes 8-9 rounds after it is sent, so three or four
+distinct certificates cannot all be inside the window; the same-shard two-round, A=3 and A=4 rows (own-round proofs, and the wallet rows with
+concurrent shard writes) are recorded as measured limits in `rows-limits.json` and do not fail the run. A=3/4 is covered by the oracle corpus and the
+contract/plug-in tests only. The explicit gap carried to testnet is: A=3/4 needs three or four shards certifying about the same root round (or a longer
+W_cert); this devnet has two shards.
+
+Other limits: the forged 64-signature worst certificate is covered by the oracle corpus and the contract tests, not live. The `inWindow` helper
+rebuilds tokens (fresh lock and mint) and is a test-shape device, not wallet evidence; wallet evidence is only the rows named `wallet:`.
