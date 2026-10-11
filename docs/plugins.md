@@ -96,5 +96,8 @@ only when `max(r) <= O` and `O - min(r) <= W_cert - M`. If `max(r) - min(r) > W_
 the newest anchor, judge the oldest anchor again after the wait, and send within a bounded number of attempts. Exhausted freshness, stale pairs or
 temporary witness unavailability are `ErrProofUnavailable` with a diagnostic cause (the unavailable family, retryable, pending state kept); an
 over-limit anchor count, gas or size stays BudgetExceeded and is never retried. Before any resend the host checks the transaction's receipt and the
-vault's spent/credit state: an RPC timeout is not a revert, an unknown send is not repeated while it may be pending, and the wallet burn is never
-repeated. The burn-time preflight is a feasibility filter, not a freshness or service guarantee.
+vault's spent/credit state: an RPC timeout is not a revert, an unknown send is not repeated while it may be pending (`RedemptionUnconfirmed` carries the
+transaction hash; the caller passes it back as `pending` and its receipt is checked before any new send), and the wallet burn is never
+repeated. A revert is retried up to `maxSends` whatever its cause, so a deterministic refusal (a closed authority interval, bad backing) costs
+`maxSends` transactions. A proof service or chain reader that fails is retried within the attempt bound and reported as `ErrProofUnavailable` with
+the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a freshness or service guarantee.

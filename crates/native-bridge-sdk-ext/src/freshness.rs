@@ -75,6 +75,23 @@ mod tests {
             classify_freshness(&[100], 116, w, 0),
             Some(Freshness::Stale)
         );
+        // several certificates in different rounds: the oldest decides staleness, the newest decides future
+        assert_eq!(
+            classify_freshness(&[100, 105], 112, w, m),
+            Some(Freshness::Stale)
+        );
+        assert_eq!(
+            classify_freshness(&[105, 100], 112, w, m),
+            Some(Freshness::Stale)
+        );
+        assert_eq!(
+            classify_freshness(&[100, 105], 109, w, m),
+            Some(Freshness::Ok)
+        );
+        assert_eq!(
+            classify_freshness(&[100, 105], 104, w, m),
+            Some(Freshness::Future)
+        );
         assert_eq!(classify_freshness(&[], 1, w, m), None);
         assert_eq!(classify_freshness(&[1], 1, w, w), None);
     }
