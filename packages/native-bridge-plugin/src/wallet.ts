@@ -246,7 +246,7 @@ export const MAX_PROOF_ATTEMPTS = 3;
  * path does not verify under its own UC. They are retried a bounded number of times with a fresh fetch;
  * nothing is re-queried to make certificates converge, and a pair that never verifies is `ErrProofUnavailable`.
  */
-const PAIR_RACE: readonly NativeReason[] = ['ErrPathInvalid', 'ErrSdkVerification', 'ErrSealRoot'];
+export const PAIR_RACE: readonly NativeReason[] = ['ErrPathInvalid', 'ErrSdkVerification', 'ErrSealRoot'];
 
 /**
  * Assemble the return proof, refreshing the aggregator proofs first from the optional transport.
