@@ -7,7 +7,7 @@
  * Every row builds its own token from a fresh lock, so rows are independent. Anchor patterns are produced by choosing, per leaf, the
  * proof the aggregator returned when the leaf was certified (its own round) or a freshly fetched one (the shard's current round): the
  * driver only selects among proofs the aggregators really served, and the plug-in never re-queries to make them converge.
- * Evidence: <lane.dir>/rows-evidence.json. Not run yet (needs a unicity-reth binary); typechecked only.
+ * Evidence: <lane.dir>/rows-evidence.json. Wallet-path rows (issue #9) use the plug-in freshness contract; the `inWindow` token rebuilding is a test-shape helper only.
  */
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -36,6 +36,8 @@ import { encodeEnvelope } from '../../packages/native-bridge-plugin/src/envelope
 import { encodeJustification, configHashOfPdr } from '../../packages/native-bridge-plugin/src/lockproof.js';
 import { projectToken } from '../../packages/native-bridge-plugin/src/history.js';
 import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../../packages/native-bridge-plugin/src/limits.js';
+import { DEFAULT_REDEEM, redeemReturn, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../../packages/native-bridge-plugin/src/freshness.js';
+import { createNativeBridgePlugin, type ProofSource } from '../../packages/native-bridge-plugin/src/wallet.js';
 import { buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
 import { arr, bs, returnReason, decodeCfg, decodePolicy, shardId, shardRow, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, policyBytes, u, valueEnvelope, H } from '../../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
@@ -443,6 +445,140 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
   record('gas-1 fails, gas+headroom succeeds', low.status === '0x0' && creditedLow === 0n && high.status === '0x1' && claimable() - before === amountWei,
     { referenceGasUsed: U, lowLimit: U - 1n, lowStatus: low.status, highLimit: U + U / 32n + 50_000n, highGasUsed: BigInt(high.gasUsed) });
 }
+// =====================================================================================================================================
+// Wallet-path rows (issue #9). These use the plug-ins' own host freshness contract (buildFreshReturnProof / redeemReturn) against the live chain and
+// shards: the proofs are refetched for the SAME burned token and nothing is rebuilt. They are the wallet evidence; the `inWindow` token rebuilding
+// above is a test-shape helper and is not. Each row records fetch latency, the seal-round spread, the origin lag at the first read, the origin
+// polls, attempts, sends and the origin at each transaction's execution block.
+// =====================================================================================================================================
+const plugin = createNativeBridgePlugin(bridge, { manifestRevision: 'rows', profileRevision: 'v3' });
+const wCertPinned = BigInt((JSON.parse(readFileSync(`${lane.dir}/b1-profile.json`, 'utf8')) as { wCert: number }).wCert);
+const roundsOfProofs = (ps: InclusionProof[]): bigint[] => [...new Map(ps.map((p) => [hex(p.unicityCertificate.toCBOR()), BigInt(p.unicityCertificate.unicitySeal.rootChainRoundNumber)])).values()];
+const maxOf = (xs: bigint[]): bigint => xs.reduce((a, b) => (a > b ? a : b));
+const minOf = (xs: bigint[]): bigint => xs.reduce((a, b) => (a < b ? a : b));
+interface WalletMetrics { fetches: { ms: number; rounds: bigint[] }[]; origins: { at: number; origin: bigint }[]; sends: Record<string, unknown>[]; t0: number }
+const newMetrics = (): WalletMetrics => ({ fetches: [], origins: [], sends: [], t0: Date.now() });
+const liveChain = (m: WalletMetrics): ChainReader => ({
+  origin: async () => { const o = await registryClock(); m.origins.push({ at: Date.now() - m.t0, origin: o }); return o; },
+  wCert: () => Promise.resolve(wCertPinned),
+});
+/** Every leaf's current proof from its own shard. `between(i)` runs after leaf i is fetched (concurrent-write rows); without it all leaves are fetched concurrently. */
+const liveSource = (m: WalletMetrics, between?: (i: number) => Promise<void>): ProofSource => async (held) => {
+  const t = Date.now();
+  const all = [held.genesis, ...held.transactions];
+  const one = async (c: (typeof all)[number]): Promise<InclusionProof> => {
+    const sid = await StateId.fromCertificationData(c.inclusionProof.certificationData);
+    return until('a current proof', 60_000, async () => (await aggOf(sid).getInclusionProof(sid)).inclusionProof ?? undefined);
+  };
+  let proofs: InclusionProof[];
+  if (between) {
+    proofs = [];
+    for (let i = 0; i < all.length; i++) { proofs.push(await one(all[i])); if (i < all.length - 1) await between(i); }
+  } else proofs = await Promise.all(all.map(one));
+  m.fetches.push({ ms: Date.now() - t, rounds: roundsOfProofs(proofs) });
+  return proofs;
+};
+const liveTransport = (m: WalletMetrics, nonce: bigint, delayFirstSendMs = 0): RedeemTransport => {
+  let n = 0;
+  return {
+    send: async (data) => {
+      if (n++ === 0 && delayFirstSendMs) await new Promise((r) => setTimeout(r, delayFirstSendMs));
+      const sender = run('cast', ['wallet', 'address', '--private-key', THIRD_PARTY_KEY]);
+      const txNonce = String(parseInt(await rpc(eth, 'eth_getTransactionCount', [sender, 'pending']), 16));
+      const raw = cast('mktx', lane.vault, 'redeem(bytes)(uint256)', `0x${hex(data)}`, '--private-key', THIRD_PARTY_KEY, '--gas-limit', REDEEM_GAS, '--nonce', txNonce, '--chain', String(lane.chainId), '--legacy', '--gas-price', '2000000000');
+      const txHash = `0x${hex(keccak256(unhex(raw)))}`;
+      const sentOrigin = await registryClock();
+      await Promise.all(lane.ethUrls.map((url) => rpc(url, 'eth_sendRawTransaction', [raw]).catch(() => undefined)));
+      m.sends.push({ txHash, sentAtMs: Date.now() - m.t0, originAtSend: sentOrigin, roundsFetched: m.fetches.at(-1)?.rounds });
+      return txHash;
+    },
+    receipt: async (h) => {
+      const r = await rpc(eth, 'eth_getTransactionReceipt', [h]);
+      if (!r) return undefined;
+      const rec = m.sends.find((s) => s.txHash === h);
+      if (rec && rec.blockNumber === undefined) {
+        rec.blockNumber = r.blockNumber; rec.gasUsed = BigInt(r.gasUsed); rec.status = r.status; rec.sealedAtMs = Date.now() - m.t0;
+        rec.originAtBlock = BigInt(await rpc(eth, 'eth_getStorageAt', [REGISTRY, clockSlot, r.blockNumber]));
+      }
+      return r.status === '0x1' ? 'success' : 'reverted';
+    },
+    redeemed: () => Promise.resolve(BigInt(`0x${hex(unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString())))}`) !== 0n),
+  };
+};
+const walletPolicy = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...DEFAULT_REDEEM, margin: BigInt(EXEC_MARGIN), receiptTimeoutMs: 60_000, ...over });
+async function walletRow(name: string, body: (m: WalletMetrics) => Promise<{ ok: boolean; data: Record<string, unknown> }>): Promise<void> {
+  const m = newMetrics();
+  try {
+    const { ok, data } = await body(m);
+    const first = m.origins[0];
+    record(name, ok, {
+      ...data, fetchMs: m.fetches.map((f) => f.ms), anchorsPerFetch: m.fetches.map((f) => f.rounds.length), roundSpreadPerFetch: m.fetches.map((f) => maxOf(f.rounds) - minOf(f.rounds)),
+      originPolls: m.origins.length, firstOriginRead: first?.origin, newestAnchorLagAtFirstRead: first && m.fetches[0] ? maxOf(m.fetches[0].rounds) - first.origin : undefined,
+      totalMs: Date.now() - m.t0, sends: m.sends,
+    });
+  } catch (e) {
+    record(name, false, { error: String((e as { detail?: string }).detail ?? (e as Error).message ?? e).slice(0, 300), reason: (e as { reason?: string }).reason, sends: m.sends, fetchMs: m.fetches.map((f) => f.ms) });
+  }
+}
+async function credit<T>(f: () => Promise<T>): Promise<{ result: T; credited: bigint }> { const before = claimable(); const result = await f(); return { result, credited: claimable() - before }; }
+
+// already-old token -> refresh all leaves -> redeem
+await walletRow('wallet: already-old token refreshed for the same burned token, then redeemed', async (m) => {
+  const b = await buildToken(3, 'same', ['other']);
+  const rounds = anchorRoundOf(b.token);
+  await until('the held proofs to be older than the window', 120_000, async () => (await registryClock()) - rounds.min > wCertPinned);
+  const heldAge = (await registryClock()) - rounds.min;
+  const { result, credited } = await credit(() => redeemReturn(plugin, b.token.toCBOR(), liveSource(m), liveChain(m), liveTransport(m, b.nonce), walletPolicy()));
+  return { ok: result.status === 'redeemed' && credited === amountWei && result.sends === 1, data: { heldAnchorAgeAtStart: heldAge, status: result.status, sendsUsed: result.sends, credited, reburned: false } };
+});
+
+// delayed sign/send: judged fresh, executed after the window, the same token is refetched and sent again
+await walletRow('wallet: delayed send expires on chain, same-token retry succeeds', async (m) => {
+  const b = await buildToken(3, 'same', ['other']);
+  const { result, credited } = await credit(() => redeemReturn(plugin, b.token.toCBOR(), liveSource(m), liveChain(m), liveTransport(m, b.nonce, 22_000), walletPolicy()));
+  const first = m.sends[0];
+  return { ok: result.status === 'redeemed' && result.sends === 2 && first?.status === '0x0' && credited === amountWei, data: { status: result.status, sendsUsed: result.sends, firstSendStatus: first?.status, firstSendOriginAtBlock: first?.originAtBlock, credited, reburned: false } };
+});
+
+// future origin: the registry imports a shard certificate some rounds after the shard made it; the wallet path waits for it
+await walletRow('wallet: freshly certified burn, origin wait, redeem', async (m) => {
+  const b = await buildToken(3, 'same', ['other']);
+  const { result, credited } = await credit(() => redeemReturn(plugin, b.token.toCBOR(), liveSource(m), liveChain(m), liveTransport(m, b.nonce), walletPolicy()));
+  const first = m.origins[0];
+  const newest = m.fetches[0] ? maxOf(m.fetches[0].rounds) : undefined;
+  return { ok: result.status === 'redeemed' && credited === amountWei, data: { status: result.status, sendsUsed: result.sends, credited, observedFutureAnchor: first !== undefined && newest !== undefined && newest > first.origin } };
+});
+
+// concurrent writes: certifications land on the shards between the per-leaf fetches, so the fetched proofs carry A = 3 or 4 distinct certificates
+async function noiseWrite(row: number, proofFile: string): Promise<void> {
+  for (let i = 0; i < 64; i++) {
+    const owner = newSigner();
+    const mint = await MintTransaction.create(NetworkId.fromId(cfg.network), SignaturePredicate.create(owner.publicKey), {
+      data: valueEnvelope(cfg.aid, amount), expiresAt: null, justification: encodeJustification(cfg.chainId, cfg.vault, cfg.zeroAddress, 1n, Uint8Array.from(readFileSync(proofFile))),
+      salt: TokenSalt.fromBytes(sha256(text(`noise-${Date.now()}-${ownerCounter++}-${i}`))), tokenType: new TokenType(cfg.ty),
+    });
+    const cd = await CertificationData.fromMintTransaction(mint);
+    const sid = await StateId.fromCertificationData(cd);
+    if (rowOfSid(sid.data) !== row) continue;
+    await aggs[row].submitCertificationRequest(cd);
+    await until('a noise write to be certified', 60_000, async () => (await aggs[row].getInclusionProof(sid)).inclusionProof ?? undefined);
+    return;
+  }
+  throw new Error('no noise write for the shard');
+}
+for (const [want, rels] of [[3, ['same']], [4, ['same', 'same']]] as const) {
+  await walletRow(`wallet: concurrent shard writes, A=${want}`, async (m) => {
+    const b = await buildToken(want, 'same', [...rels]);
+    const proofFile = `${lane.dir}/rows-lockproof-${b.nonce}.cbor`;
+    const rowsOf = await Promise.all([b.token.genesis, ...b.token.transactions].map(async (c) => rowOfSid((await StateId.fromCertificationData(c.inclusionProof.certificationData)).data)));
+    // a write to the next leaf's shard before it is fetched: that leaf is served under a newer certificate than any fetched so far on that shard
+    const policy = walletPolicy({ margin: BigInt(Math.min(EXEC_MARGIN, 4)) });
+    const { result, credited } = await credit(() => redeemReturn(plugin, b.token.toCBOR(), liveSource(m, (i) => noiseWrite(rowsOf[i + 1], proofFile)), liveChain(m), liveTransport(m, b.nonce), policy));
+    const used = m.fetches.at(-1)?.rounds.length ?? 0;
+    return { ok: result.status === 'redeemed' && credited === amountWei && used >= want, data: { want, status: result.status, sendsUsed: result.sends, anchorsInSentBundle: used, credited, margin: Number(policy.margin), rowsOfLeaves: rowsOf } };
+  });
+}
+
 // Restart and recovery of a pending redemption: burn certified and persisted, both aggregators restarted, proofs fetched again, redeem, then every
 // validator restarted between redeem and claim, and the claim paid.
 {
