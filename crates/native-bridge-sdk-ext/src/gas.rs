@@ -163,7 +163,13 @@ pub fn scan_anchor(a: &Anchor, depth: u8) -> Result<AnchorScan> {
     }
     // An over-bound certificate is the budget family (the chain says BudgetExceeded); whatever other shape failure, B1 would not
     // authenticate this certificate (oracle `ErrAnchorAuth`).
-    scan_uc(a, depth).map_err(|e| if e == E::TooManyItems { e } else { E::AnchorAuth })
+    scan_uc(a, depth).map_err(|e| {
+        if e == E::TooManyItems {
+            e
+        } else {
+            E::AnchorAuth
+        }
+    })
 }
 
 fn scan_uc(a: &Anchor, depth: u8) -> Result<AnchorScan> {
