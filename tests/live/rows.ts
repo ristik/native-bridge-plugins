@@ -470,15 +470,21 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
   const oa = await acceptedRow('gas: reference redemption (two anchors)', await mix(a.token, [true, true, true]), 2);
   const U = oa.gasUsed;
   const b = await buildToken(3, 'same', ['other']);
-  const t = await mix(b.token, [true, true, true]);
-  const built = await buildReturnProof(bridge, t);
-  await waitWindow(t);
-  const before = claimable();
-  const low = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(built.encoded)}`], THIRD_PARTY_KEY, String(U - 1n));
-  const creditedLow = claimable() - before;
-  const high = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(built.encoded)}`], THIRD_PARTY_KEY, String(U + U / 32n + 50_000n));
-  record('gas-1 fails, gas+headroom succeeds', low.status === '0x0' && creditedLow === 0n && high.status === '0x1' && claimable() - before === amountWei,
-    { referenceGasUsed: U, lowLimit: U - 1n, lowStatus: low.status, highLimit: U + U / 32n + 50_000n, highGasUsed: BigInt(high.gasUsed) });
+  // Each send gets proofs refetched for the SAME token just before it: the first send executes 8-9 rounds later, so an envelope reused for the
+  // second send would be outside W_cert and revert for staleness (run 7: the "high" send used 1.77M gas against 3.1M for a success; inferred stale, status was not recorded).
+  const send = async (limit: bigint): Promise<{ rc: Receipt; credited: bigint; anchors: number }> => {
+    const t = await mix(b.token, [true, true, true]);
+    const built = await buildReturnProof(bridge, t);
+    await waitWindow(t);
+    const before = claimable();
+    const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(built.encoded)}`], THIRD_PARTY_KEY, String(limit));
+    return { rc, credited: claimable() - before, anchors: built.envelope.anchors.length };
+  };
+  const low = await send(U - 1n);
+  const highLimit = U + U / 32n + 50_000n;
+  const high = await send(highLimit);
+  record('gas-1 fails, gas+headroom succeeds', low.rc.status === '0x0' && low.credited === 0n && low.anchors === 2 && high.anchors === 2 && high.rc.status === '0x1' && high.credited === amountWei,
+    { referenceGasUsed: U, lowLimit: U - 1n, lowStatus: low.rc.status, lowAnchors: low.anchors, highLimit, highStatus: high.rc.status, highAnchors: high.anchors, highGasUsed: BigInt(high.rc.gasUsed) });
 }
 // =====================================================================================================================================
 // Wallet-path rows (issue #9). These use the plug-ins' own host freshness contract (buildFreshReturnProof / redeemReturn) against the live chain and
