@@ -79,6 +79,15 @@ const record = (row: string, ok: boolean, data: Record<string, unknown>): void =
   writeFileSync(`${lane.dir}/rows-evidence.json`, JSON.stringify(evidence, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
   if (!ok) failedRows.push(row);
 };
+// nothing escapes uncaught: an unexpected throw is a FAILED row and the run still ends with its final line and a non-zero exit
+const diedOn = (e: unknown): void => {
+  failedRows.push(`driver error: ${(e as { reason?: string }).reason ?? String(e).slice(0, 200)}`);
+  console.log(`FAIL driver error`, String(e).slice(0, 600));
+  console.log(`ROWS COMPLETE: ${evidence.rows.length} rows, ${failedRows.length} failed (${failedRows.join('; ')}), ${limitRows.length} measured limits, evidence ${lane.dir}/rows-evidence.json`);
+  process.exit(1);
+};
+process.on('uncaughtException', diedOn);
+process.on('unhandledRejection', diedOn);
 const eth = lane.ethUrls[0];
 const cast = (...a: string[]): string => {
   for (let i = 0; ; i++) {
@@ -208,6 +217,17 @@ async function mix(token: Token, fresh: boolean[]): Promise<Token> {
     return until('a current proof', 60_000, async () => (await aggOf(sids[i]).getInclusionProof(sids[i])).inclusionProof ?? undefined);
   }));
   return refreshToken(token, proofs);
+}
+
+/** `mix` without the plug-in's token preflight: the over-bound shapes (17 leaves) the plug-in itself refuses are assembled for the chain this way. */
+async function mixRaw(token: Token): Promise<Token> {
+  const all = [token.genesis, ...token.transactions];
+  const proofs = await Promise.all(all.map(async (c) => {
+    const sid = await StateId.fromCertificationData(c.inclusionProof.certificationData);
+    return until('a current proof', 60_000, async () => (await aggOf(sid).getInclusionProof(sid)).inclusionProof ?? undefined);
+  }));
+  const certified = all.map((c, i) => arr(CborDeserializer.decodeArray(c.toCBOR(), 2)[0], proofs[i].toCBOR()));
+  return Token.fromCBOR(C.encodeTag(39040, arr(u(2), certified[0], arr(...certified.slice(1)))));
 }
 
 interface Outcome { receipt: Receipt; anchors: number; leaves: number; gasUsed: bigint; credited: bigint; calls: { uc: number; rsmt: number } | null; gate: number; diag: Record<string, unknown> }
@@ -399,7 +419,7 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
   const before = claimable();
   const rc = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(env)}`], THIRD_PARTY_KEY, REDEEM_GAS);
   const revert = callRevert(THIRD_PARTY_ADDR, env);
-  record('anchors=5 refused', plugin === 'ErrPolicyAnchors' && rc.status === '0x0' && revert === selector('BudgetExceeded()') && claimable() === before,
+  record('anchors=5 refused', plugin === 'ErrTooManyPaths' && rc.status === '0x0' && revert === selector('BudgetExceeded()') && claimable() === before,
     { plugin, chain: revert, gasUsed: BigInt(rc.gasUsed), creditUnchanged: claimable() === before });
 }
 // 16 leaves (the bound) redeem; 17 leaves are refused by the burn-time preflight and by the chain.
@@ -417,7 +437,7 @@ async function acceptedRow(name: string, token: Token, wantAnchors: number): Pro
   const held = await Token.fromCBOR(C.encodeTag(39040, arr(u(2), partsOf(b.token)[0], arr(...partsOf(b.token).slice(1, -1)))));
   let pre2 = 'NO REFUSAL';
   try { await preflightBurn(bridge, held.toCBOR()); } catch (e) { pre2 = (e as { reason?: string }).reason ?? String(e); }
-  const t = await mix(b.token, Array(MAX_LEAVES + 1).fill(true));
+  const t = await mixRaw(b.token);
   await waitWindow(t);
   const ucs = distinctUcs(t);
   const env = await uncheckedEnvelope(t, (uc) => ucs.findIndex((x) => hex(x) === uc), ucs);
