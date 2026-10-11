@@ -29,7 +29,7 @@ import { DeploymentRegistry, makeDeployment } from '../../packages/native-bridge
 import { encodeJustification } from '../../packages/native-bridge-plugin/src/lockproof.js';
 import { configHashOfPdr } from '../../packages/native-bridge-plugin/src/lockproof.js';
 import { buildReturnProof, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
-import { arr, bs, returnReason, decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, u, valueEnvelope } from '../../packages/native-bridge-plugin/src/profile.js';
+import { arr, bs, returnReason, decodeCfg, decodePolicy, shardRow, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, u, valueEnvelope } from '../../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
 import { NativeBridge } from '../../packages/native-bridge-plugin/src/verifier.js';
 import { hex, loadConfig, rpc, run, until, unhex } from './lib.js';
@@ -149,13 +149,16 @@ const justification = encodeJustification(cfg.chainId, cfg.vault, cfg.zeroAddres
 const mint = await MintTransaction.create(NetworkId.fromId(cfg.network), SignaturePredicate.create(owner.publicKey), {
   data: valueEnvelope(cfg.aid, amount), expiresAt: null, justification, salt: TokenSalt.fromBytes(salt), tokenType: new TokenType(cfg.ty),
 });
-const agg = new AggregatorClient(lane.aggUrl);
+const aggs = (lane.aggUrls ?? [lane.aggUrl]).map((u) => new AggregatorClient(u));
+/** The aggregator of the shard a state ID belongs to: the policy row of its top `depth` bits. */
+const aggOf = (sid: StateId): AggregatorClient => aggs[shardRow(dep.policy, sid.data)] ?? aggs[0];
+const agg = aggs[0];
 const cd = await CertificationData.fromMintTransaction(mint);
-const response = await agg.submitCertificationRequest(cd);
-step('mint submitted', { status: JSON.stringify(response) });
 const stateId = await StateId.fromCertificationData(cd);
+const response = await aggOf(stateId).submitCertificationRequest(cd);
+step('mint submitted', { status: JSON.stringify(response) });
 const proof = await until('the aggregator to certify the mint', 120_000, async () => {
-  const r = await agg.getInclusionProof(stateId);
+  const r = await aggOf(stateId).getInclusionProof(stateId);
   return r.inclusionProof ?? undefined;
 });
 step('mint certified by aggregator-go', { referenceTime: proof.referenceTime, rootRound: proof.unicityCertificate.unicitySeal.rootChainRoundNumber });
@@ -171,10 +174,10 @@ writeFileSync(`${lane.dir}/token-mint.cbor`, tokenBytes);
 /** Certify one transaction of `token` and return the extended token bytes. */
 async function certifyStep(token: Token, tx: TransferTransaction, signer: SigningService): Promise<{ bytes: Uint8Array; token: Token }> {
   const certData = await CertificationData.fromTransaction(tx, await SignaturePredicateUnlockScript.create(tx, signer));
-  const r = await agg.submitCertificationRequest(certData);
-  assert.equal(JSON.stringify(r), '{"status":"SUCCESS"}');
   const sid = await StateId.fromCertificationData(certData);
-  const p = await until('the aggregator to certify a transition', 120_000, async () => (await agg.getInclusionProof(sid)).inclusionProof ?? undefined);
+  const r = await aggOf(sid).submitCertificationRequest(certData);
+  assert.equal(JSON.stringify(r), '{"status":"SUCCESS"}');
+  const p = await until('the aggregator to certify a transition', 120_000, async () => (await aggOf(sid).getInclusionProof(sid)).inclusionProof ?? undefined);
   const parts = [token.genesis, ...token.transactions].map((c) => CborDeserializer.decodeArray(c.toCBOR(), 2)).map((x) => arr(x[0], x[1]));
   const bytes = C.encodeTag(39040, arr(u(2), parts[0], arr(...parts.slice(1), arr(tx.toCBOR(), p.toCBOR()))));
   return { bytes, token: await Token.fromCBOR(bytes) };
@@ -192,18 +195,17 @@ step('burn certified', { transitions: token.transactions.length });
 
 // ---- one anchor for the whole history, then the return proof ------------------------------------------------------------------------
 const sids = await Promise.all([token.genesis, ...token.transactions].map((c) => StateId.fromCertificationData(c.inclusionProof.certificationData)));
-const fresh = await until('every proof under one certificate', 120_000, async () => {
-  const rs = await Promise.all(sids.map((sid) => agg.getInclusionProof(sid)));
-  if (rs.some((r) => !r.inclusionProof)) return undefined;
-  const ps = rs.map((r) => r.inclusionProof!);
-  const first = hex(ps[0].unicityCertificate.toCBOR());
-  return ps.every((p) => hex(p.unicityCertificate.toCBOR()) === first) ? ps : undefined;
+// Every leaf is fetched from the aggregator of its own shard, concurrently; each response keeps its own (path, UC) pair and nothing
+// is re-queried to make the certificates converge. The return proof carries one anchor per distinct UC it received.
+const fresh = await until('a proof for every leaf', 120_000, async () => {
+  const rs = await Promise.all(sids.map((sid) => aggOf(sid).getInclusionProof(sid)));
+  return rs.some((r) => !r.inclusionProof) ? undefined : rs.map((r) => r.inclusionProof!);
 });
 token = await refreshToken(token, fresh);
 const ret = await buildReturnProof(bridge, token);
 const clockSlot = `0x${hex(keccak256(text('unicity.seal-registry/clock.rootRound')))}`;
 const registryClock = async (): Promise<bigint> => BigInt(await rpc(eth, 'eth_getStorageAt', ['0xff00000000000000000000000000000000000002', clockSlot, 'latest']));
-step('return proof assembled', { anchorRootRound: token.genesis.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber, registryClock: await registryClock(), bytes: ret.encoded.length, nullifier: hex(ret.verified.outcome.nullifier), leaves: ret.verified.outcome.leaves.length });
+step('return proof assembled', { anchorRootRound: token.genesis.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber, registryClock: await registryClock(), bytes: ret.encoded.length, anchors: ret.envelope.anchors.length, gateTotal: ret.gate.total, nullifier: hex(ret.verified.outcome.nullifier), leaves: ret.verified.outcome.leaves.length });
 writeFileSync(`${lane.dir}/return-proof.bin`, ret.encoded);
 {
   // The exact B1 UC_V1 request the vault's verifier builds for the anchor (B1Calls.ucRequest), kept for off-chain diagnosis against the Go reference.
@@ -215,7 +217,8 @@ writeFileSync(`${lane.dir}/return-proof.bin`, ret.encoded);
 }
 // B1 authenticates a certificate only within [registry clock - W_cert, registry clock]: a certificate newer than the clock is not yet known to the
 // registry. Wait for the clock to reach the anchor, then submit at once.
-const anchorRound = token.genesis.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber;
+// the registry clock must have reached the newest anchor (every anchor is verified by its own UC call)
+const anchorRound = [token.genesis, ...token.transactions].map((c) => c.inclusionProof.unicityCertificate.unicitySeal.rootChainRoundNumber).reduce((a, b) => (a > b ? a : b));
 await until('the registry clock to reach the anchor round', 60_000, async () => (await registryClock()) >= anchorRound);
 step('registry clock reached the anchor', { anchorRound, registryClock: await registryClock() });
 {
@@ -229,13 +232,13 @@ step('registry clock reached the anchor', { anchorRound, registryClock: await re
 
 // ---- redeem by a third party, then claim by the credited recipient --------------------------------------------------------------------
 const vaultBefore = BigInt(await rpc(eth, 'eth_getBalance', [lane.vault, 'latest']));
-const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, '2500000');
+const redeemTx = await sendAll(lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, String(Math.min(7_000_000, ret.gate.total + 200_000))); // the plug-in's gate projection bounds the gas the vault needs; a constant below it ran out of gas (run 2)
 const redeemClock = BigInt(await rpc(eth, 'eth_getStorageAt', ['0xff00000000000000000000000000000000000002', clockSlot, redeemTx.blockNumber]));
 assert.equal(redeemTx.status, '0x1', `redeem reverted: ${JSON.stringify(redeemTx).slice(0, 400)}`);
 const credited = BigInt(cast('call', lane.vault, 'claimable(address)(uint256)', RECIPIENT).split(' ')[0]);
 assert.equal(credited, amountWei, 'the certified recipient is credited with the locked amount');
 assert.equal(`0x${hex(unhex(cast('call', lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString())))}`, `0x${hex(ret.verified.outcome.nullifier)}`, 'the nullifier the vault recorded is the plug-in derivation');
-step('redeem executed (native B1 + B2 kernels)', { gasUsed: BigInt(redeemTx.gasUsed), credited, anchorRound, clockAtExecution: redeemClock });
+step('redeem executed (native B1 + B2 kernels)', { gasUsed: BigInt(redeemTx.gasUsed), gateTotal: ret.gate.total, credited, anchorRound, clockAtExecution: redeemClock });
 // Refusals, each by eth_call in the live window (state untouched): a flipped certificate byte, and a claim by an account with no credit.
 const callRevert = (from: string, sig: string, args: string[]): string => {
   try {
