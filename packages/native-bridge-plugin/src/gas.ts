@@ -14,10 +14,12 @@ import { eq } from './bytes.js';
 
 const INTRINSIC_BASE = 21_000;
 const PER_BYTE = 16;
+/** The composing verifier's own execution per envelope byte (measured 50 to 75, priced 80; owner-decisions section 22). */
+const EXEC_PER_BYTE = 80;
 const B2_BASE = 26_000;
 const B2_PER_BYTE = 20;
 const B2_PER_LEAF = 14_000;
-const UC_BASE = 1_243_700;
+const UC_BASE = 92_700;
 const UC_PER_SIGNATURE = 6_000;
 const PER_STEP = 250;
 const RSMT_BASE = 2_000;
@@ -28,8 +30,8 @@ const RSMT_REQUEST_FIXED = 136;
 
 const pad32 = (n: number): number => (n + 31) & ~31;
 
-/** `G_intrinsic = 21000 + 16*len(envelope)`. */
-export const intrinsicGas = (envelopeBytes: number): number => INTRINSIC_BASE + PER_BYTE * envelopeBytes;
+/** `G_intrinsic = 21000 + 96*len(envelope)` (16 calldata + 80 verifier execution). */
+export const intrinsicGas = (envelopeBytes: number): number => INTRINSIC_BASE + (PER_BYTE + EXEC_PER_BYTE) * envelopeBytes;
 
 /** `len(abi.encode(uint8 op, bytes cfg, bytes payload))`. */
 export const kernelRequestBytes = (cfgBytes: number, payloadBytes: number): number => 96 + 32 + pad32(cfgBytes) + 32 + pad32(payloadBytes);
@@ -37,7 +39,7 @@ export const kernelRequestBytes = (cfgBytes: number, payloadBytes: number): numb
 /** `G_B2 = 26000 + 20*B_sem + 14000*L`. */
 export const b2Gas = (requestBytes: number, leaves: number): number => B2_BASE + B2_PER_BYTE * requestBytes + B2_PER_LEAF * leaves;
 
-/** `G_UC = 1243700 + 16*B_a + 6000*S_a + 250*P_a` with `B_a = 110 + len(shard) + len(uc)`. */
+/** `G_UC = 92700 + 16*B_a + 6000*S_a + 250*P_a` with `B_a = 110 + len(shard) + len(uc)`. */
 export const ucGas = (shardBytes: number, ucBytes: number, signatures: number, steps: number): number =>
   UC_BASE + PER_BYTE * (UC_REQUEST_FIXED + shardBytes + ucBytes) + UC_PER_SIGNATURE * signatures + PER_STEP * steps;
 

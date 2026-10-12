@@ -68,7 +68,7 @@ export interface FreshnessPolicy {
 }
 
 /** M=6 is the lane's heuristic (about 2.7 s at the fast cadence), to be replaced by a measured value. */
-export const DEFAULT_FRESHNESS: FreshnessPolicy = { margin: 6n, maxAttempts: 3, maxOriginWaitMs: 10_000, pollMs: 250 };
+export const DEFAULT_FRESHNESS: FreshnessPolicy = { margin: 10n, maxAttempts: 3, maxOriginWaitMs: 10_000, pollMs: 250 };
 
 /** Reject a policy that cannot work before anything is fetched or sent. */
 function checkPolicy(policy: FreshnessPolicy, wCert: bigint, sends?: number): void {

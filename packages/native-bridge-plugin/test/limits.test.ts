@@ -30,15 +30,15 @@ test('the named bounds are the limits of profile-v3.json, the one source of the 
 });
 
 test('the shared gate prices the worst admitted bundle exactly as the oracle and the contract do', () => {
-  // The numbers of bft-core `TestWorstAdmittedBundleFitsBudget` and the contract's `BridgeBounds`.
-  assert.equal(ucGas(1, L.MAX_ANCHOR_UC_BYTES, L.MAX_SIGNATURES, 1 + L.MAX_UNICITY_STEPS), 1_768_798);
+  // The numbers of bft-core `TestGateDecidesEachBundle` and the contract's `BridgeBounds` after the repricing of owner-decisions section 22.
+  assert.equal(ucGas(1, L.MAX_ANCHOR_UC_BYTES, L.MAX_SIGNATURES, 1 + L.MAX_UNICITY_STEPS), 617_798);
   assert.equal(rsmtGas(L.MAX_RSMT_SIBLINGS), 28_810);
-  assert.equal(intrinsicGas(L.MAX_ENVELOPE_BYTES), 1_069_576);
+  assert.equal(intrinsicGas(L.MAX_ENVELOPE_BYTES), 6_312_456); // 21000 + (16 calldata + 80 verifier execution) per byte
   assert.equal(b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES), 908_560);
   const worst = intrinsicGas(L.MAX_ENVELOPE_BYTES) + b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES) +
     2 * ucGas(1, L.MAX_ANCHOR_UC_BYTES, L.MAX_SIGNATURES, 1 + L.MAX_UNICITY_STEPS) + L.MAX_LEAVES * rsmtGas(L.MAX_RSMT_SIBLINGS) + L.GAS_RESERVE;
-  assert.equal(worst, 6_976_692);
-  assert.ok(worst <= L.TX_GAS_BUDGET);
+  assert.equal(worst, 9_917_572);
+  assert.ok(worst > L.TX_GAS_BUDGET, 'the maximum envelope is priced out');
   assert.ok(L.MAX_ANCHORS * (1 + L.MAX_UNICITY_STEPS) + L.MAX_LEAVES * L.MAX_RSMT_SIBLINGS <= L.MAX_PATH_STEPS, 'the cumulative step bound cannot bind');
 });
 
@@ -46,12 +46,11 @@ test('the gate decides each bundle under the parser ceilings; the best-case proj
   const sigs = L.MAX_SIGNATURES, steps = 1 + L.MAX_UNICITY_STEPS;
   const total = (a: number, uc: number, sg: number, st: number, sib: number): number =>
     intrinsicGas(L.MAX_ENVELOPE_BYTES) + b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES) + a * ucGas(1, uc, sg, st) + L.MAX_LEAVES * rsmtGas(sib) + L.GAS_RESERVE;
-  assert.equal(L.MAX_ANCHORS, 4);
-  assert.ok(total(2, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) <= L.TX_GAS_BUDGET);
-  assert.ok(total(3, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) > L.TX_GAS_BUDGET);
+  assert.equal(L.MAX_ANCHORS, 8);
+  assert.ok(total(2, L.MAX_ANCHOR_UC_BYTES, sigs, steps, L.MAX_RSMT_SIBLINGS) > L.TX_GAS_BUDGET, 'two anchors at every cap are priced out');
   const real = (a: number): number => intrinsicGas(12 << 10) + b2Gas(kernelRequestBytes(4 << 10, 4 << 10), L.MAX_LEAVES) + a * ucGas(1, 811, 4, 1) + L.MAX_LEAVES * rsmtGas(8) + L.GAS_RESERVE;
-  assert.ok(real(L.MAX_ANCHORS) <= L.TX_GAS_BUDGET, 'four DN-B-shape certificates pass');
-  assert.ok(real(L.MAX_ANCHORS + 1) > L.TX_GAS_BUDGET, 'five DN-B-shape certificates do not');
+  assert.ok(real(L.MAX_ANCHORS) <= L.TX_GAS_BUDGET, 'eight DN-B-shape certificates pass');
+  assert.ok(real(L.MAX_ANCHORS + 1) <= L.TX_GAS_BUDGET, 'a ninth would still fit the gas: the ceiling is a parser limit');
   const fit = projectedGate(300, 150, 1, 2, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES);
   assert.ok(fit.gate.total <= L.TX_GAS_BUDGET, String(fit.gate.total));
   assert.ok(fit.envelopeBytes <= L.MAX_ENVELOPE_BYTES, String(fit.envelopeBytes));
@@ -61,7 +60,6 @@ test('the burn preflight refuses a history within BURN_HISTORY_BYTES of the boun
   const edge = L.MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
   assert.ok(checkBurnProjection(200, 300, 1, 2, L.MAX_LEAVES, edge).total <= L.TX_GAS_BUDGET, 'exactly at the margin passes');
   throwsReason(() => checkBurnProjection(200, 300, 1, 2, L.MAX_LEAVES, edge + 1), 'ErrInputTooLarge');
-  // five occupied shards: five certificates cannot pass the gate even at the smallest sizes
-  throwsReason(() => checkBurnProjection(200, 300, 2, 5, 5, 500), 'ErrGasBudget');
-  assert.ok(checkBurnProjection(200, 300, 2, 4, 5, 500).total <= L.TX_GAS_BUDGET, 'four such shards pass');
+  // after the repricing a gate refusal needs a large envelope, not a fifth shard; eight such shards pass
+  assert.ok(checkBurnProjection(200, 300, 2, 8, 8, 500).total <= L.TX_GAS_BUDGET, 'eight such shards pass');
 });

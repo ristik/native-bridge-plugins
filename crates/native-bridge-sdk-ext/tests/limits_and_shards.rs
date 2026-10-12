@@ -52,9 +52,9 @@ fn the_shared_gate_prices_the_worst_admitted_bundle_as_the_oracle_and_the_contra
         MAX_SIGNATURES as u64,
         1 + MAX_UNICITY_STEPS as u64,
     );
-    assert_eq!(uc, 1_768_798);
+    assert_eq!(uc, 617_798);
     assert_eq!(rsmt_gas(MAX_RSMT_SIBLINGS as u64), 28_810);
-    assert_eq!(intrinsic_gas(MAX_ENVELOPE_BYTES as u64), 1_069_576);
+    assert_eq!(intrinsic_gas(MAX_ENVELOPE_BYTES as u64), 6_312_456); // 21000 + (16 calldata + 80 verifier execution) per byte
     let b2 = b2_gas(
         kernel_request_bytes(MAX_SEMANTIC_BYTES as u64, MAX_SEMANTIC_BYTES as u64),
         MAX_LEAVES as u64,
@@ -65,11 +65,10 @@ fn the_shared_gate_prices_the_worst_admitted_bundle_as_the_oracle_and_the_contra
         + 2 * uc
         + MAX_LEAVES as u64 * rsmt_gas(MAX_RSMT_SIBLINGS as u64)
         + GAS_RESERVE;
-    assert_eq!(worst, 6_976_692);
-    assert!(worst <= TX_GAS_BUDGET);
-    // The gate decides each bundle: a third maximum-size certificate does not pass, four DN-B-shape ones (811 bytes, four signatures) do,
-    // five do not.
-    assert!(worst + uc > TX_GAS_BUDGET);
+    assert_eq!(worst, 9_917_572);
+    assert!(worst > TX_GAS_BUDGET, "the maximum envelope is priced out");
+    // Eight DN-B-shape certificates (811 bytes, four signatures) in a 12 KiB envelope pass; a ninth would still fit the gas (the
+    // anchor ceiling is a parser limit).
     let real = |a: u64| {
         intrinsic_gas(12 << 10)
             + b2_gas(kernel_request_bytes(4 << 10, 4 << 10), MAX_LEAVES as u64)
@@ -78,7 +77,7 @@ fn the_shared_gate_prices_the_worst_admitted_bundle_as_the_oracle_and_the_contra
             + GAS_RESERVE
     };
     assert!(real(MAX_ANCHORS as u64) <= TX_GAS_BUDGET);
-    assert!(real(MAX_ANCHORS as u64 + 1) > TX_GAS_BUDGET);
+    assert!(real(MAX_ANCHORS as u64 + 1) <= TX_GAS_BUDGET);
 }
 
 /// The cumulative step bound cannot bind: the anchor, leaf and sibling bounds already imply it.
@@ -220,12 +219,8 @@ fn the_burn_preflight_refuses_a_history_near_the_bound_and_a_best_case_the_gate_
         check_burn_projection(200, 300, 1, 2, MAX_LEAVES as u64, edge + 1).unwrap_err(),
         E::InputTooLarge
     );
-    // five occupied shards: five certificates cannot pass the gate even at the smallest sizes
-    assert_eq!(
-        check_burn_projection(200, 300, 2, 5, 5, 500).unwrap_err(),
-        E::GasBudget
-    );
-    assert!(check_burn_projection(200, 300, 2, 4, 5, 500).unwrap().total <= TX_GAS_BUDGET);
+    // after the repricing a gate refusal needs a large envelope, not a fifth shard; eight such shards pass
+    assert!(check_burn_projection(200, 300, 2, 8, 8, 500).unwrap().total <= TX_GAS_BUDGET);
 }
 
 #[test]
@@ -270,7 +265,7 @@ fn preflight_burn_prices_a_held_token_exactly() {
     // best case: one 445-byte one-signature certificate (depth 0, no shard sibling), an empty input record, the known history only
     assert_eq!(
         [gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt],
-        [2_481_322, 1_258_596, 124_960, 84_488, 13_278]
+        [1_647_762, 107_596, 124_960, 401_928, 13_278]
     );
 }
 

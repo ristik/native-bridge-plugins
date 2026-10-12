@@ -44,7 +44,7 @@
     "leaves": 16,
     "pathSteps": 2048,
     "policyBytes": 512,
-    "aggregatorAnchors": 4,
+    "aggregatorAnchors": 8,
     "aggregatorDepthMax": 1,
     "anchorUcBytes": 8192,
     "irBytes": 512,

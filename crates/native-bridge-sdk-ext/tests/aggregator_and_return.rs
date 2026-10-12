@@ -261,7 +261,7 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
     );
     assert_ne!(env.anchors[0].uc, env.anchors[1].uc);
     // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
-    assert_eq!(MAX_ANCHORS, 4);
+    assert_eq!(MAX_ANCHORS, 8);
     let per_leaf = |n: usize| {
         let tw = Tweaks {
             uc_round: Some(Box::new(|i| 900 + i as u64)),

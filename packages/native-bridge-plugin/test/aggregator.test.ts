@@ -186,7 +186,7 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   assert.deepEqual(two.envelope.leafProofs.map((l) => l.anchorIndex), [0, 1, 1]);
   assert.notDeepEqual(two.envelope.anchors[0].uc, two.envelope.anchors[1].uc);
   // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
-  assert.equal(MAX_ANCHORS, 4);
+  assert.equal(MAX_ANCHORS, 8);
   const perLeaf = (n: number) => buildToken(w, spec(1), Array.from({ length: n }, (_, i) => (i === n - 1 ? burnStep(T0 + 20n) : txStep(i + 2, 7, T0 + 10n + BigInt(i)))), T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
   for (const n of [1, 2]) {
     const out = await perLeaf(n);
@@ -320,7 +320,7 @@ test('preflightBurn prices a held token exactly (pins the best-case constants an
   const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
   const gate = await preflightBurn(w.bridge, held.bytes);
   // best case: one 445-byte one-signature certificate (depth 0, no shard sibling), an empty input record, the known history only
-  assert.deepEqual([gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt], [2_481_322, 1_258_596, 124_960, 84_488, 13_278]);
+  assert.deepEqual([gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt], [1_647_762, 107_596, 124_960, 401_928, 13_278]);
 });
 
 test('planAnchors itself refuses more than MAX_ANCHORS anchors with ErrTooManyPaths (not shadowed by checkPolicyBody)', async () => {
@@ -374,7 +374,7 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   assert.equal(calls, MAX_PROOF_ATTEMPTS, 'no more than the bound, and no re-query to make certificates converge');
   // a bound or profile failure is not retried
   calls = 0;
-  const three = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), txStep(3, 8, T0 + 12n), txStep(4, 9, T0 + 14n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
+  const three = await buildToken(w, spec(1), [...Array.from({ length: MAX_ANCHORS }, (_, i) => txStep(i + 2, 7 + i, T0 + 10n + BigInt(2 * i))), burnStep(T0 + 40n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) }); // MAX_ANCHORS + 1 distinct certificates
   const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [three.token.genesis, ...three.token.transactions].map((c) => c.inclusionProof); };
   await rejects(buildNativeReturnProof(plugin, three.bytes, overBound), 'ErrTooManyPaths');
   assert.equal(calls, 1);

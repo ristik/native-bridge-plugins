@@ -125,5 +125,5 @@ The journal entry (`RedemptionEntry`) moves `burned` -> `submitted` -> `redeemed
   sends again. Wrongly abandoning a pending claim can pay twice, so this is the host's decision, not the plug-in's. The redeem side also recovers by itself once
   anyone redeems the nonce.
 - A bundle over the anchor, gas or size bound is a budget refusal and is not retried; the refusal carries the measured distinct-anchor count (for the anchor ceiling
-  itself, "N distinct anchors fetched, ceiling 4").
+  itself, "N distinct anchors fetched, ceiling 8").
   Without a proof source a held token that does not verify is reported as the failure it is, not as an unavailable service.

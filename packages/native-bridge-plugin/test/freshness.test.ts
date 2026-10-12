@@ -9,6 +9,7 @@ import { NodeDataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/has
 import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radix/SparseMerkleTree.js';
 
 import { NativeError } from '../src/errors.js';
+import { MAX_ANCHORS } from '../src/limits.js';
 import { anchorRounds, buildFreshReturnProof, classifyFreshness, redeemReturn, RedemptionUnconfirmed, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../src/freshness.js';
 import { createNativeBridgePlugin } from '../src/wallet.js';
 import { rejects } from './util.js';
@@ -118,7 +119,7 @@ test('a future anchor waits for the origin (bounded), rechecking the oldest afte
 
 test('a bound overflow is a budget refusal, never freshness, never retried', async () => {
   const w = makeWorld();
-  const three = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), txStep(3, 8, T0 + 12n), txStep(4, 9, T0 + 14n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
+  const three = await buildToken(w, spec(1), [...Array.from({ length: MAX_ANCHORS }, (_, i) => txStep(i + 2, 7 + i, T0 + 10n + BigInt(2 * i))), burnStep(T0 + 40n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) }); // MAX_ANCHORS + 1 distinct certificates
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   let fetches = 0;
   const source = async (): Promise<InclusionProof[]> => (++fetches, [three.token.genesis, ...three.token.transactions].map((c) => c.inclusionProof));
@@ -126,7 +127,7 @@ test('a bound overflow is a budget refusal, never freshness, never retried', asy
   assert.equal(fetches, 1);
   // the refusal says how far over the ceiling the fetched bundle was
   const err = await buildFreshReturnProof(plugin, three.bytes, source, chainAt([910n]), fast).then(() => undefined, (e: unknown) => e);
-  assert.ok(err instanceof NativeError && err.family === 'budget' && err.detail === `${anchorRounds(three.token).length} distinct anchors fetched, ceiling 4; not retried`, String((err as NativeError).detail));
+  assert.ok(err instanceof NativeError && err.family === 'budget' && err.detail === `${anchorRounds(three.token).length} distinct anchors fetched, ceiling ${MAX_ANCHORS}; not retried`, String((err as NativeError).detail));
 });
 
 test('a bug or a bad policy in the pure classification is not reported as an unavailable origin and is not retried', async () => {
