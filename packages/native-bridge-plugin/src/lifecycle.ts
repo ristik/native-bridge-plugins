@@ -5,7 +5,7 @@
  * acknowledgement. The host supplies the transports; nothing here decides admission.
  */
 import { NativeError, fail } from './errors.js';
-import { redeemReturn, DEFAULT_REDEEM, type ChainReader, type RedeemPolicy, type RedeemResult, type RedeemTransport } from './freshness.js';
+import { redeemReturn, DEFAULT_REDEEM, type ChainReader, type RedeemPolicy, type RedeemResult, type RedeemTransport } from './readiness.js';
 import { claimCalldata, type NativeBridgePayments, type NativeBridgePlugin, type ProofSource, type RedemptionEntry } from './wallet.js';
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

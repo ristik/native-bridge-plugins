@@ -1,18 +1,17 @@
 /**
- * The host freshness contract for return proofs (`protocol/interop.md` "Assembly and refresh").
+ * The host readiness contract for return proofs (`protocol/interop.md` "Assembly and refresh").
  *
- * B1 accepts an anchor with seal round `r` only if `r <= O` and `O - r <= W_cert`, `O` being the registry
- * `clock.rootRound` at the redemption's EXECUTION block, not the shard round, the original time `t` or a
- * wall clock. The executing block imports its own origin, so a read of the latest block is advisory and an
- * execution margin `M` is kept: a proof is only sent when `max(r) <= O` and `O - min(r) <= W_cert - M`.
- * `M` is a host-measured inclusion margin, not a protocol constant.
+ * Protocol 4 has no certificate-age window: B1 accepts an anchor whose seal round `r` lies in its epoch's permanent registry
+ * entry, `start <= r <= O` (and `r < end` for a closed epoch), `O` being the registry `clock.rootRound` at the redemption's
+ * EXECUTION block. An old certificate never expires; a NEW one can be ahead of the registry, whose origin only advances when the
+ * system import lands. So the only advisory check left is `max(r) <= O` on the origin the host last read; the executing block
+ * imports its own origin, so a read of the latest block is advisory and a refusal on chain is final.
  *
- * Everything here consumes host transports (the chain reader, the proof source, the transaction sender) and
- * never decides admission: a wrongly judged proof is refused on chain. Freshness is repaired by refreshing
- * the proofs of the SAME burned token (exact M/T/CD/t/J preserved), never by rebuilding or re-burning, and
- * never to obtain matching certificates or fewer anchors. Exhausted freshness is `ErrProofUnavailable`
- * with a cause (the unavailable family, retryable); a bound overflow (anchors, gas, size) stays a budget
- * refusal and is never retried.
+ * Everything here consumes host transports (the chain reader, the proof source, the transaction sender) and never decides
+ * admission: a wrongly judged proof is refused on chain. A proof ahead of the origin is repaired by waiting, a racing (path, UC)
+ * pair by refetching the proofs of the SAME burned token (exact M/T/CD/t/J preserved), never by rebuilding or re-burning, and never
+ * to obtain matching certificates or fewer anchors. An exhausted wait is `ErrProofUnavailable` with a cause (the unavailable
+ * family, retryable); a bound overflow (anchors, gas, size) stays a budget refusal and is never retried.
  */
 import { NativeError, fail } from './errors.js';
 import { buildReturnProof, refreshToken } from './proof.js';
@@ -22,41 +21,24 @@ import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.j
 import { eq, toHex } from './bytes.js';
 import { MAX_ANCHORS } from './limits.js';
 
-/** What the chain says about the window, read by the host from the registry and the pinned profile (`b1.wCert`). */
+/** What the chain says about the registry, read by the host from the registry. */
 export interface ChainReader {
   /** The registry's `clock.rootRound` as of the latest block. */
   origin(): Promise<bigint>;
-  /** The committed B1 window `W_cert`, in root rounds. */
-  wCert(): Promise<bigint>;
 }
 
-/** How the bundle's anchors stand against the window. */
-export type Freshness = 'ok' | 'future' | 'stale' | 'spread';
+/** How the bundle's anchors stand against the origin: `future` means the newest anchor is beyond it (waiting helps). */
+export type Readiness = 'ok' | 'future';
 
-/**
- * Classify the seal rounds of a bundle's distinct anchors. `spread`: even the best origin cannot admit them
- * together under the margin (`max - min > wCert - margin`), so waiting never helps and only newer proofs can.
- * `future`: the newest anchor is beyond the origin, so the registry cannot know it yet (waiting helps).
- * `stale`: the oldest is too old for the origin (only newer proofs help).
- */
-export function classifyFreshness(rounds: readonly bigint[], origin: bigint, wCert: bigint, margin: bigint): Freshness {
+/** Classify the seal rounds of a bundle's distinct anchors against the origin the host last read. */
+export function classifyReadiness(rounds: readonly bigint[], origin: bigint): Readiness {
   if (rounds.length === 0) throw new TypeError('no anchor rounds');
-  if (margin < 0n || margin >= wCert) throw new RangeError('the execution margin must be in [0, W_cert)');
-  let min = rounds[0];
   let max = rounds[0];
-  for (const r of rounds) {
-    if (r < min) min = r;
-    if (r > max) max = r;
-  }
-  if (max - min > wCert - margin) return 'spread';
-  if (max > origin) return 'future';
-  if (origin - min > wCert - margin) return 'stale';
-  return 'ok';
+  for (const r of rounds) if (r > max) max = r;
+  return max > origin ? 'future' : 'ok';
 }
 
-export interface FreshnessPolicy {
-  /** The execution margin M in root rounds. */
-  margin: bigint;
+export interface ReadinessPolicy {
   /** Fetch-and-assemble attempts (each re-fetches every leaf's proof) before the proof is reported unavailable. */
   maxAttempts: number;
   /** The longest the origin is awaited, per attempt, when an anchor is newer than it. */
@@ -67,14 +49,12 @@ export interface FreshnessPolicy {
   now?: () => number;
 }
 
-/** M=6 is the lane's heuristic (about 2.7 s at the fast cadence), to be replaced by a measured value. */
-export const DEFAULT_FRESHNESS: FreshnessPolicy = { margin: 10n, maxAttempts: 3, maxOriginWaitMs: 10_000, pollMs: 250 };
+export const DEFAULT_READINESS: ReadinessPolicy = { maxAttempts: 3, maxOriginWaitMs: 10_000, pollMs: 250 };
 
 /** Reject a policy that cannot work before anything is fetched or sent. */
-function checkPolicy(policy: FreshnessPolicy, wCert: bigint, sends?: number): void {
+function checkPolicy(policy: ReadinessPolicy, sends?: number): void {
   if (!Number.isInteger(policy.maxAttempts) || policy.maxAttempts < 1) throw new RangeError('maxAttempts must be an integer >= 1');
   if (sends !== undefined && (!Number.isInteger(sends) || sends < 1)) throw new RangeError('maxSends must be an integer >= 1');
-  if (policy.margin < 0n || policy.margin >= wCert) throw new RangeError('the execution margin must be in [0, W_cert)');
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -89,36 +69,34 @@ export function anchorRounds(token: Token): bigint[] {
   return [...seen.values()];
 }
 
-export interface FreshReturnProof {
+export interface ReadyReturnProof {
   encoded: Uint8Array;
   nullifier: Uint8Array;
-  /** The anchors' seal rounds, the origin they were last judged against and W_cert (for the host's records). */
+  /** The anchors' seal rounds and the origin they were last judged against (for the host's records). */
   rounds: bigint[];
   origin: bigint;
-  wCert: bigint;
-  /** Fetch rounds used (1 = the first fetch was fresh enough). */
+  /** Fetch rounds used (1 = the first fetch was ready). */
   attempts: number;
 }
 
 /**
- * Fetch every leaf's current proof, assemble the envelope and send it nowhere: return it once it is inside
- * the window. Every attempt re-fetches all leaves for the same burned token. An anchor newer than the origin
- * is awaited for at most `maxOriginWaitMs` and then judged again, oldest anchor included.
+ * Fetch every leaf's current proof, assemble the envelope and send it nowhere: return it once no anchor is
+ * ahead of the origin. Every attempt re-fetches all leaves for the same burned token. An anchor newer than the
+ * origin is awaited for at most `maxOriginWaitMs`.
  */
-export async function buildFreshReturnProof(
+export async function buildReadyReturnProof(
   plugin: NativeBridgePlugin,
   tokenBytes: Uint8Array,
   source: ProofSource,
   chain: ChainReader,
-  policy: FreshnessPolicy = DEFAULT_FRESHNESS,
+  policy: ReadinessPolicy = DEFAULT_READINESS,
   sends?: number,
-): Promise<FreshReturnProof> {
+): Promise<ReadyReturnProof> {
   preflightToken(tokenBytes);
   const sleep = policy.sleep ?? realSleep;
   const now = policy.now ?? Date.now;
   const held = await Token.fromCBOR(tokenBytes);
-  const wCert = await chain.wCert();
-  checkPolicy(policy, wCert, sends);
+  checkPolicy(policy, sends);
   let cause = 'no attempt';
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
     let token: Token;
@@ -167,19 +145,19 @@ export async function buildFreshReturnProof(
     };
     let origin = await readOrigin();
     if (origin === undefined) continue;
-    let verdict = classifyFreshness(rounds, origin, wCert, policy.margin);
+    let verdict = classifyReadiness(rounds, origin);
     let lost = false;
     while (verdict === 'future' && now() < deadline) {
       await sleep(policy.pollMs);
       const again = await readOrigin();
       if (again === undefined) { lost = true; break; }
       origin = again;
-      verdict = classifyFreshness(rounds, origin, wCert, policy.margin);
+      verdict = classifyReadiness(rounds, origin);
     }
     if (lost) continue;
-    if (verdict === 'ok') return { encoded: built.encoded, nullifier: built.verified.outcome.nullifier, rounds, origin, wCert, attempts: attempt };
-    cause = `${verdict} (rounds ${rounds.join(',')}, origin ${origin}, W_cert ${wCert}, margin ${policy.margin})`;
-    if (verdict === 'future') break; // the registry has not imported the newest anchor within the wait: refetching cannot make it older
+    if (verdict === 'ok') return { encoded: built.encoded, nullifier: built.verified.outcome.nullifier, rounds, origin, attempts: attempt };
+    cause = `${verdict} (rounds ${rounds.join(',')}, origin ${origin})`;
+    break; // the registry has not imported the newest anchor within the wait: refetching cannot make it older
   }
   return fail('ErrProofUnavailable', cause);
 }
@@ -204,13 +182,13 @@ export interface RedeemObserver {
   sent?(txHash: string | undefined): Promise<void>;
 }
 
-export interface RedeemPolicy extends FreshnessPolicy {
+export interface RedeemPolicy extends ReadinessPolicy {
   /** Sends before giving up. Each re-fetches every proof for the same burned token. */
   maxSends: number;
   receiptTimeoutMs: number;
 }
 
-export const DEFAULT_REDEEM: RedeemPolicy = { ...DEFAULT_FRESHNESS, maxSends: 3, receiptTimeoutMs: 30_000 };
+export const DEFAULT_REDEEM: RedeemPolicy = { ...DEFAULT_READINESS, maxSends: 3, receiptTimeoutMs: 30_000 };
 
 export type RedeemResult =
   | { status: 'redeemed'; txHash?: string; nullifier: Uint8Array; sends: number }
@@ -243,9 +221,9 @@ async function isRedeemed(transport: RedeemTransport, id: { nonce: bigint; nulli
 }
 
 /**
- * Redeem a burned token. The vault is asked FIRST (after the receipts of the hashes in `pending`), before any proof is fetched and before the freshness window is judged: an already executed
+ * Redeem a burned token. The vault is asked FIRST (after the receipts of the hashes in `pending`), before any proof is fetched and before the origin is read: an already executed
  * redemption (a third party's, or an earlier send of ours whose hash was lost) is reported as such even when the proof service is down or the
- * window cannot be met. Then every hash in `pending` (an earlier unconfirmed send) is checked: a success ends the call, a transaction still
+ * origin cannot be met. Then every hash in `pending` (an earlier unconfirmed send) is checked: a success ends the call, a transaction still
  * pending, with the vault still not showing the nonce credited, leaves the call unconfirmed again with no new send, a revert is dropped. Before every send the vault's state is read again. After a send
  * the receipt and the vault state, never the RPC's answer alone, decide the next step: an RPC timeout is not a revert. A revert refetches every
  * proof for the same token and sends again, within `maxSends`, whatever its cause: a deterministic refusal (a closed authority interval, bad
@@ -264,7 +242,7 @@ export async function redeemReturn(
 ): Promise<RedeemResult> {
   const sleep = policy.sleep ?? realSleep;
   const now = policy.now ?? Date.now;
-  checkPolicy(policy, await chain.wCert(), policy.maxSends);
+  checkPolicy(policy, policy.maxSends);
   const id = await returnIdentity(plugin, tokenBytes);
   const nullifier = id.nullifier;
   // a pending hash that succeeded ends the call; one without a receipt does not end it yet: the vault is asked before it is believed (a dropped
@@ -278,7 +256,7 @@ export async function redeemReturn(
   if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends: 0 };
   if (unconfirmed !== undefined) throw new RedemptionUnconfirmed(unconfirmed);
   for (let sends = 0; sends < policy.maxSends; ) {
-    const proof = await buildFreshReturnProof(plugin, tokenBytes, source, chain, policy, policy.maxSends);
+    const proof = await buildReadyReturnProof(plugin, tokenBytes, source, chain, policy, policy.maxSends);
     if (await isRedeemed(transport, id)) return { status: 'already-redeemed', nullifier, sends };
     sends++;
     await observer.beforeSend?.();

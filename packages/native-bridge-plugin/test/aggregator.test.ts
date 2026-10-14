@@ -12,18 +12,19 @@ import { CborDeserializer } from '@unicitylabs/state-transition-sdk/lib/serializ
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 
 import { checkAnchors, checkPolicyBody, decodeEnvelope, encodeEnvelope, parseInputRecord, planAnchors } from '../src/envelope.js';
-import { computeGate, kernelRequestBytes, scanAnchor } from '../src/gas.js';
+import { measure } from '../src/certgroups.js';
+import { computeGate, kernelRequestBytes } from '../src/gas.js';
 import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../src/limits.js';
-import { BURN_HISTORY_BYTES, buildReturnProof, leafRoutes, preflightBurn, refreshToken } from '../src/proof.js';
+import { BURN_HISTORY_BYTES, buildReturnProof, leafStateIds, preflightBurn, refreshToken } from '../src/proof.js';
 import { projectToken } from '../src/history.js';
 import { NativeError, RETRYABLE } from '../src/errors.js';
 import { BEST_UC_BYTES } from '../src/gas.js';
 import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
-import { cfgBytes, shardId, shardRow } from '../src/profile.js';
+import { cfgBytes } from '../src/profile.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, PAIR_RACE } from '../src/wallet.js';
 import { DeploymentRegistry } from '../src/deployment.js';
 import { rejects, throwsReason } from './util.js';
-import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, sha, signer, spec, txStep, type World } from './world.js';
+import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, rowOf, sha, shardOf, signer, spec, txStep, type World } from './world.js';
 
 const T0 = 1_700_000_040n;
 const UC_TS = 1_700_000_900n;
@@ -42,7 +43,10 @@ test('return envelope round trips and passes policy, anchor and gate checks', as
   const ir = checkAnchors(envelope, plan, verified.outcome.leaves.map((l) => l.referenceTime));
   assert.equal(ir[0].timestamp, UC_TS);
   assert.ok(gate.total <= TX_GAS_BUDGET);
-  assert.deepEqual(computeGate(encoded.length, kernelRequestBytes(cfgBytes(w.dep.cfg).length, envelope.history.length), envelope, pol), gate);
+  assert.deepEqual(computeGate(cfgBytes(w.dep.cfg), encoded.length, kernelRequestBytes(cfgBytes(w.dep.cfg).length, envelope.history.length), envelope), gate);
+  assert.equal(gate.grouping.k, 1);
+  assert.equal(gate.j, 17 + 4 + 12 + gate.grouping.items, 'J: Cfg, policy, one IR opening and the UC occurrences');
+  assert.equal(gate.items, 1000 * gate.j);
 });
 
 test('envelope framing is canonical', async () => {
@@ -72,15 +76,18 @@ test('policy and anchor-table checks name each mismatch', async () => {
   const dup = clone();
   dup.anchors.push(structuredClone(dup.anchors[0]));
   throwsReason(() => plan(dup), 'ErrPolicyAnchors', 'identical UC bytes are one anchor, never two');
-  const shard = clone();
-  shard.anchors[0].shard = Uint8Array.of(0x40);
-  throwsReason(() => plan(shard), 'ErrPolicyTuple', 'a shard of another topology');
+  const foreign = clone();
+  foreign.anchors[0].shard = Uint8Array.of(sids[0][0] & 0x80 ? 0x40 : 0xc0);
+  throwsReason(() => plan(foreign), 'ErrPolicyLeafIndex', 'a shard whose prefix the leaf does not carry');
+  const noncanonical = clone();
+  noncanonical.anchors[0].shard = Uint8Array.of(0x00);
+  throwsReason(() => plan(noncanonical), 'ErrPolicyTuple', 'a noncanonical shard ID');
   const part = clone();
   part.anchors[0].partition += 1;
   throwsReason(() => plan(part), 'ErrPolicyTuple');
   const conf = clone();
   conf.anchors[0].shardConfHash[0] ^= 1;
-  throwsReason(() => plan(conf), 'ErrPolicyTuple');
+  plan(conf); // the configuration hash is authenticated by the UC (B1), not pinned by the policy
   throwsReason(() => plan(envelope, sids.slice(0, 2)), 'ErrPolicyLeafCount');
   const idx = clone();
   idx.leafProofs[1].anchorIndex = 1;
@@ -99,23 +106,23 @@ test('input record opening is bound to the anchor', async () => {
   const one = { leafAnchor: [0, 0, 0] };
   const a = structuredClone(envelope);
   a.anchors[0].inputRecord[10] ^= 1;
-  throwsReason(() => checkAnchors(a, one, times), 'ErrInputRecordMismatch', 'false opening');
+  throwsReason(() => checkAnchors(a, one, times), 'ErrIROpening', 'false opening');
   const b = structuredClone(envelope);
   b.anchors[0].expectedStateRoot[0] ^= 1;
-  throwsReason(() => checkAnchors(b, one, times), 'ErrInputRecordMismatch', 'state root');
-  throwsReason(() => checkAnchors(envelope, one, [UC_TS + 1n, UC_TS, UC_TS]), 'ErrReferenceTimeFuture');
+  throwsReason(() => checkAnchors(b, one, times), 'ErrIRState', 'state root');
+  throwsReason(() => checkAnchors(envelope, one, [UC_TS + 1n, UC_TS, UC_TS]), 'ErrIRTime');
   checkAnchors(envelope, one, [UC_TS, UC_TS, UC_TS]);
-  throwsReason(() => parseInputRecord(C.encodeTag(39002, C.encodeArray(C.encodeUnsignedInteger(1)))), 'ErrShape');
-  throwsReason(() => parseInputRecord(new Uint8Array(513)), 'ErrInputTooLarge');
+  throwsReason(() => parseInputRecord(C.encodeTag(39002, C.encodeArray(C.encodeUnsignedInteger(1)))), 'ErrIRShape');
+  throwsReason(() => parseInputRecord(new Uint8Array(513)), 'ErrIRShape');
   // the summary value is bounded by the native sublimit the chain enforces (256 bytes), so a received envelope cannot open what the chain refuses
   const ir = (summary: number): Uint8Array => C.encodeTag(39002, C.encodeArray(
     C.encodeUnsignedInteger(1), C.encodeUnsignedInteger(7), C.encodeUnsignedInteger(1), C.encodeNull(), C.encodeByteString(new Uint8Array(32)),
     C.encodeByteString(new Uint8Array(summary)), C.encodeUnsignedInteger(5), C.encodeNull(), C.encodeUnsignedInteger(0), C.encodeNull()));
   assert.equal(parseInputRecord(ir(256)).round, 7n);
-  throwsReason(() => parseInputRecord(ir(257)), 'ErrProofTooLarge');
+  throwsReason(() => parseInputRecord(ir(257)), 'ErrIRShape');
 });
 
-test('an over-bound certificate is a budget refusal, any other shape failure is an invalid certificate', async () => {
+test('an over-bound certificate is a budget refusal, any other shape failure is malformed', async () => {
   const w = makeWorld();
   const out = await ret(w);
   const { envelope } = await buildReturnProof(w.bridge, out.token);
@@ -125,17 +132,17 @@ test('an over-bound certificate is a budget refusal, any other shape failure is 
     const extra: [string, ReturnType<typeof signer>][] = Array.from({ length: signers - 4 }, (_, i) => [`extra${i}`, signer(100 + (i % 100))]);
     return (await makeUc(w.agg, { partition: AGG_PARTITION, conf: w.aggConf, epochIr: 1n, rootEpoch: 2n, round: BigInt(old.unicitySeal.rootChainRoundNumber), timestamp: UC_TS, stateHash: old.inputRecord.hash!, blockHash: null, signers: 4, extra })).toCBOR();
   };
-  assert.equal(scanAnchor({ ...a, uc: await sealed(64) }, 0).sigs, 64);
-  const over = await sealed(65);
-  assert.throws(() => scanAnchor({ ...a, uc: over }, 0), { reason: 'ErrTooManyItems', family: 'budget' });
-  assert.throws(() => scanAnchor({ ...a, uc: a.uc.slice(0, 20) }, 0), { reason: 'ErrAnchorAuth' });
+  assert.equal(measure([{ ...a, uc: await sealed(16) }]).q, 16);
+  const over = await sealed(17);
+  assert.throws(() => measure([{ ...a, uc: over }]), { reason: 'ErrTooManyItems', family: 'budget' });
+  assert.throws(() => measure([{ ...a, uc: a.uc.slice(0, 20) }]), { family: 'malformed' });
   // 33 unicity steps (the bound is 32), spliced into the certificate's empty step list
   const at = Buffer.from(a.uc).indexOf(Buffer.from([0xd9, 0x98, 0x5c, 0x83]));
   assert.ok(at > 0, 'the unicity tree certificate');
   const head = at + 4 + 1 + 1; // tag, array(3), version, partition (one byte each here)
   assert.equal(a.uc[head], 0x80, 'an empty step list');
   const steps = Uint8Array.from([...a.uc.slice(0, head), 0x98, 33, ...new Array<number>(33).fill(0xf6), ...a.uc.slice(head + 1)]);
-  assert.throws(() => scanAnchor({ ...a, uc: steps }, 0), { reason: 'ErrTooManyItems', family: 'budget' });
+  assert.throws(() => measure([{ ...a, uc: steps }]), { reason: 'ErrTooManyItems', family: 'budget' });
 });
 
 async function freshProofs(w: World, out: Awaited<ReturnType<typeof ret>>, extra: number, ts: bigint): Promise<InclusionProof[]> {
@@ -186,7 +193,7 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   assert.deepEqual(two.envelope.leafProofs.map((l) => l.anchorIndex), [0, 1, 1]);
   assert.notDeepEqual(two.envelope.anchors[0].uc, two.envelope.anchors[1].uc);
   // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
-  assert.equal(MAX_ANCHORS, 8);
+  assert.equal(MAX_ANCHORS, 16);
   const perLeaf = (n: number) => buildToken(w, spec(1), Array.from({ length: n }, (_, i) => (i === n - 1 ? burnStep(T0 + 20n) : txStep(i + 2, 7, T0 + 10n + BigInt(i)))), T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
   for (const n of [1, 2]) {
     const out = await perLeaf(n);
@@ -195,10 +202,11 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
     assert.equal(ok.envelope.anchors.length, n + 1);
     assert.ok(ok.gate.total <= TX_GAS_BUDGET);
   }
-  // one more than the ceiling is refused, never truncated
-  const five = await perLeaf(MAX_ANCHORS);
-  assert.equal(five.ucs.length, MAX_ANCHORS + 1);
-  await rejects(buildReturnProof(w.bridge, five.token), 'ErrTooManyPaths');
+  // every leaf of a full 16-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the gate, never truncated
+  const full = await perLeaf(MAX_LEAVES - 1);
+  assert.equal(full.ucs.length, MAX_ANCHORS);
+  const sixteen = await buildReturnProof(w.bridge, full.token).then((r) => r.envelope.anchors.length, (e: unknown) => (e as NativeError).reason);
+  assert.ok(sixteen === MAX_ANCHORS || sixteen === 'ErrGasBudget', String(sixteen));
 });
 
 async function aggErr(f: (o: { uc: Parameters<typeof makeUc>[1] }) => void): Promise<unknown> {
@@ -213,9 +221,8 @@ async function aggErr(f: (o: { uc: Parameters<typeof makeUc>[1] }) => void): Pro
   return w.bridge.verifyNativeToken(await Token.fromCBOR(bytes), 'receipt');
 }
 
-test('aggregator certificates are checked against the pinned policy and the SDK quorum', async () => {
+test('aggregator certificates are checked against the pinned partition and the SDK quorum', async () => {
   await rejects(aggErr((o) => void (o.uc.partition = 9)), 'ErrNotAdmitted');
-  await rejects(aggErr((o) => void (o.uc.conf = new Uint8Array(32).fill(9))), 'ErrNotAdmitted');
   await rejects(aggErr((o) => void (o.uc.signers = 2)), 'ErrQuorumNotMet');
   await rejects(aggErr((o) => void (o.uc.stateHash = new Uint8Array(32).fill(0x13))), 'ErrPathInvalid');
   await rejects(aggErr((o) => void (o.uc.rootEpoch = 3n)), 'ErrEpochMismatch');
@@ -232,7 +239,7 @@ test('deployment registry rejects duplicates', () => {
 async function twoShardReturn(w: World) {
   for (let k = 2; k < 60; k++) {
     const out = await buildToken(w, spec(1), [txStep(k, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
-    if (new Set(out.leaves.map(([sid]) => shardRow(w.policy, sid))).size === 2) return out;
+    if (new Set(out.leaves.map(([sid]) => rowOf(w, sid))).size === 2) return out;
   }
   throw new Error('no two-shard fixture');
 }
@@ -244,23 +251,21 @@ test('depth 1: one anchor per distinct UC in first-use order, each leaf under it
   const { envelope, encoded, verified, gate } = await buildReturnProof(w.bridge, out.token);
   assert.equal(envelope.anchors.length, 2);
   assert.deepEqual(envelope.anchors.map((a) => [...a.shard]), [[...shardIdOf(w, out, 0)], [...shardIdOf(w, out, 1)]]);
-  const rows = verified.outcome.leaves.map((l) => shardRow(w.policy, l.sid));
+  const rows = verified.outcome.leaves.map((l) => rowOf(w, l.sid));
   // anchor j is the j-th distinct shard in leaf order, and every leaf names the anchor of its own row
   const order = [...new Set(rows)];
   assert.deepEqual(envelope.leafProofs.map((l) => l.anchorIndex), rows.map((r) => order.indexOf(r)));
   const pol = checkPolicyBody(w.dep.cfg, envelope);
   const plan = planAnchors(pol, envelope, verified.outcome.leaves.map((l) => l.sid));
   checkAnchors(envelope, plan, verified.outcome.leaves.map((l) => l.referenceTime));
-  // the shard-tree sibling of the depth-1 certificate is a path step of the gate
-  assert.equal(scanAnchor(envelope.anchors[0], 1).steps, 1);
-  assert.throws(() => scanAnchor(envelope.anchors[0], 0), { reason: 'ErrAnchorAuth' });
+  // the depth of each anchor comes from its own shard ID, and its shard-tree sibling is a path step of the gate
+  assert.equal(measure([envelope.anchors[0]]).p, 1);
+  assert.throws(() => measure([{ ...envelope.anchors[0], shard: Uint8Array.of(0x80) }]), { reason: 'ErrShardMismatch' });
   assert.ok(gate.total <= TX_GAS_BUDGET);
   assert.deepEqual(decodeEnvelope(encoded), envelope);
-  // routing: every leaf is served by the row of its own shard, and the anchors agree
-  const routes = await leafRoutes(w.bridge, out.token);
-  assert.deepEqual(routes.map((r) => r.row), rows);
-  assert.deepEqual(routes.map((r) => r.sid), verified.outcome.leaves.map((l) => l.sid));
-  routes.forEach((r, i) => assert.deepEqual(r.shard, envelope.anchors[envelope.leafProofs[i].anchorIndex].shard));
+  // routing: the state ID of every leaf is what the host asks its aggregator for; the anchors carry the shards the certificates name
+  const sidsOf = await leafStateIds(out.token);
+  assert.deepEqual(sidsOf, verified.outcome.leaves.map((l) => l.sid));
   // a leaf under the other shard's anchor is refused
   const swapped = structuredClone(envelope);
   swapped.leafProofs.forEach((l) => { l.anchorIndex = 1 - l.anchorIndex; });
@@ -268,25 +273,25 @@ test('depth 1: one anchor per distinct UC in first-use order, each leaf under it
 });
 
 const shardIdOf = (w: World, out: Awaited<ReturnType<typeof twoShardReturn>>, j: number): Uint8Array => {
-  const rows = out.leaves.map(([sid]) => shardRow(w.policy, sid));
-  return shardId(w.policy, [...new Set(rows)][j]);
+  const rows = out.leaves.map(([sid]) => rowOf(w, sid));
+  return shardOf(w, [...new Set(rows)][j]);
 };
 
-test('depth 1: a certificate of the other shard is not admitted for a leaf', async () => {
+test('depth 1: a certificate of the other shard does not cover the leaf', async () => {
   const w = makeWorld(20, 1);
   const out = await twoShardReturn(w);
   // The leaves of row r are certified by a UC that names the other row's shard and configuration.
   const g = out.token.genesis;
-  const row = shardRow(w.policy, out.leaves[0][0]);
+  const row = rowOf(w, out.leaves[0][0]);
   const other = 1 - row;
   const wrong = await makeUc(w.agg, {
     partition: AGG_PARTITION, conf: w.aggConfs[other], epochIr: 1n, rootEpoch: 2n, round: 900n, timestamp: UC_TS,
     stateHash: g.inclusionProof.unicityCertificate.inputRecord.hash, blockHash: null, signers: 4,
-    shard: { bytes: shardId(w.policy, other), siblings: [sha(Uint8Array.of(1))] },
+    shard: { bytes: shardOf(w, other), siblings: [sha(Uint8Array.of(1))] },
   });
   const proof = new InclusionProof(g.inclusionProof.certificationData, g.inclusionProof.referenceTime, g.inclusionProof.inclusionCertificate, wrong);
   const bytes = C.encodeTag(39040, C.encodeArray(C.encodeUnsignedInteger(2), C.encodeArray(CborDeserializer.decodeArray(g.toCBOR(), 2)[0], proof.toCBOR()), C.encodeArray()));
-  await rejects(w.bridge.verifyNativeToken(await Token.fromCBOR(bytes), 'receipt'), 'ErrNotAdmitted');
+  await rejects(w.bridge.verifyNativeToken(await Token.fromCBOR(bytes), 'receipt'), 'ErrShardMismatch');
 });
 
 // ---- the burn-time preflight and the bounded retry ----------------------------------------------------
@@ -319,8 +324,8 @@ test('preflightBurn prices a held token exactly (pins the best-case constants an
   const w = makeWorld();
   const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
   const gate = await preflightBurn(w.bridge, held.bytes);
-  // best case: one 445-byte one-signature certificate (depth 0, no shard sibling), an empty input record, the known history only
-  assert.deepEqual([gate.total, gate.uc, gate.b2, gate.intrinsic, gate.rsmt], [1_647_762, 107_596, 124_960, 401_928, 13_278]);
+  // best case: ONE 445-byte one-signature certificate (39 items, depth 0, no shard sibling), an empty input record (12 items), the known history only
+  assert.deepEqual([gate.total, gate.batch, gate.items, gate.b2, gate.intrinsic, gate.rsmt], [1_722_174, 107_896, 72_000, 124_960, 404_040, 13_278]);
 });
 
 test('planAnchors itself refuses more than MAX_ANCHORS anchors with ErrTooManyPaths (not shadowed by checkPolicyBody)', async () => {
@@ -372,10 +377,10 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   const bad = await buildNativeReturnProof(plugin, tampered).then(() => undefined, (e: unknown) => e);
   assert.ok(bad instanceof NativeError && PAIR_RACE.includes(bad.reason), String(bad));
   assert.equal(calls, MAX_PROOF_ATTEMPTS, 'no more than the bound, and no re-query to make certificates converge');
-  // a bound or profile failure is not retried
+  // a bound or profile failure is not retried: more leaves than the profile admits is refused before anything is fetched
   calls = 0;
-  const three = await buildToken(w, spec(1), [...Array.from({ length: MAX_ANCHORS }, (_, i) => txStep(i + 2, 7 + i, T0 + 10n + BigInt(2 * i))), burnStep(T0 + 40n)], T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) }); // MAX_ANCHORS + 1 distinct certificates
-  const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [three.token.genesis, ...three.token.transactions].map((c) => c.inclusionProof); };
-  await rejects(buildNativeReturnProof(plugin, three.bytes, overBound), 'ErrTooManyPaths');
-  assert.equal(calls, 1);
+  const long = await buildToken(w, spec(1), [...Array.from({ length: MAX_LEAVES }, (_, i) => txStep(i + 2, 7 + i, T0 + 10n + BigInt(2 * i))), burnStep(T0 + 40n)], T0, UC_TS);
+  const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [long.token.genesis, ...long.token.transactions].map((c) => c.inclusionProof); };
+  await rejects(buildNativeReturnProof(plugin, long.bytes, overBound), 'ErrTooManyTx');
+  assert.ok(calls <= 1);
 });
