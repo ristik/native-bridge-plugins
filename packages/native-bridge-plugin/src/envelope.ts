@@ -89,31 +89,43 @@ function wordAt(b: Uint8Array, off: number): number | null {
   return v > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(v);
 }
 
+const U64_MAX = (1n << 64n) - 1n;
+
+/**
+ * Read the declared array lengths straight from the head words, so an over-budget count is rejected before any allocation. Words
+ * are unsigned 64-bit and sums are checked; a layout that cannot be followed is `ErrABIFraming`, a count over a bound
+ * `ErrTooManyPaths` (the oracle's `boundEnvelopeCounts`).
+ */
 function boundCounts(b: Uint8Array): void {
-  const n = b.length;
-  const w = (o: number): number => wordAt(b, o) ?? fail('ErrABIFraming');
-  const offAnchors = w(64);
-  const offLeaves = w(96);
+  const n = BigInt(b.length);
+  const word = (off: bigint): bigint => {
+    if (off + 32n > n) return fail('ErrABIFraming');
+    let v = 0n;
+    for (let i = 0n; i < 32n; i++) v = (v << 8n) | BigInt(b[Number(off + i)]);
+    return v > U64_MAX ? fail('ErrABIFraming') : v;
+  };
+  const add = (x: bigint, y: bigint): bigint => (x + y > U64_MAX ? fail('ErrABIFraming') : x + y);
+  const offAnchors = word(64n);
+  const offLeaves = word(96n);
   if (offAnchors > n || offLeaves > n) fail('ErrABIFraming');
-  const na = w(offAnchors);
+  const na = word(offAnchors);
   if (na > n) fail('ErrABIFraming');
-  if (na > MAX_ANCHORS) fail('ErrTooManyPaths');
+  if (na > BigInt(MAX_ANCHORS)) fail('ErrTooManyPaths');
   // Every anchor's UC is bounded from its declared length before anything is allocated.
-  for (let i = 0; i < na; i++) {
-    const t = offAnchors + 32 + w(offAnchors + 32 + 32 * i);
-    if (w(t + w(t + 5 * 32)) > MAX_ANCHOR_UC_BYTES) fail('ErrInputTooLarge');
+  for (let i = 0n; i < na; i++) {
+    const t = add(add(offAnchors, 32n), word(add(add(offAnchors, 32n), 32n * i)));
+    if (word(add(t, word(add(t, 160n)))) > BigInt(MAX_ANCHOR_UC_BYTES)) fail('ErrInputTooLarge');
   }
-  const nl = w(offLeaves);
+  const nl = word(offLeaves);
   if (nl > n) fail('ErrABIFraming');
-  if (nl > MAX_LEAVES) fail('ErrTooManyPaths');
-  let steps = 0;
-  for (let i = 0; i < nl; i++) {
-    const rel = w(offLeaves + 32 + 32 * i);
-    const t = offLeaves + 32 + rel;
-    const sRel = w(t + 64);
-    const sOff = t + sRel;
-    const ns = w(sOff);
-    if (ns > MAX_RSMT_SIBLINGS || ns > MAX_PATH_STEPS - steps) fail('ErrTooManyPaths');
+  if (nl > BigInt(MAX_LEAVES)) fail('ErrTooManyPaths');
+  let steps = 0n;
+  for (let i = 0n; i < nl; i++) {
+    const rel = word(add(add(offLeaves, 32n), 32n * i));
+    const t = add(add(offLeaves, 32n), rel);
+    const sOff = add(t, word(add(t, 64n)));
+    const ns = word(sOff);
+    if (ns > BigInt(MAX_RSMT_SIBLINGS) || ns > BigInt(MAX_PATH_STEPS) - steps) fail('ErrTooManyPaths');
     steps += ns;
   }
 }
