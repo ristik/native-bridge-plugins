@@ -34,9 +34,10 @@ class EvidenceGuards(unittest.TestCase):
         self.assertEqual(joined.acceptance_status([{'name': 'contracts-regenerate', 'status': 'DEFERRED', 'reason': 'later'}], tier), ('FAIL', 1))
         self.assertEqual(joined.acceptance_status([{'name': 'contracts-regenerate', 'status': 'DEFERRED'}], tier), ('FAIL', 1))
 
-    def test_pinned_deferral_names_the_contracts_tier(self):
+    def test_pinned_deferrals_name_known_tiers_and_the_contracts_tier_runs(self):
         self.assertEqual(set(joined.PINS.get('deferredSteps', {})) - set(joined.DEFERRABLE_TIERS), set())
-        self.assertEqual(joined.deferred_reason('contracts-regenerate'), "contracts at protocol 3 until dev2's protocol-4 port")
+        # protocol 4: nothing is deferred, so the contracts tier must run
+        self.assertIsNone(joined.deferred_reason('contracts-regenerate'))
         self.assertIsNone(joined.deferred_reason('b2-join'))
 
     def test_failed_component_cannot_be_hidden_by_blocker(self):
