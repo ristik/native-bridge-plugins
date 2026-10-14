@@ -1,12 +1,14 @@
 # Native bridge interoperability contract
 
-Status: protocol v3, development profile; implementation and activation gates
+Status: protocol v4, development profile; implementation and activation gates
 remain open. This document is the sole normative native byte contract.
-This unreleased v3 draft incorporates the fixed SDK trust model in
-[sdk-trust-base.md](sdk-trust-base.md) and the brute-force sharded aggregator
-admission below; earlier epoch-bundle and one-shard-policy assumptions
-are abandoned, with no compatibility, migration or acceptance promise.
-`NATIVE_BRIDGE_PROTO_VERSION=3` is independent of SDK Token.VERSION and the
+This unreleased v4 draft incorporates the fixed SDK trust model in
+[sdk-trust-base.md](sdk-trust-base.md), the any-age registry-backed certificate
+batch of bft-core `briefs/b1-any-age-contract.md` (one `CERT_BATCH_V2` call over
+the anchor table) and the aggregation-partition policy below; the v3 sharded
+policy, per-anchor certificate calls and earlier assumptions are abandoned, with
+no compatibility, migration or acceptance promise.
+`NATIVE_BRIDGE_PROTO_VERSION=4` is independent of SDK Token.VERSION and the
 external bridge's BRIDGE_PROTO_VERSION. Any byte/derivation change MUST bump
 this version and semantic profile. Consensus parsers accept only this profile;
 there is no pre-3.0 decoder, migration or dual-format interpretation.
@@ -42,8 +44,7 @@ Cfg = C(b("UNICITY_BR_CFG"),network,b(rootGenesis),chainId,
         b(ty),b(aid),b(semanticProfileHash),b(tokenVerifier20),
         b(tokenVerifierCodeHash),b(b1ProfileHash),b(aggregatorPolicyHash))
 cfg = H(Cfg)
-Policy = C(b("UNICITY_BR_AGG_SHARDED"),1,aggregatorPartition,depth,
-           [[b(shardID),b(shardConfHash)],...])
+Policy = C(b("UNICITY_BR_AGG_PARTITION"),2,aggregatorPartition)
 aggregatorPolicyHash = H(Policy)
 salt = H(C(b("UNICITY_BR_SALT"),b(cfg),nonce))
 id = H(C(b(salt),network))
@@ -53,24 +54,26 @@ K = [b(zero20),b(ty),b(aid),b(amount),b(id),b(rcpt)]
 d = H(C(b("UNICITY_BR_LOCK"),b(cfg),nonce,K))
 ```
 
-### Sharded aggregator policy
+### Aggregation partition policy (AGG_PARTITION_V2)
 
-The aggregator is one native partition, distinct from evmPartition, served by a
-complete uniform MSB-first SID-prefix shard topology of `depth` in {0,1}
-(`depth=0`: shard `80`; `depth=1`: shards `40` and `c0`). DN-B deploys `depth=1`. A shard ID
-is the native canonical encoding of the prefix bits followed by one set
-terminator bit and zero padding, never empty bytes or ASCII text. Policy has
-exactly 2^depth entries `[b(shardID),b(shardConfHash)]` in increasing shardID byte
-order; shardConfHash is 32 bytes, the authenticated native PDR configuration
-hash of that shard. Reject holes, overlaps, duplicate shards, a depth other than
-0 or 1, a version other than 1, a zero partition, extra fields, noncanonical
-encodings and any body above 512 bytes. Check SHA-256(policy body) against the
-immutable Cfg.aggregatorPolicyHash before interpreting it. The old
-`UNICITY_BR_AGG_ONE` policy is rejected; there is no migration or dual decoder.
-Endpoint URLs are untrusted routing hints and never part of the policy.
-Topology and shard configuration are fixed for the generation; shard
-validator/key rotation is a configuration change and fails closed. Live
-split-refresh and further depths are unsupported (bft-core #438).
+The aggregator is one native partition, distinct from evmPartition, whose
+certified shard configurations are authorized by the root quorum. The policy
+names only that partition: no depth, shard list, configuration hash or
+allow-list. Each anchor's UC authenticates its own historical shard and shard
+configuration hash; its depth is that of its canonical native shard ID,
+`d = 8*len(shard) - trailingZeroBits(lastByte) - 1` (lastByte nonzero, 1..33
+bytes, 0<=d<=256). A shard ID is the native canonical encoding of the prefix
+bits followed by one set terminator bit and zero padding, never empty bytes or
+ASCII text. Shards of one history need not be prefix-free as one set: a parent
+shard before a topology split and its child after it are both admitted, each
+bound by its own UC. Reject a version other than 2, a zero partition or one
+above 2^32-1, extra or missing fields, noncanonical encodings and any body above
+512 bytes. Check SHA-256(policy body) against the immutable
+Cfg.aggregatorPolicyHash before interpreting it. The v3 `UNICITY_BR_AGG_SHARDED`
+and older `UNICITY_BR_AGG_ONE` bodies are rejected; there is no migration or
+dual decoder. Endpoint URLs are untrusted routing hints and never part of the
+policy. An unsupported token/hash/predicate format fails its pinned semantic
+rule even with a valid UC; certified configurations select no token semantics.
 EVM backing policy is separately pinned, never inferred from a submitted UC.
 Type/coin exclude vault: approved replacement vaults share asset identity but
 never inherit deployment trust. Config, salt, lock and redemption bind their
@@ -200,7 +203,7 @@ Lock first, obtain certified proof, construct J, then hash/sign/certify M.
 Lock digest excludes J/txHash, so there is no circularity. J cannot be refreshed
 after certification. Historical proof establishes permanent lock existence,
 not current spent=0. Certified single-spend history and live vault nonce guard
-have distinct roles. Historical backing has no live B1 W_cert requirement.
+have distinct roles. Historical backing has no B1 certificate-age requirement.
 
 J stays byte-identical after certification. Offline receipt is supported only
 under the pinned fixed base. Aggregator refresh may replace paths/UCs within
@@ -272,34 +275,38 @@ LeafProof=(uint16 anchorIndex,bytes32 bitmap,bytes32[] siblings). All earlier
 Anchor fields retain order; the native inputRecord opening is appended after UC.
 Reject aliases, noncanonical offsets/padding, trailing bytes and budget overflow.
 
-Anchors (profile v3, one anchor per distinct complete UC). Each anchor is one
-complete canonical native UC with its policy row and the two native openings.
+Anchors (profile v4, one anchor per distinct complete UC). Each anchor is one
+complete canonical native UC with its claim fields and the two native openings.
 Anchors have pairwise distinct UC bytes (byte-identical UCs are one anchor,
 never two; a repeated or conflicting entry is rejected); several different UCs
 of one shard, even of one root round, are separate anchors. Anchor count is not
-bounded by the shard count, only by the profile parameter A_max below. The
-kernel result orders exported leaves; leaf i belongs to shard `shard(sid_i)`,
-the policy row whose shardID names the top `depth` bits of its raw 32-byte SID
-(depth 0: `80`; depth 1: `40` if the top bit is 0, else `c0`). Every anchor's
-partition, shard and shardConfHash must equal one policy row (claim fields are
-derived from the UC and the policy; only expectedStateRoot and expectedIRHash
-are caller openings, authenticated by B1). Order anchors by first use in
-kernel leaf order: scanning leaves in order, a leaf's anchorIndex is either an
-already-used index or exactly the next unused one, and every anchor must be
-used. Require exactly one LeafProof per leaf in kernel order, retaining
-duplicate-SID rejection, and that the anchor named by each leaf is an anchor
-of that leaf's own shard. Reject an out-of-range, skipped, unused,
-duplicated or foreign anchor and any anchor table that is not exactly that
-function of the exported leaves. Mint (one leaf) has exactly one anchor.
-Apply this to mint and return alike. There is no convergence requirement: the
-plug-in submits whatever (path, UC) pairs it holds.
+bounded by the shard count, only by the profile parameter A_max below. Every
+anchor's partition must be the policy partition and its shard a canonical
+native shard ID; its shardConfHash, expectedStateRoot and expectedIRHash are
+claim fields the batch authenticates against the UC (B1). The kernel result
+orders exported leaves. Order anchors by first use in kernel leaf order:
+scanning leaves in order, a leaf's anchorIndex is either an already-used index
+or exactly the next unused one, and every anchor must be used. Require exactly
+one LeafProof per leaf in kernel order, retaining duplicate-SID rejection, and
+that the first d bits of each leaf's 32-byte SID equal the prefix bits of the
+anchor it names (d that anchor's shard depth; never the current topology or a
+transaction timestamp). Reject an out-of-range, skipped, unused, duplicated or
+foreign anchor and any anchor table that is not exactly that function of the
+exported leaves. Mint (one leaf) has exactly one anchor. Apply this to mint and
+return alike. There is no convergence requirement: the plug-in submits whatever
+(path, UC) pairs it holds.
 
-Each anchor is authenticated by its own single-claim `STATICCALL 0x0100`
-`(partition,shard,shardConfHash,expectedStateRoot,expectedIRHash,full UC)`;
-`0x0101` is never called. Each call must return exactly 64 bytes `(1,true)`.
-Anchors may carry different root rounds, seals and eligible root epochs; B1
-checks each seal against its own W_cert window and signer epoch, with no common
-cut and no EVM certificate at any anchor's round.
+The whole anchor table is authenticated by one `STATICCALL 0x0100`
+(`CERT_BATCH_V2`): `version 2 | flags 0 | K | Claim[K]`, K the table length,
+claims in table order, each `partition:u32 | shardLen:u16 | shard |
+shardConfHash | expectedStateRoot | expectedIRHash | ucLen:u32 | uc`; `0x0101`
+is never called. The call returns exactly 64 bytes `abi.encode(uint256(2),bool)`
+and the composition requires `(2,true)`: one verdict for the table, no partial
+success. Anchors may carry different root rounds, seals and epochs; B1 checks
+each seal against its own epoch's permanent registry entry (any age: start <=
+round <= the usable origin round O, and round < end for a closed epoch), with no
+certificate-age window, common cut or EVM certificate at any anchor's round.
+B1's own scan requires exactly d shard-tree siblings for the UC's own shard.
 
 Opening is canonical tag(39002,[1,round,epoch,previousHash,stateHash,summary,
 timestamp,blockHash,fees,executedTransactionsHash]) (arity 10). Version=1;
@@ -309,14 +316,14 @@ native B1 bounds, null/width/canonical rules. Require
 H(inputRecord)==expectedIRHash and stateHash==expectedStateRoot.
 
 Composition checks framing/budgets/Cfg/policy and obtains the kernel result,
-then derives and checks the anchor table above and the gas gate below. B1
-0x0100 MUST authenticate both expected root and expected IR hash of every
-anchor. Only after success may that anchor's opened timestamp authorize the
+then derives and checks the anchor table above and the gas gate below. The one
+B1 0x0100 batch MUST authenticate both expected root and expected IR hash of
+every anchor. Only after success may an anchor's opened timestamp authorize the
 t<=timestamp comparison of the leaves routed to it (each leaf against its OWN
 anchor only). For each ordered leaf call unchanged B1 0x0102 with sid, raw
-leafValue and the root/path of that leaf's own anchor. Each B1 result MUST be exactly 64 bytes encoding
-(uint256(1),true); no partial success. B1 algorithm/ABI/registry/profile does
-not change for SDK3; do not invent a new B1 profile hash. Caller-supplied scalar
+leafValue and the root/path of that leaf's own anchor. Each 0x0102 result MUST be exactly 64 bytes encoding
+(uint256(1),true), and the 0x0100 batch result (uint256(2),true); no partial success. The B1 profile hash is the
+deployment's pinned any-age profile; do not invent one. Caller-supplied scalar
 timestamps or unauthenticated IR hashes cannot authorize time checks.
 
 ## Resource and custody profile
@@ -327,9 +334,10 @@ header<=2048; each MPT<=65 nodes; node<=1024; combined MPT bytes<=24576;
 CBOR/RLP depth<=16, CBOR items<=32768; semantic history<=16384;
 direct envelope<=65536; <=15 transfers including burn, <=16 leaves;
 anchor UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity
-steps and exactly `depth` shard-tree siblings per UC (the shard certificate
-must name the policy shard); A<=A_max=8 distinct UC anchors (a parser ceiling: the gas gate below decides each bundle); A<=L.
-These bounds are the named parameters of `profile-v3.json` `limits`
+steps and exactly d shard-tree siblings per UC (d its own shard's depth, the
+anchor's shard equal to the UC's); Cfg<=1024; A<=A_max=16 distinct UC anchors
+(a parser ceiling: the gas gate below decides each bundle); A<=L.
+These bounds are the named parameters of `profile-v4.json` `limits`
 (the single source for contract, oracle and plug-ins); a later profile version
 may raise them, e.g. when multi-proof services land. The initial testnet
 assumes few transactions per token.
@@ -340,15 +348,19 @@ cumulative counts overflow-safely before allocation.
 ### Direct-call gas gate (7,000,000)
 
 Native prices are the actual B1/B2 charges, with no shared or warm discount.
-For anchor a with request bytes `B_a = 110 + len(shard) + len(uc)`, `S_a` the
-signature entries of its UC seal and `P_a` its shard-tree plus unicity step
-count: `G_UC(a) = 92700 + 16*B_a + 6000*S_a + 250*P_a`. For leaf i with `s_i`
-RSMT siblings: `G_RSMT(i) = 2000 + 16*(136+32*s_i) + 250*(1+s_i)`. With `B_sem`
-the byte length of the kernel request `abi.encode(op,cfg,history)` and L the
-exported leaf count: `G_B2 = 26000 + 20*B_sem + 14000*L`. The intrinsic term is
-the direct-call bound `G_intrinsic = 21000 + 96*len(envelope)` (16 per calldata byte and 80 per byte for the composing verifier's own execution; owner-decisions §22).
-Admission requires
-`G_intrinsic + G_B2 + sum_a G_UC(a) + sum_i G_RSMT(i) + 1000000 <= 7000000`.
+The one 0x0100 batch over the anchor table is charged
+`G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P`,
+with C its request bytes, K the anchors, and E, S, Q, A, P its canonical
+first-use grouping (distinct declared epochs; distinct complete seals and their
+signature-map sizes; distinct claims and their shard-tree plus unicity steps),
+computed from the request bytes alone (bft-core `b1ref.Group`). For leaf i with
+`s_i` RSMT siblings: `G_leaf(i) = 2000 + 16*(136+32*s_i) + 250*(1+s_i)`. With
+`B_kernel = 160 + pad32(B_cfg) + pad32(B_history)` the kernel request bytes and L
+the exported leaf count: `G_kernel = 26000 + 20*B_kernel + 14000*L`. The
+call-data allowance is `D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)` (the
+two-bytes-argument TokenVerifier call) and the composing verifier's own
+execution is 80 per envelope byte. Admission requires
+`21000 + 16*D_max + 80*B_env + G_kernel + G_batch + sum_i G_leaf(i) + 1000000 <= 7000000`.
 The fixed reserve covers Solidity scanning and copying, call and EIP-150
 headroom and vault accounting. The gate is computed from complete bounded
 scans, never from caller-declared costs, and is identical in the contract,
@@ -362,21 +374,21 @@ a latest UC or splits a redemption, and means "direct exit unavailable", not
 (`maxGas` minus the system gas reserved for certificate transactions); it is
 never raised implicitly (a larger ordinary capacity is a later profile version).
 The parser ceilings do not promise that every admitted bundle passes the gate;
-the gate admits or refuses each bundle. After the repricing of the certificate call (owner-decisions §22: `G_UC = 92700 + ...`) and the execution term above, a
-maximum-size bundle (L=16, UC 8192 bytes with 64 signatures and 33 steps, 32-sibling paths, history 16384, envelope 65536 bytes) is
-priced out even with two anchors (9,917,572): the 65,536-byte envelope alone costs 6.3M. Real DN-B certificates (4 signatures, one
-shard sibling) are 811 bytes; eight such anchors with sixteen 8-sibling leaves in a 12 KiB envelope price 3,839,656 and pass. A
-typical bundle (4 KiB UC, 5 signatures, 8 steps, 8-sibling paths, 2 KiB history, 8 KiB envelope) with two anchors is 2,694,928. The
-anchor ceiling (eight, B1's own claim ceiling) is a parser limit, not a consequence of the gate. Anything refused by the gate or above
-a ceiling is BudgetExceeded or an input-size refusal before any native call.
+the gate admits or refuses each bundle. bft-core `briefs/b1-any-age-contract.md`
+section 5 tabulates worked cases from signed native fixtures: with sixteen
+8-sibling leaves, a 16,384-byte history and a 512-byte Cfg, one anchor of a
+four-member committee gates at 4,301,234; sixteen anchors under one shared seal
+at 6,759,824 (admitted) and under sixteen seals of distinct epochs at 7,568,324
+(BudgetExceeded). Anything refused by the gate or above a ceiling is
+BudgetExceeded or an input-size refusal before any native call.
 Bounds are not additive entitlements or measured activation
 prices. Freeze in canonical semantic profile/vectors before activation; native
 x86-64/arm64 full-transaction measurements and final gas gates remain required.
 
 ### Assembly and refresh
 
-The plug-in reconstructs every SID of the history and routes each by the pinned
-policy. For each used shard it fetches, concurrently, only the existing
+The plug-in reconstructs every SID of the history and routes each to the
+aggregator shard that serves its prefix (the policy names no topology). For each used shard it fetches, concurrently, only the existing
 aggregator `get_inclusion_proof.v2(stateId)` and keeps each response's path and
 its UC as an inseparable pair, verifying locally the path against that UC's
 root and the returned CD and t against the original history. A path is never
@@ -385,7 +397,7 @@ NOT re-query to make responses share a certificate: it builds the anchor table
 from the distinct UCs it received, in first-use leaf order. A racing or
 mismatched (path, UC) pair gets a bounded retry, then retryable unavailability
 (never BudgetExceeded). The plug-in validates the complete envelope (including
-the gas gate and the windows against one observed EVM origin) before
+the gas gate and every anchor's round against one observed EVM origin O) before
 submission, and runs the same gate BEFORE creating a burn, refusing a burn
 that cannot pass the gas gate (`txGasBudget`) even in the best case (fewest
 anchors, smallest certificates, shortest paths): it does not project one

@@ -99,14 +99,14 @@ def validate_sdk_trust_document(data, expected_digest):
 def main():
     validator()
     abi = load('protocol/abi.json')
-    assert abi['protocolVersion'] == 3
+    assert abi['protocolVersion'] == 4
     assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
     assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v3.json')
-    assert profile['nativeBridgeProtocolVersion'] == 3 and profile['sdkVersion'] == '3.0.1'
+    profile = load('protocol/profile-v4.json')
+    assert profile['nativeBridgeProtocolVersion'] == 4 and profile['sdkVersion'] == '3.0.1'
     assert profile['limits']['semanticBytes'] == 16384 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'fixed-sdk-root-trust-base'
     assert profile['trustModel']['validatorStake'] == '1'
@@ -122,7 +122,7 @@ def main():
     subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs')], check=True)
     if (ROOT / 'protocol/vectors/MANIFEST.sha256').exists():
         subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs'), '--corpus', str(ROOT / 'protocol/vectors')], check=True)
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=3' in (ROOT / 'protocol/interop.md').read_text()
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=4' in (ROOT / 'protocol/interop.md').read_text()
     assert JS_COMMIT in (ROOT / 'protocol/interop.md').read_text()
     assert RUST_COMMIT in (ROOT / 'protocol/interop.md').read_text()
     package = load('packages/native-bridge-plugin/package.json')
