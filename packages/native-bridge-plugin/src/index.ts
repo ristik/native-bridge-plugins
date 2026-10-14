@@ -33,6 +33,6 @@ export function bridgeTokenPlugin(bridge: NativeBridge, revision = 'native-bridg
 
 import { createNativeBridgePlugin } from './wallet.js';
 function createNativeBridgePluginInternal(bridge: NativeBridge, revision: string): import('@unicitylabs/bridge-core').WalletTokenPlugin {
-  return createNativeBridgePlugin(bridge, { manifestRevision: revision, profileRevision: 'v3' }).walletPlugin;
+  return createNativeBridgePlugin(bridge, { manifestRevision: revision, profileRevision: 'v4' }).walletPlugin;
 }
 export * from './lifecycle.js';
