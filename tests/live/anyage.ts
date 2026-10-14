@@ -280,8 +280,8 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   const redeemData = redeemCalldata(envelope);
   const redeemOut = await rpc(c.eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]);
   const redeemGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]));
-  // redeem returns the credited amount: the whole relation held for exactly the saved amount
-  assert.equal(BigInt(redeemOut), BigInt(saved.amountWei), `the redeem eth_call must return the saved amount: ${redeemOut}`);
+  // BridgeVault.redeem returns the redeemed lock's nonce (the credited amount is checked by release on the real transaction)
+  assert.equal(BigInt(redeemOut), BigInt(saved.nonce), `the redeem eth_call must return the saved nonce: ${redeemOut}`);
   const result = { epoch, block: head, registry: reg, anchorAges: ages, batch: { returndata: out, valid, estimatedGas: batchGas }, redeem: { returndata: redeemOut, estimatedGas: redeemGas } };
   writeFileSync(`${dir}/verify-${epoch}.json`, toJson(result));
   console.log(`VERIFIED ${epoch}`, toJson({ block: head, usableEpoch: usable, anchorEpochs, anchorAges: ages, batchGas, redeemGas }));
@@ -301,10 +301,12 @@ async function release(cfgPath: string, savedPath: string): Promise<void> {
   const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', String(saved.nonce))));
   assert.equal(credited, amountWei, 'the recipient is credited with exactly the locked amount by this redemption');
   assert.equal(recorded, saved.nullifier, 'the vault recorded the saved nullifier');
-  const before = BigInt(await rpc(c.eth, 'eth_getBalance', [PAYEE, 'latest']));
   const claim = await sendAll(c, c.lane.vault, 'claim(uint256,address)', [amountWei.toString(), PAYEE], RECIPIENT_KEY, '500000');
   assert.equal(claim.status, '0x1', 'claim reverted');
-  const after = BigInt(await rpc(c.eth, 'eth_getBalance', [PAYEE, 'latest']));
+  // the payee's balance just before and at the claim block, so no other block's transfer can enter the delta
+  const claimBlock = BigInt(claim.blockNumber);
+  const before = BigInt(await rpc(c.eth, 'eth_getBalance', [PAYEE, `0x${(claimBlock - 1n).toString(16)}`]));
+  const after = BigInt(await rpc(c.eth, 'eth_getBalance', [PAYEE, claim.blockNumber]));
   assert.equal(after - before, amountWei, 'the payee received the locked amount');
   const result = {
     redeem: { tx: rc.transactionHash, block: rc.blockNumber, gasUsed: BigInt(rc.gasUsed), gasLimit: gas, registry: await registryAt(c, rc.blockNumber, (saved.anchors as { epoch: string }[]).map((a) => BigInt(a.epoch))) },
