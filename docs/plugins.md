@@ -84,30 +84,42 @@ supported 65-byte signature encoding. Embedded UC, ordinary UC-tree paths and RS
 one cumulative 2048-step budget. The independent constructor fixtures are separate from the released Go corpus;
 corpus integrity/regeneration and joined component CI check their respective boundaries.
 
-## Host freshness contract for return proofs
+## Host readiness contract for return proofs
 
-B1 accepts an anchor of seal round `r` only if `r <= O` and `O - r <= W_cert`, with `O` the registry `clock.rootRound` at the redemption's
-execution block (not the shard round, `t` or a wall clock); `W_cert` is the committed profile parameter `b1.wCert`. The executing block imports
-its own origin, so a read of the latest block is advisory and the host keeps an execution margin `M` (measured; not a protocol constant): send
-only when `max(r) <= O` and `O - min(r) <= W_cert - M`. If `max(r) - min(r) > W_cert - M` no origin admits the bundle.
+Protocol 4 has no certificate-age window: B1 accepts an anchor of seal round `r` when `r` lies in the permanent registry entry of the anchor's
+own epoch (`start <= r <= O`, and `r < end` for a closed epoch), `O` being the registry `clock.rootRound` at the redemption's execution block (not
+the shard round, `t` or a wall clock). An old certificate never expires; a new one can be ahead of the registry. The executing block imports its
+own origin, so a read of the latest block is advisory: the host sends only when `max(r) <= O`. There is no `W_cert`, no execution margin and no
+spread rule, and the plug-in does not require the anchors to be close in round or epoch.
 
-`buildFreshReturnProof` and `redeemReturn` (TypeScript; `freshness::classify_freshness` in Rust) refetch every leaf for the SAME burned token
+`buildReadyReturnProof` and `redeemReturn` (TypeScript; `readiness::classify_readiness` in Rust) refetch every leaf for the SAME burned token
 (never rebuilding or re-burning, never to obtain matching certificates or fewer anchors), wait a bounded time for an origin that has not imported
-the newest anchor, judge the oldest anchor again after the wait, and send within a bounded number of attempts. Exhausted freshness, stale pairs or
-temporary witness unavailability are `ErrProofUnavailable` with a diagnostic cause (the unavailable family, retryable, pending state kept); an
-over-limit anchor count, gas or size stays BudgetExceeded and is never retried. Before any resend the host checks the transaction's receipt and the
+the newest anchor, and send within a bounded number of attempts. An exhausted wait or temporary witness unavailability is `ErrProofUnavailable`
+with a diagnostic cause (the unavailable family, retryable, pending state kept); an over-limit anchor count, gas or size stays BudgetExceeded and
+is never retried. Before any resend the host checks the transaction's receipt and the
 vault's spent/credit state: an RPC timeout is not a revert, an unknown send is not repeated while it may be pending (`RedemptionUnconfirmed` carries the
 transaction hash; the caller passes it back as `pending` and its receipt is checked before any new send), and the wallet burn is never
 repeated. A revert is retried up to `maxSends` whatever its cause, so a deterministic refusal (a closed authority interval, bad backing) costs
 `maxSends` transactions. A proof service or chain reader that fails is retried within the attempt bound and reported as `ErrProofUnavailable` with
-the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a freshness or service guarantee.
+the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a service guarantee: it
+prices the best case with ONE anchor, because a single certificate may serve every leaf; it never projects one anchor per shard. The burn is therefore refused only when even that best case cannot pass the gate; a bundle fetched later
+can still fail the gate (`ErrGasBudget`, "direct exit unavailable", not "token invalid").
+
+### The anchor table
+
+The aggregator policy names the partition only. Each anchor is read from its own UC (its shard, shard configuration hash and partition); the
+plug-in routes a leaf to an aggregator by its state ID, and whatever certificate the response carries is kept with its path. The depth of an anchor is
+the depth of its own shard ID, and every leaf's state ID must carry the prefix bits of the anchor it names. Parent and child shards of a topology
+split may both appear in one history. The gate is `21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum G_leaf + 1,000,000`, with `J`
+the CBOR item occurrences of the Cfg, the policy, every UC and every IR opening (at most 4,096) and `G_batch` the price of the one
+`CERT_BATCH_V2` call, grouped by `certgroups.ts` / `certgroups.rs` exactly as the contract and the oracle do.
 
 ## From burn to claimed native funds (wallet lifecycle)
 
 The journal entry (`RedemptionEntry`) moves `burned` -> `submitted` -> `redeemed` -> `settled` and every step is written by the plug-in
 (`redeemBurned`, `claimCredited` in `lifecycle.ts`), never inferred from the wallet burn acknowledgement:
 
-- `redeemReturn` asks the vault, before any proof is fetched or the window is judged, whether the token's lock nonce is already credited, so an
+- `redeemReturn` asks the vault, before any proof is fetched or the origin is read, whether the token's lock nonce is already credited, so an
   already executed redemption (a third party's, or an earlier send whose hash was lost) is reported as such even while the proof service is down.
   This holds with pending hashes too: a hash whose receipt is a success ends the call, a hash with no receipt is believed only when the vault does not
   show the nonce credited (a dropped transaction never gets a receipt). The

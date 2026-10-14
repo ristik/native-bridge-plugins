@@ -11,8 +11,9 @@
 
 mod common;
 use common::*;
+use native_bridge_sdk_ext::certgroups::measure;
 use native_bridge_sdk_ext::envelope::*;
-use native_bridge_sdk_ext::gas::{compute_gate, kernel_request_bytes, scan_anchor};
+use native_bridge_sdk_ext::gas::{compute_gate, kernel_request_bytes};
 use native_bridge_sdk_ext::limits::{MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET};
 use native_bridge_sdk_ext::proof::{build_return_proof, preflight_burn, refresh_token};
 use native_bridge_sdk_ext::token::Expect;
@@ -55,12 +56,19 @@ fn return_envelope_round_trips_and_passes_policy_anchor_and_gate_checks() {
     let ir = check_anchors(&back, &plan, &times).unwrap();
     assert_eq!(ir[0].timestamp, UC_TS);
     assert!(gate.total <= TX_GAS_BUDGET);
+    assert_eq!(gate.grouping.k, 1);
+    assert_eq!(
+        gate.j,
+        17 + 4 + 12 + gate.grouping.items,
+        "J: Cfg, policy, one IR opening and the UC occurrences"
+    );
+    assert_eq!(gate.items, 1000 * gate.j);
     assert_eq!(
         compute_gate(
+            &w.dep.cfg.to_bytes(),
             bytes.len(),
             kernel_request_bytes(w.dep.cfg.to_bytes().len() as u64, back.history.len() as u64),
             &back,
-            &pol,
             TX_GAS_BUDGET
         )
         .unwrap(),
@@ -110,14 +118,28 @@ fn policy_and_anchor_table_checks_name_each_mismatch() {
         "identical UC bytes are one anchor, never two"
     );
     let mut e = env.clone();
-    e.anchors[0].shard = vec![0x40];
-    assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyTuple);
+    e.anchors[0].shard = vec![if sids[0][0] & 0x80 != 0 { 0x40 } else { 0xc0 }];
+    assert_eq!(
+        plan(&e, &sids).unwrap_err(),
+        E::PolicyLeafIndex,
+        "a shard whose prefix the leaf does not carry"
+    );
+    let mut e = env.clone();
+    e.anchors[0].shard = vec![0x00];
+    assert_eq!(
+        plan(&e, &sids).unwrap_err(),
+        E::PolicyTuple,
+        "a noncanonical shard ID"
+    );
     let mut e = env.clone();
     e.anchors[0].partition += 1;
     assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyTuple);
     let mut e = env.clone();
     e.anchors[0].shard_conf_hash[0] ^= 1;
-    assert_eq!(plan(&e, &sids).unwrap_err(), E::PolicyTuple);
+    assert!(
+        plan(&e, &sids).is_ok(),
+        "the configuration hash is authenticated by the UC (B1), not pinned by the policy"
+    );
     assert_eq!(plan(&env, &sids[..2]).unwrap_err(), E::PolicyLeafCount);
     let mut e = env.clone();
     e.leaf_proofs[1].anchor_index = 1;
@@ -143,20 +165,14 @@ fn input_record_opening_is_bound_to_the_anchor() {
     };
     let mut e = env.clone();
     e.anchors[0].input_record[10] ^= 1; // false opening: hash no longer equals expectedIRHash
-    assert_eq!(
-        check_anchors(&e, &one, &times).unwrap_err(),
-        E::InputRecordMismatch
-    );
+    assert_eq!(check_anchors(&e, &one, &times).unwrap_err(), E::IROpening);
     let mut e = env.clone();
     e.anchors[0].expected_state_root[0] ^= 1;
-    assert_eq!(
-        check_anchors(&e, &one, &times).unwrap_err(),
-        E::InputRecordMismatch
-    );
+    assert_eq!(check_anchors(&e, &one, &times).unwrap_err(), E::IRState);
     // A time later than the authenticated timestamp.
     assert_eq!(
         check_anchors(&env, &one, &[UC_TS + 1, UC_TS, UC_TS]).unwrap_err(),
-        E::ReferenceTimeFuture
+        E::IRTime
     );
     assert!(check_anchors(&env, &one, &[UC_TS, UC_TS, UC_TS]).is_ok());
 }
@@ -165,14 +181,11 @@ fn input_record_opening_is_bound_to_the_anchor() {
 fn input_record_opening_rejects_wrong_shape() {
     use unicity_token::cbor::*;
     let ir9 = encode_tag(39002, &encode_array(&[&encode_uint(1)]));
-    assert_eq!(parse_input_record(&ir9).unwrap_err(), E::Shape);
+    assert_eq!(parse_input_record(&ir9).unwrap_err(), E::IRShape);
     let two = encode_uint(2);
     let ir = encode_tag(39002, &encode_array(&[two.as_slice(); 10]));
-    assert_eq!(parse_input_record(&ir).unwrap_err(), E::Version);
-    assert_eq!(
-        parse_input_record(&vec![0u8; 513]).unwrap_err(),
-        E::InputTooLarge
-    );
+    assert_eq!(parse_input_record(&ir).unwrap_err(), E::IRShape);
+    assert_eq!(parse_input_record(&vec![0u8; 513]).unwrap_err(), E::IRShape);
     // the summary value is bounded by the native sublimit the chain enforces (256 bytes)
     let ir_with = |summary: usize| {
         let one = encode_uint(1);
@@ -189,14 +202,11 @@ fn input_record_opening_rejects_wrong_shape() {
         parse_input_record(&ir_with(256)).unwrap().state_hash,
         [0u8; 32]
     );
-    assert_eq!(
-        parse_input_record(&ir_with(257)).unwrap_err(),
-        E::ProofTooLarge
-    );
+    assert_eq!(parse_input_record(&ir_with(257)).unwrap_err(), E::IRShape);
 }
 
 #[test]
-fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_an_invalid_one() {
+fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_malformed() {
     let w = make_world(20);
     let env = build_return_proof(&w.bridge, &ret(&w).token).unwrap().0;
     let a = &env.anchors[0];
@@ -209,8 +219,8 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_an_i
     assert_eq!(a.uc[head], 0x80, "an empty step list");
     let mut over = a.clone();
     over.uc = [&a.uc[..head], &[0x98, 33], &[0xf6u8; 33], &a.uc[head + 1..]].concat();
-    assert_eq!(scan_anchor(&over, 0).unwrap_err(), E::TooManyItems);
-    // 65 seal signatures (the bound is 64): the scan reads only the map's header, so patch the one map(4) header of the seal
+    assert_eq!(measure(&[over], 0).unwrap_err(), E::TooManyItems);
+    // 17 seal signatures (the bound is 16): the scan reads only the map's header, so patch the one map(4) header of the seal
     let seal =
         a.uc.windows(4)
             .position(|x| x == [0xd9, 0x98, 0x5d, 0x88])
@@ -221,8 +231,8 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_an_i
             continue;
         }
         let mut sigs = a.clone();
-        sigs.uc = [&a.uc[..i], &[0xb8, 65], &a.uc[i + 1..]].concat();
-        if scan_anchor(&sigs, 0) == Err(E::TooManyItems) {
+        sigs.uc = [&a.uc[..i], &[0xb1], &a.uc[i + 1..]].concat();
+        if measure(&[sigs], 0) == Err(E::TooManyItems) {
             hit = true;
             break;
         }
@@ -233,7 +243,10 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_an_i
     );
     let mut cut = a.clone();
     cut.uc.truncate(20);
-    assert_eq!(scan_anchor(&cut, 0).unwrap_err(), E::AnchorAuth);
+    assert!(matches!(
+        measure(&[cut], 0).unwrap_err(),
+        E::Truncated | E::Shape | E::NonCanonical | E::Tag
+    ));
 }
 
 #[test]
@@ -261,7 +274,7 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
     );
     assert_ne!(env.anchors[0].uc, env.anchors[1].uc);
     // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
-    assert_eq!(MAX_ANCHORS, 8);
+    assert_eq!(MAX_ANCHORS, 16);
     let per_leaf = |n: usize| {
         let tw = Tweaks {
             uc_round: Some(Box::new(|i| 900 + i as u64)),
@@ -281,13 +294,14 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
         assert_eq!(env.anchors.len(), n + 1);
         assert!(gate.total <= TX_GAS_BUDGET);
     }
-    // one more than the ceiling is refused, never truncated
-    let five = per_leaf(MAX_ANCHORS);
-    assert_eq!(five.ucs.len(), MAX_ANCHORS + 1);
-    assert_eq!(
-        build_return_proof(&w.bridge, &five.token).unwrap_err(),
-        E::TooManyPaths
-    );
+    // every leaf of a full 16-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the gate,
+    // never truncated
+    let full = per_leaf(MAX_LEAVES - 1);
+    assert_eq!(full.ucs.len(), MAX_ANCHORS);
+    match build_return_proof(&w.bridge, &full.token) {
+        Ok((env, _, _)) => assert_eq!(env.anchors.len(), MAX_ANCHORS),
+        Err(e) => assert_eq!(e, E::GasBudget),
+    }
 }
 
 fn fresh_proofs(w: &World, out: &TokenOut, extra: usize, ts: u64) -> Vec<InclusionProof> {
@@ -406,9 +420,8 @@ fn agg_err(f: impl FnOnce(&World, &mut UcSpec)) -> E {
 }
 
 #[test]
-fn aggregator_certificates_are_checked_against_the_pinned_policy() {
+fn aggregator_certificates_are_checked_against_the_pinned_partition() {
     assert_eq!(agg_err(|_, u| u.partition = 9), E::NotAdmitted);
-    assert_eq!(agg_err(|_, u| u.conf = vec![9; 32]), E::NotAdmitted);
 }
 
 #[test]

@@ -8,10 +8,10 @@
 
 extern crate alloc;
 
+pub mod certgroups;
 pub mod deployment;
 pub mod envelope;
 pub mod error;
-pub mod freshness;
 pub mod gas;
 pub mod header;
 pub mod history;
@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod mpt;
 pub mod profile;
 pub mod proof;
+pub mod readiness;
 pub mod resources;
 pub mod rlp;
 pub mod scan;
@@ -32,8 +33,8 @@ pub mod verifier;
 
 pub use error::{Family, NativeError, Result};
 
-/// Native bridge protocol version (`NATIVE_BRIDGE_PROTO_VERSION=3`).
-pub const NATIVE_BRIDGE_PROTO_VERSION: u8 = 3;
+/// Native bridge protocol version (`NATIVE_BRIDGE_PROTO_VERSION=4`).
+pub const NATIVE_BRIDGE_PROTO_VERSION: u8 = 4;
 /// Bridge identity family.
 pub const NATIVE_BRIDGE_FAMILY: &str = "unicity-native";
 /// SDK the byte profile is built for.

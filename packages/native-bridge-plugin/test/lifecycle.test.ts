@@ -10,7 +10,7 @@ import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radi
 
 import { eq } from '../src/bytes.js';
 import { NativeError } from '../src/errors.js';
-import { RedemptionUnconfirmed, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../src/freshness.js';
+import { RedemptionUnconfirmed, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../src/readiness.js';
 import { ClaimUnconfirmed, abandonAttempt, claimCredited, redeemBurned, type ClaimPolicy, type ClaimTransport } from '../src/lifecycle.js';
 import { MemoryRedemptionJournal, NativeBridgePayments, createNativeBridgePlugin, uintOf, type NativeWalletBackend, type RedemptionEntry } from '../src/wallet.js';
 import { AGG_PARTITION, VAULT, buildToken, burnStep, makeUc, makeWorld, recipient20, sha, spec, txStep, type World } from './world.js';
@@ -19,10 +19,10 @@ const T0 = 1_700_000_040n;
 const UC_TS = 1_700_000_900n;
 const rev = { manifestRevision: 'm', profileRevision: 'p' };
 const noWait = { sleep: () => Promise.resolve() };
-const fast = { margin: 6n, maxAttempts: 3, maxOriginWaitMs: 1_000, pollMs: 1, ...noWait };
+const fast = { maxAttempts: 3, maxOriginWaitMs: 1_000, pollMs: 1, ...noWait };
 const rp = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...fast, maxSends: 3, receiptTimeoutMs: 10, now: (() => { let n = 0; return () => (n += 4); })(), ...over });
 const cp = (over: Partial<ClaimPolicy> = {}): ClaimPolicy => ({ receiptTimeoutMs: 10, pollMs: 1, now: (() => { let n = 0; return () => (n += 4); })(), ...noWait, ...over });
-const chain: ChainReader = { origin: () => Promise.resolve(952n), wCert: () => Promise.resolve(15n) };
+const chain: ChainReader = { origin: () => Promise.resolve(952n) };
 
 async function setup() {
   const w = makeWorld();

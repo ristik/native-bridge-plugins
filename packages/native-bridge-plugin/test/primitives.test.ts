@@ -102,7 +102,7 @@ test('cfg and policy round trip; deployment construction rejects forged identity
   };
   throwsReason(bad((c) => void (c.ty[0] ^= 1)), 'ErrCfgMismatch');
   throwsReason(bad((c) => void (c.aggregatorPolicyHash[0] ^= 1)), 'ErrPolicyHash');
-  const p = makePolicy(7, w.aggConf);
+  const p = makePolicy(7);
   throwsReason(bad((c) => void (c.aggregatorPolicyHash = sha(policyBytes(p))), p), 'ErrPolicyPartition');
   throwsReason(() => makeDeployment(w.dep.cfg, new Uint8Array(32), new Uint8Array(32), { fields: 19 as never }, w.policy), 'ErrCfgMismatch');
 });

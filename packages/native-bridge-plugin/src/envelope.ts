@@ -6,12 +6,12 @@
  * opening is appended after `uc`; all earlier fields keep their order.
  */
 import { concat, eq, toHex } from './bytes.js';
-import { fail } from './errors.js';
+import { NativeError, fail } from './errors.js';
 import {
   MAX_ANCHORS, MAX_ANCHOR_UC_BYTES, MAX_ENVELOPE_BYTES, MAX_INPUT_RECORD_BYTES, MAX_IR_SUMMARY_BYTES, MAX_LEAVES, MAX_PATH_STEPS, MAX_POLICY_BYTES,
   MAX_RSMT_SIBLINGS, TAG_INPUT_RECORD,
 } from './limits.js';
-import { H, decodePolicy, policyBytes, shardId, shardRow, type Cfg, type Policy } from './profile.js';
+import { H, decodePolicy, policyBytes, shardCovers, shardDepth, type Cfg, type Policy } from './profile.js';
 import { arrayOf, bytesN, nullableBytes, scanOne, tagContent, uint, version } from './scan.js';
 
 export interface Anchor {
@@ -89,31 +89,43 @@ function wordAt(b: Uint8Array, off: number): number | null {
   return v > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(v);
 }
 
+const U64_MAX = (1n << 64n) - 1n;
+
+/**
+ * Read the declared array lengths straight from the head words, so an over-budget count is rejected before any allocation. Words
+ * are unsigned 64-bit and sums are checked; a layout that cannot be followed is `ErrABIFraming`, a count over a bound
+ * `ErrTooManyPaths` (the oracle's `boundEnvelopeCounts`).
+ */
 function boundCounts(b: Uint8Array): void {
-  const n = b.length;
-  const w = (o: number): number => wordAt(b, o) ?? fail('ErrABIFraming');
-  const offAnchors = w(64);
-  const offLeaves = w(96);
+  const n = BigInt(b.length);
+  const word = (off: bigint): bigint => {
+    if (off + 32n > n) return fail('ErrABIFraming');
+    let v = 0n;
+    for (let i = 0n; i < 32n; i++) v = (v << 8n) | BigInt(b[Number(off + i)]);
+    return v > U64_MAX ? fail('ErrABIFraming') : v;
+  };
+  const add = (x: bigint, y: bigint): bigint => (x + y > U64_MAX ? fail('ErrABIFraming') : x + y);
+  const offAnchors = word(64n);
+  const offLeaves = word(96n);
   if (offAnchors > n || offLeaves > n) fail('ErrABIFraming');
-  const na = w(offAnchors);
+  const na = word(offAnchors);
   if (na > n) fail('ErrABIFraming');
-  if (na > MAX_ANCHORS) fail('ErrTooManyPaths');
+  if (na > BigInt(MAX_ANCHORS)) fail('ErrTooManyPaths');
   // Every anchor's UC is bounded from its declared length before anything is allocated.
-  for (let i = 0; i < na; i++) {
-    const t = offAnchors + 32 + w(offAnchors + 32 + 32 * i);
-    if (w(t + w(t + 5 * 32)) > MAX_ANCHOR_UC_BYTES) fail('ErrInputTooLarge');
+  for (let i = 0n; i < na; i++) {
+    const t = add(add(offAnchors, 32n), word(add(add(offAnchors, 32n), 32n * i)));
+    if (word(add(t, word(add(t, 160n)))) > BigInt(MAX_ANCHOR_UC_BYTES)) fail('ErrInputTooLarge');
   }
-  const nl = w(offLeaves);
+  const nl = word(offLeaves);
   if (nl > n) fail('ErrABIFraming');
-  if (nl > MAX_LEAVES) fail('ErrTooManyPaths');
-  let steps = 0;
-  for (let i = 0; i < nl; i++) {
-    const rel = w(offLeaves + 32 + 32 * i);
-    const t = offLeaves + 32 + rel;
-    const sRel = w(t + 64);
-    const sOff = t + sRel;
-    const ns = w(sOff);
-    if (ns > MAX_RSMT_SIBLINGS || ns > MAX_PATH_STEPS - steps) fail('ErrTooManyPaths');
+  if (nl > BigInt(MAX_LEAVES)) fail('ErrTooManyPaths');
+  let steps = 0n;
+  for (let i = 0n; i < nl; i++) {
+    const rel = word(add(add(offLeaves, 32n), 32n * i));
+    const t = add(add(offLeaves, 32n), rel);
+    const sOff = add(t, word(add(t, 64n)));
+    const ns = word(sOff);
+    if (ns > BigInt(MAX_RSMT_SIBLINGS) || ns > BigInt(MAX_PATH_STEPS) - steps) fail('ErrTooManyPaths');
     steps += ns;
   }
 }
@@ -183,8 +195,8 @@ export function decodeEnvelope(b: Uint8Array): Envelope {
 
 /**
  * The composing verifier's opening, run before the kernel and before any B1 call: the supplied body is
- * hashed against `Cfg.aggregatorPolicyHash` before it is interpreted, decoded, the aggregator partition
- * must differ from the EVM partition and the anchor count must be within the bound. A submitted anchor
+ * hashed against `Cfg.aggregatorPolicyHash` before it is interpreted, decoded (the partition-only body), the aggregator
+ * partition must differ from the EVM partition and the anchor count must be within the bound. A submitted anchor
  * table never chooses its own admission.
  */
 export function checkPolicyBody(cfg: Cfg, e: Envelope): Policy {
@@ -204,33 +216,35 @@ export interface AnchorPlan {
 }
 
 /**
- * The envelope's anchor table must be exactly the function of the exported leaves the profile defines:
- * one leaf proof per leaf in kernel order; every anchor's partition, shard and configuration equal to a
- * policy row; anchors pairwise distinct by complete UC bytes (byte-identical UCs are one anchor, never
- * two); anchors numbered by first use in leaf order with none unused; and each leaf's `anchorIndex`
- * naming an anchor of the leaf's own shard (the top `depth` bits of its state ID). Different UCs of one
- * shard, even of one root round, are separate anchors. The number of anchors is not tied to the number
- * of shards.
+ * The envelope's anchor table must be exactly the function of the exported leaves the profile defines: one leaf proof per leaf in
+ * kernel order; every anchor of the policy's partition with a canonical native shard ID; anchors pairwise distinct by complete UC
+ * bytes (byte-identical UCs are one anchor, never two); anchors numbered by first use in leaf order with none unused; and each
+ * leaf's `anchorIndex` naming an anchor whose shard prefix the leaf's state ID carries (the first `d` bits, `d` that anchor's own
+ * shard depth, never the current topology). Anchors of one history may come from different topologies: a parent shard before a
+ * split and its child after it are both admitted, each bound by its own UC. The shard configuration hash is not checked here:
+ * the UC authenticates it (B1). The number of anchors is not tied to the number of shards.
  */
 export function planAnchors(pol: Policy, e: Envelope, sids: Uint8Array[]): AnchorPlan {
   if (e.leafProofs.length !== sids.length) fail('ErrPolicyLeafCount');
   if (e.anchors.length > MAX_ANCHORS) fail('ErrTooManyPaths');
   if (e.anchors.length === 0 || e.anchors.length > sids.length) fail('ErrPolicyAnchors');
-  const rowOf: number[] = [];
   const seen = new Set<string>();
-  e.anchors.forEach((a) => {
-    const row = pol.shardConfs.findIndex((_, r) => eq(a.shard, shardId(pol, r)));
-    if (row < 0 || a.partition !== pol.partition || !eq(a.shardConfHash, pol.shardConfs[row])) fail('ErrPolicyTuple');
-    rowOf.push(row);
+  for (const a of e.anchors) {
+    try {
+      shardDepth(a.shard);
+    } catch {
+      fail('ErrPolicyTuple');
+    }
+    if (a.partition !== pol.partition) fail('ErrPolicyTuple');
     const key = toHex(H(a.uc));
     if (seen.has(key)) fail('ErrPolicyAnchors');
     seen.add(key);
-  });
+  }
   const leafAnchor: number[] = [];
   let next = 0;
   sids.forEach((sid, i) => {
     const idx = e.leafProofs[i].anchorIndex;
-    if (idx >= e.anchors.length || idx > next || rowOf[idx] !== shardRow(pol, sid)) fail('ErrPolicyLeafIndex');
+    if (idx >= e.anchors.length || idx > next || !shardCovers(e.anchors[idx].shard, sid)) fail('ErrPolicyLeafIndex');
     if (idx === next) next++;
     leafAnchor.push(idx);
   });
@@ -245,27 +259,32 @@ export interface InputRecordOpening {
   timestamp: bigint;
 }
 
-/** Bound, scan and parse the exact canonical native InputRecord opening (tag 39002, v1, arity 10). */
+/** Bound, scan and parse the exact canonical native InputRecord opening (tag 39002, v1, arity 10); any shape failure is `ErrIRShape`. */
 export function parseInputRecord(raw: Uint8Array): InputRecordOpening {
-  if (raw.length > MAX_INPUT_RECORD_BYTES) fail('ErrInputTooLarge');
-  const k = arrayOf(tagContent(scanOne(raw), TAG_INPUT_RECORD), 10) ?? fail('ErrShape');
-  version(k[0], 1n);
-  for (const i of [3, 7, 9]) {
-    const v = nullableBytes(k[i]);
-    if (v !== null && v.length !== 32) fail('ErrLength');
+  if (raw.length === 0 || raw.length > MAX_INPUT_RECORD_BYTES) fail('ErrIRShape');
+  try {
+    const k = arrayOf(tagContent(scanOne(raw), TAG_INPUT_RECORD), 10) ?? fail('ErrShape');
+    version(k[0], 1n);
+    for (const i of [3, 7, 9]) {
+      const v = nullableBytes(k[i]);
+      if (v !== null && v.length !== 32) fail('ErrLength');
+    }
+    const summary = nullableBytes(k[5]); // summary value: null or bytes, at most the native sublimit (the chain refuses more)
+    if (summary !== null && summary.length > MAX_IR_SUMMARY_BYTES) fail('ErrProofTooLarge');
+    uint(k[8]);
+    return { round: uint(k[1]), epoch: uint(k[2]), stateHash: bytesN(k[4], 32), timestamp: uint(k[6]) };
+  } catch (e) {
+    if (e instanceof NativeError) return fail('ErrIRShape');
+    throw e;
   }
-  const summary = nullableBytes(k[5]); // summary value: null or bytes, at most the native sublimit (the chain refuses more)
-  if (summary !== null && summary.length > MAX_IR_SUMMARY_BYTES) fail('ErrProofTooLarge');
-  uint(k[8]);
-  return { round: uint(k[1]), epoch: uint(k[2]), stateHash: bytesN(k[4], 32), timestamp: uint(k[6]) };
 }
 
-/** `H(inputRecord)==expectedIRHash`, opened state hash == expectedStateRoot, every `t <=` timestamp. */
-export function checkAnchor(a: Anchor, leafTimes: bigint[]): InputRecordOpening {
-  if (!eq(H(a.inputRecord), a.expectedIRHash)) fail('ErrInputRecordMismatch');
+/** The anchor's opening: `H(inputRecord)==expectedIRHash`, then the exact shape, then the opened state hash == expectedStateRoot. */
+export function openAnchor(a: Anchor): InputRecordOpening {
+  if (a.inputRecord.length === 0 || a.inputRecord.length > MAX_INPUT_RECORD_BYTES) fail('ErrIRShape');
+  if (!eq(H(a.inputRecord), a.expectedIRHash)) fail('ErrIROpening');
   const ir = parseInputRecord(a.inputRecord);
-  if (!eq(ir.stateHash, a.expectedStateRoot)) fail('ErrInputRecordMismatch');
-  if (leafTimes.some((t) => t > ir.timestamp)) fail('ErrReferenceTimeFuture');
+  if (!eq(ir.stateHash, a.expectedStateRoot)) fail('ErrIRState');
   return ir;
 }
 
@@ -274,14 +293,9 @@ export function checkAnchor(a: Anchor, leafTimes: bigint[]): InputRecordOpening 
  * (`t <=` its own IR time, never another anchor's).
  */
 export function checkAnchors(e: Envelope, plan: AnchorPlan, leafTimes: bigint[]): InputRecordOpening[] {
-  const opened = e.anchors.map((a) => {
-    if (!eq(H(a.inputRecord), a.expectedIRHash)) fail('ErrInputRecordMismatch');
-    const ir = parseInputRecord(a.inputRecord);
-    if (!eq(ir.stateHash, a.expectedStateRoot)) fail('ErrInputRecordMismatch');
-    return ir;
-  });
+  const opened = e.anchors.map(openAnchor);
   leafTimes.forEach((t, i) => {
-    if (t > opened[plan.leafAnchor[i]].timestamp) fail('ErrReferenceTimeFuture');
+    if (t > opened[plan.leafAnchor[i]].timestamp) fail('ErrIRTime');
   });
   return opened;
 }

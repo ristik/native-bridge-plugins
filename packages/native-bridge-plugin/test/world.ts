@@ -35,7 +35,7 @@ import { EMPTY_TRIE_ROOT, EMPTY_UNCLE_HASH } from '../src/header.js';
 import { encodeJustification, encodeLockProof, type LockProof } from '../src/lockproof.js';
 import {
   H, accountTrieKey, arr, bs, deriveAsset, deriveSalt, deriveTokenId, deriveType, keccak256, leafValue, lockDigest,
-  lockDigestSlot, lockRecord, makePolicy, policyHash, returnReason, shardId, shardRow, storageTrieKey, u, valueEnvelope, type Policy,
+  lockDigestSlot, lockRecord, makePolicy, policyHash, returnReason, storageTrieKey, u, valueEnvelope, type Policy,
 } from '../src/profile.js';
 import { encodeBytes, encodeList, encodeU64 } from '../src/rlp.js';
 import { TrustInput } from '../src/trust.js';
@@ -226,11 +226,19 @@ export interface World {
   dep: Deployment;
   bridge: NativeBridge;
   policy: Policy;
-  /** The configuration hash of the first policy row (the only one at depth 0). */
+  /** The fixture topology depth (0: one shard `80`; 1: shards `40` and `c0`). The policy names none of it. */
+  depth: 0 | 1;
+  /** The configuration hash of the first shard (the only one at depth 0). */
   aggConf: Uint8Array;
-  /** The configuration hash of every policy row. */
+  /** The configuration hash of every fixture shard, in shard byte order. */
   aggConfs: Uint8Array[];
 }
+
+const FIXTURE_SHARDS: readonly (readonly Uint8Array[])[] = [[Uint8Array.of(0x80)], [Uint8Array.of(0x40), Uint8Array.of(0xc0)]];
+/** The native shard ID of fixture shard `row`. */
+export const shardOf = (w: Pick<World, 'depth'>, row: number): Uint8Array => FIXTURE_SHARDS[w.depth][row];
+/** The fixture shard (row) a state ID falls in: the top `depth` bits. */
+export const rowOf = (w: Pick<World, 'depth'>, sid: Uint8Array): number => (w.depth === 0 ? 0 : sid[0] >> 7);
 
 export function makeWorld(headerFields: 20 | 21 = 20, depth: 0 | 1 = 0): World {
   const agg = makeRoot(2, 4, 10);
@@ -238,7 +246,7 @@ export function makeWorld(headerFields: 20 | 21 = 20, depth: 0 | 1 = 0): World {
   const aggConfs = Array.from({ length: 1 << depth }, (_, i) => sha(text(`aggregator shard configuration ${i}`)));
   if (depth === 0) aggConfs[0] = sha(text('aggregator shard configuration'));
   const aggConf = aggConfs[0];
-  const policy: Policy = makePolicy(AGG_PARTITION, ...aggConfs);
+  const policy: Policy = makePolicy(AGG_PARTITION);
   const cfg = {
     network: NETWORK, rootGenesis: ROOT_GENESIS, chainId: CHAIN_ID, executionGenesis: EXEC_GENESIS, evmPartition: EVM_PARTITION,
     evmShard: Uint8Array.of(0x80), vault: VAULT, zeroAddress: ZERO20,
@@ -249,7 +257,7 @@ export function makeWorld(headerFields: 20 | 21 = 20, depth: 0 | 1 = 0): World {
   };
   const dep = makeDeployment(cfg, sha(text('vault runtime')), pdrConfigHash(), { fields: headerFields }, policy);
   const bridge = new NativeBridge(new DeploymentRegistry([dep]), agg.trust);
-  return { agg, evm, dep, bridge, policy, aggConf, aggConfs };
+  return { agg, evm, dep, bridge, policy, depth, aggConf, aggConfs };
 }
 
 export interface EvmSpec {
@@ -422,7 +430,7 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
   // rounds are separate anchors even when every other field is equal.
   const groups = new Map<string, { row: number; round: bigint; members: number[] }>();
   items.forEach((it, i) => {
-    const row = shardRow(w.policy, it.sid);
+    const row = rowOf(w, it.sid);
     const round = tw.ucRound ? tw.ucRound(i) : 900n;
     const key = `${row}:${round}`;
     const g = groups.get(key) ?? { row, round, members: [] };
@@ -438,7 +446,7 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
     const uc = await makeUc(w.agg, {
       partition: AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
       blockHash: null, signers: 4,
-      shard: { bytes: shardId(w.policy, g.row), siblings: w.policy.depth === 0 ? [] : [sha(text(`sibling of shard ${g.row}`))] },
+      shard: { bytes: shardOf(w, g.row), siblings: w.depth === 0 ? [] : [sha(text(`sibling of shard ${g.row}`))] },
     });
     for (const i of g.members) certOf[i] = { root, uc };
   }

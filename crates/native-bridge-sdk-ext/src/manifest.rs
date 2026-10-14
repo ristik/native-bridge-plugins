@@ -116,16 +116,6 @@ pub struct PolicyRecord {
     pub body_hex: String,
     pub sha256: String,
     pub partition: u64,
-    pub depth: u64,
-    pub shards: Vec<PolicyShardRecord>,
-}
-
-/// One row of the sharded aggregator policy: its native shard and configuration hash.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PolicyShardRecord {
-    pub shard_hex: String,
-    pub configuration_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -234,18 +224,8 @@ fn deployment(
     if policy.to_bytes() != policy_bytes
         || policy.hash() != hex_n::<32>(&pol.sha256)?
         || u64::from(policy.partition) != pol.partition
-        || u64::from(policy.depth) != pol.depth
-        || pol.shards.len() != policy.shard_confs.len()
     {
         return Err(E::Manifest);
-    }
-    // The listed rows are the opened body's rows, in order, each shard in its single native encoding.
-    for (i, row) in pol.shards.iter().enumerate() {
-        if row.shard_hex != hex_lower(policy.shard_id(i))
-            || policy.shard_confs[i] != hex_n::<32>(&row.configuration_hash)?
-        {
-            return Err(E::Manifest);
-        }
     }
     let backing = &d.evm_backing_policy;
     let evm_shard = hex_vec(&backing.shard_hex, 33)?;
@@ -433,8 +413,6 @@ pub fn deployment_record(
         policy_body_hex: hex_lower(&d.policy.to_bytes()),
         policy_sha256: hex_lower(&d.policy.hash()),
         policy_partition: d.policy.partition,
-        policy_depth: d.policy.depth,
-        policy_configuration_hashes: d.policy.shard_confs.iter().map(|c| hex_lower(c)).collect(),
         evm_partition: d.cfg.evm_partition,
         evm_shard_hex: hex_lower(&d.cfg.evm_shard),
         evm_configuration_hash: hex_lower(&d.evm_config_hash),
@@ -457,8 +435,6 @@ pub struct DeploymentRecordOut {
     pub policy_body_hex: String,
     pub policy_sha256: String,
     pub policy_partition: u32,
-    pub policy_depth: u8,
-    pub policy_configuration_hashes: Vec<String>,
     pub evm_partition: u32,
     pub evm_shard_hex: String,
     pub evm_configuration_hash: String,

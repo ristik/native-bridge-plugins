@@ -14,11 +14,9 @@ use crate::limits::*;
 use crate::scan::{fixed, scan_one};
 
 const CFG_DOMAIN: &[u8] = b"UNICITY_BR_CFG";
-const POLICY_DOMAIN: &[u8] = b"UNICITY_BR_AGG_SHARDED";
-/// The literal version field of the sharded policy body.
-const POLICY_VERSION: u64 = 1;
-/// The deepest admitted shard topology.
-pub const MAX_POLICY_DEPTH: u8 = 1;
+const POLICY_DOMAIN: &[u8] = b"UNICITY_BR_AGG_PARTITION";
+/// The literal version field of the policy body (the v3 `AGG_SHARDED` and `AGG_ONE` bodies are not decoded).
+const POLICY_VERSION: u64 = 2;
 
 /// The one-byte native encoding of the empty shard prefix (not the empty bstr).
 pub const EMPTY_PREFIX_SHARD: [u8; 1] = [0x80];
@@ -208,74 +206,25 @@ pub fn value_envelope(aid: &[u8; 32], amount: &[u8]) -> Vec<u8> {
     )
 }
 
-/// The complete uniform MSB-first prefix topology of depth `depth`, in increasing shard byte order.
-/// A native shard ID is the prefix bits, one set terminator bit and zero padding.
-pub fn shard_topology(depth: u8) -> &'static [&'static [u8]] {
-    match depth {
-        0 => &[&EMPTY_PREFIX_SHARD],
-        _ => &[&[0x40], &[0xc0]],
-    }
-}
-
-/// The sole admitted aggregator policy body
-/// `C("UNICITY_BR_AGG_SHARDED", 1, partition, depth, [[b(shardID), b(shardConfHash)], ...])` with exactly
-/// `2^depth` rows in increasing shard byte order.
+/// The sole admitted aggregator policy body `C("UNICITY_BR_AGG_PARTITION", 2, partition)`: it names the aggregation partition
+/// only. Every anchor's UC authenticates its own historical shard and shard configuration hash; there is no depth, shard list
+/// or allow-list in the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub partition: u32,
-    pub depth: u8,
-    /// The native configuration hash of every row, in row order.
-    pub shard_confs: Vec<[u8; 32]>,
 }
 
 impl Policy {
-    /// The policy of a complete topology of depth `log2(confs.len())` (one or two rows).
-    pub fn new(partition: u32, confs: &[[u8; 32]]) -> Result<Policy> {
-        let depth = match confs.len() {
-            1 => 0,
-            2 => 1,
-            _ => return Err(E::Shape),
-        };
-        Ok(Policy {
-            partition,
-            depth,
-            shard_confs: confs.to_vec(),
-        })
-    }
-
-    /// The shard ID bytes of row `row`.
-    pub fn shard_id(&self, row: usize) -> &'static [u8] {
-        shard_topology(self.depth)[row]
-    }
-
-    /// The row (shard) a state ID belongs to: the top `depth` bits of the raw 32-byte SID.
-    pub fn shard_row(&self, sid: &[u8; 32]) -> usize {
-        if self.depth == 0 {
-            0
-        } else {
-            usize::from(sid[0] >> 7)
-        }
+    /// The policy of an aggregation partition.
+    pub fn new(partition: u32) -> Policy {
+        Policy { partition }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let rows: Vec<Vec<u8>> = self
-            .shard_confs
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                encode_array(&[
-                    &encode_byte_string(self.shard_id(i)),
-                    &encode_byte_string(c),
-                ])
-            })
-            .collect();
-        let row_refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
         encode_array(&[
             &encode_byte_string(POLICY_DOMAIN),
             &encode_uint(POLICY_VERSION),
             &encode_uint(self.partition as u64),
-            &encode_uint(self.depth as u64),
-            &encode_array(&row_refs),
         ])
     }
 
@@ -290,7 +239,7 @@ impl Policy {
             return Err(E::InputTooLarge);
         }
         let root = scan_one(b)?;
-        let k = root.array(5).ok_or(E::Shape)?;
+        let k = root.array(3).ok_or(E::Shape)?;
         if k[0].bytes().map_err(|_| E::Shape)? != POLICY_DOMAIN {
             return Err(E::Shape);
         }
@@ -299,27 +248,35 @@ impl Policy {
         if partition == 0 {
             return Err(E::IntRange);
         }
-        let depth = k[3].uint().map_err(|_| E::Shape)?;
-        if depth > u64::from(MAX_POLICY_DEPTH) {
-            return Err(E::Shape);
-        }
-        let depth = depth as u8;
-        let topo = shard_topology(depth);
-        let rows = k[4].array(topo.len()).ok_or(E::Shape)?;
-        let mut shard_confs = Vec::new();
-        for (r, want) in rows.iter().zip(topo) {
-            let row = r.array(2).ok_or(E::Shape)?;
-            if row[0].bytes().map_err(|_| E::Shape)? != *want {
-                return Err(E::Shape);
-            }
-            shard_confs.push(fixed(&row[1])?);
-        }
-        Ok(Policy {
-            partition,
-            depth,
-            shard_confs,
-        })
+        Ok(Policy { partition })
     }
+}
+
+/// The depth of a native shard ID: the bits before its terminator, `8*len - trailingZeroBits(lastByte) - 1`. The ID is 1..33
+/// bytes with a nonzero last byte (the terminator is that byte's lowest set bit).
+pub fn shard_depth(shard: &[u8]) -> Result<usize> {
+    let last = *shard.last().ok_or(E::ShardMismatch)?;
+    if shard.len() > MAX_SHARD_BYTES || last == 0 {
+        return Err(E::ShardMismatch);
+    }
+    Ok(8 * shard.len() - last.trailing_zeros() as usize - 1)
+}
+
+/// Whether the first `shard_depth(shard)` bits of `sid` equal the prefix bits of the native shard ID `shard`.
+pub fn shard_covers(shard: &[u8], sid: &[u8; 32]) -> bool {
+    let Ok(d) = shard_depth(shard) else {
+        return false;
+    };
+    let whole = d / 8;
+    if shard[..whole] != sid[..whole] {
+        return false;
+    }
+    let rest = d % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = (0xffu16 << (8 - rest)) as u8;
+    (sid[whole] & mask) == (shard[whole] & mask)
 }
 
 /// `salt = H(C("UNICITY_BR_SALT", b(cfg), n))`.

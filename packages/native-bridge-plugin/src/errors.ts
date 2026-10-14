@@ -33,6 +33,8 @@ const FAMILY = {
   ErrEvmConfigHash: I, ErrEvmConfigPin: I, ErrHeaderHash: I, ErrHeaderRoot: I, ErrHeaderProfile: I,
   ErrAccountProof: I, ErrAccountCode: I, ErrStorageProof: I, ErrStorageValue: I, ErrLockDigest: I,
   ErrManifest: I,
+  // protocol 4 (the oracle's names): certificate scan, anchor openings and the leaf proof
+  ErrCertScan: M, ErrCertSigLength: M, ErrIROpening: I, ErrIRShape: I, ErrIRState: I, ErrIRTime: I, ErrLeafProof: I,
 } as const;
 
 export type NativeReason = keyof typeof FAMILY;

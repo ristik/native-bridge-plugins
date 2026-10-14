@@ -1,15 +1,15 @@
 /**
- * Named profile-v3 bounds and fixed protocol constants. The numbers of the first block are the
- * `limits` of `protocol/profile-v3.json` (the single source shared with the oracle and the contract;
+ * Named profile-v4 bounds and fixed protocol constants. The numbers of the first block are the
+ * `limits` of `protocol/profile-v4.json` (the single source shared with the oracle and the contract;
  * `test/limits.test.ts` pins them): a later profile version raises them together with the gas budget.
  * Limits are intersected, never additive entitlements, and every cumulative bound is checked before
  * allocation or cryptography.
  */
-export const NATIVE_BRIDGE_PROTO_VERSION = 3 as const;
+export const NATIVE_BRIDGE_PROTO_VERSION = 4 as const;
 
-// ---- profile parameters (profile-v3.json `limits`) -------------------------------------------------
+// ---- profile parameters (profile-v4.json `limits`) -------------------------------------------------
 /** Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle. */
-export const MAX_ANCHORS = 8;
+export const MAX_ANCHORS = 16;
 /** B2 leaves of one redemption: the mint, every transfer and the final burn. */
 export const MAX_LEAVES = 16;
 export const MAX_TRANSFERS = MAX_LEAVES - 1;
@@ -21,12 +21,24 @@ export const MAX_PATH_STEPS = 2048;
 export const MAX_POLICY_BYTES = 512;
 /** B1's own sublimits, which the gate prices. */
 export const MAX_UNICITY_STEPS = 32;
-export const MAX_SIGNATURES = 64;
+/** Signatures of one seal and over one batch (`CERT_BATCH_V2`), contract section 4. */
+export const MAX_SIGS_PER_SEAL = 16;
+export const MAX_TOTAL_SIGS = 256;
+/** A native shard ID is 1..33 bytes (depth 0..256). */
+export const MAX_SHARD_BYTES = 33;
+export const MAX_SHARD_DEPTH = 256;
+/** The batch request: claim count, bytes and the raw (pre-deduplication) path steps of all occurrences. */
+export const MAX_BATCH_BYTES = 262_144;
+export const MAX_RAW_STEPS = 4_608;
+export const MAX_BATCH_UC_BYTES = 24_576;
 
 // ---- the shared gas gate (interop.md "Direct-call gas gate") ----------------------------------------
 /** DN-B ordinary transaction capacity. */
 export const TX_GAS_BUDGET = 7_000_000;
 export const GAS_RESERVE = 1_000_000;
+/** The bridge's cumulative CBOR item budget (Cfg, policy, every UC and every IR opening) and its price per item. */
+export const BRIDGE_CBOR_ITEMS = 4096;
+export const BRIDGE_ITEM_GAS = 1000;
 
 export const MAX_CBOR_DEPTH = 16;
 export const MAX_CBOR_ITEMS = 32768;

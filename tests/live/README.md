@@ -1,5 +1,10 @@
 # Live DN-B lane driver
 
+> **Protocol 3 lane.** This driver, `rows.ts` and `postcheck.ts` were written against the protocol-3 plug-in (policy rows, the `W_cert` window and
+> `freshness.ts`) and the protocol-3 devnet. The plug-ins are at protocol 4 (partition-only policy, any-age anchors, `readiness.ts`, no `leafRoutes`), so
+> these scripts no longer compile against `packages/native-bridge-plugin/src` and are not run by CI. Their protocol-4 port waits for the DN-B devnet
+> lanes at protocol 4 (bft-core); the descriptions below are the protocol-3 record and the `W_cert` timing rule in them no longer applies.
+
 Runs the private bridge round trip against a running devnet: `lock → mint → transfer → burn → redeem → claim`, with the TS plug-in as the client and
 nothing synthetic in the loop. Component evidence (`tests/joined`) is unchanged; this is the live tier it listed as blocked.
 
