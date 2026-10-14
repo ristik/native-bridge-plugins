@@ -1,5 +1,5 @@
 {
-  "protocolVersion": 3,
+  "protocolVersion": 4,
   "kernelAddress": "0x0000000000000000000000000000000000000104",
   "reservedAddress": "0x0000000000000000000000000000000000000103",
   "input": [
@@ -82,36 +82,55 @@
     "uint256(1)",
     "bool(true)"
   ],
-  "policy": {
-    "domain": "UNICITY_BR_AGG_SHARDED",
-    "version": 1,
-    "maxBytes": 512,
-    "depths": [
-      0,
-      1
+  "certBatch": {
+    "address": "0x0000000000000000000000000000000000000100",
+    "operation": "CERT_BATCH_V2",
+    "request": [
+      "uint8 version=2",
+      "uint8 flags=0",
+      "uint16 K",
+      "Claim[K]"
     ],
-    "shardIds": {
-      "0": [
-        "80"
-      ],
-      "1": [
-        "40",
-        "c0"
-      ]
-    },
-    "entry": [
-      "bytes shardId",
-      "bytes32 shardConfHash"
+    "claim": [
+      "uint32 partition",
+      "uint16 shardLen",
+      "bytes shard",
+      "bytes32 shardConfHash",
+      "bytes32 expectedStateRoot",
+      "bytes32 expectedIRHash",
+      "uint32 ucLen",
+      "bytes uc"
+    ],
+    "claimOrder": "the anchor table, in table order; K = the table length",
+    "resultBytes": 64,
+    "result": [
+      "uint256(2)",
+      "bool(true)"
     ]
   },
-  "anchorRule": "one anchor per distinct complete UC (pairwise distinct UC bytes), ordered by first use in kernel leaf order; each leaf's anchorIndex is an already-used index or the next unused one and names an anchor of its own shard; no unused anchors",
+  "policy": {
+    "domain": "UNICITY_BR_AGG_PARTITION",
+    "version": 2,
+    "maxBytes": 512,
+    "fields": [
+      "bytes domain",
+      "uint version",
+      "uint32 aggregatorPartition"
+    ],
+    "shardDepth": "per anchor: 8*len(shard) - trailingZeroBits(lastByte) - 1, 0..256"
+  },
+  "anchorRule": "one anchor per distinct complete UC (pairwise distinct UC bytes), of the policy partition with a canonical shard ID, ordered by first use in kernel leaf order; each leaf's anchorIndex is an already-used index or the next unused one and names an anchor whose shard prefix (its first d bits) the leaf's SID carries; no unused anchors",
   "gas": {
     "txBudget": 7000000,
     "reserve": 1000000,
-    "ucBase": 92700,
-    "ucPerByte": 16,
-    "ucPerSignature": 6000,
-    "ucPerStep": 250,
+    "batchScanBase": 60000,
+    "batchPerByte": 16,
+    "batchPerPair": 500,
+    "batchCommonReads": 1100,
+    "batchPerEpoch": 29900,
+    "batchPerSignature": 6000,
+    "batchPerClaim": 2000,
+    "batchPerStep": 250,
     "rsmtBase": 2000,
     "rsmtRequestFixed": 136,
     "rsmtPerSibling": 32,
@@ -120,8 +139,10 @@
     "b2Base": 26000,
     "b2PerByte": 20,
     "b2PerLeaf": 14000,
+    "b2RequestFixed": 160,
     "intrinsicBase": 21000,
-    "intrinsicPerByte": 16,
+    "intrinsicPerCallDataByte": 16,
+    "callDataFixed": 132,
     "intrinsicExecPerByte": 80
   }
 }

@@ -4,7 +4,7 @@
     "plugins": "f4bc312e3044dcc1a5706c5838228313e5608e73",
     "ureth": "4c16f0765d22df5e1d65cab8b8887b82b1332c42",
     "contracts": "5c0af1433adac291289c4ec48a9901ea31b8d77a",
-    "oracle": "f2b23b3f9316055da536731c25d51a88c6b061a6",
+    "oracle": "1f3317341eee423f0ad585e4b2b865b4ca9425de",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
@@ -20,5 +20,8 @@
     "old-J validity across rotation",
     "full B1/SDK seal-signature acceptance parity"
   ],
-  "pluginsTree": "2f2e7b59a0411912269402dd60bf3c1e9435672077bb0231c5c26bc9ee12957e"
+  "deferredSteps": {
+    "contracts-tier": "contracts at protocol 3 until dev2's protocol-4 port"
+  },
+  "pluginsTree": "99479f16c02b7fdecdfc33ada0e0f471b3c8db770f98f82d0b76a03763271d6f"
 }

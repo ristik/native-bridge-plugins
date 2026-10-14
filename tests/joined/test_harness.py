@@ -16,6 +16,29 @@ class EvidenceGuards(unittest.TestCase):
         self.assertEqual(joined.acceptance_status([{'status': 'NOT RUN'}]), ('BLOCKED', 2))
         self.assertEqual(joined.acceptance_status([]), ('BLOCKED', 2))
 
+    def test_deferred_tier_is_blocked_never_pass(self):
+        tier = {'contracts-tier': 'contracts at protocol 3 until dev2\'s protocol-4 port'}
+        reason = tier['contracts-tier']
+        listed = [{'name': 'b2-join', 'status': 'PASS'}, {'name': 'contracts-regenerate', 'status': 'DEFERRED', 'reason': reason}]
+        self.assertEqual(joined.acceptance_status(listed, tier), ('BLOCKED', 2))
+        self.assertEqual(joined.acceptance_status([{'name': 'native-driver', 'status': 'DEFERRED', 'reason': reason}], tier), ('BLOCKED', 2))
+
+    def test_unlisted_deferred_step_fails_the_run(self):
+        tier = {'contracts-tier': 'contracts at protocol 3 until dev2\'s protocol-4 port'}
+        reason = tier['contracts-tier']
+        # a step outside every deferrable tier
+        self.assertEqual(joined.acceptance_status([{'name': 'corpus-regenerate', 'status': 'DEFERRED', 'reason': reason}], tier), ('FAIL', 1))
+        # a tier step while no tier is pinned as deferred
+        self.assertEqual(joined.acceptance_status([{'name': 'contracts-regenerate', 'status': 'DEFERRED', 'reason': reason}], {}), ('FAIL', 1))
+        # a tier step with another or no reason
+        self.assertEqual(joined.acceptance_status([{'name': 'contracts-regenerate', 'status': 'DEFERRED', 'reason': 'later'}], tier), ('FAIL', 1))
+        self.assertEqual(joined.acceptance_status([{'name': 'contracts-regenerate', 'status': 'DEFERRED'}], tier), ('FAIL', 1))
+
+    def test_pinned_deferral_names_the_contracts_tier(self):
+        self.assertEqual(set(joined.PINS.get('deferredSteps', {})) - set(joined.DEFERRABLE_TIERS), set())
+        self.assertEqual(joined.deferred_reason('contracts-regenerate'), "contracts at protocol 3 until dev2's protocol-4 port")
+        self.assertIsNone(joined.deferred_reason('b2-join'))
+
     def test_failed_component_cannot_be_hidden_by_blocker(self):
         self.assertEqual(joined.acceptance_status([{'status': 'PASS'}, {'status': 'FAIL'}]), ('FAIL', 1))
 

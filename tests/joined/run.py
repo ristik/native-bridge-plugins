@@ -132,9 +132,32 @@ def check_native_report(path):
             'gas': {n: steps[n]['gasUsed'] for n in NATIVE_REQUIRED[:4]}}
 
 
-def acceptance_status(steps):
+# A deferred tier is a named block of steps that a pinned reason may defer (pins.json `deferredSteps`). Its steps are still reported, one
+# entry each with status DEFERRED and the pinned reason; nothing is silently skipped, and no other step may be deferred.
+DEFERRABLE_TIERS = {
+    'contracts-tier': ['contracts-regenerate', 'contracts-comparison', 'contracts-doubles', 'native-contracts-build', 'native-genesis',
+                       'native-golden', 'native-fmt', 'native-driver', 'native-report'],
+}
+
+
+def deferred_reason(name, deferred=None):
+    """The pinned reason a step may be DEFERRED, or None when it must run."""
+    deferred = PINS.get('deferredSteps', {}) if deferred is None else deferred
+    for tier, steps in DEFERRABLE_TIERS.items():
+        if name in steps and deferred.get(tier):
+            return deferred[tier]
+    return None
+
+
+def acceptance_status(steps, deferred=None):
     if any(s['status'] == 'FAIL' for s in steps):
         return 'FAIL', 1
+    for s in steps:
+        if s['status'] == 'DEFERRED':
+            reason = deferred_reason(s.get('name'), deferred)
+            if not reason or s.get('reason') != reason:
+                return 'FAIL', 1  # a DEFERRED step must be named by a pinned tier and carry its exact reason
+    # DEFERRED, like NOT RUN, never turns into acceptance.
     # These source pins have no integrated live runner. Component greens cannot
     # promote them to acceptance, even if someone empties the blockers map.
     return 'BLOCKED', 2
@@ -159,7 +182,7 @@ def main():
     report = {'schema': 1, 'profile': PINS['profile'], 'status': 'RUNNING',
               'host': {'system': platform.system(), 'machine': platform.machine()},
               'pins': PINS['sources'], 'harnessHead': git(ROOT, 'rev-parse', 'HEAD'),
-              'steps': [], 'blocked': PINS['blocked'], 'deferred': PINS['deferred'],
+              'steps': [], 'blocked': PINS['blocked'], 'deferred': PINS['deferred'], 'deferredSteps': PINS.get('deferredSteps', {}),
               'evidenceClass': 'component + in-process native vault calls (node EVM factory); no running aggregator, no devnet'}
     report['inputs'] = {str(p.relative_to(ROOT)): digest(p) for p in sorted(HERE.rglob('*'))
                         if p.is_file() and '__pycache__' not in p.parts}
@@ -242,44 +265,53 @@ def main():
                 shutil.copyfile(sources['ureth'] / 'Cargo.lock', driver / 'Cargo.lock')
                 step('b2-join', ['cargo', 'run', '--manifest-path', str(driver / 'Cargo.toml'), '--', str(out / 'joined.json')], env=env)
                 shutil.copyfile(driver / 'Cargo.lock', out / 'b2-Cargo.lock')
-                overlay = scratch / 'overlay.json'
-                overlay.write_text(json.dumps({'Replace': {
-                    str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_golden_test.go'):
-                    str(sources['contracts'] / 'script/bridge-golden/golden_pr5_test.go.txt')}}))
-                golden_env = dict(env, BRIDGE_PR5_GOLDEN=str(out / 'contracts-golden.json'))
-                step('contracts-regenerate', ['go', 'test', '-p', '1', '-overlay', str(overlay), './bridgeprofile',
-                                              '-run', '^TestGenPR5Golden$', '-count=1'], sources['oracle'], golden_env)
-                report['contractsComparison'] = compare_contracts(sources['contracts'], out / 'contracts-golden.json')
-                step('contracts-doubles', ['forge', 'test', '--threads', '2', '--match-path', 'test/bridge/*.t.sol'], sources['contracts'], env)
-                # Native-call tier: real vault/verifier runtimes, the production B1 genesis path and the node EVM factory.
-                step('native-contracts-build', ['forge', 'build', '--threads', '2', 'src/bridge/BridgeVault.sol', 'src/bridge/TokenVerifier.sol'], sources['contracts'], env)
-                native_overlay = scratch / 'native-overlay.json'
-                native_overlay.write_text(json.dumps({'Replace': {
-                    str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_golden_test.go'):
-                    str(sources['contracts'] / 'script/bridge-golden/golden_pr5_test.go.txt'),
-                    str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_native_golden_test.go'): str(HERE / 'native/golden_test.go.txt'),
-                    str(sources['oracle'] / 'registrygenesis/zz_nbp_pr6_native_genesis_test.go'): str(HERE / 'native/genesis_test.go.txt')}}))
-                step('native-genesis', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './registrygenesis',
-                                        '-run', '^TestNBPPR6NativeGenesis$', '-count=1'], sources['oracle'],
-                     dict(env, NBP_PR6_NATIVE_OUT=str(out / 'native-genesis.json')))
-                step('native-golden', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './bridgeprofile',
-                                       '-run', '^TestNBPPR6NativeGolden$', '-count=1'], sources['oracle'],
-                     dict(env, NBP_PR6_NATIVE_GOLDEN=str(out / 'native-golden.json'),
-                          NBP_PR6_NATIVE_GENESIS=str(out / 'native-genesis.json'),
-                          NBP_PR6_VERIFIER_ARTIFACT=str(sources['contracts'] / 'out/TokenVerifier.sol/TokenVerifier.json')))
-                step('native-fmt', ['rustfmt', '--edition', '2021', '--check', str(HERE / 'native/src/main.rs')], env=env)
-                native = scratch / 'native'
-                shutil.copytree(HERE / 'native', native, ignore=shutil.ignore_patterns('*.txt'))
-                template = (native / 'Cargo.toml.in').read_text()
-                (native / 'Cargo.toml').write_text(template
-                    .replace('@EXECUTION_PATH@', json.dumps(str(sources['ureth'] / 'crates/unicity/execution')))
-                    .replace('@B1_PATH@', json.dumps(str(sources['ureth'] / 'crates/unicity/b1'))))
-                shutil.copyfile(sources['ureth'] / 'Cargo.lock', native / 'Cargo.lock')
-                step('native-driver', ['cargo', 'run', '--manifest-path', str(native / 'Cargo.toml'), '--',
-                                       str(out / 'native-genesis.json'), str(out / 'native-golden.json'),
-                                       str(sources['contracts']), str(out / 'native-report.json')], env=env)
-                shutil.copyfile(native / 'Cargo.lock', out / 'native-Cargo.lock')
-                report['nativeCalls'] = check_native_report(out / 'native-report.json')
+                tier_reason = PINS.get('deferredSteps', {}).get('contracts-tier')
+                if tier_reason:
+                    for name in DEFERRABLE_TIERS['contracts-tier']:
+                        report['steps'].append({'name': name, 'status': 'DEFERRED', 'reason': tier_reason})
+                        print(f'DEFERRED {name}: {tier_reason}', flush=True)
+                    report['contractsComparison'] = {'status': 'DEFERRED', 'reason': tier_reason}
+                    report['nativeCalls'] = {'status': 'DEFERRED', 'reason': tier_reason}
+                    save()
+                else:
+                    overlay = scratch / 'overlay.json'
+                    overlay.write_text(json.dumps({'Replace': {
+                        str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_golden_test.go'):
+                        str(sources['contracts'] / 'script/bridge-golden/golden_pr5_test.go.txt')}}))
+                    golden_env = dict(env, BRIDGE_PR5_GOLDEN=str(out / 'contracts-golden.json'))
+                    step('contracts-regenerate', ['go', 'test', '-p', '1', '-overlay', str(overlay), './bridgeprofile',
+                                                  '-run', '^TestGenPR5Golden$', '-count=1'], sources['oracle'], golden_env)
+                    report['contractsComparison'] = compare_contracts(sources['contracts'], out / 'contracts-golden.json')
+                    step('contracts-doubles', ['forge', 'test', '--threads', '2', '--match-path', 'test/bridge/*.t.sol'], sources['contracts'], env)
+                    # Native-call tier: real vault/verifier runtimes, the production B1 genesis path and the node EVM factory.
+                    step('native-contracts-build', ['forge', 'build', '--threads', '2', 'src/bridge/BridgeVault.sol', 'src/bridge/TokenVerifier.sol'], sources['contracts'], env)
+                    native_overlay = scratch / 'native-overlay.json'
+                    native_overlay.write_text(json.dumps({'Replace': {
+                        str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_golden_test.go'):
+                        str(sources['contracts'] / 'script/bridge-golden/golden_pr5_test.go.txt'),
+                        str(sources['oracle'] / 'bridgeprofile/zz_nbp_pr6_native_golden_test.go'): str(HERE / 'native/golden_test.go.txt'),
+                        str(sources['oracle'] / 'registrygenesis/zz_nbp_pr6_native_genesis_test.go'): str(HERE / 'native/genesis_test.go.txt')}}))
+                    step('native-genesis', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './registrygenesis',
+                                            '-run', '^TestNBPPR6NativeGenesis$', '-count=1'], sources['oracle'],
+                         dict(env, NBP_PR6_NATIVE_OUT=str(out / 'native-genesis.json')))
+                    step('native-golden', ['go', 'test', '-p', '1', '-overlay', str(native_overlay), './bridgeprofile',
+                                           '-run', '^TestNBPPR6NativeGolden$', '-count=1'], sources['oracle'],
+                         dict(env, NBP_PR6_NATIVE_GOLDEN=str(out / 'native-golden.json'),
+                              NBP_PR6_NATIVE_GENESIS=str(out / 'native-genesis.json'),
+                              NBP_PR6_VERIFIER_ARTIFACT=str(sources['contracts'] / 'out/TokenVerifier.sol/TokenVerifier.json')))
+                    step('native-fmt', ['rustfmt', '--edition', '2021', '--check', str(HERE / 'native/src/main.rs')], env=env)
+                    native = scratch / 'native'
+                    shutil.copytree(HERE / 'native', native, ignore=shutil.ignore_patterns('*.txt'))
+                    template = (native / 'Cargo.toml.in').read_text()
+                    (native / 'Cargo.toml').write_text(template
+                        .replace('@EXECUTION_PATH@', json.dumps(str(sources['ureth'] / 'crates/unicity/execution')))
+                        .replace('@B1_PATH@', json.dumps(str(sources['ureth'] / 'crates/unicity/b1'))))
+                    shutil.copyfile(sources['ureth'] / 'Cargo.lock', native / 'Cargo.lock')
+                    step('native-driver', ['cargo', 'run', '--manifest-path', str(native / 'Cargo.toml'), '--',
+                                           str(out / 'native-genesis.json'), str(out / 'native-golden.json'),
+                                           str(sources['contracts']), str(out / 'native-report.json')], env=env)
+                    shutil.copyfile(native / 'Cargo.lock', out / 'native-Cargo.lock')
+                    report['nativeCalls'] = check_native_report(out / 'native-report.json')
         # Refuse evidence from sources modified while commands ran.
         for key, path in sources.items():
             validate_source(path, PINS['sources'][key])

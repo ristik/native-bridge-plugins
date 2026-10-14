@@ -59,11 +59,19 @@ jobs:
           set -e
           test "$result" -eq 2
           python3 - <<'PY'
-          import json
+          import importlib.util, json
+          spec = importlib.util.spec_from_file_location('joined_run', 'tests/joined/run.py')
+          run = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(run)
           r = json.load(open('/tmp/joined-evidence/report.json'))
           assert r['status'] == 'BLOCKED'
           assert r['blocked']
-          assert all(s['status'] == 'PASS' for s in r['steps']), r['steps']
+          for s in r['steps']:
+              if s['status'] == 'DEFERRED':
+                  # only a step of a pinned deferred tier, with its exact non-empty reason
+                  assert s.get('reason') and s['reason'] == run.deferred_reason(s['name']), s
+              else:
+                  assert s['status'] == 'PASS', s
           PY
       - uses: actions/upload-artifact@v4
         if: always()
