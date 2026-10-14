@@ -21,6 +21,7 @@ import { NativeError, RETRYABLE } from '../src/errors.js';
 import { BEST_UC_BYTES } from '../src/gas.js';
 import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
 import { cfgBytes } from '../src/profile.js';
+import { toHex } from '../src/bytes.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, PAIR_RACE } from '../src/wallet.js';
 import { DeploymentRegistry } from '../src/deployment.js';
 import { rejects, throwsReason } from './util.js';
@@ -207,6 +208,35 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   assert.equal(full.ucs.length, MAX_ANCHORS);
   const sixteen = await buildReturnProof(w.bridge, full.token).then((r) => r.envelope.anchors.length, (e: unknown) => (e as NativeError).reason);
   assert.ok(sixteen === MAX_ANCHORS || sixteen === 'ErrGasBudget', String(sixteen));
+});
+
+test('consolidation (evidence 1c): re-proving the same token under one certificate changes the seals, never the transactions, IDs, times or the nullifier', async () => {
+  const w = makeWorld();
+  // before: the genesis is certified in one round, the transfers in another: two UCs, two seals
+  const a = await ret(w);
+  const b = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS + 5n);
+  const before = await Token.fromCBOR(
+    C.encodeTag(39040, C.encodeArray(C.encodeUnsignedInteger(2), a.token.genesis.toCBOR(), C.encodeArray(...b.token.transactions.map((t) => t.toCBOR())))),
+  );
+  // after: every leaf re-proved under ONE later certificate (the refresh keeps exact M/T/CD/t/J)
+  const after = await refreshToken(before, await freshProofs(w, a, 0, UC_TS + 5000n));
+  const vb = await w.bridge.verifyNativeToken(before, 'return');
+  const va = await w.bridge.verifyNativeToken(after, 'return');
+  // signed transaction bytes (the proofs aside), token and leaf IDs, reference-time inputs and the burn nullifier are unchanged
+  const txs = (t: Token): string[] => [t.genesis, ...t.transactions].map((c) => toHex(CborDeserializer.decodeArray(c.toCBOR(), 2)[0]));
+  assert.deepEqual(txs(after), txs(before), 'signed transaction bytes');
+  assert.deepEqual(va.outcome.leaves.map((l) => l.sid), vb.outcome.leaves.map((l) => l.sid), 'leaf IDs');
+  assert.deepEqual(va.outcome.leaves.map((l) => l.txHash), vb.outcome.leaves.map((l) => l.txHash), 'transaction hashes');
+  assert.deepEqual(va.outcome.leaves.map((l) => l.referenceTime), vb.outcome.leaves.map((l) => l.referenceTime), 'reference times');
+  assert.deepEqual(va.outcome.nullifier, vb.outcome.nullifier, 'burn nullifier');
+  assert.equal(va.outcome.nonce, vb.outcome.nonce);
+  // the batch grouping shrinks: fewer distinct seals, fewer signatures, never more epochs or claims
+  const gb = (await buildReturnProof(w.bridge, before)).gate.grouping;
+  const ga = (await buildReturnProof(w.bridge, after)).gate.grouping;
+  assert.equal(gb.s, 2);
+  assert.equal(ga.s, 1);
+  assert.ok(ga.q < gb.q, `Q ${gb.q} -> ${ga.q}`);
+  assert.ok(ga.e <= gb.e && ga.a < gb.a && ga.k < gb.k, `E ${gb.e}->${ga.e} A ${gb.a}->${ga.a} K ${gb.k}->${ga.k}`);
 });
 
 async function aggErr(f: (o: { uc: Parameters<typeof makeUc>[1] }) => void): Promise<unknown> {

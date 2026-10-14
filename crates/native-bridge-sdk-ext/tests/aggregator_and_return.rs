@@ -304,6 +304,50 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
     }
 }
 
+#[test]
+fn consolidation_changes_the_seals_never_the_transactions_ids_times_or_the_nullifier() {
+    // evidence 1c: before, the genesis and the transfers are certified in two rounds (two UCs); after, one later certificate
+    let w = make_world(20);
+    let a = ret(&w);
+    let b = build_token(
+        &w,
+        &spec(1),
+        &[tx_step(2, 7, T0 + 10), burn_step(T0 + 20)],
+        T0,
+        UC_TS + 5,
+    );
+    let before =
+        unicity_token::Token::new(a.token.genesis().clone(), b.token.transactions().to_vec());
+    let after = refresh_token(&before, &fresh_proofs(&w, &a, 0, UC_TS + 5000)).unwrap();
+    let vb = w
+        .bridge
+        .verify_native_token(&before, Expect::Return)
+        .unwrap();
+    let va = w
+        .bridge
+        .verify_native_token(&after, Expect::Return)
+        .unwrap();
+    let ids = |v: &native_bridge_sdk_ext::token::VerifiedToken| -> Vec<([u8; 32], [u8; 32], u64)> {
+        v.outcome
+            .leaves
+            .iter()
+            .map(|l| (l.sid, l.tx_hash, l.reference_time))
+            .collect()
+    };
+    assert_eq!(
+        ids(&va),
+        ids(&vb),
+        "leaf IDs, transaction hashes, reference times"
+    );
+    assert_eq!(va.outcome.nullifier, vb.outcome.nullifier, "burn nullifier");
+    assert_eq!(va.outcome.nonce, vb.outcome.nonce);
+    let gb = build_return_proof(&w.bridge, &before).unwrap().2.grouping;
+    let ga = build_return_proof(&w.bridge, &after).unwrap().2.grouping;
+    assert_eq!((gb.s, ga.s), (2, 1));
+    assert!(ga.q < gb.q);
+    assert!(ga.e <= gb.e && ga.a < gb.a && ga.k < gb.k);
+}
+
 fn fresh_proofs(w: &World, out: &TokenOut, extra: usize, ts: u64) -> Vec<InclusionProof> {
     // A later root containing the same leaves plus unrelated ones.
     let mut leaves = out.leaves.clone();
