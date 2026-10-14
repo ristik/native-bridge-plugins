@@ -1,5 +1,31 @@
 # Live DN-B lane driver
 
+## Any-age lane (protocol 4): `anyage.ts`
+
+Three non-interleaved commands for the final any-age lane (bft-core `briefs/anyage-final-lane-plan.md`, steps L1a, L1b and L1c), on the
+protocol-4 plug-in (partition-only policy, one `CERT_BATCH_V2` over the anchor table):
+
+* `anyage.ts save <lane-config.json> [<out-dir>]` locks, mints and burns one token, certified by the live aggregator(s), and saves
+  the return proof assembled once from the proofs returned at certification (never refreshed). It writes:
+  * `token.cbor`, `envelope.bin` and `batch-request.bin`, with their sha256 in `saved.json`;
+  * each anchor's seal epoch and round;
+  * the registry words at the save block: usable epoch U, clock O, tip, and each anchor epoch's start, end and hasEnd.
+* `anyage.ts verify <lane-config.json> <saved.json> --epoch current|historical` re-checks the saved bytes' sha256 and runs two
+  `eth_call`s, then writes `verify-<epoch>.json`:
+  * the native `CERT_BATCH_V2` verdict on the saved request, which must be `(2, true)`;
+  * the vault's whole `redeem` relation as the third-party submitter, without sending.
+
+  `current` requires every anchor epoch to be the usable epoch; `historical` requires every anchor epoch to be below it (after the
+  root handoff). It prints each anchor's age O − r and the estimated gas.
+* `anyage.ts release <lane-config.json> <saved.json>` sends the one redemption of the saved envelope, checks the credit and the
+  recorded nullifier, claims to a payee, and writes `release.json` (receipt, gas, nullifier, balance delta, registry at the redeem
+  block).
+
+Shard routing is host knowledge: `lane-config.json` may carry `aggShards: [{shard, url}]`. A leaf goes to the deepest configured shard
+whose prefix its state ID carries, otherwise to `aggUrl`. The anchor's shard and configuration come from the UC, and the verifier refuses
+a UC whose shard does not cover the leaf. The lock proof is `dnb-tool lockproof` (bft-core) as for the protocol-3 lane: the archived EVM
+certificate under the fixed SDK trust base. The lock must therefore be certified before the lane's root handoff, which L1a does.
+
 > **Protocol 3 lane.** This driver, `rows.ts` and `postcheck.ts` were written against the protocol-3 plug-in (policy rows, the `W_cert` window and
 > `freshness.ts`) and the protocol-3 devnet. The plug-ins are at protocol 4 (partition-only policy, any-age anchors, `readiness.ts`, no `leafRoutes`), so
 > these scripts no longer compile against `packages/native-bridge-plugin/src` and are not run by CI. Their protocol-4 port waits for the DN-B devnet
@@ -17,7 +43,7 @@ nothing synthetic in the loop. Component evidence (`tests/joined`) is unchanged;
 * `postcheck.ts <lane-config.json>` — after restarts, the aggregator still serves every state of the previous token with its original CD and reference time.
 
 Requires Foundry 1.8.1 (`cast`), Node ≥ 22 (`npm ci --ignore-scripts`), the devnet lock (`briefs/devnet-lock.sh`), and `DNB_TOOL` (built `dnb-tool`).
-Timing matters: B1 authenticates a certificate only within `W_cert` root rounds of the registry clock, and refuses one newer than the clock.
+Timing (protocol 3 only; protocol 4 has no certificate-age window, see `anyage.ts` above): B1 authenticated a certificate only within `W_cert` root rounds of the registry clock, and refused one newer than the clock.
 
 ## Two-shard acceptance rows (B3)
 
