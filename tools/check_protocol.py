@@ -42,17 +42,15 @@ def cbor_bytes(b):
     return cbor_head(2, len(b)) + b
 
 
-def policy_body(partition, depth, shards):
-    """Canonical C(b("UNICITY_BR_AGG_SHARDED"),1,partition,depth,[[b(shard),b(conf)]...])."""
-    rows = b''.join(cbor_head(4, 2) + cbor_bytes(bytes.fromhex(s['shardHex'])) + cbor_bytes(bytes.fromhex(s['configurationHash'])) for s in shards)
-    return cbor_head(4, 5) + cbor_bytes(b'UNICITY_BR_AGG_SHARDED') + cbor_head(0, 1) + cbor_head(0, partition) + cbor_head(0, depth) + cbor_head(4, len(shards)) + rows
+def policy_body(partition):
+    """Canonical C(b("UNICITY_BR_AGG_PARTITION"),2,partition): the partition only (AGG_PARTITION_V2)."""
+    return cbor_head(4, 3) + cbor_bytes(b'UNICITY_BR_AGG_PARTITION') + cbor_head(0, 2) + cbor_head(0, partition)
 
 
 def validate_policy(policy):
-    """Policy shape: complete uniform MSB-first prefix topology, increasing shard bytes, canonical body."""
-    expected = {0: ['80'], 1: ['40', 'c0']}[policy['depth']]
-    assert [s['shardHex'] for s in policy['shards']] == expected, 'policy shards are not the complete topology in order'
-    assert policy_body(policy['partition'], policy['depth'], policy['shards']).hex() == policy['bodyHex'], 'policy body is not the canonical encoding'
+    """Policy shape: the partition-only body in its canonical encoding; no depth, shard list or configuration."""
+    assert set(policy) == {'bodyHex', 'sha256', 'partition'}, 'policy carries fields the partition-only body does not have'
+    assert policy_body(policy['partition']).hex() == policy['bodyHex'], 'policy body is not the canonical encoding'
 
 
 def validate_manifest(registry):
