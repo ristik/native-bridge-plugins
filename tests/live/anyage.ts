@@ -62,6 +62,13 @@ const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const sha = (b: Uint8Array): string => hex(sha256(b));
 const toJson = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x), 2);
 const word = (n: bigint): Uint8Array => unhex(n.toString(16).padStart(64, '0'));
+/** ABI calldata of `redeem(bytes)` (selector 0x9945e3d3), encoded here: `cast calldata` is offline (no --rpc-url, so not c.cast) and a
+ * large envelope would exceed the per-argument limit of a subprocess. */
+const redeemCalldata = (envelope: Uint8Array): string => {
+  const padded = new Uint8Array(Math.ceil(envelope.length / 32) * 32);
+  padded.set(envelope);
+  return `0x9945e3d3${hex(word(32n))}${hex(word(BigInt(envelope.length)))}${hex(padded)}`;
+};
 
 /** One lane configuration, with an optional aggregator per shard: protocol 4 names no shard table, so a leaf goes to the aggregator whose
  * shard prefix its state ID carries (`shardCovers`), and to `aggUrl` when no shard list is given. */
@@ -270,7 +277,7 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   assert.ok(version === 2n && valid, `the native CERT_BATCH_V2 verdict on the saved request must be (2, true): ${out}`);
 
   // the vault's whole redeem relation on the saved envelope, as the third-party submitter, without sending
-  const redeemData = c.cast('calldata', 'redeem(bytes)', `0x${hex(envelope)}`);
+  const redeemData = redeemCalldata(envelope);
   const redeemOut = await rpc(c.eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]);
   const redeemGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]));
   // redeem returns the credited amount: the whole relation held for exactly the saved amount
