@@ -335,7 +335,8 @@ CBOR/RLP depth<=16, CBOR items<=32768; semantic history<=16384;
 direct envelope<=65536; <=15 transfers including burn, <=16 leaves;
 anchor UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity
 steps and exactly d shard-tree siblings per UC (d its own shard's depth, the
-anchor's shard equal to the UC's); Cfg<=1024; A<=A_max=16 distinct UC anchors
+anchor's shard equal to the UC's); Cfg<=1024; bridge CBOR items J<=4096 (the
+gate below); A<=A_max=16 distinct UC anchors
 (a parser ceiling: the gas gate below decides each bundle); A<=L.
 These bounds are the named parameters of `profile-v4.json` `limits`
 (the single source for contract, oracle and plug-ins); a later profile version
@@ -359,8 +360,15 @@ computed from the request bytes alone (bft-core `b1ref.Group`). For leaf i with
 the exported leaf count: `G_kernel = 26000 + 20*B_kernel + 14000*L`. The
 call-data allowance is `D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)` (the
 two-bytes-argument TokenVerifier call) and the composing verifier's own
-execution is 80 per envelope byte. Admission requires
-`21000 + 16*D_max + 80*B_env + G_kernel + G_batch + sum_i G_leaf(i) + 1000000 <= 7000000`.
+execution is 80 per envelope byte plus `G_items = 1000*J`, J the bridge CBOR
+item occurrences: the item heads of the canonical Cfg, the policy body, every
+anchor UC and every anchor IR opening, each encoded occurrence counted once
+(tags and containers, scalar and string heads, every child and map key and
+value; the contents of a byte string are opaque; an IR opening and the IR inside
+its UC are two occurrences; repeated parser passes never add to J). J is also the
+bridge's shared CBOR preflight budget: J<=4096, refused as BudgetExceeded as soon
+as the next item would cross it, before any native call. Admission requires
+`21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1000000 <= 7000000`.
 The fixed reserve covers Solidity scanning and copying, call and EIP-150
 headroom and vault accounting. The gate is computed from complete bounded
 scans, never from caller-declared costs, and is identical in the contract,
