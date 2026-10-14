@@ -143,6 +143,8 @@
     "intrinsicBase": 21000,
     "intrinsicPerCallDataByte": 16,
     "callDataFixed": 132,
-    "intrinsicExecPerByte": 80
+    "intrinsicExecPerByte": 80,
+    "perBridgeCborItem": 1000,
+    "bridgeCborItemsMax": 4096
   }
 }

@@ -4,7 +4,7 @@
     "plugins": "f4bc312e3044dcc1a5706c5838228313e5608e73",
     "ureth": "4c16f0765d22df5e1d65cab8b8887b82b1332c42",
     "contracts": "5c0af1433adac291289c4ec48a9901ea31b8d77a",
-    "oracle": "1f3317341eee423f0ad585e4b2b865b4ca9425de",
+    "oracle": "a96f221397bdcb66531263404e844f15c04a23d1",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
@@ -23,5 +23,5 @@
   "deferredSteps": {
     "contracts-tier": "contracts at protocol 3 until dev2's protocol-4 port"
   },
-  "pluginsTree": "99479f16c02b7fdecdfc33ada0e0f471b3c8db770f98f82d0b76a03763271d6f"
+  "pluginsTree": "9ad242ab0d0026cfaad5c22976a5251095cb271cb3f8ec6f71a6cc71a9545ac6"
 }
