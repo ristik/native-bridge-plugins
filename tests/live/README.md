@@ -43,7 +43,7 @@ nothing synthetic in the loop. Component evidence (`tests/joined`) is unchanged;
 * `postcheck.ts <lane-config.json>` — after restarts, the aggregator still serves every state of the previous token with its original CD and reference time.
 
 Requires Foundry 1.8.1 (`cast`), Node ≥ 22 (`npm ci --ignore-scripts`), the devnet lock (`briefs/devnet-lock.sh`), and `DNB_TOOL` (built `dnb-tool`).
-Timing matters: B1 authenticates a certificate only within `W_cert` root rounds of the registry clock, and refuses one newer than the clock.
+Timing (protocol 3 only; protocol 4 has no certificate-age window, see `anyage.ts` above): B1 authenticated a certificate only within `W_cert` root rounds of the registry clock, and refused one newer than the clock.
 
 ## Two-shard acceptance rows (B3)
 

@@ -204,10 +204,15 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
   const ret = await buildReturnProof(bridge, token);
   const request = batchRequest(ret.envelope.anchors);
   const counts = measure(ret.envelope.anchors);
-  const seals = [token.genesis, ...token.transactions].map((t) => t.inclusionProof.unicityCertificate.unicitySeal);
-  const anchors = ret.envelope.anchors.map((a) => {
-    const seal = seals.find((s, i) => hex([token.genesis, ...token.transactions][i].inclusionProof.unicityCertificate.toCBOR()) === hex(a.uc)) ?? seals[0];
-    return { epoch: seal.epoch, round: seal.rootChainRoundNumber, shard: hex(a.shard), ucSha256: sha(a.uc) };
+  // Each anchor is labelled by the seal of the certificate it carries: its UC must be one of the token's certificates (byte for byte),
+  // and every certificate with those bytes has one epoch and round. No fallback: a mislabelled anchor would mislabel the evidence.
+  const certs = [token.genesis, ...token.transactions].map((t) => t.inclusionProof.unicityCertificate);
+  const anchors = ret.envelope.anchors.map((a, i) => {
+    const matching = certs.filter((uc) => hex(uc.toCBOR()) === hex(a.uc));
+    assert.ok(matching.length > 0, `anchor ${i}: its UC is not one of the token's certificates`);
+    const labels = new Set(matching.map((uc) => `${uc.unicitySeal.epoch}/${uc.unicitySeal.rootChainRoundNumber}`));
+    assert.equal(labels.size, 1, `anchor ${i}: its certificate occurrences disagree on epoch/round`);
+    return { epoch: matching[0].unicitySeal.epoch, round: matching[0].unicitySeal.rootChainRoundNumber, shard: hex(a.shard), ucSha256: sha(a.uc) };
   });
   const head = await rpc(c.eth, 'eth_blockNumber', []);
   const saved = {
@@ -247,6 +252,13 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
     assert.ok(anchorEpochs.every((e) => e === usable), `--epoch current: the anchors' epochs ${anchorEpochs} must be the usable epoch ${usable}`);
   } else {
     assert.ok(anchorEpochs.every((e) => e < usable), `--epoch historical: the anchors' epochs ${anchorEpochs} must be below the usable epoch ${usable}`);
+    // the closed-interval acceptance itself: each anchor's epoch is closed and its round lies inside [start, end)
+    const entries = reg.entries as Record<string, { start: bigint; end: bigint; hasEnd: bigint }>;
+    for (const a of saved.anchors as { epoch: string; round: string }[]) {
+      const e = entries[a.epoch];
+      const r = BigInt(a.round);
+      assert.ok(e.hasEnd === 1n && e.start <= r && r < e.end, `--epoch historical: anchor epoch ${a.epoch} must be closed with start <= ${r} < end (${e.start}, ${e.end}, hasEnd ${e.hasEnd})`);
+    }
   }
   const ages = (saved.anchors as { round: string }[]).map((a) => (reg.clockRound as bigint) - BigInt(a.round));
 
@@ -261,6 +273,8 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   const redeemData = c.cast('calldata', 'redeem(bytes)', `0x${hex(envelope)}`);
   const redeemOut = await rpc(c.eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]);
   const redeemGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]));
+  // redeem returns the credited amount: the whole relation held for exactly the saved amount
+  assert.equal(BigInt(redeemOut), BigInt(saved.amountWei), `the redeem eth_call must return the saved amount: ${redeemOut}`);
   const result = { epoch, block: head, registry: reg, anchorAges: ages, batch: { returndata: out, valid, estimatedGas: batchGas }, redeem: { returndata: redeemOut, estimatedGas: redeemGas } };
   writeFileSync(`${dir}/verify-${epoch}.json`, toJson(result));
   console.log(`VERIFIED ${epoch}`, toJson({ block: head, usableEpoch: usable, anchorEpochs, anchorAges: ages, batchGas, redeemGas }));
@@ -272,11 +286,13 @@ async function release(cfgPath: string, savedPath: string): Promise<void> {
   const { saved, dir, envelope } = loadSaved(savedPath);
   const amountWei = BigInt(saved.amountWei);
   const gas = String(Math.min(7_000_000, Number(saved.gate.total) + 200_000));
+  const claimable = (): bigint => BigInt(c.cast('call', c.lane.vault, 'claimable(address)(uint256)', saved.recipient).split(' ')[0]);
+  const creditBefore = claimable();
   const rc = await sendAll(c, c.lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(envelope)}`], THIRD_PARTY_KEY, gas);
   assert.equal(rc.status, '0x1', `redeem reverted: ${JSON.stringify(rc).slice(0, 400)}`);
-  const credited = BigInt(c.cast('call', c.lane.vault, 'claimable(address)(uint256)', saved.recipient).split(' ')[0]);
+  const credited = claimable() - creditBefore;
   const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', String(saved.nonce))));
-  assert.equal(credited, amountWei, 'the recipient is credited with the locked amount');
+  assert.equal(credited, amountWei, 'the recipient is credited with exactly the locked amount by this redemption');
   assert.equal(recorded, saved.nullifier, 'the vault recorded the saved nullifier');
   const before = BigInt(await rpc(c.eth, 'eth_getBalance', [PAYEE, 'latest']));
   const claim = await sendAll(c, c.lane.vault, 'claim(uint256,address)', [amountWei.toString(), PAYEE], RECIPIENT_KEY, '500000');
