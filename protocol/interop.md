@@ -328,7 +328,7 @@ CBOR/RLP depth<=16, CBOR items<=32768; semantic history<=16384;
 direct envelope<=65536; <=15 transfers including burn, <=16 leaves;
 anchor UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity
 steps and exactly `depth` shard-tree siblings per UC (the shard certificate
-must name the policy shard); A<=A_max=4 distinct UC anchors (a parser ceiling: the gas gate below decides each bundle); A<=L.
+must name the policy shard); A<=A_max=8 distinct UC anchors (a parser ceiling: the gas gate below decides each bundle); A<=L.
 These bounds are the named parameters of `profile-v3.json` `limits`
 (the single source for contract, oracle and plug-ins); a later profile version
 may raise them, e.g. when multi-proof services land. The initial testnet
@@ -342,11 +342,11 @@ cumulative counts overflow-safely before allocation.
 Native prices are the actual B1/B2 charges, with no shared or warm discount.
 For anchor a with request bytes `B_a = 110 + len(shard) + len(uc)`, `S_a` the
 signature entries of its UC seal and `P_a` its shard-tree plus unicity step
-count: `G_UC(a) = 1243700 + 16*B_a + 6000*S_a + 250*P_a`. For leaf i with `s_i`
+count: `G_UC(a) = 92700 + 16*B_a + 6000*S_a + 250*P_a`. For leaf i with `s_i`
 RSMT siblings: `G_RSMT(i) = 2000 + 16*(136+32*s_i) + 250*(1+s_i)`. With `B_sem`
 the byte length of the kernel request `abi.encode(op,cfg,history)` and L the
 exported leaf count: `G_B2 = 26000 + 20*B_sem + 14000*L`. The intrinsic term is
-the direct-call bound `G_intrinsic = 21000 + 16*len(envelope)`.
+the direct-call bound `G_intrinsic = 21000 + 96*len(envelope)` (16 per calldata byte and 80 per byte for the composing verifier's own execution; owner-decisions §22).
 Admission requires
 `G_intrinsic + G_B2 + sum_a G_UC(a) + sum_i G_RSMT(i) + 1000000 <= 7000000`.
 The fixed reserve covers Solidity scanning and copying, call and EIP-150
@@ -362,15 +362,12 @@ a latest UC or splits a redemption, and means "direct exit unavailable", not
 (`maxGas` minus the system gas reserved for certificate transactions); it is
 never raised implicitly (a larger ordinary capacity is a later profile version).
 The parser ceilings do not promise that every admitted bundle passes the gate;
-the gate admits or refuses each bundle. At the maximum sizes (L=16, UC 8192
-bytes with 64 signatures and 33 steps, 32-sibling paths, history 16384,
-envelope 65536 bytes) two anchors price 6,976,692 and pass, three do not. Real
-DN-B certificates (4 signatures, one shard sibling) are 811 bytes and price 1,282,702 each
-(`compose-anchors-max-dnb`): four such anchors with four leaves price 6,429,792 and pass, while the same four
-anchors with sixteen leaves and deep paths (185 path steps) price 7,024,626 and do not
-(`compose-anchors-max-dnb-load-over-budget`); five can never pass (five minimal certificates alone exceed the budget with the reserve). A typical
-bundle (4 KiB UC, 5 signatures, 8 steps, 8-sibling paths, 2 KiB history, 8 KiB
-envelope) with two anchors is about 4.3M. Anything refused by the gate or above
+the gate admits or refuses each bundle. After the repricing of the certificate call (owner-decisions §22: `G_UC = 92700 + ...`) and the execution term above, a
+maximum-size bundle (L=16, UC 8192 bytes with 64 signatures and 33 steps, 32-sibling paths, history 16384, envelope 65536 bytes) is
+priced out even with two anchors (9,917,572): the 65,536-byte envelope alone costs 6.3M. Real DN-B certificates (4 signatures, one
+shard sibling) are 811 bytes; eight such anchors with sixteen 8-sibling leaves in a 12 KiB envelope price 3,839,656 and pass. A
+typical bundle (4 KiB UC, 5 signatures, 8 steps, 8-sibling paths, 2 KiB history, 8 KiB envelope) with two anchors is 2,694,928. The
+anchor ceiling (eight, B1's own claim ceiling) is a parser limit, not a consequence of the gate. Anything refused by the gate or above
 a ceiling is BudgetExceeded or an input-size refusal before any native call.
 Bounds are not additive entitlements or measured activation
 prices. Freeze in canonical semantic profile/vectors before activation; native

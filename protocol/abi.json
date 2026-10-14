@@ -108,7 +108,7 @@
   "gas": {
     "txBudget": 7000000,
     "reserve": 1000000,
-    "ucBase": 1243700,
+    "ucBase": 92700,
     "ucPerByte": 16,
     "ucPerSignature": 6000,
     "ucPerStep": 250,
@@ -121,6 +121,7 @@
     "b2PerByte": 20,
     "b2PerLeaf": 14000,
     "intrinsicBase": 21000,
-    "intrinsicPerByte": 16
+    "intrinsicPerByte": 16,
+    "intrinsicExecPerByte": 80
   }
 }

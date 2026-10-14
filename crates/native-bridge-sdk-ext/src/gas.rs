@@ -11,10 +11,12 @@ use crate::profile::Policy;
 
 const INTRINSIC_BASE: u64 = 21_000;
 const PER_BYTE: u64 = 16;
+/// The composing verifier's own execution per envelope byte (measured 50 to 75, priced 80; owner-decisions section 22).
+const EXEC_PER_BYTE: u64 = 80;
 const B2_BASE: u64 = 26_000;
 const B2_PER_BYTE: u64 = 20;
 const B2_PER_LEAF: u64 = 14_000;
-const UC_BASE: u64 = 1_243_700;
+const UC_BASE: u64 = 92_700;
 const UC_PER_SIGNATURE: u64 = 6_000;
 const PER_STEP: u64 = 250;
 const RSMT_BASE: u64 = 2_000;
@@ -27,9 +29,9 @@ const fn pad32(n: u64) -> u64 {
     (n + 31) & !31
 }
 
-/// `G_intrinsic = 21000 + 16*len(envelope)`.
+/// `G_intrinsic = 21000 + 96*len(envelope)` (16 calldata + 80 verifier execution).
 pub const fn intrinsic_gas(envelope_bytes: u64) -> u64 {
-    INTRINSIC_BASE + PER_BYTE * envelope_bytes
+    INTRINSIC_BASE + (PER_BYTE + EXEC_PER_BYTE) * envelope_bytes
 }
 
 /// `len(abi.encode(uint8 op, bytes cfg, bytes payload))`.
@@ -42,7 +44,7 @@ pub const fn b2_gas(request_bytes: u64, leaves: u64) -> u64 {
     B2_BASE + B2_PER_BYTE * request_bytes + B2_PER_LEAF * leaves
 }
 
-/// `G_UC = 1243700 + 16*B_a + 6000*S_a + 250*P_a` with `B_a = 110 + len(shard) + len(uc)`.
+/// `G_UC = 92700 + 16*B_a + 6000*S_a + 250*P_a` with `B_a = 110 + len(shard) + len(uc)`.
 pub const fn uc_gas(shard_bytes: u64, uc_bytes: u64, signatures: u64, steps: u64) -> u64 {
     UC_BASE
         + PER_BYTE * (UC_REQUEST_FIXED + shard_bytes + uc_bytes)
