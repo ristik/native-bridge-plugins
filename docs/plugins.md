@@ -102,7 +102,8 @@ transaction hash; the caller passes it back as `pending` and its receipt is chec
 repeated. A revert is retried up to `maxSends` whatever its cause, so a deterministic refusal (a closed authority interval, bad backing) costs
 `maxSends` transactions. A proof service or chain reader that fails is retried within the attempt bound and reported as `ErrProofUnavailable` with
 the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a service guarantee: it
-prices the best case with ONE anchor, because a single certificate may serve every leaf; it never projects one anchor per shard.
+prices the best case with ONE anchor, because a single certificate may serve every leaf; it never projects one anchor per shard. The burn is therefore refused only when even that best case cannot pass the gate; a bundle fetched later
+can still fail the gate (`ErrGasBudget`, "direct exit unavailable", not "token invalid").
 
 ### The anchor table
 
