@@ -1,13 +1,13 @@
-//! Named profile-v3 bounds and fixed protocol bytes of the native profile (protocol version 3).
+//! Named profile-v4 bounds and fixed protocol bytes of the native profile (protocol version 4).
 //!
-//! The numbers of the first block are the `limits` of `protocol/profile-v3.json`, the single source
+//! The numbers of the first block are the `limits` of `protocol/profile-v4.json`, the single source
 //! shared with the oracle, the contract and the TypeScript plug-in (`tests/limits.rs` pins them). A
 //! later profile version raises them together with the gas budget. Limits are intersected, not
 //! additive entitlements: every cumulative bound is checked before allocation or cryptography.
 
-// ---- profile parameters (profile-v3.json `limits`) ----------------------------------------------
+// ---- profile parameters (profile-v4.json `limits`) ----------------------------------------------
 /// Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle.
-pub const MAX_ANCHORS: usize = 8;
+pub const MAX_ANCHORS: usize = 16;
 /// B2 leaves of one redemption: the mint, every transfer and the final burn.
 pub const MAX_LEAVES: usize = 16;
 pub const MAX_TRANSFERS: usize = MAX_LEAVES - 1;
@@ -19,12 +19,23 @@ pub const MAX_PATH_STEPS: usize = 2048;
 pub const MAX_POLICY_BYTES: usize = 512;
 /// B1's own sublimits, which the gate prices.
 pub const MAX_UNICITY_STEPS: usize = 32;
-pub const MAX_SIGNATURES: usize = 64;
+/// Signatures of one seal and over one batch (`CERT_BATCH_V2`), contract section 4.
+pub const MAX_SIGS_PER_SEAL: usize = 16;
+pub const MAX_TOTAL_SIGS: usize = 256;
+/// A native shard ID is 1..33 bytes (depth 0..256).
+pub const MAX_SHARD_BYTES: usize = 33;
+pub const MAX_SHARD_DEPTH: usize = 256;
+/// The batch request: bytes and the raw (pre-deduplication) path steps of all occurrences.
+pub const MAX_BATCH_BYTES: usize = 262_144;
+pub const MAX_RAW_STEPS: usize = 4_608;
 
 // ---- the shared gas gate (interop.md "Direct-call gas gate") ------------------------------------
 /// DN-B ordinary transaction capacity.
 pub const TX_GAS_BUDGET: u64 = 7_000_000;
 pub const GAS_RESERVE: u64 = 1_000_000;
+/// The bridge's cumulative CBOR item budget (Cfg, policy, every UC and every IR opening) and its price per item.
+pub const BRIDGE_CBOR_ITEMS: usize = 4096;
+pub const BRIDGE_ITEM_GAS: u64 = 1000;
 
 pub const MAX_CBOR_DEPTH: usize = 16;
 pub const MAX_CBOR_ITEMS: usize = 32768;

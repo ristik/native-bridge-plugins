@@ -58,8 +58,8 @@ pub fn refresh_token(token: &Token, fresh: &[InclusionProof]) -> Result<Token> {
 /// pair. The token is verified in full as a return first.
 ///
 /// The anchor table is the profile's: one anchor per distinct complete UC (byte-identical UCs are one
-/// anchor), in first-use leaf order, each claim derived from its UC and the pinned policy row of its
-/// shard. Nothing here re-queries to make certificates converge: the pairs are used as fetched, and an
+/// anchor), in first-use leaf order, each claim read from its own UC (its shard, shard configuration hash and
+/// partition: the policy names only the partition, and the UC authenticates the rest). Nothing here re-queries to make certificates converge: the pairs are used as fetched, and an
 /// envelope that needs more anchors than the profile bound, or does not fit the shared gas gate, is
 /// `PolicyAnchors` or `GasBudget` (BudgetExceeded), never truncated or split.
 pub fn build_return_proof(
@@ -80,12 +80,11 @@ pub fn build_return_proof(
     let mut anchors: Vec<Anchor> = Vec::new();
     let mut ucs: Vec<Vec<u8>> = Vec::new();
     let mut leaf_proofs = Vec::new();
-    for (i, p) in proofs.iter().enumerate() {
+    for p in proofs.iter() {
         let uc_bytes = p.unicity_certificate.to_cbor();
         let idx = match ucs.iter().position(|u| *u == uc_bytes) {
             Some(idx) => idx,
             None => {
-                let row = dep.policy.shard_row(&verified.outcome.leaves[i].sid);
                 let ir = p.unicity_certificate.input_record.to_cbor();
                 let state_root: [u8; 32] = p
                     .unicity_certificate
@@ -95,9 +94,17 @@ pub fn build_return_proof(
                     .try_into()
                     .map_err(|_| E::PathInvalid)?;
                 anchors.push(Anchor {
-                    partition: dep.policy.partition,
-                    shard: dep.policy.shard_id(row).to_vec(),
-                    shard_conf_hash: dep.policy.shard_confs[row],
+                    partition: p
+                        .unicity_certificate
+                        .unicity_tree_certificate
+                        .partition_identifier,
+                    shard: p.unicity_certificate.shard_tree_certificate.shard.encode(),
+                    shard_conf_hash: p
+                        .unicity_certificate
+                        .shard_configuration_hash
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| E::PathInvalid)?,
                     expected_state_root: state_root,
                     expected_ir_hash: h(&ir),
                     uc: uc_bytes.clone(),
@@ -136,10 +143,10 @@ pub fn build_return_proof(
     let pol = check_policy_body(&dep.cfg, &env)?;
     let plan = plan_anchors(&pol, &env, &sids)?;
     let gate = compute_gate(
+        &dep.cfg.to_bytes(),
         encoded.len(),
         kernel_request_bytes(dep.cfg.to_bytes().len() as u64, env.history.len() as u64),
         &env,
-        &pol,
         TX_GAS_BUDGET,
     )?;
     let times: Vec<u64> = verified
@@ -167,15 +174,10 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
     if leaves > MAX_LEAVES {
         return Err(E::TooManyTx);
     }
-    // the fewest anchors the known leaves can need: one per shard they occupy
-    let mut rows: Vec<usize> = leaf_routes(bridge, token)?.iter().map(|r| r.row).collect();
-    rows.sort_unstable();
-    rows.dedup();
+    // the fewest anchors any bundle can need is one: a single certificate may serve every leaf
     check_burn_projection(
         dep.cfg.to_bytes().len() as u64,
         dep.policy.to_bytes().len() as u64,
-        u64::from(dep.policy.depth),
-        rows.len() as u64,
         leaves as u64,
         history::project(token).len(),
     )
@@ -189,22 +191,13 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
 pub fn check_burn_projection(
     cfg_len: u64,
     policy_len: u64,
-    depth: u64,
-    min_anchors: u64,
     leaves: u64,
     history: usize,
 ) -> Result<Gate> {
     if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
         return Err(E::InputTooLarge);
     }
-    let (gate, envelope) = projected_gate(
-        cfg_len,
-        policy_len,
-        depth,
-        min_anchors,
-        leaves,
-        history as u64,
-    );
+    let (gate, envelope) = projected_gate(cfg_len, policy_len, leaves, history as u64);
     if envelope > MAX_ENVELOPE_BYTES as u64 {
         return Err(E::InputTooLarge);
     }
@@ -241,36 +234,10 @@ fn deployment_of<'a>(bridge: &'a NativeBridge, token: &Token) -> Result<&'a Depl
         .find(mint.network_id().id(), parsed.chain_id, &parsed.vault)
 }
 
-/// Where one history leaf's aggregator proof is served: the policy row of its own shard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafRoute {
-    /// The leaf's position in the history (genesis first).
-    pub index: usize,
-    /// The raw 32-byte state ID `get_inclusion_proof.v2` is asked for.
-    pub sid: [u8; 32],
-    /// The policy row of the leaf's shard: the top `depth` bits of the state ID.
-    pub row: usize,
-    /// The native shard ID of that row.
-    pub shard: Vec<u8>,
-}
-
-/// Route every leaf of `token` to its shard. The host maps rows to its aggregator endpoints
-/// (installation metadata, never a verification input) and fetches `get_inclusion_proof.v2` per leaf;
-/// whatever certificate each response carries is kept with its path. Nothing is re-queried to make
-/// certificates converge.
-pub fn leaf_routes(bridge: &NativeBridge, token: &Token) -> Result<Vec<LeafRoute>> {
-    let dep = deployment_of(bridge, token)?;
-    Ok(leaf_transactions(token)
+/// The raw 32-byte state ID of every history leaf (genesis first): what `get_inclusion_proof.v2` is asked for.
+pub fn leaf_state_ids(token: &Token) -> Vec<[u8; 32]> {
+    leaf_transactions(token)
         .into_iter()
-        .enumerate()
-        .map(|(index, (_, sid))| {
-            let row = dep.policy.shard_row(&sid);
-            LeafRoute {
-                index,
-                sid,
-                row,
-                shard: dep.policy.shard_id(row).to_vec(),
-            }
-        })
-        .collect())
+        .map(|(_, sid)| sid)
+        .collect()
 }

@@ -228,15 +228,16 @@ pub fn check_leaf(
         return Err(E::CDMismatch);
     }
     trust.check_guards(uc)?;
-    // Aggregator admission against the pinned policy row of the leaf's own shard, never the
-    // certificate's own tuple: the shard is the top `depth` bits of the leaf's state ID.
-    let row = dep.policy.shard_row(&leaf.sid);
-    if uc.unicity_tree_certificate.partition_identifier != dep.policy.partition
-        || uc.shard_configuration_hash.as_slice() != dep.policy.shard_confs[row].as_slice()
-    {
+    // Aggregator admission: the pinned policy names the partition only. The certificate authenticates its own historical shard and
+    // configuration; the shard must be a canonical native ID whose prefix the leaf's state ID carries (the first `d` bits, `d` its
+    // own depth).
+    if uc.unicity_tree_certificate.partition_identifier != dep.policy.partition {
         return Err(E::NotAdmitted);
     }
-    if uc.shard_tree_certificate.shard.encode().as_slice() != dep.policy.shard_id(row) {
+    let shard = uc.shard_tree_certificate.shard.encode();
+    if crate::profile::shard_depth(&shard).is_err()
+        || !crate::profile::shard_covers(&shard, &leaf.sid)
+    {
         return Err(E::ShardMismatch);
     }
     let encoded = proof.inclusion_certificate.encode();

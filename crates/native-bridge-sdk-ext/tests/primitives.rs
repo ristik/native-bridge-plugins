@@ -223,7 +223,7 @@ fn deployment_construction_rejects_forged_identity_and_policy() {
         Deployment::new(c, [0; 32], [0; 32], hp, w.policy.clone()).unwrap_err(),
         E::PolicyHash
     );
-    let p = native_bridge_sdk_ext::profile::Policy::new(EVM_PARTITION, &[w.agg_conf]).unwrap();
+    let p = native_bridge_sdk_ext::profile::Policy::new(EVM_PARTITION);
     let mut c = w.dep.cfg.clone();
     c.aggregator_policy_hash = p.hash();
     assert_eq!(

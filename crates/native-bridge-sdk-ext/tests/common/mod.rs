@@ -435,10 +435,32 @@ pub struct World {
     pub dep: Deployment,
     pub bridge: NativeBridge,
     pub policy: Policy,
-    /// The configuration hash of the first policy row (the only one at depth 0).
+    /// The fixture topology depth (0: one shard `80`; 1: shards `40` and `c0`). The policy names none of it.
+    pub depth: u8,
+    /// The configuration hash of the first fixture shard (the only one at depth 0).
     pub agg_conf: [u8; 32],
-    /// The configuration hash of every policy row.
+    /// The configuration hash of every fixture shard, in shard byte order.
     pub agg_confs: Vec<[u8; 32]>,
+}
+
+/// The native shard ID of fixture shard `row`.
+pub fn shard_of(w: &World, row: usize) -> &'static [u8] {
+    if w.depth == 0 {
+        &[0x80]
+    } else if row == 0 {
+        &[0x40]
+    } else {
+        &[0xc0]
+    }
+}
+
+/// The fixture shard (row) a state ID falls in: the top `depth` bits.
+pub fn row_of(w: &World, sid: &[u8; 32]) -> usize {
+    if w.depth == 0 {
+        0
+    } else {
+        usize::from(sid[0] >> 7)
+    }
 }
 
 pub fn identity() -> (u16, [u8; 32], [u8; 32], u64) {
@@ -462,7 +484,7 @@ pub fn make_world_depth(header_fields: u8, depth: u8) -> World {
         agg_confs[0] = sha(b"aggregator shard configuration");
     }
     let agg_conf = agg_confs[0];
-    let policy = Policy::new(AGG_PARTITION, &agg_confs).unwrap();
+    let policy = Policy::new(AGG_PARTITION);
     let (n, rg, eg, c) = identity();
     let cfg = Cfg {
         network: n,
@@ -502,6 +524,7 @@ pub fn make_world_depth(header_fields: u8, depth: u8) -> World {
         dep,
         bridge,
         policy,
+        depth,
         agg_conf,
         agg_confs,
     }
@@ -948,7 +971,7 @@ pub fn assemble_token(
     // different rounds are separate anchors even when every other field is equal.
     let mut groups: Vec<(usize, u64, Vec<usize>)> = Vec::new();
     for (i, l) in leaves.iter().enumerate() {
-        let row = w.policy.shard_row(&l.0);
+        let row = row_of(w, &l.0);
         let round = tw.uc_round.as_ref().map(|f| f(i)).unwrap_or(900);
         match groups.iter_mut().find(|g| g.0 == row && g.1 == round) {
             Some(g) => g.2.push(i),
@@ -960,7 +983,7 @@ pub fn assemble_token(
     for (gi, (row, round, members)) in groups.iter().enumerate() {
         let group_leaves: Vec<_> = members.iter().map(|&i| leaves[i]).collect();
         let (root, _) = tree(&group_leaves, &group_leaves[0].0);
-        let sibling = if w.policy.depth == 0 {
+        let sibling = if w.depth == 0 {
             vec![]
         } else {
             vec![sha(format!("sibling of shard {row}").as_bytes())]
@@ -978,7 +1001,7 @@ pub fn assemble_token(
                 block_hash: None,
                 signers: 4,
             },
-            w.policy.shard_id(*row),
+            shard_of(w, *row),
             &sibling,
         );
         for (k, &i) in members.iter().enumerate() {

@@ -69,6 +69,9 @@ errors! {
     LockDigest => Invalid,
     // manifests
     Manifest => Invalid,
+    // protocol 4 (the oracle's names): certificate scan, anchor openings and the leaf proof
+    CertScan => Malformed, CertSigLength => Malformed, IROpening => Invalid, IRShape => Invalid,
+    IRState => Invalid, IRTime => Invalid, LeafProof => Invalid,
 }
 
 impl core::fmt::Display for NativeError {
