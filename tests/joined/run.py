@@ -84,7 +84,7 @@ def compare_contracts(contracts, generated):
             'note': 'contracts retain pre-merge provenance pins; compared to merged bytes and regenerated oracle here'}
 
 
-NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER = 'B2 kernel 0x0104', 'B1 UC_V1 0x0100', 'B1 RSMT_MEMBER_V1 0x0102'
+NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER = 'B2 kernel 0x0104', 'B1 CERT_BATCH_V2 0x0100', 'B1 RSMT_MEMBER_V1 0x0102'
 NATIVE_TARGETS = {NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER}
 # Minimum native calls per step (redeem proves three leaves). Coverage is per step, never a union over the report.
 NATIVE_STEP_CALLS = {

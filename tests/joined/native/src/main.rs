@@ -5,6 +5,7 @@
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use alloy_primitives::{address, hex, keccak256, Address, TxKind, B256, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
+use reth_unicity_b1::Pins;
 use reth_unicity_execution::{
     evm_factory::UnicityEvmFactory,
     execute_registry_transition,
@@ -34,7 +35,7 @@ use std::{collections::BTreeMap, fs};
 const NATIVE: [(Address, &str); 3] = [
     (
         address!("0000000000000000000000000000000000000100"),
-        "B1 UC_V1 0x0100",
+        "B1 CERT_BATCH_V2 0x0100",
     ),
     (
         address!("0000000000000000000000000000000000000102"),
@@ -142,6 +143,8 @@ struct World {
     db: CacheDB<EmptyDB>,
     chain_id: u64,
     gas_cap: u64,
+    /// The deployment pins the certificate batch compares the registry with (the genesis' commitment and profile hash).
+    pins: Pins,
     errors: BTreeMap<[u8; 4], String>,
 }
 impl World {
@@ -158,7 +161,7 @@ impl World {
         EvmEnv::new(cfg, block)
     }
     fn run(&mut self, tx: &Tx, commit: bool) -> Out {
-        let mut evm = UnicityEvmFactory::default().create_evm_with_inspector(
+        let mut evm = UnicityEvmFactory::new(self.pins).create_evm_with_inspector(
             self.db.clone(),
             self.env(),
             Recorder::default(),
@@ -406,7 +409,7 @@ fn snapshot(w: &World, at: Address) -> (U256, BTreeMap<U256, U256>) {
 }
 
 const KERNEL: &str = "B2 kernel 0x0104";
-const UC: &str = "B1 UC_V1 0x0100";
+const UC: &str = "B1 CERT_BATCH_V2 0x0100";
 const MEMBER: &str = "B1 RSMT_MEMBER_V1 0x0102";
 
 /// A step must have made at least `n` calls to each named native address, each a native precompile
@@ -447,17 +450,18 @@ fn matches_oracle(step: &str, o: &Out, kernel: &Value, envelope: Option<&Value>)
         "{step}: kernel result"
     );
     if let Some(e) = envelope {
-        // One 0x0100 call per anchor, in the envelope's first-use order, each with its own request.
+        // ONE 0x0100 CERT_BATCH_V2 call over the whole anchor table, with the oracle's batch request.
         let ucs: Vec<&Value> = o.native.iter().filter(|c| c["target"] == UC).collect();
-        let anchors = e["anchors"].as_array().unwrap();
-        assert_eq!(ucs.len(), anchors.len(), "{step}: UC call count");
-        for (got, want) in ucs.iter().zip(anchors) {
-            assert_eq!(
-                got["input"],
-                want["ucRequest"].as_str().unwrap().to_lowercase(),
-                "{step}: UC request"
-            );
-        }
+        assert_eq!(
+            ucs.len(),
+            1,
+            "{step}: one batch call for the whole anchor table"
+        );
+        assert_eq!(
+            ucs[0]["input"],
+            e["batch"]["request"].as_str().unwrap().to_lowercase(),
+            "{step}: batch request"
+        );
         let members: Vec<&Value> = o.native.iter().filter(|c| c["target"] == MEMBER).collect();
         let want = e["members"].as_array().unwrap();
         assert_eq!(members.len(), want.len(), "{step}: RSMT call count");
@@ -517,6 +521,10 @@ fn main() {
         db: CacheDB::new(EmptyDB::default()),
         chain_id: cfg["chainId"].as_u64().unwrap(),
         gas_cap: ordinary,
+        pins: Pins {
+            genesis_commitment: U256::from_be_slice(h32(&genesis["genesisCommitment"]).as_slice()),
+            profile_hash: U256::from_be_slice(h32(&genesis["profileHash"]).as_slice()),
+        },
         errors: error_table(&[vault_abi, verifier_abi]),
     };
 
@@ -588,7 +596,8 @@ fn main() {
         profile_hash: B256::from_slice(
             &hex::decode(genesis["profileHash"].as_str().unwrap()).unwrap(),
         ),
-        w_cert: genesis["wCert"].as_u64().unwrap(),
+        genesis_commitment: h32(&genesis["genesisCommitment"]),
+        max_epochs: genesis["maxEpochsPerUpdate"].as_u64().unwrap(),
         hook: Default::default(), // no custody: the profile has no records hook
     };
     let conf = h32(&genesis["shardConfHash"]);

@@ -30,10 +30,10 @@ func TestNBPPR6NativeGenesis(t *testing.T) {
 	h, err := q3format.NewHistory(d.TB)
 	require.NoError(t, err)
 
-	const w = 1
+	const b = 2 // B, the epochs one block may install (the registry's measured cap)
 	p := b1state.Profile{Network: 3, RootGenesisID: h.Genesis(), ExecutionChainID: 31337,
 		RuntimeHash: [32]byte(common.HexToHash(b1registry.CodeHashHex)), CompilerHash: b1registry.CompilerHash(),
-		WCert: w, DeltaEV: w + 1, DeltaHold: w + 2, RestGas: b1registry.MinRestGas(w),
+		MaxEpochsPerUpdate: b, DeltaEV: 16, DeltaHold: 17, RestGas: b1registry.MinRestGas(b),
 		CompanionBytes: 1 << 20, OtherCompanionBytes: 65536, OrdinaryCapacity: 7000000, GenesisUCTime: 1000}
 	p.SystemGas, err = p.RequiredSystemGas()
 	require.NoError(t, err)
@@ -53,11 +53,11 @@ func TestNBPPR6NativeGenesis(t *testing.T) {
 		words[k.Hex()] = v.Hex()
 	}
 	doc := map[string]any{
-		"network": p.Network, "executionChainId": p.ExecutionChainID, "wCert": p.WCert,
+		"network": p.Network, "executionChainId": p.ExecutionChainID, "maxEpochsPerUpdate": p.MaxEpochsPerUpdate,
 		"rootGenesisId": hex.EncodeToString(p.RootGenesisID[:]), "profileHash": hex.EncodeToString(profileHash[:]),
 		"runtimeHash": hex.EncodeToString(p.RuntimeHash[:]), "systemGas": p.SystemGas, "maxGas": p.MaxGas,
 		"ordinaryCapacity": p.OrdinaryCapacity, "restGas": p.RestGas,
-		"evmGenesisHash": g.EVMGenesisHash().Hex(), "shardConfHash": g.FullShardConfHash().Hex(),
+		"evmGenesisHash": g.EVMGenesisHash().Hex(), "genesisCommitment": g.GenesisCommitment().Hex(), "shardConfHash": g.FullShardConfHash().Hex(),
 		"registryWords": words, "genesis": json.RawMessage(g.GenesisJSON()),
 	}
 	enc, err := json.MarshalIndent(doc, "", "  ")
