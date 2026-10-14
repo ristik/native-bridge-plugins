@@ -20,5 +20,8 @@
     "old-J validity across rotation",
     "full B1/SDK seal-signature acceptance parity"
   ],
+  "deferredSteps": {
+    "contracts-tier": "contracts at protocol 3 until dev2's protocol-4 port"
+  },
   "pluginsTree": "99479f16c02b7fdecdfc33ada0e0f471b3c8db770f98f82d0b76a03763271d6f"
 }

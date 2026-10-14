@@ -13,6 +13,11 @@ listing of `packages`, `crates`, `protocol` and `package-lock.json`; recompute w
 `python3 tests/joined/run.py --print-plugin-tree`), so a squash merge, which keeps the
 content and loses the commit, does not turn main red. `sources.plugins` is recorded provenance only. Harness changes do not alter protocol bytes.
 
+`deferredSteps` defers a named tier of steps with a pinned reason. Each step of the tier is still reported, with status
+`DEFERRED` and that reason, and the run stays BLOCKED; a DEFERRED step outside a pinned tier, or with another reason, fails the
+run. Currently deferred: `contracts-tier` (the contracts golden and comparison, the contract doubles and the whole native-call tier),
+"contracts at protocol 3 until dev2's protocol-4 port". dev2's contracts protocol-4 PR removes the entry and moves the contracts pin.
+
 Prepare clean worktrees named `nbp-pr6-{ureth,contracts,oracle,aggregator}` under
 a source directory outside this repository at the commits in `pins.json`. Initialize the contracts'
 submodules. Install Node >=22, Python with `tools/requirements.txt`, Go >=1.25,
