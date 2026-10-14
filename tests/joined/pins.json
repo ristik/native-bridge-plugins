@@ -2,8 +2,8 @@
   "profile": "fixed-base-unit-weight-sdk-3.0.1",
   "sources": {
     "plugins": "f4bc312e3044dcc1a5706c5838228313e5608e73",
-    "ureth": "4c16f0765d22df5e1d65cab8b8887b82b1332c42",
-    "contracts": "5c0af1433adac291289c4ec48a9901ea31b8d77a",
+    "ureth": "6e59b68cc29f196d54d3d6e28d6266a8c02d05a1",
+    "contracts": "5f089f14e8b87b3f94970a6340d8f9985d7a8ac6",
     "oracle": "2cf93f3158b4e57e1ee74f14e82af1f8052870af",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
@@ -20,8 +20,5 @@
     "old-J validity across rotation",
     "full B1/SDK seal-signature acceptance parity"
   ],
-  "deferredSteps": {
-    "contracts-tier": "contracts at protocol 3 until dev2's protocol-4 port"
-  },
   "pluginsTree": "11c77c7099a68f4874f1e349a4a031618d65b99b32f8284940264b3c7f57fe41"
 }
