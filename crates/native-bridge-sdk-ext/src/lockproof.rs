@@ -259,14 +259,15 @@ pub fn verify(
     // keccak256(headerRLP) == IR.blockHash and header.stateRoot == IR.hash: a signature over an
     // unrelated state root is insufficient.
     let block_hash = uc.input_record.block_hash.as_deref().ok_or(E::HeaderHash)?;
-    if block_hash.len() != 32 || uc.input_record.hash.len() != 32 {
+    let state_hash = uc.input_record.hash.as_deref().ok_or(E::HeaderHash)?;
+    if block_hash.len() != 32 || state_hash.len() != 32 {
         return Err(E::HeaderHash);
     }
     if keccak(&[lp.header]).as_slice() != block_hash {
         return Err(E::HeaderHash);
     }
     let hdr = header::decode(lp.header, dep.header)?;
-    if hdr.state_root.as_slice() != uc.input_record.hash.as_slice() {
+    if hdr.state_root.as_slice() != state_hash {
         return Err(E::HeaderRoot);
     }
     // Account MPT at keccak256(vault) under header.stateRoot; codeHash == immutable runtime pin.

@@ -70,8 +70,9 @@ export function mapSdkFailure(r: VerificationResult<unknown>): NativeReason {
   return walk(r) ?? 'ErrSdkVerification';
 }
 
+/** Whether two authorities are the same history: the same network and the same genesis entry. */
 function sameBase(a: IVerificationContext['trustBase'], b: IVerificationContext['trustBase']): boolean {
-  return JSON.stringify(a.toJSON()) === JSON.stringify(b.toJSON());
+  return a.networkId.id === b.networkId.id && a.genesisEpoch === b.genesisEpoch && a.committee(a.genesisEpoch)?.id === b.committee(b.genesisEpoch)?.id;
 }
 
 export class NativeBridge {
@@ -85,12 +86,12 @@ export class NativeBridge {
   }
 
   /** The SDK verification context with this bridge's justification verifier and issuance policies. */
-  public context(base?: Partial<Pick<IVerificationContext, 'predicateVerifier' | 'unicityCertificateVerifier'>>): VerificationContext {
+  public async context(base?: Partial<Pick<IVerificationContext, 'predicateVerifier' | 'unicityCertificateVerifier'>>): Promise<VerificationContext> {
     const mjvs = new MintJustificationVerifierService().register(new NativeLockJustificationVerifier(this));
     const tiv = new TokenIssuanceVerifierService(true);
     for (const ty of this.registry.tokenTypes) tiv.register(new BridgedTokenIssuancePolicy(this, ty));
     return new VerificationContext(
-      this.trust.base,
+      await this.trust.authority(),
       base?.predicateVerifier ?? PredicateVerifierService.create(),
       base?.unicityCertificateVerifier ??
         new UnicityCertificateVerifier(new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier())),
@@ -158,7 +159,7 @@ export class NativeBridge {
     for (let i = 0; i < all.length; i++) await this.checkLeaf(dep, all[i].inclusionProof, outcome.leaves[i], steps);
 
     // The SDK's own ordinary verification, with the same base throughout.
-    const r = await new TokenVerifier().verify(token, this.context(parts));
+    const r = await new TokenVerifier().verify(token, await this.context(parts));
     if (r.status !== VerificationStatus.OK) fail(mapSdkFailure(r));
     return { outcome, lock, deployment: index };
   }
@@ -300,7 +301,7 @@ export class NativeBridgeTokenVerifier implements ITokenVerifier {
   public async verify(token: Token, context: IVerificationContext): Promise<VerificationResult<VerificationStatus>> {
     this.lastError = null;
     try {
-      if (!sameBase(context.trustBase, this.bridge.trust.base)) fail('ErrTrustBase');
+      if (!sameBase(context.trustBase, await this.bridge.trust.authority())) fail('ErrTrustBase');
       await this.bridge.verifyNativeToken(token, this.expect, {
         predicateVerifier: context.predicateVerifier,
         unicityCertificateVerifier: context.unicityCertificateVerifier,

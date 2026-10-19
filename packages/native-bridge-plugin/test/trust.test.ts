@@ -7,7 +7,7 @@ import { rejects, throwsReason } from './util.js';
 import { buildToken, makeRoot, makeUc, makeWorld, sha, spec, text } from './world.js';
 
 const ucOf = (r: ReturnType<typeof makeRoot>, signers: number, extra: Parameters<typeof makeUc>[1]['extra'] = undefined) =>
-  makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch: 2n, round: 200n, timestamp: 1n, stateHash: new Uint8Array(32), blockHash: null, signers, extra });
+  makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch: 2n, round: 200n, timestamp: 1_700_000_000n, stateHash: new Uint8Array(32), blockHash: new Uint8Array(32).fill(2), signers, extra });
 
 test('embedded UC rule is the SDK count quorum', async () => {
   const r = makeRoot(2, 4, 10);
@@ -17,13 +17,13 @@ test('embedded UC rule is the SDK count quorum', async () => {
 
 test('embedded UC rejects false root and wrong network like the SDK', async () => {
   const r = makeRoot(2, 4, 10);
-  const bad = await makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch: 2n, round: 200n, timestamp: 1n, stateHash: new Uint8Array(32), blockHash: null, signers: 4, sealHash: new Uint8Array(32).fill(7) });
+  const bad = await makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch: 2n, round: 200n, timestamp: 1_700_000_000n, stateHash: new Uint8Array(32), blockHash: new Uint8Array(32).fill(2), signers: 4, sealHash: new Uint8Array(32).fill(7) });
   await rejects(r.trust.verifyEmbeddedUc(bad), 'ErrSealRoot');
-  const net = await makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch: 2n, round: 200n, timestamp: 1n, stateHash: new Uint8Array(32), blockHash: null, signers: 4, network: 4 });
+  const net = await makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch: 2n, round: 200n, timestamp: 1_700_000_000n, stateHash: new Uint8Array(32), blockHash: new Uint8Array(32).fill(2), signers: 4, network: 4 });
   await rejects(r.trust.verifyEmbeddedUc(net), 'ErrSealNetwork');
 });
 
-test('an unknown or wrong-key signer adds nothing', async () => {
+test('an unknown or wrong-key signer fails the seal (B1)', async () => {
   const r = makeRoot(2, 4, 10);
   const { signer } = await import('./world.js');
   const uc = await ucOf(r, 2, [['stranger', signer(250)], [r.signers[2][0], signer(251)]]);

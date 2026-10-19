@@ -284,8 +284,6 @@ fn header_fields_are_each_pinned() {
 
 #[test]
 fn sdk_registry_adapters_accept_and_reject_through_the_public_hooks() {
-    use unicity_token::api::bft::{RootTrustBase, RootTrustBaseNodeInfo};
-    use unicity_token::api::NetworkId;
     use unicity_token::verify::{
         verify_token_with_policy, MintJustificationRegistry, VerificationPolicy,
     };
@@ -293,8 +291,8 @@ fn sdk_registry_adapters_accept_and_reject_through_the_public_hooks() {
     let bridge = Rc::new(w.bridge.clone());
     let mut reg = MintJustificationRegistry::new();
     native_bridge_sdk_ext::verifier::install(bridge.clone(), &mut reg).unwrap();
-    // The SDK's own count-based quorum is satisfied by this unit-stake committee.
-    let tb = w.bridge.trust.base().clone();
+    // The SDK's own weighted quorum is satisfied by this unit-weight committee.
+    let tb = w.bridge.trust.history().clone();
     let pol = VerificationPolicy {
         require_token_data_verifier: true,
         ..Default::default()
@@ -313,6 +311,73 @@ fn sdk_registry_adapters_accept_and_reject_through_the_public_hooks() {
     // No registry entry for the type: generic hooks refuse the data (the SDK default is fail-closed).
     let empty = MintJustificationRegistry::new();
     assert!(verify_token_with_policy(&ok.token, &tb, &empty, pol).is_err());
+}
+
+/// Shares one justification verifier with a registry, so the test can read its exact reason.
+struct Shared(Rc<NativeLockJustificationVerifier>);
+
+impl unicity_token::verify::MintJustificationVerifier for Shared {
+    fn tag(&self) -> u64 {
+        self.0.tag()
+    }
+    fn verify(
+        &self,
+        genesis: &unicity_token::transaction::CertifiedMintTransaction,
+        context: &mut unicity_token::verify::VerificationContext<'_>,
+    ) -> Result<(), unicity_token::verify::VerificationError> {
+        self.0.verify(genesis, context)
+    }
+}
+
+#[test]
+fn the_justification_hook_requires_the_bridge_history_genesis() {
+    use unicity_token::api::bft::{TrustBaseEntry, TrustBaseHistory};
+    use unicity_token::verify::{
+        verify_token_with_policy, MintJustificationRegistry, VerificationPolicy,
+    };
+    let w = make_world(20);
+    let ok = build_token(&w, &spec(1), &[], 1_700_000_040, 1_700_000_900);
+    let v = Rc::new(NativeLockJustificationVerifier::new(Rc::new(
+        w.bridge.clone(),
+    )));
+    let mut reg = MintJustificationRegistry::new();
+    reg.register(Box::new(Shared(v.clone()))).unwrap();
+    let pol = VerificationPolicy::default();
+    verify_token_with_policy(&ok.token, w.bridge.trust.history(), &reg, pol).unwrap();
+    assert_eq!(v.last_error(), None);
+    // The same network and committee, another genesis (epoch start 0): every certificate still
+    // verifies, so only the hook's genesis check refuses it.
+    let g = w.bridge.trust.base();
+    let other = TrustBaseEntry::new(
+        g.network_id,
+        g.epoch,
+        0,
+        g.members.clone(),
+        g.quorum_threshold,
+        None,
+        None,
+        [0; 32],
+    );
+    let other = TrustBaseHistory::from_trusted_chain(vec![other]).unwrap();
+    assert_ne!(other.genesis_id(), w.bridge.trust.history().genesis_id());
+    assert!(verify_token_with_policy(&ok.token, &other, &reg, pol).is_err());
+    assert_eq!(v.last_error(), Some(E::TrustBase));
+}
+
+#[test]
+fn the_native_seal_rule_failure_is_a_short_quorum() {
+    use native_bridge_sdk_ext::token::map_sdk;
+    use unicity_token::verify::VerificationError;
+    assert_eq!(
+        map_sdk(&VerificationError::SealSignerInvalid),
+        E::QuorumNotMet
+    );
+    assert_eq!(
+        map_sdk(&VerificationError::Genesis(Box::new(
+            VerificationError::SealSignerInvalid
+        ))),
+        E::QuorumNotMet
+    );
 }
 
 #[test]

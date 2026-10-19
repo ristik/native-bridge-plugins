@@ -281,7 +281,7 @@ fn preflight_burn_prices_a_held_token_exactly() {
             gate.intrinsic,
             gate.rsmt
         ],
-        [1_722_174, 107_896, 72_000, 124_960, 404_040, 13_278]
+        [1_725_886, 107_896, 72_000, 125_600, 407_112, 13_278]
     );
 }
 

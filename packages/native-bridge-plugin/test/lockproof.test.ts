@@ -9,7 +9,7 @@ import { decode } from '../src/rlp.js';
 import { C } from './cbor.js';
 import { rejects } from './util.js';
 import {
-  CHAIN_ID, VAULT, ZERO20, buildToken, encodeParts, headerRlp, lockParts, makeUc, makeWorld, pdrBytes, sha, signer, spec, type LockParts,
+  CHAIN_ID, EVM_PARTITION, VAULT, ZERO20, buildToken, encodeParts, headerRlp, lockParts, makeUc, makeWorld, pdrBytes, sha, signer, spec, type LockParts,
   type MintSpec, type World,
 } from './world.js';
 
@@ -42,10 +42,11 @@ test('cfg and trustBaseId must match the installed deployment and trust base', a
   await rejects(mutated((_, p) => void (p.trustBaseId = flip(p.trustBaseId, 0))), 'ErrLockProofTrust');
 });
 
-test('quorum: one short is rejected, three of four is enough, strangers add nothing', async () => {
+test('quorum: one short is rejected, three of four is enough, a stranger fails the seal (B1)', async () => {
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2 }))), 'ErrQuorumNotMet');
   await mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 3 })));
-  await mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: [['intruder', signer(200)]] })));
+  // B1: every signature must be a valid one of a committee member; an unknown signer fails the seal even beside a full quorum
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: [['intruder', signer(200)]] }))), 'ErrQuorumNotMet');
   // Two genuine plus two known members signing with the wrong keys: no quorum.
   await rejects(
     mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2, extra: [[w.evm.signers[2][0], signer(201)], [w.evm.signers[3][0], signer(202)]] }))),
@@ -61,7 +62,7 @@ test('certificate guards: false root, wrong network, wrong epoch, round before s
 });
 
 test('EVM partition, shard and configuration pins', async () => {
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { partition: 8 }))), 'ErrEvmPartition');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { partition: EVM_PARTITION + 1 }))), 'ErrEvmPartition');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { shard: { bytes: Uint8Array.of(0x40), siblings: [new Uint8Array(32)] } }))), 'ErrEvmShard');
   await rejects(mutated((_, p) => void (p.pdr = flip(p.pdr, 3))), 'ErrEvmConfigHash');
   // A self-consistent certificate over a PDR changing a non-membership setting.
@@ -92,7 +93,9 @@ test('EVM partition, shard and configuration pins', async () => {
 test('header bindings', async () => {
   await rejects(mutated((_, p) => void (p.header = flip(p.header, 40))), 'ErrHeaderHash');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { stateHash: new Uint8Array(32).fill(0x5a) }))), 'ErrHeaderRoot');
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: null }))), 'ErrHeaderHash');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: new Uint8Array(32).fill(0x5b) }))), 'ErrHeaderHash');
+  // a changed state with no block hash is not a native input record: refused by the certificate check, before any header binding
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: null }))), 'ErrCertStructure');
   // A well-formed 21-field header under a deployment pinned to 20 fields.
   await rejects(
     mutated(async (w, p) => {

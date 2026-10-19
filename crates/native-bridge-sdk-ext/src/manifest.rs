@@ -293,7 +293,7 @@ impl Loaded {
     /// network; the bridge then verifies under that one base.
     pub fn install(&self, trust: TrustInput) -> Result<NativeBridge> {
         for (network, _root, doc) in &self.trust_pins {
-            if *doc != trust.id() || *network != trust.base().network_id.id() {
+            if *doc != trust.id() || *network != trust.network_id().id() {
                 return Err(E::TrustBaseDigest);
             }
         }

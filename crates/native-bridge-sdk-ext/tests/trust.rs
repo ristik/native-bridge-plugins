@@ -7,7 +7,7 @@ use common::*;
 use native_bridge_sdk_ext::profile::from_hex;
 use native_bridge_sdk_ext::trust::{check_fixed_profile, verify_embedded_uc, TrustInput};
 use native_bridge_sdk_ext::NativeError as E;
-use unicity_token::api::bft::{RootTrustBase, RootTrustBaseNodeInfo};
+use unicity_token::api::bft::{TrustBaseEntry, TrustBaseMember};
 use unicity_token::crypto::signer::Signer;
 
 fn uc_with(root: &Root, signers: usize) -> unicity_token::api::bft::UnicityCertificate {
@@ -19,9 +19,9 @@ fn uc_with(root: &Root, signers: usize) -> unicity_token::api::bft::UnicityCerti
             epoch_ir: 1,
             root_epoch: 2,
             round: 200,
-            timestamp: 1,
+            timestamp: 1_700_000_000,
             state_hash: vec![0; 32],
-            block_hash: None,
+            block_hash: Some(vec![2; 32]),
             signers,
         },
     )
@@ -47,7 +47,7 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
     let w = make_world(20);
     let r = &w.agg;
     let ti = input(r);
-    let out = build_token(&w, &spec(1), &[], 1, 2);
+    let out = build_token(&w, &spec(1), &[], 1_700_000_040, 1_700_000_900);
     let proof = out.token.genesis().inclusion_proof().clone();
     let sid = unicity_token::api::StateId::derive(
         out.token.genesis().transaction().lock_script(),
@@ -55,12 +55,13 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
     );
     verify_embedded_uc(&ti, &proof.unicity_certificate).unwrap();
     proof
-        .verify_for(&sid, proof.reference_time, ti.base())
+        .verify_for(&sid, proof.reference_time, ti.history())
         .unwrap();
     let sdk_error = |uc: unicity_token::api::bft::UnicityCertificate| {
         let mut p = proof.clone();
         p.unicity_certificate = uc;
-        p.verify_for(&sid, p.reference_time, ti.base()).unwrap_err()
+        p.verify_for(&sid, p.reference_time, ti.history())
+            .unwrap_err()
     };
     // Wrong network.
     let mut uc = proof.unicity_certificate.clone();
@@ -78,7 +79,7 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
         sdk_error(uc),
         unicity_token::verify::VerificationError::SealRootMismatch
     );
-    // Insufficient valid count: two valid, two corrupt.
+    // Two valid, two corrupt: the native rule fails the seal on an invalid signature.
     let mut uc = proof.unicity_certificate.clone();
     uc.unicity_seal.signatures.truncate(2);
     let d = uc.unicity_seal.calculate_hash();
@@ -92,12 +93,12 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::QuorumNotMet);
     assert_eq!(
         sdk_error(uc),
-        unicity_token::verify::VerificationError::QuorumNotMet
+        unicity_token::verify::VerificationError::SealSignerInvalid
     );
 }
 
 #[test]
-fn unknown_and_duplicate_signers_add_nothing() {
+fn unknown_signers_fail_the_seal() {
     let r = make_root(2, 4, 10);
     let mut uc = uc_with(&r, 2);
     let d = uc.unicity_seal.calculate_hash();
@@ -130,56 +131,84 @@ fn fixed_profile_guards_name_network_epoch_and_start_round() {
     );
 }
 
-fn base(stakes: &[u64], threshold: u64, version: u64) -> RootTrustBase {
+fn base(stakes: &[u64], threshold: u64) -> TrustBaseEntry {
     let nodes = stakes
         .iter()
         .enumerate()
-        .map(|(i, st)| RootTrustBaseNodeInfo {
-            node_id: format!("n{i}"),
-            signing_key: signer(40 + i as u8).public_key(),
-            stake: *st,
+        .map(|(i, st)| {
+            TrustBaseMember::new(format!("n{i}"), signer(40 + i as u8).public_key(), *st)
         })
         .collect();
-    RootTrustBase::new(
-        version,
+    TrustBaseEntry::new(
         unicity_token::api::NetworkId::new(NETWORK).unwrap(),
         2,
         1,
         nodes,
         threshold,
+        None,
+        None,
+        [0; 32],
     )
 }
 
 #[test]
 fn non_unit_or_non_matching_configurations_are_rejected_at_installation() {
-    assert!(check_fixed_profile(&base(&[1, 1, 1, 1], 3, 1)).is_ok());
-    assert!(check_fixed_profile(&base(&[1], 1, 1)).is_ok());
-    assert!(check_fixed_profile(&base(&[1, 1, 1, 1, 1, 1, 1], 5, 1)).is_ok()); // 7 - 6/3 = 5
-                                                                               // A heavy validator is never flattened into a unit one.
+    assert!(check_fixed_profile(&base(&[1, 1, 1, 1], 3)).is_ok());
+    assert!(check_fixed_profile(&base(&[1], 1)).is_ok());
+    assert!(check_fixed_profile(&base(&[1, 1, 1, 1, 1, 1, 1], 5)).is_ok()); // 7 - 6/3 = 5
+                                                                            // A heavy validator is never flattened into a unit one.
     assert_eq!(
-        check_fixed_profile(&base(&[98, 1, 1], 3, 1)).unwrap_err(),
+        check_fixed_profile(&base(&[98, 1, 1], 3)).unwrap_err(),
         E::UnsupportedTrustBase
     );
     assert_eq!(
-        check_fixed_profile(&base(&[1, 1, 1, 1], 2, 1)).unwrap_err(),
+        check_fixed_profile(&base(&[1, 1, 1, 1], 2)).unwrap_err(),
         E::UnsupportedTrustBase
     );
     assert_eq!(
-        check_fixed_profile(&base(&[1, 1, 1, 1], 4, 1)).unwrap_err(),
+        check_fixed_profile(&base(&[1, 1, 1, 1], 4)).unwrap_err(),
         E::UnsupportedTrustBase
     );
     assert_eq!(
-        check_fixed_profile(&base(&[1, 1, 1, 1], 3, 0)).unwrap_err(),
+        check_fixed_profile(&base(&[], 1)).unwrap_err(),
         E::UnsupportedTrustBase
     );
     assert_eq!(
-        check_fixed_profile(&base(&[], 1, 1)).unwrap_err(),
+        TrustInput::from_provisioned(base(&[2, 2], 2), [0; 32]).unwrap_err(),
         E::UnsupportedTrustBase
     );
+    // Isolated weight check: (2,1,1) with threshold 3 satisfies both floor(2W/3)+1 = 3 and the
+    // count rule N-(N-1)/3 = 3, so only the unit-weight rule refuses it.
+    assert!(base(&[2, 1, 1], 3).validate().is_ok());
     assert_eq!(
-        TrustInput::from_provisioned(base(&[2, 2], 2, 1), [0; 32]).unwrap_err(),
+        check_fixed_profile(&base(&[2, 1, 1], 3)).unwrap_err(),
         E::UnsupportedTrustBase
     );
+}
+
+#[test]
+fn document_member_order_does_not_change_the_genesis() {
+    // two members in reverse node-id order: the entry sorts them, as the JS SDK's create() does
+    let r = make_root(2, 2, 10);
+    let doc = String::from_utf8(trust_doc(&r)).unwrap();
+    let (a, b) = (&r.tb.members[0], &r.tb.members[1]);
+    assert!(a.node_id < b.node_id);
+    let node = |m: &unicity_token::api::bft::TrustBaseMember| {
+        format!(
+            "{{\"nodeId\":\"{}\",\"sigKey\":\"{}\",\"stake\":\"1\"}}",
+            m.node_id,
+            native_bridge_sdk_ext::profile::hex_lower(m.signing_key.as_bytes())
+        )
+    };
+    let reversed = doc.replace(
+        &format!("[{},{}]", node(a), node(b)),
+        &format!("[{},{}]", node(b), node(a)),
+    );
+    assert_ne!(reversed, doc);
+    let sorted = TrustInput::from_json(doc.as_bytes(), &sha(doc.as_bytes())).unwrap();
+    let rev = TrustInput::from_json(reversed.as_bytes(), &sha(reversed.as_bytes())).unwrap();
+    assert_eq!(rev.history().genesis_id(), sorted.history().genesis_id());
+    assert_eq!(rev.base().members, sorted.base().members);
 }
 
 #[test]
@@ -198,6 +227,15 @@ fn installed_document_must_hash_to_the_pin_and_parse() {
     assert_eq!(
         TrustInput::from_json(&spaced, &sha(&doc)).unwrap_err(),
         E::TrustBaseDigest
+    );
+    // the document format is version 1
+    let v0 = String::from_utf8(doc.clone())
+        .unwrap()
+        .replace("\"version\":\"1\"", "\"version\":\"0\"")
+        .into_bytes();
+    assert_eq!(
+        TrustInput::from_json(&v0, &sha(&v0)).unwrap_err(),
+        E::TrustBase
     );
     let garbage = b"{not json".to_vec();
     assert_eq!(
@@ -264,6 +302,6 @@ fn the_published_sdk_trust_base_fixture_installs_with_its_digest_as_the_id() {
     assert_eq!(t.id(), pin);
     assert_eq!(t.base().network_id.id(), 3);
     assert_eq!(t.base().epoch, 1);
-    assert_eq!(t.base().epoch_start_round, 0);
-    assert_eq!(t.base().root_nodes.len(), 1);
+    assert_eq!(t.base().epoch_start, 0);
+    assert_eq!(t.base().members.len(), 1);
 }

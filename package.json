@@ -19,5 +19,11 @@
   },
   "devDependencies": {
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "@unicitylabs/state-transition-sdk": "$@unicitylabs/state-transition-sdk"
+  },
+  "dependencies": {
+    "@unicitylabs/state-transition-sdk": "file:vendor/unicitylabs-state-transition-sdk-4.0.0-utb.cc9a95b.tgz"
   }
 }

@@ -43,8 +43,8 @@ import { NativeBridge } from '../src/verifier.js';
 
 export const NETWORK = 3;
 export const CHAIN_ID = 7777n;
-export const EVM_PARTITION = 7;
-export const AGG_PARTITION = 1;
+export const EVM_PARTITION = 8;
+export const AGG_PARTITION = 7;
 export const VAULT = new Uint8Array(20).fill(0xaa);
 export const ROOT_GENESIS = new Uint8Array(32).fill(0x11);
 export const EXEC_GENESIS = new Uint8Array(32).fill(0x22);
@@ -201,11 +201,16 @@ export interface UcSpec {
   shard?: { bytes: Uint8Array; siblings: Uint8Array[] };
 }
 
+/** Every fixture certificate's technical record hash (natively it is always 32 bytes). */
+const TECHNICAL_RECORD_HASH = sha(text('technical record'));
+
 export async function makeUc(root: Root, s: UcSpec): Promise<UnicityCertificate> {
-  const ir = new InputRecord(s.round, s.epochIr, null, s.stateHash, new Uint8Array(), s.timestamp, s.blockHash, 0n, null);
+  // Native-valid records (bft-go-base IsValid, checked by the SDK): an aggregator round that changes the state always has a block
+  const blockHash = s.blockHash ?? (s.partition === AGG_PARTITION ? sha(concat(text('aggregator block'), s.stateHash)) : null);
+  const ir = new InputRecord(s.round, s.epochIr, null, s.stateHash, new Uint8Array(), s.timestamp, blockHash, 0n, null);
   const shard = s.shard ? ShardId.decode(s.shard.bytes) : ShardId.decode(Uint8Array.of(0x80));
   const stc = new ShardTreeCertificate(shard, s.shard?.siblings ?? []);
-  const shardRoot = await UnicityCertificate.calculateShardTreeCertificateRootHash(ir, null, s.conf, stc);
+  const shardRoot = await UnicityCertificate.calculateShardTreeCertificateRootHash(ir, TECHNICAL_RECORD_HASH, s.conf, stc);
   const key = new Uint8Array(4);
   new DataView(key.buffer).setUint32(0, s.partition);
   const unicityTreeHash = sha(bs(shardRoot.data));
@@ -215,7 +220,7 @@ export async function makeUc(root: Root, s: UcSpec): Promise<UnicityCertificate>
   const seal = await UnicitySeal.create(
     NetworkId.fromId(s.network ?? NETWORK), s.round, s.rootEpoch, s.timestamp, null, s.sealHash ?? treeRoot, signers,
   );
-  return new UnicityCertificate(ir, null, s.conf, stc, new UnicityTreeCertificate(BigInt(s.partition), []), seal);
+  return new UnicityCertificate(ir, TECHNICAL_RECORD_HASH, s.conf, stc, new UnicityTreeCertificate(BigInt(s.partition), []), seal);
 }
 
 // ---- the world ---------------------------------------------------------------------------------

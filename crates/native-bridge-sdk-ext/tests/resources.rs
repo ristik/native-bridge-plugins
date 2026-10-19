@@ -61,7 +61,7 @@ fn sized_uc(base: &UnicityCertificate, target: usize) -> UnicityCertificate {
         uc.unicity_seal.signatures = (0..count)
             .map(|i| (format!("{:x>128}", i), vec![0; 65]))
             .collect();
-        uc.input_record.summary_value.clear();
+        uc.input_record.summary_value = Some(vec![]);
         let base_len = uc.to_cbor().len();
         if base_len > target {
             continue;
@@ -71,7 +71,7 @@ fn sized_uc(base: &UnicityCertificate, target: usize) -> UnicityCertificate {
             if gap < adjustment || gap - adjustment > 256 {
                 continue;
             }
-            uc.input_record.summary_value = vec![0; gap - adjustment];
+            uc.input_record.summary_value = Some(vec![0; gap - adjustment]);
             if uc.to_cbor().len() == target {
                 return uc;
             }
@@ -119,7 +119,7 @@ fn native_uc_sublimits_on_ordinary_and_standalone_embedded_certificates() {
     let w = make_world(20);
     let out = build_token(&w, &spec(1), &[], 1, 2);
     let mutations: Vec<Box<dyn Fn(&mut UnicityCertificate)>> = vec![
-        Box::new(|uc| uc.input_record.summary_value = vec![0; 257]),
+        Box::new(|uc| uc.input_record.summary_value = Some(vec![0; 257])),
         Box::new(|uc| uc.shard_tree_certificate.shard = ShardId::decode(&[128; 34]).unwrap()),
         Box::new(|uc| uc.shard_tree_certificate.sibling_hash_list = vec![vec![0; 32]; 257]),
         Box::new(|uc| {

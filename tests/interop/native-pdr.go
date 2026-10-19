@@ -20,7 +20,7 @@ func main() {
 		panic(err)
 	}
 	p := types.PartitionDescriptionRecord{
-		Version: 1, NetworkID: 3, PartitionID: 7, ShardID: types.ShardID{},
+		Version: 1, NetworkID: 3, PartitionID: 8, ShardID: types.ShardID{},
 		PartitionTypeID: 1, TypeIDLen: 0, UnitIDLen: 256,
 		SummaryTrustBase: []byte{}, T2Timeout: 2_500_000_000,
 		PartitionParams: map[string]string{"chainId": "7777"}, Epoch: 5,

@@ -8,7 +8,7 @@ import { verifyProof } from '../src/mpt.js';
 import { decodeCfg, cfgBytes, decodePolicy, deriveAsset, deriveType, identityDomain, keccak256, makePolicy, policyBytes, valueEnvelope } from '../src/profile.js';
 import { decode, encodeBytes, encodeList, encodeU64, u64Of } from '../src/rlp.js';
 import { throwsReason } from './util.js';
-import { CHAIN_ID, EXEC_GENESIS, NETWORK, ROOT_GENESIS, headerRlp, makeWorld, sha, text, trie } from './world.js';
+import { CHAIN_ID, EVM_PARTITION, EXEC_GENESIS, NETWORK, ROOT_GENESIS, headerRlp, makeWorld, sha, text, trie } from './world.js';
 
 test('rlp rejects every non-canonical form', () => {
   const cases: [string, number[]][] = [
@@ -102,7 +102,7 @@ test('cfg and policy round trip; deployment construction rejects forged identity
   };
   throwsReason(bad((c) => void (c.ty[0] ^= 1)), 'ErrCfgMismatch');
   throwsReason(bad((c) => void (c.aggregatorPolicyHash[0] ^= 1)), 'ErrPolicyHash');
-  const p = makePolicy(7);
+  const p = makePolicy(EVM_PARTITION);
   throwsReason(bad((c) => void (c.aggregatorPolicyHash = sha(policyBytes(p))), p), 'ErrPolicyPartition');
   throwsReason(() => makeDeployment(w.dep.cfg, new Uint8Array(32), new Uint8Array(32), { fields: 19 as never }, w.policy), 'ErrCfgMismatch');
 });

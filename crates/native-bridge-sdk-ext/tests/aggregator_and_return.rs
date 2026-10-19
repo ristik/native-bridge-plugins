@@ -443,7 +443,7 @@ fn agg_err(f: impl FnOnce(&World, &mut UcSpec)) -> E {
         root_epoch: 2,
         round: 900,
         timestamp: UC_TS,
-        state_hash: out.uc.input_record.hash.clone(),
+        state_hash: out.uc.input_record.hash.clone().unwrap(),
         block_hash: None,
         signers: 4,
     };

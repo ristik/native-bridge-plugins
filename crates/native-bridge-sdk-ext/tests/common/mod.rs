@@ -13,7 +13,7 @@ use unicity_token::api::bft::{
     InputRecord, ShardId, ShardTreeCertificate, UnicityCertificate, UnicitySeal,
     UnicityTreeCertificate,
 };
-use unicity_token::api::bft::{RootTrustBase, RootTrustBaseNodeInfo};
+use unicity_token::api::bft::{TrustBaseEntry, TrustBaseMember};
 use unicity_token::api::{
     CertificationData, InclusionCertificate, InclusionProof, NetworkId, StateId,
 };
@@ -32,8 +32,9 @@ use unicity_token::transaction::{
 
 pub const NETWORK: u16 = 3;
 pub const CHAIN_ID: u64 = 7777;
-pub const EVM_PARTITION: u32 = 7;
-pub const AGG_PARTITION: u32 = 1;
+pub const EVM_PARTITION: u32 = 8;
+/// The SDK's fixed aggregation partition.
+pub const AGG_PARTITION: u32 = 7;
 pub const VAULT: [u8; 20] = [0xaa; 20];
 pub const ROOT_GENESIS: [u8; 32] = [0x11; 32];
 pub const EXEC_GENESIS: [u8; 32] = [0x22; 32];
@@ -237,27 +238,27 @@ pub fn header_rlp(state_root: &[u8; 32], number: u64, fields: usize) -> Vec<u8> 
 
 pub struct Root {
     pub signers: Vec<(String, Secp256k1Signer)>,
-    pub tb: RootTrustBase,
+    pub tb: TrustBaseEntry,
 }
 
 /// The pinned document B: the SDK JSON representation in the SDK's emitted field order.
 pub fn trust_doc(r: &Root) -> Vec<u8> {
     let nodes: Vec<String> =
-        r.tb.root_nodes
+        r.tb.members
             .iter()
             .map(|n| {
                 format!(
                     "{{\"nodeId\":\"{}\",\"sigKey\":\"{}\",\"stake\":\"{}\"}}",
                     n.node_id,
                     hex_lower(n.signing_key.as_bytes()),
-                    n.stake
+                    n.weight
                 )
             })
             .collect();
     format!(
         "{{\"changeRecordHash\":null,\"epoch\":\"{}\",\"epochStartRound\":\"{}\",\"networkId\":{},\"previousEntryHash\":null,\"quorumThreshold\":\"{}\",\"rootNodes\":[{}],\"signatures\":{{}},\"stateHash\":\"\",\"version\":\"1\"}}",
         r.tb.epoch,
-        r.tb.epoch_start_round,
+        r.tb.epoch_start,
         r.tb.network_id.id(),
         r.tb.quorum_threshold,
         nodes.join(",")
@@ -283,21 +284,18 @@ pub fn make_root(epoch: u64, n: usize, seed: u8) -> Root {
     signers.sort_by(|a, b| a.0.cmp(&b.0));
     let nodes = signers
         .iter()
-        .map(|(id, s)| RootTrustBaseNodeInfo {
-            node_id: id.clone(),
-            signing_key: s.public_key(),
-            stake: 1,
-        })
+        .map(|(id, s)| TrustBaseMember::new(id.clone(), s.public_key(), 1))
         .collect();
-    let tb = RootTrustBase::try_new(
-        1,
+    let tb = TrustBaseEntry::new(
         NetworkId::new(NETWORK).unwrap(),
         epoch,
         1,
         nodes,
         (n as u64) * 2 / 3 + 1,
-    )
-    .unwrap();
+        None,
+        None,
+        [0; 32],
+    );
     Root { signers, tb }
 }
 
@@ -325,28 +323,37 @@ pub fn make_uc_in_shard(
     shard: &[u8],
     siblings: &[[u8; 32]],
 ) -> UnicityCertificate {
+    // Native-valid records (bft-go-base IsValid, checked by the SDK): an aggregator round that
+    // changes the state always has a block
+    let block_hash = s.block_hash.clone().or_else(|| {
+        (s.partition == AGG_PARTITION)
+            .then(|| sha(&[b"aggregator block".as_slice(), &s.state_hash].concat()).to_vec())
+    });
     let ir = InputRecord {
         round_number: s.round,
         epoch: s.epoch_ir,
         previous_hash: None,
-        hash: s.state_hash.clone(),
-        summary_value: vec![],
+        hash: Some(s.state_hash.clone()),
+        summary_value: Some(vec![]),
         timestamp: s.timestamp,
-        block_hash: s.block_hash.clone(),
+        block_hash,
         sum_of_earned_fees: 0,
         executed_transactions_hash: None,
     };
     let mut uc = UnicityCertificate {
         input_record: ir,
-        technical_record_hash: None,
+        // natively always 32 bytes
+        technical_record_hash: Some(sha(b"technical record").to_vec()),
         shard_configuration_hash: s.conf.clone(),
         shard_tree_certificate: ShardTreeCertificate {
             shard: ShardId::decode(shard).unwrap(),
             sibling_hash_list: siblings.iter().map(|x| x.to_vec()).collect(),
+            empty_as_null: false,
         },
         unicity_tree_certificate: UnicityTreeCertificate {
             partition_identifier: s.partition,
             steps: vec![],
+            empty_as_null: false,
         },
         unicity_seal: UnicitySeal {
             network_id: NetworkId::new(NETWORK).unwrap(),

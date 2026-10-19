@@ -56,7 +56,7 @@ impl NativeBridge {
     /// base's network.
     pub fn new(registry: DeploymentRegistry, trust: TrustInput) -> Result<Self> {
         for d in registry.deployments() {
-            if d.cfg.network != trust.base().network_id.id() {
+            if d.cfg.network != trust.network_id().id() {
                 return Err(E::NetworkMismatch);
             }
         }
@@ -196,7 +196,7 @@ impl NativeBridge {
             require_token_data_verifier: true,
             ..Default::default()
         };
-        verify_token_with_policy(token, self.trust.base(), &registry, policy)
+        verify_token_with_policy(token, self.trust.history(), &registry, policy)
             .map_err(|e| map_sdk(&e))?;
         Ok(VerifiedToken {
             outcome,
@@ -281,7 +281,8 @@ pub fn map_sdk(e: &VerificationError) -> E {
         VerificationError::CertificationDataMismatch
         | VerificationError::TransactionHashMismatch
         | VerificationError::ReferenceTimeMismatch => E::CDMismatch,
-        VerificationError::InvalidTrustBase(_) => E::TrustBase,
+        // the native seal rule: an unknown signer or an invalid signature fails the seal like a short quorum
+        VerificationError::SealSignerInvalid => E::QuorumNotMet,
         _ => E::SdkVerification,
     }
 }

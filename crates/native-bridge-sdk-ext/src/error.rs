@@ -59,7 +59,7 @@ errors! {
     TrustBase => Invalid, SdkVerification => Invalid, EpochMismatch => Invalid,
     RoundBeforeEpochStart => Invalid, UnsupportedTrustBase => Invalid, TrustBaseDigest => Invalid,
     UnsupportedCertificateEncoding => Invalid,
-    SealNetwork => Invalid, SealRoot => Invalid, QuorumNotMet => Invalid,
+    SealNetwork => Invalid, SealRoot => Invalid, QuorumNotMet => Invalid, CertStructure => Invalid,
     NotAdmitted => Invalid, ShardMismatch => Invalid, PathInvalid => Invalid,
     // embedded lock proof
     MissingBacking => Invalid, LockProofCfg => Invalid, LockProofTrust => Invalid,
