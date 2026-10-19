@@ -1,5 +1,5 @@
 {
-  "protocolVersion": 4,
+  "protocolVersion": 5,
   "kernelAddress": "0x0000000000000000000000000000000000000104",
   "reservedAddress": "0x0000000000000000000000000000000000000103",
   "input": [

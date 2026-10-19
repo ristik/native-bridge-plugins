@@ -249,13 +249,13 @@
           "const": 1
         },
         "protocolVersion": {
-          "const": 4
+          "const": 5
         },
         "family": {
           "const": "unicity-native"
         },
         "sdkVersion": {
-          "const": "3.0.1"
+          "const": "4.0.0"
         },
         "tokenTypeHex": {
           "$ref": "#/$defs/hash"
@@ -320,19 +320,23 @@
               "$ref": "#/$defs/hash"
             },
             "format": {
-              "const": "sdk-root-trust-base-json-v1"
+              "const": "utb-release-bundle-v1"
             },
-            "document": {
+            "genesisEntryId": {
+              "$ref": "#/$defs/hash"
+            },
+            "bundle": {
               "$ref": "#/$defs/artifact"
             }
           },
           "required": [
             "networkId",
             "rootGenesisHash",
-            "document",
-            "format"
+            "format",
+            "genesisEntryId",
+            "bundle"
           ],
-          "description": "One installed SDK 3.0.1 RootTrustBase document B, whose exact-file SHA-256 is the immutable trustBaseId in J. Installation authenticates correspondence to network/root genesis and enforces unit stakes, matching count quorum and one fixed epoch."
+          "description": "The network's Unicity Trust Base history: genesisEntryId is the EntryID of its genesis entry, the immutable trustBaseId in J and the installation pin; bundle is a release bundle (tag 39015) an installation may start from, pinned by exact-file SHA-256 (installation metadata, never the pin)."
         },
         "proofEndpoints": {
           "type": "array",

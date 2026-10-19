@@ -1,14 +1,15 @@
 # Native bridge interoperability contract
 
-Status: protocol v4, development profile; implementation and activation gates
+Status: protocol v5, development profile; implementation and activation gates
 remain open. This document is the sole normative native byte contract.
-This unreleased v4 draft incorporates the fixed SDK trust model in
-[sdk-trust-base.md](sdk-trust-base.md), the any-age registry-backed certificate
+This unreleased v5 draft incorporates the Unicity Trust Base trust model in
+[trust-base.md](trust-base.md) (v4's fixed SDK 3.0.1 trust document is
+abandoned, without compatibility), the any-age registry-backed certificate
 batch of bft-core `briefs/b1-any-age-contract.md` (one `CERT_BATCH_V2` call over
 the anchor table) and the aggregation-partition policy below; the v3 sharded
 policy, per-anchor certificate calls and earlier assumptions are abandoned, with
 no compatibility, migration or acceptance promise.
-`NATIVE_BRIDGE_PROTO_VERSION=4` is independent of SDK Token.VERSION and the
+`NATIVE_BRIDGE_PROTO_VERSION=5` is independent of SDK Token.VERSION and the
 external bridge's BRIDGE_PROTO_VERSION. Any byte/derivation change MUST bump
 this version and semantic profile. Consensus parsers accept only this profile;
 there is no pre-3.0 decoder, migration or dual-format interpretation.
@@ -24,7 +25,7 @@ objects, indefinite lengths and trailing data. Hashes/salts/IDs are 32 bytes,
 addresses 20 bytes, compressed secp256k1 keys 33 bytes.
 Amount is minimal positive unsigned big-endian bstr, 1..32 bytes (no leading
 zero). Arithmetic is uint256; chain ID and nonzero nonce are u64, network
-is in 1..65535 (SDK 3.0.1 NetworkId), partitions uint32. Cfg and mint wire
+is in 1..65535 (SDK NetworkId), partitions uint32. Cfg and mint wire
 decoders reject network zero and values above 65535 with IntRange. JS uses bigint or decimal strings, never lossy number
 conversion. `e` is null or uint64 in [1,2^64-1]; `t` is uint64 Unix seconds.
 
@@ -80,11 +81,13 @@ never inherit deployment trust. Config, salt, lock and redemption bind their
 own vault. Reject lock digest d=0. The stateless TokenVerifier has no cfg/vault immutable,
 avoiding a code-hash/configuration cycle. Runtime chain/vault MUST match Cfg.
 
-## SDK 3.0.1 wire
+## SDK wire
 
-Pins: JS `f5f0737306901215860aa920a6ab570b699efba8`, Rust
-`635011b3d7066db6f3296e9cb8d2f24d4bd1fec7`. Both SDK packages are v3.0.1.
-Predicate version and tags are unchanged; no SDK fork or patch is authorized.
+Pins: the ristik SDK lines (`integration/enshrined-evm`), JS
+`cc38d7cc51dc9dea470d1b7301f1e84f53737b4b` (4.0.0-utb), Rust
+`447b6b1d0f376a76cedfb9e766d2f3d440c6ba25` (unicity-token 4.0.0). The token,
+predicate and certification wire below is unchanged from SDK 3.0.1; predicate
+version and tags are unchanged. No other SDK fork or patch is authorized.
 
 ```
 P = tag(39032,[1,b(encode_uint(type)),b(params)])
@@ -153,35 +156,37 @@ Native tags stay 39049 lock / 39048 return; reject external 1330002, old
 pointer-only reasons, null/unknown/split reasons and detached backing evidence.
 PDR and UC are complete canonical native encodings. UC contains InputRecord,
 shard-tree certificate, Unicity-tree certificate and quorum-signed root seal.
-`trustBaseId=SHA256(B)` identifies the exact installed SDK RootTrustBase JSON
-bytes defined in [sdk-trust-base.md](sdk-trust-base.md), not an epoch artifact,
-stateHash or a reconstructed Rust serialization. It MUST equal the manifest's
-installed document digest; it never authorizes keys or a different base.
+`trustBaseId` is the EntryID of the genesis entry of the network's Unicity
+Trust Base history ([trust-base.md](trust-base.md)), not a document digest, an
+epoch's entry or a stateHash. It MUST equal the manifest's
+`trustBase.genesisEntryId` and the installed history's genesis; it never
+authorizes keys or another history.
 
 Receipt verification MUST have only token plus locally pinned configuration
-and the single installed SDK trust base. It has no RPC, URL, node or
-witness-provider capability. Installation admits only unit-weight validators,
-one fixed epoch/committee and the SDK count threshold `N-(N-1)/3` matching the
-native deployment. Reject non-unit configuration; do not flatten weights.
+and the installed trust-base history (a release bundle under its genesis
+EntryID). It has no RPC, URL, node or witness-provider capability. Committees,
+weights and thresholds (`floor(2W/3)+1`) are the history's entries'.
 
 Bound and parse canonically before SDK allocation/crypto; match
 chain/vault/native asset/cfg and allow-listed deployment. Every ordinary and
-embedded UC seal MUST match the pinned base's network/epoch and have root round
-at least epochStartRound. Use existing SDK 3.0.1 token/UC verification as is,
-including count quorum and SDK signature acceptance. For the embedded EVM UC,
-TS calls public seal-root/quorum rules; Rust uses only the minimal composition
-of public SDK primitives described in sdk-trust-base.md because standalone UC
-verification is private. No plug-in native-weight verifier or epoch resolver.
+embedded UC is verified by the SDK under the entry of its own seal epoch:
+network equal to the history's (`SealNetwork`), an epoch newer than the latest
+held one `NoEntryForEpoch` (retryable), an epoch before the genesis or a root
+round outside `[start_e, start_e+1)` `SealEpoch`, native structure
+(`CertStructure`), tree root (`SealRoot`) and the native B1 seal rule under the
+epoch's committee (`QuorumNotMet`). The embedded EVM UC uses the SDK certificate
+verifier for its own partition (TS `verifyCertificate`, Rust
+`verify_certificate_of_partition`). No plug-in weighted verifier, epoch
+resolver or trust-base store.
 
 Both ordinary and embedded UCs MUST be in the canonical native/SDK-decodable
-intersection: 65-byte seal signatures with native suffix 0/1, byte-string IR summary, array-valued
+intersection: seal signatures of 64 bytes or 65 with suffix 0/1 (the suffix is
+ignored, as in both SDKs and native B1), byte-string IR summary, array-valued
 shard siblings and Unicity steps (including empty arrays), valid signature maps,
 SDK integer/key widths, and existing native/bridge bounds. Construction/import/
-refresh fail `UnsupportedCertificateEncoding` outside this subset. Never append
-a suffix to a 64-byte seal, rewrite null to empty, or mutate J. Shared positives
-use low-s correctly recoverable signatures accepted by both SDKs and native B1.
-SDK/native seal acceptance differences remain documented limitations; strict
-token-unlock recovery remains separate and unchanged.
+refresh fail `UnsupportedCertificateEncoding` outside this subset. Never rewrite
+null to empty or mutate J. Strict token-unlock recovery remains separate and
+unchanged.
 
 After SDK UC verification, enforce the bridge-specific pinned EVM partition,
 shard and configuration relation; hash PDR to UC's configuration commitment,
@@ -205,17 +210,15 @@ after certification. Historical proof establishes permanent lock existence,
 not current spent=0. Certified single-spend history and live vault nonce guard
 have distinct roles. Historical backing has no B1 certificate-age requirement.
 
-J stays byte-identical after certification. Offline receipt is supported only
-under the pinned fixed base. Aggregator refresh may replace paths/UCs within
-that same base/epoch while preserving M/T, CD and original t. Another epoch or
-base is unsupported: never install it from token input, union keys or fetch it.
-
-**DEFERRED: common SDK trust-base work / unsupported in this profile** — epoch
-changes, trust-base append/fetch, arbitrary weights, mixed historical/current
-committees, interval closure, old-J validity through rotation and full B1/SDK
-seal acceptance parity. Tracked in [bft-core #421](https://github.com/ristik/bft-core/issues/421).
-No bridge-owned epoch artifact, interval sidecar or trust-history service exists.
-Native return B1 keeps its independent consensus, registry, window and ABI.
+J stays byte-identical after certification. A lock certificate of any epoch the
+history holds verifies under that epoch's committee and interval, so backing
+survives later rotations. Aggregator refresh may replace paths/UCs under any
+held epoch while preserving M/T, CD and original t. Never install a history from
+token input or union keys. Trust-base evolution is the SDK's: the wallet appends
+newer entries (each witnessed by its predecessor) and retries `NoEntryForEpoch`;
+the plug-ins fetch nothing. No bridge-owned epoch artifact, interval sidecar or
+trust-history service exists. Native return B1 keeps its independent consensus,
+registry, window and ABI.
 
 ## Whole-token history and return
 
@@ -275,7 +278,7 @@ LeafProof=(uint16 anchorIndex,bytes32 bitmap,bytes32[] siblings). All earlier
 Anchor fields retain order; the native inputRecord opening is appended after UC.
 Reject aliases, noncanonical offsets/padding, trailing bytes and budget overflow.
 
-Anchors (profile v4, one anchor per distinct complete UC). Each anchor is one
+Anchors (one anchor per distinct complete UC). Each anchor is one
 complete canonical native UC with its claim fields and the two native openings.
 Anchors have pairwise distinct UC bytes (byte-identical UCs are one anchor,
 never two; a repeated or conflicting entry is rejected); several different UCs
@@ -338,7 +341,7 @@ steps and exactly d shard-tree siblings per UC (d its own shard's depth, the
 anchor's shard equal to the UC's); Cfg<=1024; bridge CBOR items J<=4096 (the
 gate below); A<=A_max=16 distinct UC anchors
 (a parser ceiling: the gas gate below decides each bundle); A<=L.
-These bounds are the named parameters of `profile-v4.json` `limits`
+These bounds are the named parameters of `profile-v5.json` `limits`
 (the single source for contract, oracle and plug-ins); a later profile version
 may raise them, e.g. when multi-proof services land. The initial testnet
 assumes few transactions per token.
@@ -435,7 +438,8 @@ credited recipient redirects payment. Preserve custody on every verifier error.
 Schema v1 registry is keyed by tokenTypeHex (lowercase hex, no 0x).
 `manifest.schema.json` defines structural rules; application installation also
 MUST recompute identifiers, chainRef, Cfg/cfg, policy hashes, semantic-profile
-hash and runtime/trust pins (one SDK document plus exact-file digest), match
+hash and runtime/trust pins (the trust-base genesis EntryID; a release bundle by
+exact-file digest), match
 key to tokenTypeHex, reject ambiguous
 network/chain/vault entries and inconsistent replacement records. JSON text is
 never the Cfg preimage. Hash canonical published artifacts exactly, never an

@@ -87,7 +87,9 @@ function uc(n: Node, budget: Budget): void {
   for (let i = 0; i < sigs.length; i += 2) {
     if (sigs[i].major !== 3) unsupported();
     if (sigs[i].data.length > 128) fail('ErrProofTooLarge');
-    if (sigs[i + 1].major !== 2 || sigs[i + 1].data.length !== 65 || sigs[i + 1].data[64] > 1) unsupported();
+    // 64 bytes (r||s) or 65 with a 0/1 recovery suffix, as both SDKs and native B1
+    const sig = sigs[i + 1];
+    if (sig.major !== 2 || (sig.data.length !== 64 && sig.data.length !== 65) || (sig.data.length === 65 && sig.data[64] > 1)) unsupported();
   }
 }
 function visit(n: Node, budget: Budget): void {

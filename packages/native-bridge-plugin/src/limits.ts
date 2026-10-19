@@ -5,7 +5,7 @@
  * Limits are intersected, never additive entitlements, and every cumulative bound is checked before
  * allocation or cryptography.
  */
-export const NATIVE_BRIDGE_PROTO_VERSION = 4 as const;
+export const NATIVE_BRIDGE_PROTO_VERSION = 5 as const;
 
 // ---- profile parameters (profile-v4.json `limits`) -------------------------------------------------
 /** Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle. */

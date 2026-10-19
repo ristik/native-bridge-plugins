@@ -13,7 +13,7 @@ seal must match its network/epoch and start round. The SDKs' verification stays
 unchanged; no bridge-owned weighted authority or epoch-history workaround exists.
 The exact SDK-emitted JSON bytes and their SHA-256 are pinned; integrity does not
 authenticate the base. Provisioning binds it to the native network/root genesis.
-See [the byte and API contract](../../protocol/sdk-trust-base.md).
+See [the byte and API contract](../../protocol/trust-base.md).
 
 J is immutable. Proof refresh is supported only within this fixed base/epoch,
 preserving M/T/CD/t. Another epoch/base is unsupported and never fetched during
