@@ -74,4 +74,4 @@ export const PRED_BURN = 2;
 
 export const NATIVE_BRIDGE_FAMILY = 'unicity-native' as const;
 export const FAMILY = NATIVE_BRIDGE_FAMILY;
-export const SDK_VERSION = '3.0.1' as const;
+export const SDK_VERSION = '4.0.0' as const;

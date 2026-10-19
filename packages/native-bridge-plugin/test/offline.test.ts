@@ -19,7 +19,7 @@ test('verifier sources contain no network or filesystem capability', () => {
 
 test('receipt verification succeeds with the network disabled', async (t) => {
   if (process.env.NBP_NO_NET_CHILD) {
-    const w = makeWorld();
+    const w = await makeWorld();
     const out = await buildToken(w, spec(1), [txStep(2, 7, 1_700_000_050n)], 1_700_000_040n, 1_700_000_900n);
     await w.bridge.verifyNativeTokenBytes(out.bytes, 'receipt');
     const net = await import('node:net');

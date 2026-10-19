@@ -30,8 +30,8 @@ fn hx(v: &Value) -> Vec<u8> {
 }
 
 fn bridge(f: &Value) -> NativeBridge {
-    let doc = hx(&f["trustDocument"]);
-    let trust = TrustInput::from_json(&doc, &sha(&doc)).unwrap();
+    let pin: [u8; 32] = hx(&f["trustPin"]).try_into().unwrap();
+    let trust = TrustInput::from_bundle(&hx(&f["trustBundle"]), &pin).unwrap();
     let d = &f["deployment"];
     let cfg = Cfg::from_bytes(&hx(&d["cfg"])).unwrap();
     let policy = Policy::from_bytes(&hx(&d["policy"])).unwrap();
@@ -77,7 +77,9 @@ fn rust_world_matches_the_typescript_world() {
     let d = &f["deployment"];
     assert_eq!(w.dep.cfg.to_bytes(), hx(&d["cfg"]));
     assert_eq!(w.policy.to_bytes(), hx(&d["policy"]));
-    assert_eq!(trust_doc(&w.agg), hx(&f["trustDocument"]));
+    // the TypeScript and Rust test worlds build the same trust base, byte for byte
+    assert_eq!(w.agg.bundle, hx(&f["trustBundle"]));
+    assert_eq!(w.agg.pin.to_vec(), hx(&f["trustPin"]));
     assert_eq!(w.dep.evm_config_hash.to_vec(), hx(&d["evmConfigHash"]));
 }
 

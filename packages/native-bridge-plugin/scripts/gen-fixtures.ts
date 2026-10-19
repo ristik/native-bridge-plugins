@@ -23,7 +23,7 @@ interface Case {
 }
 
 export async function generate(): Promise<unknown> {
-  const w = makeWorld();
+  const w = await makeWorld();
   const cases: Case[] = [];
   const add = async (name: string, expect: 'receipt' | 'return', s: MintSpec, steps: Step[], opts: { tw?: Tweaks; mintT?: bigint; ucTs?: bigint; parts?: (w: World, s: MintSpec) => ReturnType<typeof lockParts> } = {}): Promise<void> => {
     const parts = opts.parts ? await opts.parts(w, s) : undefined;
@@ -56,8 +56,9 @@ export async function generate(): Promise<unknown> {
   await add('neg_wrong_envelope_amount', 'receipt', spec(1), [], { tw: { mintData: valueEnvelope(w.dep.cfg.aid, Uint8Array.of(3, 233)) } });
   void signer;
   return {
-    description: 'provisional cross-stack fixtures for native-bridge-plugins PR3 (SDK 3.0.1, protocol v4); not the normative corpus',
-    trustDocument: toHex(w.agg.doc),
+    description: 'provisional cross-stack fixtures for native-bridge-plugins (SDK 4.0.0 trust-base history, protocol v4); not the normative corpus',
+    trustBundle: toHex(w.agg.bundle),
+    trustPin: toHex(w.agg.pin),
     deployment: {
       cfg: toHex(cfgBytes(w.dep.cfg)),
       policy: toHex(policyBytes(w.policy)),

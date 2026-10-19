@@ -32,7 +32,7 @@ const UC_TS = 1_700_000_900n;
 const ret = (w: World) => buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
 
 test('return envelope round trips and passes policy, anchor and gate checks', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const { envelope, encoded, verified, gate } = await buildReturnProof(w.bridge, (await ret(w)).token);
   assert.deepEqual(decodeEnvelope(encoded), envelope);
   assert.equal(envelope.leafProofs.length, 3);
@@ -51,7 +51,7 @@ test('return envelope round trips and passes policy, anchor and gate checks', as
 });
 
 test('envelope framing is canonical', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const { envelope, encoded } = await buildReturnProof(w.bridge, (await ret(w)).token);
   throwsReason(() => decodeEnvelope(Uint8Array.of(...encoded, ...new Uint8Array(32))), 'ErrABIFraming', 'trailing word');
   throwsReason(() => decodeEnvelope(Uint8Array.of(...encoded, 0)), 'ErrABIFraming', 'unaligned');
@@ -62,7 +62,7 @@ test('envelope framing is canonical', async () => {
 });
 
 test('policy and anchor-table checks name each mismatch', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const { envelope, verified } = await buildReturnProof(w.bridge, (await ret(w)).token);
   const cfg = w.dep.cfg;
   const sids = verified.outcome.leaves.map((l) => l.sid);
@@ -101,7 +101,7 @@ test('policy and anchor-table checks name each mismatch', async () => {
 });
 
 test('input record opening is bound to the anchor', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const { envelope, verified } = await buildReturnProof(w.bridge, (await ret(w)).token);
   const times = verified.outcome.leaves.map((l) => l.referenceTime);
   const one = { leafAnchor: [0, 0, 0] };
@@ -124,7 +124,7 @@ test('input record opening is bound to the anchor', async () => {
 });
 
 test('an over-bound certificate is a budget refusal, any other shape failure is malformed', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const { envelope } = await buildReturnProof(w.bridge, out.token);
   const a = envelope.anchors[0];
@@ -158,7 +158,7 @@ async function freshProofs(w: World, out: Awaited<ReturnType<typeof ret>>, extra
 }
 
 test('refresh to a later anchor preserves t and J and verifies', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const refreshed = await refreshToken(out.token, await freshProofs(w, out, 5, UC_TS + 5000n));
   assert.deepEqual(refreshed.genesis.justification, out.token.genesis.justification);
@@ -170,7 +170,7 @@ test('refresh to a later anchor preserves t and J and verifies', async () => {
 });
 
 test('refresh changing t or certification data is rejected', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const f1 = await freshProofs(w, out, 1, UC_TS + 10n);
   f1[1] = new InclusionProof(f1[1].certificationData, f1[1].referenceTime + 1n, f1[1].inclusionCertificate, f1[1].unicityCertificate);
@@ -182,7 +182,7 @@ test('refresh changing t or certification data is rejected', async () => {
 });
 
 test('distinct certificates are distinct anchors, up to the profile bound', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   // genesis certified in one round, the transfers in another: two UCs, two anchors, first-use order
   const a = await ret(w);
   const b = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS + 5n);
@@ -211,7 +211,7 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
 });
 
 test('consolidation (evidence 1c): re-proving the same token under one certificate changes the seals, never the transactions, IDs, times or the nullifier', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   // before: the genesis is certified in one round, the transfers in another: two UCs, two seals
   const a = await ret(w);
   const b = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS + 5n);
@@ -240,7 +240,7 @@ test('consolidation (evidence 1c): re-proving the same token under one certifica
 });
 
 async function aggErr(f: (o: { uc: Parameters<typeof makeUc>[1] }) => void): Promise<unknown> {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await buildToken(w, spec(1), [], T0, UC_TS);
   const g = out.token.genesis;
   const uc = { partition: AGG_PARTITION, conf: w.aggConf, epochIr: 1n, rootEpoch: 2n, round: 900n, timestamp: UC_TS, stateHash: g.inclusionProof.unicityCertificate.inputRecord.hash, blockHash: null, signers: 4 } as Parameters<typeof makeUc>[1];
@@ -255,11 +255,13 @@ test('aggregator certificates are checked against the pinned partition and the S
   await rejects(aggErr((o) => void (o.uc.partition = 9)), 'ErrNotAdmitted');
   await rejects(aggErr((o) => void (o.uc.signers = 2)), 'ErrQuorumNotMet');
   await rejects(aggErr((o) => void (o.uc.stateHash = new Uint8Array(32).fill(0x13))), 'ErrPathInvalid');
-  await rejects(aggErr((o) => void (o.uc.rootEpoch = 3n)), 'ErrEpochMismatch');
+  // an epoch the history does not hold yet is retryable; one before its genesis is not
+  await rejects(aggErr((o) => void (o.uc.rootEpoch = 3n)), 'ErrNoEntryForEpoch');
+  await rejects(aggErr((o) => void (o.uc.rootEpoch = 1n)), 'ErrSealEpoch');
 });
 
-test('deployment registry rejects duplicates', () => {
-  const w = makeWorld();
+test('deployment registry rejects duplicates', async () => {
+  const w = await makeWorld();
   assert.throws(() => new DeploymentRegistry([w.dep, w.dep]), /ErrAmbiguousDeployment/);
 });
 
@@ -275,7 +277,7 @@ async function twoShardReturn(w: World) {
 }
 
 test('depth 1: one anchor per distinct UC in first-use order, each leaf under its own shard', async () => {
-  const w = makeWorld(20, 1);
+  const w = await makeWorld(20, 1);
   const out = await twoShardReturn(w);
   assert.equal(out.ucs.length, 2);
   const { envelope, encoded, verified, gate } = await buildReturnProof(w.bridge, out.token);
@@ -308,7 +310,7 @@ const shardIdOf = (w: World, out: Awaited<ReturnType<typeof twoShardReturn>>, j:
 };
 
 test('depth 1: a certificate of the other shard does not cover the leaf', async () => {
-  const w = makeWorld(20, 1);
+  const w = await makeWorld(20, 1);
   const out = await twoShardReturn(w);
   // The leaves of row r are certified by a UC that names the other row's shard and configuration.
   const g = out.token.genesis;
@@ -327,7 +329,7 @@ test('depth 1: a certificate of the other shard does not cover the leaf', async 
 // ---- the burn-time preflight and the bounded retry ----------------------------------------------------
 
 test('burn-time preflight admits a redeemable history and refuses one leaf more than the profile bound', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const fits = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 2 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
   const gate = await preflightBurn(w.bridge, fits.bytes);
   assert.ok(gate.total <= TX_GAS_BUDGET, String(gate.total));
@@ -336,7 +338,7 @@ test('burn-time preflight admits a redeemable history and refuses one leaf more 
 });
 
 test('preflightBurn on a held token: a history within BURN_HISTORY_BYTES of the bound is refused, one byte less passes', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const held = (n: number) => buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS, { mintData: new Uint8Array(n).fill(7) });
   const edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
   // the projection grows one byte per data byte once the byte-string header width is fixed
@@ -351,7 +353,7 @@ test('preflightBurn on a held token: a history within BURN_HISTORY_BYTES of the 
 });
 
 test('preflightBurn prices a held token exactly (pins the best-case constants and the known-history rule)', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
   const gate = await preflightBurn(w.bridge, held.bytes);
   // best case: ONE 445-byte one-signature certificate (39 items, depth 0, no shard sibling), an empty input record (12 items), the known history only
@@ -359,7 +361,7 @@ test('preflightBurn prices a held token exactly (pins the best-case constants an
 });
 
 test('planAnchors itself refuses more than MAX_ANCHORS anchors with ErrTooManyPaths (not shadowed by checkPolicyBody)', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const { envelope, verified } = await buildReturnProof(w.bridge, (await ret(w)).token);
   const pol = checkPolicyBody(w.dep.cfg, envelope);
   const over = structuredClone(envelope);
@@ -368,7 +370,7 @@ test('planAnchors itself refuses more than MAX_ANCHORS anchors with ErrTooManyPa
 });
 
 test('a real burn leaf adds no more history than BURN_HISTORY_BYTES, and the best-case certificate is no larger than any real one', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
   const burned = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
   const added = projectToken(burned.token).length - projectToken(held.token).length;
@@ -384,7 +386,7 @@ test('the retryable unavailability is its own family, not an invalid token', () 
 });
 
 test('a racing (path, UC) pair is retried a bounded number of times, then retryable unavailability', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const good = (): Promise<InclusionProof[]> => freshProofs(w, out, 0, UC_TS);

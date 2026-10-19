@@ -1,24 +1,24 @@
 #![allow(clippy::type_complexity, clippy::ptr_arg, unused_imports, dead_code)]
-//! The fixed-base profile: one pinned SDK trust base, unit weights, SDK count quorum.
-//! Weighted, rotating and historical-authority scenarios are DEFERRED (common SDK work, bft-core#421).
+//! The trust input: a release bundle under its genesis EntryID; each seal verified by the SDK
+//! under its own epoch's committee (weighted quorum, B1 seal rule, round interval).
 
 mod common;
 use common::*;
 use native_bridge_sdk_ext::profile::from_hex;
-use native_bridge_sdk_ext::trust::{check_fixed_profile, verify_embedded_uc, TrustInput};
+use native_bridge_sdk_ext::trust::{verify_embedded_uc, TrustInput};
 use native_bridge_sdk_ext::NativeError as E;
-use unicity_token::api::bft::{TrustBaseEntry, TrustBaseMember};
+use unicity_token::api::bft::{TrustBaseHistory, UnicityCertificate};
 use unicity_token::crypto::signer::Signer;
 
-fn uc_with(root: &Root, signers: usize) -> unicity_token::api::bft::UnicityCertificate {
+fn uc_in(root: &Root, signers: usize, root_epoch: u64, round: u64) -> UnicityCertificate {
     make_uc(
         root,
         &UcSpec {
             partition: 1,
             conf: vec![1; 32],
             epoch_ir: 1,
-            root_epoch: 2,
-            round: 200,
+            root_epoch,
+            round,
             timestamp: 1_700_000_000,
             state_hash: vec![0; 32],
             block_hash: Some(vec![2; 32]),
@@ -27,16 +27,39 @@ fn uc_with(root: &Root, signers: usize) -> unicity_token::api::bft::UnicityCerti
     )
 }
 
+fn uc_with(root: &Root, signers: usize) -> UnicityCertificate {
+    uc_in(root, signers, 2, 200)
+}
+
 fn input(r: &Root) -> TrustInput {
     trust_input(r)
 }
 
 #[test]
-fn embedded_uc_rule_is_the_sdk_count_quorum() {
+fn embedded_uc_rule_is_the_sdk_weighted_quorum() {
     let r = make_root(2, 4, 10);
     verify_embedded_uc(&input(&r), &uc_with(&r, 3)).unwrap();
     assert_eq!(
         verify_embedded_uc(&input(&r), &uc_with(&r, 2)).unwrap_err(),
+        E::QuorumNotMet
+    );
+}
+
+#[test]
+fn weighted_committee_threshold_is_two_thirds_of_the_weights() {
+    // weights 98, 1, 1 in member order: W = 100, threshold 67
+    let r = make_weighted_root(2, 3, 50, Some(&[98, 1, 1]));
+    verify_embedded_uc(&input(&r), &uc_with(&r, 1)).unwrap();
+    let mut light = uc_with(&r, 0);
+    let d = light.unicity_seal.calculate_hash();
+    for (id, s) in &r.signers[1..] {
+        light
+            .unicity_seal
+            .signatures
+            .push((id.clone(), s.sign(&d).encode().to_vec()));
+    }
+    assert_eq!(
+        verify_embedded_uc(&input(&r), &light).unwrap_err(),
         E::QuorumNotMet
     );
 }
@@ -115,161 +138,104 @@ fn unknown_signers_fail_the_seal() {
 }
 
 #[test]
-fn fixed_profile_guards_name_network_epoch_and_start_round() {
+fn each_seal_is_verified_under_its_own_epoch() {
     let r = make_root(2, 4, 10);
-    let ti = input(&r);
-    let mut uc = uc_with(&r, 4);
-    uc.unicity_seal.epoch = 3;
-    resign(&r, &mut uc, 4);
-    assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::EpochMismatch);
-    let mut uc = uc_with(&r, 4);
-    uc.unicity_seal.root_chain_round_number = 0;
-    resign(&r, &mut uc, 4);
+    let r3 = next_epoch(&r, 1000, 4, 30);
+    // r holds epoch 2 only: a newer epoch is retryable, an older one invalid
     assert_eq!(
-        verify_embedded_uc(&ti, &uc).unwrap_err(),
-        E::RoundBeforeEpochStart
-    );
-}
-
-fn base(stakes: &[u64], threshold: u64) -> TrustBaseEntry {
-    let nodes = stakes
-        .iter()
-        .enumerate()
-        .map(|(i, st)| {
-            TrustBaseMember::new(format!("n{i}"), signer(40 + i as u8).public_key(), *st)
-        })
-        .collect();
-    TrustBaseEntry::new(
-        unicity_token::api::NetworkId::new(NETWORK).unwrap(),
-        2,
-        1,
-        nodes,
-        threshold,
-        None,
-        None,
-        [0; 32],
-    )
-}
-
-#[test]
-fn non_unit_or_non_matching_configurations_are_rejected_at_installation() {
-    assert!(check_fixed_profile(&base(&[1, 1, 1, 1], 3)).is_ok());
-    assert!(check_fixed_profile(&base(&[1], 1)).is_ok());
-    assert!(check_fixed_profile(&base(&[1, 1, 1, 1, 1, 1, 1], 5)).is_ok()); // 7 - 6/3 = 5
-                                                                            // A heavy validator is never flattened into a unit one.
-    assert_eq!(
-        check_fixed_profile(&base(&[98, 1, 1], 3)).unwrap_err(),
-        E::UnsupportedTrustBase
+        verify_embedded_uc(&input(&r), &uc_in(&r3, 4, 3, 1500)).unwrap_err(),
+        E::NoEntryForEpoch
     );
     assert_eq!(
-        check_fixed_profile(&base(&[1, 1, 1, 1], 2)).unwrap_err(),
-        E::UnsupportedTrustBase
+        verify_embedded_uc(&input(&r), &uc_in(&r, 4, 1, 200)).unwrap_err(),
+        E::SealEpoch
+    );
+    // r3 holds epochs 2 and 3: epoch 2 ends where epoch 3 starts
+    let t3 = input(&r3);
+    verify_embedded_uc(&t3, &uc_in(&r3, 3, 3, 1500)).unwrap();
+    verify_embedded_uc(&t3, &uc_in(&r, 3, 2, 999)).unwrap();
+    assert_eq!(
+        verify_embedded_uc(&t3, &uc_in(&r, 4, 2, 1000)).unwrap_err(),
+        E::SealEpoch
     );
     assert_eq!(
-        check_fixed_profile(&base(&[1, 1, 1, 1], 4)).unwrap_err(),
-        E::UnsupportedTrustBase
+        verify_embedded_uc(&t3, &uc_in(&r3, 4, 3, 999)).unwrap_err(),
+        E::SealEpoch
     );
+    // epoch 3 is signed by its own committee only
     assert_eq!(
-        check_fixed_profile(&base(&[], 1)).unwrap_err(),
-        E::UnsupportedTrustBase
-    );
-    assert_eq!(
-        TrustInput::from_provisioned(base(&[2, 2], 2), [0; 32]).unwrap_err(),
-        E::UnsupportedTrustBase
+        verify_embedded_uc(&t3, &uc_in(&r, 4, 3, 1500)).unwrap_err(),
+        E::QuorumNotMet
     );
 }
 
 #[test]
-fn installed_document_must_hash_to_the_pin_and_parse() {
+fn installation_requires_the_pinned_genesis_and_an_authenticated_chain() {
     let r = make_root(2, 4, 10);
-    let doc = trust_doc(&r);
-    assert!(TrustInput::from_json(&doc, &sha(&doc)).is_ok());
     assert_eq!(
-        TrustInput::from_json(&doc, &[0; 32]).unwrap_err(),
+        TrustInput::from_bundle(&r.bundle, &[0; 32]).unwrap_err(),
         E::TrustBaseDigest
     );
-    // A semantically equivalent but differently serialised file has a different identity.
-    let mut spaced = doc.clone();
-    spaced.extend(b"\n");
-    assert_ne!(sha(&spaced), sha(&doc));
+    let mut trailing = r.bundle.clone();
+    trailing.push(0);
     assert_eq!(
-        TrustInput::from_json(&spaced, &sha(&doc)).unwrap_err(),
-        E::TrustBaseDigest
+        TrustInput::from_bundle(&trailing, &r.pin).unwrap_err(),
+        E::TrustBase
     );
-    // the document format is version 1
-    let v0 = String::from_utf8(doc.clone())
+    let r3 = next_epoch(&r, 1000, 4, 30);
+    // a successor witnessed by a committee other than its predecessor's
+    let forged = successor_entry(&r, 1000, 4, 31, &r3.signers);
+    let bundle = TrustBaseHistory::from_trusted_chain(vec![r.entries[0].clone(), forged])
         .unwrap()
-        .replace("\"version\":\"1\"", "\"version\":\"0\"")
-        .into_bytes();
+        .to_bundle();
     assert_eq!(
-        TrustInput::from_json(&v0, &sha(&v0)).unwrap_err(),
+        TrustInput::from_bundle(&bundle, &r.pin).unwrap_err(),
         E::TrustBase
     );
-    let garbage = b"{not json".to_vec();
-    assert_eq!(
-        TrustInput::from_json(&garbage, &sha(&garbage)).unwrap_err(),
-        E::TrustBase
-    );
+    assert_eq!(input(&r3).history().latest().epoch, 3);
 }
 
 #[test]
-fn a_weighted_document_cannot_be_installed() {
-    let r = make_root(2, 4, 10);
-    let doc = String::from_utf8(trust_doc(&r)).unwrap().replacen(
-        "\"stake\":\"1\"",
-        "\"stake\":\"98\"",
-        1,
-    );
-    assert_eq!(
-        TrustInput::from_json(doc.as_bytes(), &sha(doc.as_bytes())).unwrap_err(),
-        E::UnsupportedTrustBase
-    );
-}
-
-#[test]
-fn lock_proof_naming_another_base_or_a_foreign_epoch_is_rejected_end_to_end() {
-    // Mismatched trustBaseId: LockProofTrust (lock_proof.rs); foreign epoch: EpochMismatch here.
+fn a_foreign_epoch_inside_a_lock_proof_is_retryable_end_to_end() {
     let w = make_world(20);
     let s = spec(1);
     let mut parts = lock_parts(&w, &s);
     parts.uc.unicity_seal.epoch = 9;
     resign(&w.evm_root, &mut parts.uc, 4);
-    let out = build_token_with(&w, &s, &parts, &Tweaks::default(), &[], 1, 2);
+    let out = build_token_with(
+        &w,
+        &s,
+        &parts,
+        &Tweaks::default(),
+        &[],
+        1_700_000_040,
+        1_700_000_900,
+    );
     assert_eq!(
         w.bridge
             .verify_native_token(&out.token, native_bridge_sdk_ext::token::Expect::Receipt)
             .unwrap_err(),
-        E::EpochMismatch
+        E::NoEntryForEpoch
     );
 }
 
 #[test]
-#[ignore = "DEFERRED: (98,1,1) weighted acceptance — common SDK trust-base work, unsupported in the current bridge profile"]
-fn deferred_weighted_acceptance() {}
-
-#[test]
-#[ignore = "DEFERRED: mixed historical/current committees, trust-base append/fetch, interval closure — common SDK work"]
-fn deferred_historical_and_current_committees() {}
-
-#[test]
-#[ignore = "DEFERRED: old-J validity through rotation and full B1/SDK seal-acceptance parity — common SDK work"]
-fn deferred_rotation_and_seal_parity() {}
-
-#[test]
-fn the_published_sdk_trust_base_fixture_installs_with_its_digest_as_the_id() {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../protocol/vectors/config/sdk-root-trust-base.json");
-    let bytes = std::fs::read(p).unwrap();
-    assert_eq!(bytes.len(), 524);
-    let pin: [u8; 32] =
-        from_hex("e5454ae4fe566b05dab8c1b15c88a05356b8816b1cd66a2b7adcce184af27fb5")
+fn the_shared_dev_trust_base_fixture_installs_under_its_pin() {
+    // the same bytes as both SDKs' dev fixture: epochs 1..4, weighted from epoch 2
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/interop/utb-dev");
+    let bundle = std::fs::read(dir.join("bft-trustbase.dev.bundle.cbor")).unwrap();
+    let pin: [u8; 32] = from_hex(
+        std::fs::read_to_string(dir.join("bft-trustbase.dev.genesis.entryid"))
             .unwrap()
-            .try_into()
-            .unwrap();
-    let t = TrustInput::from_json(&bytes, &pin).unwrap();
+            .trim(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let t = TrustInput::from_bundle(&bundle, &pin).unwrap();
     assert_eq!(t.id(), pin);
-    assert_eq!(t.base().network_id.id(), 3);
-    assert_eq!(t.base().epoch, 1);
-    assert_eq!(t.base().epoch_start, 0);
-    assert_eq!(t.base().members.len(), 1);
+    assert_eq!(t.network_id().id(), 3);
+    assert_eq!(t.history().genesis().epoch, 1);
+    assert_eq!(t.history().latest().epoch, 4);
+    assert_eq!(t.history().get(2).unwrap().quorum_threshold, 7);
 }

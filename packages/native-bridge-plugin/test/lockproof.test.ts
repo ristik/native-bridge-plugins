@@ -10,13 +10,15 @@ import { C } from './cbor.js';
 import { rejects } from './util.js';
 import {
   CHAIN_ID, EVM_PARTITION, VAULT, ZERO20, buildToken, encodeParts, headerRlp, lockParts, makeUc, makeWorld, pdrBytes, sha, signer, spec, type LockParts,
-  type MintSpec, type World,
+  nextEpoch, type MintSpec, type World,
 } from './world.js';
+import { NativeBridge } from '../src/verifier.js';
 
 const T0 = 1_700_000_040n;
 const UC_TS = 1_700_000_900n;
 
-async function mutated(f: (w: World, p: LockParts, s: MintSpec) => Promise<void> | void, specMut?: (s: MintSpec) => void, w = makeWorld()): Promise<unknown> {
+async function mutated(f: (w: World, p: LockParts, s: MintSpec) => Promise<void> | void, specMut?: (s: MintSpec) => void, world?: World): Promise<unknown> {
+  const w = world ?? (await makeWorld());
   const s = spec(1);
   specMut?.(s);
   const parts = await lockParts(w, s);
@@ -54,11 +56,28 @@ test('quorum: one short is rejected, three of four is enough, a stranger fails t
   );
 });
 
-test('certificate guards: false root, wrong network, wrong epoch, round before start', async () => {
+test('certificate checks: false root, wrong network, an epoch not held yet, an epoch before the genesis', async () => {
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { sealHash: new Uint8Array(32).fill(1) }))), 'ErrSealRoot');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { network: 4 }))), 'ErrSealNetwork');
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 9n }))), 'ErrEpochMismatch');
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { round: 0n }))), 'ErrRoundBeforeEpochStart');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 9n }))), 'ErrNoEntryForEpoch');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 1n }))), 'ErrSealEpoch');
+});
+
+test('an epoch change: retryable until the history holds the new epoch, then verified under its own committee and interval', async () => {
+  const w = await makeWorld();
+  // the root committee changes at round 1000 (epoch 3, a new committee witnessed by epoch 2's)
+  const next = await nextEpoch(w.evm, 1000n, 4, 30);
+  const sealedIn3 = { ...w, evm: next };
+  // the bridge still holds only epoch 2: the lock certificate of epoch 3 is retryable, never invalid
+  await rejects(mutated(async (_, p) => void (p.uc = await resignUc(sealedIn3, p, { rootEpoch: 3n, round: 1500n })), undefined, w), 'ErrNoEntryForEpoch');
+  // the wallet appended epoch 3: the same kind of certificate verifies
+  const held: World = { ...sealedIn3, bridge: new NativeBridge(w.bridge.registry, next.trust) };
+  await mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 1500n })), undefined, held);
+  // ... under epoch 3's committee only, within its interval
+  await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 500n })), undefined, held), 'ErrSealEpoch');
+  await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 3n, round: 1500n })), undefined, held), 'ErrQuorumNotMet');
+  // epoch 2 has ended at round 1000: an epoch-2 seal at round 1500 is outside its interval
+  await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 2n, round: 1500n })), undefined, held), 'ErrSealEpoch');
 });
 
 test('EVM partition, shard and configuration pins', async () => {
@@ -122,7 +141,7 @@ test('account and storage proofs: mutated, extra, missing, empty nodes', async (
 });
 
 test('a digest with leading zero bytes round trips through the stored word', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const { digestOf } = await import('./world.js');
   for (let n = 1n; n < 3000n; n++) {
     const s = spec(1);
@@ -144,7 +163,7 @@ test('certificates outside the SDK-decodable subset are unsupported', async () =
 // ---- bounds ------------------------------------------------------------------------------------
 
 async function parse(f: (p: LockParts) => void): Promise<void> {
-  const w = makeWorld();
+  const w = await makeWorld();
   const p = await lockParts(w, spec(1));
   f(p);
   parseJustification(encodeJustification(CHAIN_ID, VAULT, ZERO20, 1n, encodeParts(p)));
@@ -182,7 +201,7 @@ test('certificate, header and PDR boundaries', async () => {
 });
 
 test('over-bound evidence never triggers online fallback; justification is bounded first', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const s = spec(1);
   const p = await lockParts(w, s);
   p.accountNodes = Array(66).fill(Uint8Array.of(0xc0));
@@ -191,7 +210,7 @@ test('over-bound evidence never triggers online fallback; justification is bound
 });
 
 test('proof arity and version are exact', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const p = await lockParts(w, spec(1));
   const good = encodeParts(p);
   const k = C.encodeArray(...[1, 2, 3, 4, 5, 6, 7].map((n) => C.encodeUnsignedInteger(n)));

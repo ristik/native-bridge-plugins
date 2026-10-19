@@ -34,7 +34,7 @@ const rec = (w: World): Record<string, any> => ({
 });
 
 const entry = (w: World): Record<string, any> => ({
-  schemaVersion: 1, protocolVersion: 4, family: 'unicity-native', sdkVersion: '3.0.1',
+  schemaVersion: 1, protocolVersion: 4, family: 'unicity-native', sdkVersion: '4.0.0',
   tokenTypeHex: toHex(deriveType(NETWORK, ROOT_GENESIS, EXEC_GENESIS, CHAIN_ID)),
   coinIdHex: toHex(deriveAsset(NETWORK, ROOT_GENESIS, EXEC_GENESIS, CHAIN_ID)),
   symbol: 'UCT', decimals: 18,
@@ -42,32 +42,38 @@ const entry = (w: World): Record<string, any> => ({
   networkId: NETWORK, rootGenesisHash: toHex(ROOT_GENESIS), executionGenesisHash: toHex(EXEC_GENESIS),
   evmChainId: CHAIN_ID.toString(), chainRef: `eip155:${CHAIN_ID}`, asset: '0'.repeat(40),
   activeDeployment: rec(w), replacedDeployments: [],
-  trustBase: { networkId: NETWORK, rootGenesisHash: toHex(ROOT_GENESIS), format: 'sdk-root-trust-base-json-v1', document: { sha256: toHex(w.bridge.trust.id), location: 'file:///etc/native/trust-base.json' } },
+  trustBase: {
+    networkId: NETWORK, rootGenesisHash: toHex(ROOT_GENESIS), format: 'utb-release-bundle-v1', genesisEntryId: toHex(w.bridge.trust.id),
+    bundle: { sha256: toHex(sha(w.agg.bundle)), location: 'file:///etc/native/trust-base.bundle.cbor' },
+  },
   proofEndpoints: ['https://aggregator.invalid'], rpcUrls: [],
 });
 
 const registry = (e: Record<string, any>): string => JSON.stringify({ [e.tokenTypeHex]: e });
 
-const load = (f: (d: Record<string, any>) => void): number => {
-  const e = entry(makeWorld());
+const load = (w: World, f: (d: Record<string, any>) => void): number => {
+  const e = entry(w);
   f(e);
   return loadManifests(registry(e), artifacts).registry.deployments.length;
 };
 
-test('a schema-shaped manifest loads the recomputed deployment and installs under the pinned document', () => {
-  const w = makeWorld();
+test('a schema-shaped manifest loads the recomputed deployment and installs under the pinned trust base genesis', async () => {
+  const w = await makeWorld();
   const loaded = loadManifests(registry(entry(w)), artifacts);
   assert.equal(loaded.registry.deployments.length, 1);
   assert.deepEqual(loaded.registry.deployments[0].cfg, w.dep.cfg);
   loaded.install(w.bridge.trust);
 });
 
-test('every identity and profile field is recomputed or rejected', () => {
+test('every identity and profile field is recomputed or rejected', async () => {
   const cases: [string, (d: Record<string, any>) => void][] = [
     ['schema', (d) => void (d.schemaVersion = 2)],
     ['protocol', (d) => void (d.protocolVersion = 1)],
     ['family', (d) => void (d.family = 'eip155')],
-    ['sdk', (d) => void (d.sdkVersion = '3.0.0')],
+    ['sdk', (d) => void (d.sdkVersion = '3.0.1')],
+    ['genesis entry id', (d) => void (d.trustBase.genesisEntryId = 'zz'.repeat(32))],
+    ['bundle digest missing', (d) => void delete d.trustBase.bundle.sha256],
+    ['legacy trust document', (d) => void (d.trustBase = { networkId: NETWORK, rootGenesisHash: d.rootGenesisHash, format: 'sdk-root-trust-base-json-v1', document: d.trustBase.bundle })],
     ['type', (d) => void (d.tokenTypeHex = toHex(new Uint8Array(32).fill(1)))],
     ['coin', (d) => void (d.coinIdHex = toHex(new Uint8Array(32).fill(1)))],
     ['chain ref', (d) => void (d.chainRef = 'eip155:1')],
@@ -92,28 +98,30 @@ test('every identity and profile field is recomputed or rejected', () => {
     ['npm version', (d) => void (d.plugin.npm.version = '9.9.9')],
     ['replaced missing', (d) => void delete d.replacedDeployments],
   ];
-  for (const [name, f] of cases) assert.throws(() => load(f), /./s, name);
+  const lw = await makeWorld();
+  for (const [name, f] of cases) assert.throws(() => load(lw, f), /./s, name);
 });
 
-test('installed artifacts must match their pins and the genesis PDR must yield the pinned configuration', () => {
-  const e = entry(makeWorld());
+test('installed artifacts must match their pins and the genesis PDR must yield the pinned configuration', async () => {
+  const e = entry(await makeWorld());
   const wrong = (h: string): Uint8Array | undefined => (h === toHex(sha(pdr)) ? text('not the pdr') : artifacts(h));
   throwsReason(() => loadManifests(registry(e), wrong), 'ErrManifest');
   const otherPdr = pdrBytes(5n, 1n);
-  const e2 = entry(makeWorld());
+  const e2 = entry(await makeWorld());
   e2.activeDeployment.evmBackingPolicy.pdr.sha256 = toHex(sha(otherPdr));
   const other = (h: string): Uint8Array | undefined => (h === toHex(sha(otherPdr)) ? otherPdr : artifacts(h));
   throwsReason(() => loadManifests(registry(e2), other), 'ErrManifest');
   // The execution profile is required and must be exactly the header shape.
-  throwsReason(() => loadManifests(registry(entry(makeWorld())), () => undefined), 'ErrManifest');
+  const bare = entry(await makeWorld());
+  throwsReason(() => loadManifests(registry(bare), () => undefined), 'ErrManifest');
 });
 
-test('symbol is not identity', () => {
-  assert.equal(load((d) => void (d.symbol = 'SOMETHING-ELSE')), 1);
+test('symbol is not identity', async () => {
+  assert.equal(load(await makeWorld(), (d) => void (d.symbol = 'SOMETHING-ELSE')), 1);
 });
 
-test('the registry key must be the tokenTypeHex and a replaced vault may not equal the active one', () => {
-  const w = makeWorld();
+test('the registry key must be the tokenTypeHex and a replaced vault may not equal the active one', async () => {
+  const w = await makeWorld();
   const e = entry(w);
   assert.throws(() => loadManifests(JSON.stringify({ [toHex(new Uint8Array(32))]: e }), artifacts), /./);
   const dup = entry(w);
@@ -122,19 +130,23 @@ test('the registry key must be the tokenTypeHex and a replaced vault may not equ
   assert.throws(() => loadManifests('{}', artifacts));
 });
 
-test('the pinned document digest must be the installed trust input', () => {
-  const w = makeWorld();
+test('the pinned genesis must be the installed trust input\'s, and the bundle file is not the pin', async () => {
+  const w = await makeWorld();
   const e = entry(w);
-  e.trustBase.document.sha256 = toHex(new Uint8Array(32).fill(9));
+  e.trustBase.genesisEntryId = toHex(new Uint8Array(32).fill(9));
   const loaded = loadManifests(registry(e), artifacts);
   throwsReason(() => loaded.install(w.bridge.trust), 'ErrTrustBaseDigest');
   assert.deepEqual(manifestTrustBaseId(entry(w)), w.bridge.trust.id);
   assert.equal(validateManifest(entry(w), artifacts).deployments.length, 1);
+  // a newer release bundle of the same history (another file digest) installs under the same genesis pin
+  const newer = entry(w);
+  newer.trustBase.bundle.sha256 = toHex(new Uint8Array(32).fill(7));
+  loadManifests(registry(newer), artifacts).install(w.bridge.trust);
 });
 
-test('endpoints and locations are installation metadata, never verification inputs', () => {
-  const e = entry(makeWorld());
+test('endpoints and locations are installation metadata, never verification inputs', async () => {
+  const e = entry(await makeWorld());
   e.proofEndpoints = ['https://unreachable.invalid'];
-  e.trustBase.document.location = 'https://unreachable.invalid/B.json';
+  e.trustBase.bundle.location = 'https://unreachable.invalid/trust-base.bundle.cbor';
   assert.equal(loadManifests(registry(e), artifacts).registry.deployments.length, 1);
 });

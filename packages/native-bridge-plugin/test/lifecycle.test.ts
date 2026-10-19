@@ -25,7 +25,7 @@ const cp = (over: Partial<ClaimPolicy> = {}): ClaimPolicy => ({ receiptTimeoutMs
 const chain: ChainReader = { origin: () => Promise.resolve(952n) };
 
 async function setup() {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const v = await plugin.bridge.verifyNativeToken(out.token, 'return');

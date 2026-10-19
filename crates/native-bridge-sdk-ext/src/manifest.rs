@@ -3,9 +3,10 @@
 //!
 //! Structural validity is not authorisation: installation recomputes identifiers, `chainRef`,
 //! Cfg/cfg, policy hashes and every pin, and cross-checks the artifacts the application installed.
-//! JSON is never a hash preimage. `trustBase.document.sha256` is the exact-file digest of the one
-//! pinned SDK `RootTrustBase` document `B` and must equal the installed [`TrustInput`] and every
-//! lock proof's `trustBaseId`. `proofEndpoints`/`rpcUrls`/artifact locations are installation
+//! JSON is never a hash preimage. `trustBase.genesisEntryId` is the EntryID of the network's
+//! Unicity Trust Base genesis entry and must equal the installed [`TrustInput`]'s and every lock
+//! proof's `trustBaseId`; `trustBase.bundle` names, by exact-file digest, the release bundle an
+//! installation may start from. `proofEndpoints`/`rpcUrls`/artifact locations are installation
 //! metadata for construction and refresh only; verification never reads them.
 //!
 //! Artifacts pinned by hash (`pdr`, `executionProfile`) are supplied by the installer through an
@@ -97,7 +98,8 @@ pub struct TrustBasePin {
     pub network_id: u64,
     pub root_genesis_hash: String,
     pub format: String,
-    pub document: Artifact,
+    pub genesis_entry_id: String,
+    pub bundle: Artifact,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,20 +279,20 @@ fn deployment(
 
 const MAX_POLICY_BODY: usize = crate::limits::MAX_POLICY_BYTES;
 
-/// `(networkId, rootGenesisHash, document sha256)` of an entry's trust pin.
+/// `(networkId, rootGenesisHash, genesisEntryId)` of an entry's trust pin.
 pub type TrustPin = (u16, [u8; 32], [u8; 32]);
 
-/// A validated registry and the single trust-document pins it names.
+/// A validated registry and the trust-base genesis pins it names.
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub registry: DeploymentRegistry,
-    /// `(networkId, rootGenesisHash, document sha256)` per entry.
+    /// `(networkId, rootGenesisHash, genesisEntryId)` per entry.
     pub trust_pins: Vec<TrustPin>,
 }
 
 impl Loaded {
-    /// Install: every entry's pinned document must be exactly the installed trust input and name its
-    /// network; the bridge then verifies under that one base.
+    /// Install: every entry's pinned genesis must be exactly the installed trust input's, on its
+    /// network; the bridge then verifies under that history.
     pub fn install(&self, trust: TrustInput) -> Result<NativeBridge> {
         for (network, _root, doc) in &self.trust_pins {
             if *doc != trust.id() || *network != trust.network_id().id() {
@@ -340,13 +342,14 @@ pub fn validate(
     hex_n::<20>(&m.plugin.protocol_commit)?;
     hex_n::<32>(&m.plugin.vector_manifest_sha256)?;
     let t = &m.trust_base;
-    if t.format != "sdk-root-trust-base-json-v1"
+    if t.format != "utb-release-bundle-v1"
         || t.network_id != m.network_id
         || hex_n::<32>(&t.root_genesis_hash)? != root
     {
         return Err(E::Manifest);
     }
-    let doc = hex_n::<32>(&t.document.sha256)?;
+    hex_n::<32>(&t.bundle.sha256)?;
+    let doc = hex_n::<32>(&t.genesis_entry_id)?;
     let c = Ctx {
         network,
         root,

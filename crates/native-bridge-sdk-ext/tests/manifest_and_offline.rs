@@ -59,7 +59,7 @@ fn rec(w: &World) -> Value {
 fn entry(w: &World) -> Value {
     let (n, rg, eg, c) = identity();
     json!({
-      "schemaVersion": 1, "protocolVersion": 4, "family": "unicity-native", "sdkVersion": "3.0.1",
+      "schemaVersion": 1, "protocolVersion": 4, "family": "unicity-native", "sdkVersion": "4.0.0",
       "tokenTypeHex": hex_lower(&derive_type(n, &rg, &eg, c)),
       "coinIdHex": hex_lower(&derive_asset(n, &rg, &eg, c)),
       "symbol": "UCT", "decimals": 18,
@@ -72,8 +72,9 @@ fn entry(w: &World) -> Value {
       "evmChainId": c.to_string(), "chainRef": format!("eip155:{c}"), "asset": "0".repeat(40),
       "activeDeployment": rec(w), "replacedDeployments": [],
       "trustBase": {
-        "networkId": n, "rootGenesisHash": hex_lower(&rg), "format": "sdk-root-trust-base-json-v1",
-        "document": { "sha256": hex_lower(&w.bridge.trust.id()), "location": "file:///etc/native/trust-base.json" },
+        "networkId": n, "rootGenesisHash": hex_lower(&rg), "format": "utb-release-bundle-v1",
+        "genesisEntryId": hex_lower(&w.bridge.trust.id()),
+        "bundle": { "sha256": hex_lower(&sha(&w.agg.bundle)), "location": "file:///etc/native/trust-base.bundle.cbor" },
       },
       "proofEndpoints": ["https://aggregator.invalid"], "rpcUrls": [],
     })
@@ -106,7 +107,11 @@ fn every_identity_and_profile_field_is_recomputed_or_rejected() {
         ("schema", Box::new(|d| d["schemaVersion"] = 2.into())),
         ("protocol", Box::new(|d| d["protocolVersion"] = 1.into())),
         ("family", Box::new(|d| d["family"] = "eip155".into())),
-        ("sdk", Box::new(|d| d["sdkVersion"] = "3.0.0".into())),
+        ("sdk", Box::new(|d| d["sdkVersion"] = "3.0.1".into())),
+        (
+            "genesis entry id",
+            Box::new(|d| d["trustBase"]["genesisEntryId"] = "zz".repeat(32).into()),
+        ),
         (
             "type",
             Box::new({
@@ -295,7 +300,7 @@ fn the_registry_key_must_be_the_token_type_and_vaults_must_be_distinct() {
 fn the_pinned_document_digest_must_be_the_installed_trust_input() {
     let w = make_world(20);
     let mut e = entry(&w);
-    e["trustBase"]["document"]["sha256"] = hex_lower(&[9u8; 32]).into();
+    e["trustBase"]["genesisEntryId"] = hex_lower(&[9u8; 32]).into();
     let loaded = manifest::load(&registry(&e), Some(&artifacts)).unwrap();
     assert_eq!(
         loaded.install(w.bridge.trust.clone()).unwrap_err(),
@@ -308,7 +313,8 @@ fn endpoints_and_locations_are_installation_metadata_never_verification_inputs()
     assert_eq!(
         load_with(|d| {
             d["proofEndpoints"] = json!(["https://unreachable.invalid"]);
-            d["trustBase"]["document"]["location"] = "https://unreachable.invalid/B.json".into();
+            d["trustBase"]["bundle"]["location"] =
+                "https://unreachable.invalid/trust-base.bundle.cbor".into();
         })
         .unwrap(),
         1
