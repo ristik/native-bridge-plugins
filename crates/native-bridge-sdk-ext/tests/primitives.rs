@@ -284,8 +284,6 @@ fn header_fields_are_each_pinned() {
 
 #[test]
 fn sdk_registry_adapters_accept_and_reject_through_the_public_hooks() {
-    use unicity_token::api::bft::{RootTrustBase, RootTrustBaseNodeInfo};
-    use unicity_token::api::NetworkId;
     use unicity_token::verify::{
         verify_token_with_policy, MintJustificationRegistry, VerificationPolicy,
     };
@@ -293,8 +291,8 @@ fn sdk_registry_adapters_accept_and_reject_through_the_public_hooks() {
     let bridge = Rc::new(w.bridge.clone());
     let mut reg = MintJustificationRegistry::new();
     native_bridge_sdk_ext::verifier::install(bridge.clone(), &mut reg).unwrap();
-    // The SDK's own count-based quorum is satisfied by this unit-stake committee.
-    let tb = w.bridge.trust.base().clone();
+    // The SDK's own weighted quorum is satisfied by this unit-weight committee.
+    let tb = w.bridge.trust.history().clone();
     let pol = VerificationPolicy {
         require_token_data_verifier: true,
         ..Default::default()

@@ -90,9 +90,9 @@ pub fn build_return_proof(
                     .unicity_certificate
                     .input_record
                     .hash
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| E::PathInvalid)?;
+                    .as_deref()
+                    .and_then(|h| h.try_into().ok())
+                    .ok_or(E::PathInvalid)?;
                 anchors.push(Anchor {
                     partition: p
                         .unicity_certificate

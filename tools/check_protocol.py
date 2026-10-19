@@ -12,8 +12,13 @@ import tomllib
 from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
+# the SDK 3.0.1 commits protocol/interop.md names as the protocol-4 wire reference
 JS_COMMIT = 'f5f0737306901215860aa920a6ab570b699efba8'
 RUST_COMMIT = '635011b3d7066db6f3296e9cb8d2f24d4bd1fec7'
+# the installed SDKs: the ristik forks (integration/enshrined-evm line), same token and predicate wire
+SDK_JS_FORK_COMMIT = 'cc38d7cc51dc9dea470d1b7301f1e84f53737b4b'
+SDK_JS_FORK_VERSION = '4.0.0-utb.cc38d7c'
+SDK_RUST_FORK_COMMIT = '447b6b1d0f376a76cedfb9e766d2f3d440c6ba25'
 
 
 def load(path):
@@ -126,14 +131,26 @@ def main():
     package = load('packages/native-bridge-plugin/package.json')
     assert package['private'] and package['license'] == 'MIT OR Apache-2.0'
     deps = package['dependencies']
-    assert deps['@unicitylabs/state-transition-sdk'] == '3.0.1'
+    sp = load('vendor/state-transition-sdk.provenance.json')
+    assert sp['repository'] == 'https://github.com/ristik/state-transition-sdk-js.git'
+    assert sp['commit'] == SDK_JS_FORK_COMMIT and sp['version'] == SDK_JS_FORK_VERSION
+    assert deps['@unicitylabs/state-transition-sdk'] == f"file:../../vendor/{sp['tarball']}"
     assert deps['@unicitylabs/bridge-core'] == 'file:../../vendor/unicitylabs-bridge-core-0.1.0-bridge.2.tgz'
+    # one SDK copy for the plug-in and bridge-core: the root declares it and overrides every nested request with it
+    root = load('package.json')
+    assert root['dependencies']['@unicitylabs/state-transition-sdk'] == f"file:vendor/{sp['tarball']}"
+    assert root['overrides'] == {'@unicitylabs/state-transition-sdk': '$@unicitylabs/state-transition-sdk'}
+    sb = (ROOT / 'vendor' / sp['tarball']).read_bytes()
+    assert hashlib.sha256(sb).hexdigest() == sp['sha256'], 'SDK SHA-256 mismatch'
+    assert 'sha512-' + base64.b64encode(hashlib.sha512(sb).digest()).decode() == sp['integrity'], 'SDK integrity mismatch'
+    with tarfile.open(ROOT / 'vendor' / sp['tarball']) as archive:
+        packed = json.load(archive.extractfile('package/package.json'))
+    assert packed['name'] == '@unicitylabs/state-transition-sdk' and packed['version'] == SDK_JS_FORK_VERSION
     lock = load('package-lock.json')
-    for name, record in lock['packages'].items():
-        if name.endswith('node_modules/@unicitylabs/state-transition-sdk'):
-            assert record['version'] == '3.0.1', 'unexpected nested SDK version'
+    copies = [name for name in lock['packages'] if name.endswith('node_modules/@unicitylabs/state-transition-sdk')]
+    assert copies == ['node_modules/@unicitylabs/state-transition-sdk'], 'more than one SDK copy'
     sdk = lock['packages']['node_modules/@unicitylabs/state-transition-sdk']
-    assert sdk['version'] == '3.0.1' and sdk['integrity'].startswith('sha512-')
+    assert sdk['version'] == SDK_JS_FORK_VERSION and sdk['integrity'] == sp['integrity']
     p = load('vendor/bridge-core.provenance.json')
     assert p['commit'] == 'deb2b86c0a1fa0398928cb88caac9feccda6f4e9'
     assert p['version'] == '0.1.0-bridge.2'
@@ -149,7 +166,7 @@ def main():
     cargo = tomllib.loads((ROOT / 'crates/native-bridge-sdk-ext/Cargo.toml').read_text())
     assert cargo['package']['publish'] == {'workspace': True}
     rust = cargo['dependencies']['unicity-token']
-    assert rust == {'git': 'https://github.com/unicitynetwork/state-transition-sdk-rust.git', 'tag': 'v3.0.1', 'default-features': False, 'features': ['alloc']}
+    assert rust == {'git': 'https://github.com/ristik/state-transition-sdk-rust.git', 'rev': SDK_RUST_FORK_COMMIT, 'default-features': False, 'features': ['alloc']}
     for path in ROOT.rglob('Cargo.toml'):
         if 'target' in path.parts:
             continue
@@ -157,8 +174,8 @@ def main():
         assert '[patch' not in text and 'path =' not in text, 'patch/path dependency forbidden'
     clock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
     sdk_rust = [p for p in clock['package'] if p['name'] == 'unicity-token']
-    assert len(sdk_rust) == 1 and sdk_rust[0]['version'] == '3.0.1'
-    assert sdk_rust[0]['source'].endswith('#' + RUST_COMMIT)
+    assert len(sdk_rust) == 1 and sdk_rust[0]['version'] == '4.0.0'
+    assert sdk_rust[0]['source'].endswith('#' + SDK_RUST_FORK_COMMIT)
     for path in sorted((ROOT / 'deployments').glob('*.json')):
         validate_manifest(json.loads(path.read_text()))
     print('protocol/schema/dependency/ABI checks passed (no full installation authorization)')

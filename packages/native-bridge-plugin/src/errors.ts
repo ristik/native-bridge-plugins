@@ -27,7 +27,7 @@ const FAMILY = {
   ErrAmbiguousDeployment: I, ErrNetworkMismatch: I,
   ErrTrustBase: I, ErrSdkVerification: I, ErrEpochMismatch: I, ErrRoundBeforeEpochStart: I,
   ErrUnsupportedTrustBase: I, ErrTrustBaseDigest: I, ErrUnsupportedCertificateEncoding: I,
-  ErrSealNetwork: I, ErrSealRoot: I, ErrQuorumNotMet: I, ErrNotAdmitted: I, ErrShardMismatch: I,
+  ErrSealNetwork: I, ErrSealRoot: I, ErrQuorumNotMet: I, ErrCertStructure: I, ErrNotAdmitted: I, ErrShardMismatch: I,
   ErrPathInvalid: I,
   ErrMissingBacking: I, ErrLockProofCfg: I, ErrLockProofTrust: I, ErrEvmPartition: I, ErrEvmShard: I,
   ErrEvmConfigHash: I, ErrEvmConfigPin: I, ErrHeaderHash: I, ErrHeaderRoot: I, ErrHeaderProfile: I,

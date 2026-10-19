@@ -79,9 +79,10 @@ fn a_quorum_short_by_one_signature_is_rejected() {
 }
 
 #[test]
-fn a_signer_unknown_to_the_trust_base_carries_no_weight_as_in_the_sdk() {
-    // The SDK rule counts only known, distinct, valid validators; an extra stranger is ignored.
-    mutated(|_, p, _| {
+fn a_signer_unknown_to_the_trust_base_fails_the_seal_as_in_the_sdk() {
+    // The native (B1) rule the SDK applies: every signature must be a valid one of a committee
+    // member; an extra stranger fails the seal even beside a full quorum.
+    let e = mutated(|_, p, _| {
         let intruder = signer(200);
         let digest = p.uc.unicity_seal.calculate_hash();
         p.uc.unicity_seal.signatures.push((
@@ -89,7 +90,8 @@ fn a_signer_unknown_to_the_trust_base_carries_no_weight_as_in_the_sdk() {
             intruder.sign(&digest).encode().to_vec(),
         ));
     })
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(e, E::QuorumNotMet);
 }
 
 #[test]
@@ -97,9 +99,9 @@ fn a_signer_unknown_to_the_trust_base_carries_no_weight_as_in_the_sdk() {
 fn weighted_quorum_and_epoch_rotation_are_future_sdk_work() {}
 
 #[test]
-fn invalid_signatures_of_known_members_carry_no_weight() {
-    // Three genuine signatures plus one corrupt known member: still a quorum of three.
-    mutated(|w, p, _| {
+fn invalid_signatures_of_known_members_fail_the_seal() {
+    // Three genuine signatures plus one corrupt known member: the corrupt one fails the seal (B1).
+    let e = mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 3);
         let (id, sg) = &w.evm_root.signers[3];
         let mut bad = sg
@@ -109,7 +111,8 @@ fn invalid_signatures_of_known_members_carry_no_weight() {
         bad[10] ^= 1;
         p.uc.unicity_seal.signatures.push((id.clone(), bad));
     })
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(e, E::QuorumNotMet);
     // Two genuine plus two corrupt: no quorum.
     let e = mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 2);
@@ -230,7 +233,7 @@ fn header_not_hashing_to_the_block_hash_is_rejected() {
 fn signature_over_an_unrelated_state_root_is_insufficient() {
     // A genuine header, but the certified input-record state hash is another root.
     let e = mutated(|w, p, _| {
-        p.uc.input_record.hash = vec![0x5a; 32];
+        p.uc.input_record.hash = Some(vec![0x5a; 32]);
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
@@ -239,8 +242,17 @@ fn signature_over_an_unrelated_state_root_is_insufficient() {
 
 #[test]
 fn missing_block_hash_is_rejected() {
+    // a changed state with no block hash is not a native input record: refused by the certificate
+    // check, before any header binding
     let e = mutated(|w, p, _| {
         p.uc.input_record.block_hash = None;
+        resign(&w.evm_root, &mut p.uc, 4);
+    })
+    .unwrap_err();
+    assert_eq!(e, E::CertStructure);
+    // a block hash that is not the header's
+    let e = mutated(|w, p, _| {
+        p.uc.input_record.block_hash = Some(vec![0x5b; 32]);
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();

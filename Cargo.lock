@@ -442,8 +442,8 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicity-token"
-version = "3.0.1"
-source = "git+https://github.com/unicitynetwork/state-transition-sdk-rust.git?tag=v3.0.1#635011b3d7066db6f3296e9cb8d2f24d4bd1fec7"
+version = "4.0.0"
+source = "git+https://github.com/ristik/state-transition-sdk-rust.git?rev=447b6b1d0f376a76cedfb9e766d2f3d440c6ba25#447b6b1d0f376a76cedfb9e766d2f3d440c6ba25"
 dependencies = [
  "getrandom",
  "hex",
