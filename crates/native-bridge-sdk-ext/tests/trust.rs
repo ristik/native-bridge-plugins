@@ -167,6 +167,38 @@ fn each_seal_is_verified_under_its_own_epoch() {
         verify_embedded_uc(&t3, &uc_in(&r, 4, 3, 1500)).unwrap_err(),
         E::QuorumNotMet
     );
+    // Isolated weight check: (2,1,1) with threshold 3 satisfies both floor(2W/3)+1 = 3 and the
+    // count rule N-(N-1)/3 = 3, so only the unit-weight rule refuses it.
+    assert!(base(&[2, 1, 1], 3).validate().is_ok());
+    assert_eq!(
+        check_fixed_profile(&base(&[2, 1, 1], 3)).unwrap_err(),
+        E::UnsupportedTrustBase
+    );
+}
+
+#[test]
+fn document_member_order_does_not_change_the_genesis() {
+    // two members in reverse node-id order: the entry sorts them, as the JS SDK's create() does
+    let r = make_root(2, 2, 10);
+    let doc = String::from_utf8(trust_doc(&r)).unwrap();
+    let (a, b) = (&r.tb.members[0], &r.tb.members[1]);
+    assert!(a.node_id < b.node_id);
+    let node = |m: &unicity_token::api::bft::TrustBaseMember| {
+        format!(
+            "{{\"nodeId\":\"{}\",\"sigKey\":\"{}\",\"stake\":\"1\"}}",
+            m.node_id,
+            native_bridge_sdk_ext::profile::hex_lower(m.signing_key.as_bytes())
+        )
+    };
+    let reversed = doc.replace(
+        &format!("[{},{}]", node(a), node(b)),
+        &format!("[{},{}]", node(b), node(a)),
+    );
+    assert_ne!(reversed, doc);
+    let sorted = TrustInput::from_json(doc.as_bytes(), &sha(doc.as_bytes())).unwrap();
+    let rev = TrustInput::from_json(reversed.as_bytes(), &sha(reversed.as_bytes())).unwrap();
+    assert_eq!(rev.history().genesis_id(), sorted.history().genesis_id());
+    assert_eq!(rev.base().members, sorted.base().members);
 }
 
 #[test]

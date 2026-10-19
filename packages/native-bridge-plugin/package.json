@@ -27,7 +27,7 @@
     "@noble/curves": "2.2.0",
     "@noble/hashes": "2.2.0",
     "@unicitylabs/bridge-core": "file:../../vendor/unicitylabs-bridge-core-0.1.0-bridge.2.tgz",
-    "@unicitylabs/state-transition-sdk": "file:../../vendor/unicitylabs-state-transition-sdk-4.0.0-utb.cc38d7c.tgz"
+    "@unicitylabs/state-transition-sdk": "file:../../vendor/unicitylabs-state-transition-sdk-4.0.0-utb.cc9a95b.tgz"
   },
   "devDependencies": {
     "@types/node": "22.13.14",

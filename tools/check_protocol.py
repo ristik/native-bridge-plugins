@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 JS_COMMIT = 'f5f0737306901215860aa920a6ab570b699efba8'
 RUST_COMMIT = '635011b3d7066db6f3296e9cb8d2f24d4bd1fec7'
 # the installed SDKs: the ristik forks (integration/enshrined-evm line), same token and predicate wire
-SDK_JS_FORK_COMMIT = 'cc38d7cc51dc9dea470d1b7301f1e84f53737b4b'
-SDK_JS_FORK_VERSION = '4.0.0-utb.cc38d7c'
-SDK_RUST_FORK_COMMIT = '447b6b1d0f376a76cedfb9e766d2f3d440c6ba25'
+SDK_JS_FORK_COMMIT = 'cc9a95bcf5e043770dfd1ae79e54516cf424e859'
+SDK_JS_FORK_VERSION = '4.0.0-utb.cc9a95b'
+SDK_RUST_FORK_COMMIT = '772be681c740442a35ecef35724a1545cf42b7f4'
 
 
 def load(path):
