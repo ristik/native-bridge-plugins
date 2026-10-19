@@ -70,7 +70,7 @@ def provenance_check(provenance):
 
 def fixed_profile_check(files):
     """Reject abandoned trust drafts even if their own digest is consistent."""
-    expected_profile = json.loads((ROOT / 'protocol/profile-v4.json').read_bytes())
+    expected_profile = json.loads((ROOT / 'protocol/profile-v5.json').read_bytes())
     actual_profile = json.loads(files['config/semantic-profile.json'])
     require(actual_profile.get('trustModel') == expected_profile['trustModel'], 'unsupported trust model')
     require(actual_profile.get('normativeArtifactSha256') == expected_profile['normativeArtifactSha256'], 'normative artifact pins mismatch')

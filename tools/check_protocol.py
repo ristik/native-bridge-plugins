@@ -108,7 +108,7 @@ def main():
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v4.json')
+    profile = load('protocol/profile-v5.json')
     assert profile['nativeBridgeProtocolVersion'] == 4 and profile['sdkVersion'] == '3.0.1'
     assert profile['limits']['semanticBytes'] == 16384 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'fixed-sdk-root-trust-base'

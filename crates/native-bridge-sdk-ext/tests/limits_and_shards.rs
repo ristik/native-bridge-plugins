@@ -1,5 +1,5 @@
 #![allow(clippy::type_complexity, unused_imports, unused_variables, dead_code)]
-//! The named profile-v4 bounds against `protocol/profile-v4.json`, the shared gas gate at the worst
+//! The named profile-v5 bounds against `protocol/profile-v5.json`, the shared gas gate at the worst
 //! admitted bundle, the DN-B depth-1 topology and the burn-time preflight.
 
 mod common;
@@ -21,7 +21,7 @@ fn the_named_bounds_are_the_limits_of_profile_v3_the_one_source() {
     let p: serde_json::Value = serde_json::from_slice(
         &std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../protocol/profile-v4.json"
+            "/../../protocol/profile-v5.json"
         ))
         .unwrap(),
     )

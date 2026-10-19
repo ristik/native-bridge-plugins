@@ -20,7 +20,7 @@ class CorpusTests(unittest.TestCase):
         for family in v.FAMILIES:
             (self.root / family).mkdir()
             (self.root / family / 'synthetic.json').write_text('{"testOnly":true}\n')
-        profile = (ROOT / 'protocol/profile-v4.json').read_bytes()
+        profile = (ROOT / 'protocol/profile-v5.json').read_bytes()
         for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
             (self.root / 'config' / name).write_bytes((ROOT / 'protocol/vectors/config' / name).read_bytes())
         (self.root / 'config/semantic-profile.json').write_bytes(profile)

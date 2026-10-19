@@ -1,11 +1,11 @@
-//! Named profile-v4 bounds and fixed protocol bytes of the native profile (protocol version 4).
+//! Named profile-v5 bounds and fixed protocol bytes of the native profile (protocol version 4).
 //!
-//! The numbers of the first block are the `limits` of `protocol/profile-v4.json`, the single source
+//! The numbers of the first block are the `limits` of `protocol/profile-v5.json`, the single source
 //! shared with the oracle, the contract and the TypeScript plug-in (`tests/limits.rs` pins them). A
 //! later profile version raises them together with the gas budget. Limits are intersected, not
 //! additive entitlements: every cumulative bound is checked before allocation or cryptography.
 
-// ---- profile parameters (profile-v4.json `limits`) ----------------------------------------------
+// ---- profile parameters (profile-v5.json `limits`) ----------------------------------------------
 /// Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle.
 pub const MAX_ANCHORS: usize = 16;
 /// B2 leaves of one redemption: the mint, every transfer and the final burn.
