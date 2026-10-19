@@ -17,7 +17,7 @@ const T0: u64 = 1_700_000_040;
 const UC_TS: u64 = 1_700_000_900;
 
 #[test]
-fn the_named_bounds_are_the_limits_of_profile_v3_the_one_source() {
+fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     let p: serde_json::Value = serde_json::from_slice(
         &std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -42,7 +42,7 @@ fn the_named_bounds_are_the_limits_of_profile_v3_the_one_source() {
     assert_eq!(TX_GAS_BUDGET, n("txGasBudget"));
     assert_eq!(GAS_RESERVE, n("gasReserve"));
     assert_eq!(MAX_JUSTIFICATION_BYTES as u64, n("justificationBytes"));
-    assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 4);
+    assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 5);
     assert_eq!(BRIDGE_CBOR_ITEMS as u64, n("bridgeCborItems"));
     assert_eq!(BRIDGE_ITEM_GAS, n("bridgeItemGas"));
     assert_eq!(MAX_SHARD_DEPTH as u64, n("shardDepthMax"));
