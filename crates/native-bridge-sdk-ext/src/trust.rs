@@ -46,7 +46,8 @@ pub fn check_fixed_profile(entry: &TrustBaseEntry) -> Result<()> {
 
 /// The genesis entry of a version-1 SDK JSON trust document, field for field as the JS SDK's
 /// `RootTrustBaseV2.genesisFromLegacy`: zero previous identity, no signatures, the document's
-/// threshold, members in document order, an empty hash read as absent.
+/// threshold, members sorted by node identifier (UTF-8 bytes, as `create` does), an empty hash
+/// read as absent.
 #[cfg(feature = "host")]
 fn genesis_of_json(text: &str) -> Option<TrustBaseEntry> {
     use alloc::vec::Vec;
@@ -82,6 +83,8 @@ fn genesis_of_json(text: &str) -> Option<TrustBaseEntry> {
             num(n.get("stake")?)?,
         ));
     }
+    // the entry's identity is over its canonical member order, whatever the document's
+    members.sort_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
     Some(TrustBaseEntry::new(
         network,
         num(v.get("epoch")?)?,

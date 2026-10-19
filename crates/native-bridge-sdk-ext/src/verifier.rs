@@ -108,8 +108,8 @@ impl MintJustificationVerifier for NativeLockJustificationVerifier {
         self.last.set(None);
         // One fixed base throughout: a caller-supplied different history (network or genesis) is
         // outside the profile.
-        let (theirs, ours) = (context.history(), self.bridge.trust.history());
-        if theirs.network_id() != ours.network_id() || theirs.genesis_id() != ours.genesis_id() {
+        // The same genesis is the same history; the genesis entry names its network.
+        if context.history().genesis_id() != self.bridge.trust.history().genesis_id() {
             self.last.set(Some(E::TrustBase));
             return Err(VerificationError::UnsupportedMintJustification);
         }
