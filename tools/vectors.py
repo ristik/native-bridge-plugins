@@ -55,7 +55,7 @@ def inventory(root):
 
 def provenance_check(provenance):
     require(set(provenance) == {'protocolVersion', 'sdkVersion', 'semanticProfileSha256', 'generator'}, 'provenance fields')
-    require(provenance['protocolVersion'] == 4 and provenance['sdkVersion'] == '3.0.1', 'unexpected protocol/SDK version')
+    require(provenance['protocolVersion'] == 5 and provenance['sdkVersion'] == '4.0.0', 'unexpected protocol/SDK version')
     require(bool(HEX.fullmatch(provenance['semanticProfileSha256'])), 'invalid semantic profile digest')
     g = provenance['generator']
     require(set(g) == {'repository', 'commit', 'command'}, 'generator fields')
@@ -74,9 +74,13 @@ def fixed_profile_check(files):
     actual_profile = json.loads(files['config/semantic-profile.json'])
     require(actual_profile.get('trustModel') == expected_profile['trustModel'], 'unsupported trust model')
     require(actual_profile.get('normativeArtifactSha256') == expected_profile['normativeArtifactSha256'], 'normative artifact pins mismatch')
-    for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
-        key = 'config/' + name
-        require(files.get(key) == (ROOT / 'protocol/vectors' / key).read_bytes(), 'SDK trust fixture mismatch')
+    # The dev trust input: a release bundle and its genesis EntryID, the fixture set's "pinned" entry
+    # (tools/utb_trust_fixture.mjs installs every bundle with the SDK).
+    bundle, pin = files.get('config/trust-base.bundle.cbor'), files.get('config/trust-base.genesis.entryid')
+    require(bundle is not None and pin is not None, 'trust-base fixture missing')
+    require(bool(re.fullmatch(rb'[0-9a-f]{64}\n', pin)), 'trust-base pin must be lowercase hex plus newline')
+    pinned = json.loads(files['config/fixtures.json'])['trustBases']['pinned']
+    require(pinned == {'bundle': bundle.hex(), 'pin': pin.decode().strip()}, 'trust-base fixture differs from the pinned fixture')
 
 
 def seal(root, provenance):
@@ -87,7 +91,7 @@ def seal(root, provenance):
         require(any(n.startswith(family + '/') for n in files), f'missing family: {family}')
     require('config/semantic-profile.json' in files and digest(files['config/semantic-profile.json']) == provenance['semanticProfileSha256'], 'semantic profile artifact mismatch')
     fixed_profile_check(files)
-    (root / 'VERSION').write_bytes(b'2\n')
+    (root / 'VERSION').write_bytes(b'3\n')
     (root / 'provenance.json').write_bytes(canonical_json(provenance))
     files.update({n: (root / n).read_bytes() for n in ('VERSION', 'provenance.json')})
     sums = ''.join(f'{digest(data)}  {name}\n' for name, data in sorted(files.items())).encode()
@@ -104,7 +108,7 @@ def check(root, expected=None):
     require(bool(re.fullmatch(r'[0-9a-f]{64}\n', pin)), 'digest must be lowercase SHA-256 plus newline')
     if expected is not None:
         require(bool(HEX.fullmatch(expected)) and pin.strip() == expected, 'unexpected corpus digest')
-    require((root / 'VERSION').read_bytes() == b'2\n', 'unexpected corpus VERSION')
+    require((root / 'VERSION').read_bytes() == b'3\n', 'unexpected corpus VERSION')
     provenance = json.loads((root / 'provenance.json').read_bytes())
     provenance_check(provenance)
     require((root / 'provenance.json').read_bytes() == canonical_json(provenance), 'noncanonical provenance')

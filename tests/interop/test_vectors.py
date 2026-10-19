@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,14 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('vectors', ROOT / 'tools/vectors.py')
 v = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(v)
+
+
+def trust_files():
+    """The corpus trust input: the dev release bundle, its genesis pin, and a fixture set naming them as pinned."""
+    bundle = (ROOT / 'protocol/vectors/config/trust-base.bundle.cbor').read_bytes()
+    pin = (ROOT / 'protocol/vectors/config/trust-base.genesis.entryid').read_bytes()
+    fixtures = json.dumps({'trustBases': {'pinned': {'bundle': bundle.hex(), 'pin': pin.decode().strip()}}}).encode()
+    return {'config/trust-base.bundle.cbor': bundle, 'config/trust-base.genesis.entryid': pin, 'config/fixtures.json': fixtures}
 
 
 class CorpusTests(unittest.TestCase):
@@ -21,10 +30,10 @@ class CorpusTests(unittest.TestCase):
             (self.root / family).mkdir()
             (self.root / family / 'synthetic.json').write_text('{"testOnly":true}\n')
         profile = (ROOT / 'protocol/profile-v5.json').read_bytes()
-        for name in ('sdk-root-trust-base.json', 'sdk-root-trust-base.provenance.json'):
-            (self.root / 'config' / name).write_bytes((ROOT / 'protocol/vectors/config' / name).read_bytes())
+        for name, data in trust_files().items():
+            (self.root / name).write_bytes(data)
         (self.root / 'config/semantic-profile.json').write_bytes(profile)
-        self.provenance = {'protocolVersion': 4, 'sdkVersion': '3.0.1', 'semanticProfileSha256': hashlib.sha256(profile).hexdigest(), 'generator': {'repository': v.REPOSITORY, 'commit': 'b'*40, 'command': ['go', 'run', './cmd/test-generator', '-out', '{output}']}}
+        self.provenance = {'protocolVersion': 5, 'sdkVersion': '4.0.0', 'semanticProfileSha256': hashlib.sha256(profile).hexdigest(), 'generator': {'repository': v.REPOSITORY, 'commit': 'b'*40, 'command': ['go', 'run', './cmd/test-generator', '-out', '{output}']}}
         self.pin = v.seal(self.root, self.provenance)
 
     def test_import_and_check(self):
@@ -104,9 +113,14 @@ class CorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(v.CorpusError, 'normative artifact pins mismatch'):
             v.seal(self.root, p)
 
-    def test_sdk_document_fixture_mutation_rejected(self):
-        (self.root / 'config/sdk-root-trust-base.json').write_bytes(b'{}')
-        with self.assertRaisesRegex(v.CorpusError, 'SDK trust fixture mismatch'):
+    def test_trust_fixture_mutation_rejected(self):
+        (self.root / 'config/trust-base.bundle.cbor').write_bytes(b'\x00')
+        with self.assertRaisesRegex(v.CorpusError, 'trust-base fixture differs from the pinned fixture'):
+            v.seal(self.root, self.provenance)
+
+    def test_trust_pin_format_rejected(self):
+        (self.root / 'config/trust-base.genesis.entryid').write_bytes(b'not-a-pin\n')
+        with self.assertRaisesRegex(v.CorpusError, 'trust-base pin must be lowercase hex'):
             v.seal(self.root, self.provenance)
 
     def test_old_protocol_rejected(self):

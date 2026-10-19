@@ -84,8 +84,8 @@ avoiding a code-hash/configuration cycle. Runtime chain/vault MUST match Cfg.
 ## SDK wire
 
 Pins: the ristik SDK lines (`integration/enshrined-evm`), JS
-`cc38d7cc51dc9dea470d1b7301f1e84f53737b4b` (4.0.0-utb), Rust
-`447b6b1d0f376a76cedfb9e766d2f3d440c6ba25` (unicity-token 4.0.0). The token,
+`cc9a95bcf5e043770dfd1ae79e54516cf424e859` (4.0.0-utb), Rust
+`772be681c740442a35ecef35724a1545cf42b7f4` (unicity-token 4.0.0). The token,
 predicate and certification wire below is unchanged from SDK 3.0.1; predicate
 version and tags are unchanged. No other SDK fork or patch is authorized.
 
