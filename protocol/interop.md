@@ -319,7 +319,7 @@ native B1 bounds, null/width/canonical rules. Require
 H(inputRecord)==expectedIRHash and stateHash==expectedStateRoot.
 
 Composition checks framing/budgets/Cfg/policy and obtains the kernel result,
-then derives and checks the anchor table above and the gas gate below. The one
+then derives and checks the anchor table above and the gas estimate below. The one
 B1 0x0100 batch MUST authenticate both expected root and expected IR hash of
 every anchor. Only after success may an anchor's opened timestamp authorize the
 t<=timestamp comparison of the leaves routed to it (each leaf against its OWN
@@ -331,25 +331,26 @@ timestamps or unauthenticated IR hashes cannot authorize time checks.
 
 ## Resource and custody profile
 
-Provisional intersected ceilings (unsupported/budget-exceeded rejects offline,
-never fetches): J<=65536; UC<=16384 plus B1's tighter sublimits; PDR<=16384;
-header<=2048; each MPT<=65 nodes; node<=1024; combined MPT bytes<=24576;
-CBOR/RLP depth<=16, CBOR items<=32768; semantic history<=16384;
-direct envelope<=65536; <=15 transfers including burn, <=16 leaves;
-anchor UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity
-steps and exactly d shard-tree siblings per UC (d its own shard's depth, the
-anchor's shard equal to the UC's); Cfg<=1024; bridge CBOR items J<=4096 (the
-gate below); A<=A_max=16 distinct UC anchors
-(a parser ceiling: the gas gate below decides each bundle); A<=L.
-These bounds are the named parameters of `profile-v5.json` `limits`
-(the single source for contract, oracle and plug-ins); a later profile version
-may raise them, e.g. when multi-proof services land. The initial testnet
-assumes few transactions per token.
-<=2048 cumulative RSMT+shard-tree+unicity steps (each anchor counted once).
-Bitmap popcount must equal the sibling count of every leaf path. Check
-cumulative counts overflow-safely before allocation.
+One resource policy (owner section 36; unsupported/budget-exceeded rejects
+offline, never fetches). There is no gas ceiling and no bridge-specific history
+cap. The aggregate bounds are the native kernels' own until the native
+composition streams them: <=64 transfers including burn and <=65 leaves (B2),
+semantic history<=131072 (B2), A<=A_max=16 distinct UC anchors (B1 claims);
+A<=L. Direct envelope<=524288 is the ingress bound the pool and RPC carry. The
+rest are per-object shape bounds: J<=65536; UC<=16384 plus B1's tighter
+sublimits; PDR<=16384; header<=2048; each MPT<=65 nodes; node<=1024; combined
+MPT bytes<=24576; CBOR/RLP depth<=16, CBOR items<=32768 per object; anchor
+UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity steps and
+exactly d shard-tree siblings per UC (d its own shard's depth, the anchor's
+shard equal to the UC's); Cfg<=1024. These are the named parameters of
+`profile-v5.json` `limits` (the single source for contract, oracle and
+plug-ins). There is no cumulative path-step budget and no shared CBOR item
+budget: path steps and items are charged. An envelope's declared RSMT siblings
+never exceed its bytes/32 in sum (refused before allocation). Bitmap popcount
+must equal the sibling count of every leaf path. Check counts overflow-safely
+before allocation.
 
-### Direct-call gas gate (7,000,000)
+### Direct-call gas estimate
 
 Native prices are the actual B1/B2 charges, with no shared or warm discount.
 The one 0x0100 batch over the anchor table is charged
@@ -368,33 +369,24 @@ item occurrences: the item heads of the canonical Cfg, the policy body, every
 anchor UC and every anchor IR opening, each encoded occurrence counted once
 (tags and containers, scalar and string heads, every child and map key and
 value; the contents of a byte string are opaque; an IR opening and the IR inside
-its UC are two occurrences; repeated parser passes never add to J). J is also the
-bridge's shared CBOR preflight budget: J<=4096, refused as BudgetExceeded as soon
-as the next item would cross it, before any native call. Admission requires
-`21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1000000 <= 7000000`.
+its UC are two occurrences; repeated parser passes never add to J). The estimate
+is `21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1000000`.
 The fixed reserve covers Solidity scanning and copying, call and EIP-150
 headroom and vault accounting. The gate is computed from complete bounded
 scans, never from caller-declared costs, and is identical in the contract,
 oracle and plug-ins. Every native call is forwarded exactly its computed
 charge, so a malformed late call cannot consume the remaining transaction
-budget. The gate is a conservative admission rule, not a measured fit: a bundle
-inside the parser ceilings may still be BudgetExceeded. BudgetExceeded is
-reported before any native call, never truncates history, omits leaves, selects
-a latest UC or splits a redemption, and means "direct exit unavailable", not
-"token invalid". The 7,000,000 transaction budget is the DN-B ordinary transaction capacity
-(`maxGas` minus the system gas reserved for certificate transactions); it is
-never raised implicitly (a larger ordinary capacity is a later profile version).
-The parser ceilings do not promise that every admitted bundle passes the gate;
-the gate admits or refuses each bundle. bft-core `briefs/b1-any-age-contract.md`
-section 5 tabulates worked cases from signed native fixtures: with sixteen
-8-sibling leaves, a 16,384-byte history and a 512-byte Cfg, one anchor of a
-four-member committee gates at 4,301,234; sixteen anchors under one shared seal
-at 6,759,824 (admitted) and under sixteen seals of distinct epochs at 7,568,324
-(BudgetExceeded). Anything refused by the gate or above a ceiling is
-BudgetExceeded or an input-size refusal before any native call.
+budget. The estimate is conservative, not a measured fit, and it is never an
+admission rule (owner section 36): a wallet sets the transaction gas limit from
+it, and a transaction with too little gas runs out of gas and reverts
+atomically. The only gas bound is the deployment's ordinary block capacity, an
+ordinary profile parameter (the pool admits one transaction of it). A bundle
+above a resource bound is BudgetExceeded or an input-size refusal before any
+native call, never truncates history, omits leaves, selects a latest UC or
+splits a redemption, and means "direct exit unavailable", not "token invalid".
 Bounds are not additive entitlements or measured activation
 prices. Freeze in canonical semantic profile/vectors before activation; native
-x86-64/arm64 full-transaction measurements and final gas gates remain required.
+x86-64/arm64 full-transaction measurements and benchmarked native prices remain required.
 
 ### Assembly and refresh
 
@@ -444,13 +436,14 @@ NOT re-query to make responses share a certificate: it builds the anchor table
 from the distinct UCs it received, in first-use leaf order. A racing or
 mismatched (path, UC) pair gets a bounded retry, then retryable unavailability
 (never BudgetExceeded). The plug-in validates the complete envelope (including
-the gas gate and every anchor's round against one observed EVM origin O) before
-submission, and runs the same gate BEFORE creating a burn, refusing a burn
-that cannot pass the gas gate (`txGasBudget`) even in the best case (the
-consolidated bundle: K = min(m, L) anchors under one seal, S = 1, smallest
-certificates, shortest paths), and the redemption path accepts up to
-A_max distinct UCs (the per-SID fallback) whenever the gate passes (BudgetExceeded for an over-limit
-bundle; no truncation or partial credit). Pending history and bundle
+the gas estimate and every anchor's round against one observed EVM origin O)
+before submission, and BEFORE creating a burn refuses only a burn the resource
+policy cannot carry (more leaves than the native kernel admits, a history or
+envelope over its bound), reporting the best-case estimate (the consolidated
+bundle: K = min(m, L) anchors under one seal, S = 1, smallest certificates,
+shortest paths); the redemption path accepts up to A_max distinct UCs (the
+per-SID fallback) (BudgetExceeded for an over-limit bundle; no truncation or
+partial credit). Pending history and bundle
 are persisted atomically for restart, aged pairs are revalidated or refetched.
 There is no common cut, cross-shard synchronization or guarantee that fresh
 proofs become available. Offline receipt verification is network-free and
