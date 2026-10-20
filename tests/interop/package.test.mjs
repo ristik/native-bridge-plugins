@@ -8,9 +8,9 @@ test('facade and every verifier export load without Node process/Buffer', async 
     globalThis.process = undefined;
     globalThis.Buffer = undefined;
     const p = await import('../../packages/native-bridge-plugin/lib/index.js');
-    assert.equal(p.NATIVE_BRIDGE_PROTO_VERSION, 4);
+    assert.equal(p.NATIVE_BRIDGE_PROTO_VERSION, 5);
     assert.equal(p.NATIVE_BRIDGE_FAMILY, 'unicity-native');
-    assert.equal(p.SDK_VERSION, '3.0.1');
+    assert.equal(p.SDK_VERSION, '4.0.0');
     for (const name of ['verifyNativeToken', 'NativeBridge', 'NativeLockJustificationVerifier', 'BridgedTokenIssuancePolicy',
       'NativeBridgeTokenVerifier', 'TrustInput', 'loadManifests', 'buildReturnProof', 'refreshToken', 'createNativeBridgePlugin',
       'bridgeTokenPlugin', 'mintBridgedToken', 'burnForReturn', 'recoverPendingBurns', 'claim', 'verifyUnlock']) {
