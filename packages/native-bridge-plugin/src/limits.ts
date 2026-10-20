@@ -11,7 +11,7 @@ export const NATIVE_BRIDGE_PROTO_VERSION = 5 as const;
 /** Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle. */
 export const MAX_ANCHORS = 16;
 /** B2 leaves of one redemption: the mint, every transfer and the final burn. */
-export const MAX_LEAVES = 16;
+export const MAX_LEAVES = 24;
 export const MAX_TRANSFERS = MAX_LEAVES - 1;
 export const MAX_SEMANTIC_BYTES = 16 << 10;
 export const MAX_ENVELOPE_BYTES = 64 << 10;
