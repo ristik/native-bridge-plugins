@@ -104,8 +104,8 @@ type Ctx = ReturnType<typeof ctx>;
 /** The installed bridge: Cfg from the vault itself, trust, EVM PDR and policy from the lane's pinned documents. */
 async function installedBridge(c: Ctx) {
   const cfg = decodeCfg(unhex(c.cast('call', c.lane.vault, 'cfgBytes()(bytes)')));
-  const trustDoc = readFileSync(`${c.lane.dir}/sdk-trust-base.json`);
-  const trust = TrustInput.fromJson(Uint8Array.from(trustDoc), sha256(trustDoc));
+  const trustDoc = readFileSync(`${c.lane.dir}/trust-base.bundle.cbor`);
+  const trust = await TrustInput.fromBundle(Uint8Array.from(trustDoc), Uint8Array.from(Buffer.from(readFileSync(`${c.lane.dir}/trust-base.genesis.entryid`, 'utf8').trim(), 'hex')));
   const pdr = Uint8Array.from(readFileSync(`${c.lane.dir}/evm-pdr.cbor`));
   const policy = decodePolicy(unhex(JSON.parse(readFileSync(`${c.lane.dir}/bridge-deployment.json`, 'utf8')).policyBody));
   const vaultCode = unhex(await rpc(c.eth, 'eth_getCode', [c.lane.vault, 'latest']));
@@ -174,7 +174,7 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
   await until('the lock block to be certified and archived', 120_000, async () => {
     try {
       run(DNB_TOOL, ['lockproof', '--archive', c.lane.archive, '--block-hash', sent.blockHash, '--eth-url', c.eth, '--vault', c.lane.vault, '--nonce', nonce.toString(),
-        '--full-shard-conf', `${c.lane.dir}/evm-full-shard-conf.json`, '--trust-doc', `${c.lane.dir}/sdk-trust-base.json`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
+        '--full-shard-conf', `${c.lane.dir}/evm-full-shard-conf.json`, '--trust-bundle', `${c.lane.dir}/trust-base.bundle.cbor`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
       return true;
     } catch {
       return false;

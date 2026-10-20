@@ -68,10 +68,10 @@ def compare_contracts(contracts, generated):
         raise ValueError('contract golden bytes differ from their pin')
     golden = json.loads(original.read_text())
     corpus_root = ROOT / 'protocol/vectors'
-    trust = digest(corpus_root / 'config/sdk-root-trust-base.json')
+    trust = (corpus_root / 'config/trust-base.genesis.entryid').read_text().strip()
     for op in ('mint', 'return'):
         if trust not in golden[op]['history'].lower():
-            raise ValueError('contract history has stale trust digest')
+            raise ValueError('contract history does not name the corpus trustBaseId')
     corpus = ''.join(p.read_text().lower() for p in sorted(corpus_root.rglob('*.json')))
     for path in pin['golden']['sharedPaths']:
         value = golden

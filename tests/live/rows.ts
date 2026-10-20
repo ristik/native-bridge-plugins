@@ -134,11 +134,11 @@ const callRevert = (from: string, data: Uint8Array): string => {
 
 // ---- the installed bridge ------------------------------------------------------------------------------------------------------------
 const cfg = decodeCfg(unhex(cast('call', lane.vault, 'cfgBytes()(bytes)')));
-const trustDoc = readFileSync(`${lane.dir}/sdk-trust-base.json`);
+const trustDoc = readFileSync(`${lane.dir}/trust-base.bundle.cbor`);
 const pdr = Uint8Array.from(readFileSync(`${lane.dir}/evm-pdr.cbor`));
 const policyBody = unhex(JSON.parse(readFileSync(`${lane.dir}/bridge-deployment.json`, 'utf8')).policyBody);
 const dep = makeDeployment(cfg, keccak256(unhex(await rpc(eth, 'eth_getCode', [lane.vault, 'latest']))), configHashOfPdr(pdr), { fields: 20 }, decodePolicy(policyBody));
-const bridge = new NativeBridge(new DeploymentRegistry([dep]), TrustInput.fromJson(Uint8Array.from(trustDoc), sha256(trustDoc)));
+const bridge = new NativeBridge(new DeploymentRegistry([dep]), await TrustInput.fromBundle(Uint8Array.from(trustDoc), Uint8Array.from(Buffer.from(readFileSync(`${lane.dir}/trust-base.genesis.entryid`, 'utf8').trim(), 'hex'))));
 assert.equal(dep.policy.depth, 1, 'the two-shard rows need the depth-1 policy');
 const aggs = lane.aggUrls!.map((url) => new AggregatorClient(url));
 const rowOfSid = (sid: Uint8Array): number => shardRow(dep.policy, sid);
@@ -167,7 +167,7 @@ async function lockAndMint(leaf1: 'same' | 'other' | null): Promise<Built> {
     await until('the lock block to be certified and archived', 120_000, async () => {
       try {
         run(DNB_TOOL, ['lockproof', '--archive', lane.archive, '--block-hash', sent.blockHash, '--eth-url', eth, '--vault', lane.vault, '--nonce', nonce.toString(),
-          '--full-shard-conf', `${lane.dir}/evm-full-shard-conf.json`, '--trust-doc', `${lane.dir}/sdk-trust-base.json`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
+          '--full-shard-conf', `${lane.dir}/evm-full-shard-conf.json`, '--trust-bundle', `${lane.dir}/trust-base.bundle.cbor`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
         return true;
       } catch { return false; }
     });
