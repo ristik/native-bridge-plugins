@@ -306,19 +306,27 @@ fn the_pinned_document_digest_must_be_the_installed_trust_input() {
         loaded.install(w.bridge.trust.clone()).unwrap_err(),
         E::TrustBaseDigest
     );
-    // the installation must start from exactly the named bundle: another file of the same history
-    let mut other = entry(&w);
-    other["trustBase"]["bundle"]["sha256"] = hex_lower(&[7u8; 32]).into();
-    let loaded = manifest::load(&registry(&other), Some(&artifacts)).unwrap();
-    assert_eq!(
-        loaded.install(w.bridge.trust.clone()).unwrap_err(),
-        E::TrustBaseDigest
-    );
-    // and the named one installs
+    // the authority is the genesis pin: a history grown past the named bundle, exported and
+    // reinstalled (a wallet's own bundle), installs
+    let grown = next_epoch(&w.agg, 1000, 4, 30);
+    let exported = native_bridge_sdk_ext::trust::TrustInput::from_bundle(
+        &trust_input(&grown).history().to_bundle(),
+        &w.agg.pin,
+    )
+    .unwrap();
+    assert_eq!(exported.history().latest().epoch, 3);
     manifest::load(&registry(&entry(&w)), Some(&artifacts))
         .unwrap()
-        .install(w.bridge.trust.clone())
+        .install(exported)
         .unwrap();
+    // another genesis is another trust input
+    let loaded = manifest::load(&registry(&entry(&w)), Some(&artifacts)).unwrap();
+    assert_eq!(
+        loaded
+            .install(trust_input(&make_root(2, 4, 20)))
+            .unwrap_err(),
+        E::TrustBaseDigest
+    );
 }
 
 #[test]

@@ -14,8 +14,6 @@ use unicity_token::api::bft::{HistoryError, TrustBaseHistory, UnicityCertificate
 use unicity_token::api::NetworkId;
 use unicity_token::verify::{verify_certificate_of_partition, SealSession, VerificationError};
 
-use alloc::vec::Vec;
-
 use crate::error::{NativeError as E, Result};
 
 /// The installed trust: the held SDK history and its genesis EntryID.
@@ -23,7 +21,6 @@ use crate::error::{NativeError as E, Result};
 pub struct TrustInput {
     history: TrustBaseHistory,
     id: [u8; 32],
-    bundle: Vec<u8>,
 }
 
 impl TrustInput {
@@ -34,11 +31,7 @@ impl TrustInput {
             HistoryError::PinMismatch => E::TrustBaseDigest,
             _ => E::TrustBase,
         })?;
-        Ok(TrustInput {
-            history,
-            id: *pin,
-            bundle: bundle.to_vec(),
-        })
+        Ok(TrustInput { history, id: *pin })
     }
 
     /// The held history (the wallet appends newer entries to its own copy and reinstalls).
@@ -48,12 +41,6 @@ impl TrustInput {
 
     pub fn network_id(&self) -> NetworkId {
         self.history.network_id()
-    }
-
-    /// The release bundle it was installed from, exactly: the file a manifest's `trustBase.bundle`
-    /// names by digest.
-    pub fn bundle(&self) -> &[u8] {
-        &self.bundle
     }
 
     /// The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal.

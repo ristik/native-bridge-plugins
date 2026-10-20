@@ -27,8 +27,6 @@ export class TrustInput {
     public readonly history: TrustBaseHistory,
     /** The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal. */
     public readonly id: Uint8Array,
-    /** The release bundle it was installed from, exactly: the file a manifest's `trustBase.bundle` names by digest. */
-    public readonly bundle: Uint8Array,
   ) {}
 
   /**
@@ -42,7 +40,7 @@ export class TrustInput {
     } catch (e) {
       return fail(e instanceof TrustBaseError && e.reason === 'genesis' ? 'ErrTrustBaseDigest' : 'ErrTrustBase');
     }
-    return new TrustInput(history, pin.slice(), bundle.slice());
+    return new TrustInput(history, pin.slice());
   }
 
   public get network(): NetworkId {

@@ -4,8 +4,9 @@ import { test } from 'node:test';
 import { toHex } from '../src/bytes.js';
 import { loadManifests, manifestTrustBaseId, validateManifest } from '../src/manifest.js';
 import { cfgBytes, cfgHash, deriveAsset, deriveType, policyBytes, policyHash } from '../src/profile.js';
+import { TrustInput } from '../src/trust.js';
 import { throwsReason } from './util.js';
-import { CHAIN_ID, EXEC_GENESIS, NETWORK, ROOT_GENESIS, makeWorld, pdrBytes, sha, text, type World } from './world.js';
+import { CHAIN_ID, EXEC_GENESIS, NETWORK, ROOT_GENESIS, makeRoot, makeWorld, nextEpoch, pdrBytes, sha, text, type World } from './world.js';
 
 const execProfile = text('{"headerFields":20}');
 const pdr = pdrBytes(5n, 0n);
@@ -130,18 +131,22 @@ test('the registry key must be the tokenTypeHex and a replaced vault may not equ
   assert.throws(() => loadManifests('{}', artifacts));
 });
 
-test('the pinned genesis must be the installed trust input\'s, installed from the named bundle', async () => {
+test('the pinned genesis must be the installed trust input\'s; a grown history of it installs', async () => {
   const w = await makeWorld();
+  const other = await makeRoot(2, 4, 20);
   const e = entry(w);
   e.trustBase.genesisEntryId = toHex(new Uint8Array(32).fill(9));
   const loaded = loadManifests(registry(e), artifacts);
   throwsReason(() => loaded.install(w.bridge.trust), 'ErrTrustBaseDigest');
   assert.deepEqual(manifestTrustBaseId(entry(w)), w.bridge.trust.id);
   assert.equal(validateManifest(entry(w), artifacts).deployments.length, 1);
-  // the installation must start from exactly the named bundle: another file of the same history is refused
-  const other = entry(w);
-  other.trustBase.bundle.sha256 = toHex(new Uint8Array(32).fill(7));
-  throwsReason(() => loadManifests(registry(other), artifacts).install(w.bridge.trust), 'ErrTrustBaseDigest');
+  // the authority is the genesis pin: a history grown past the named bundle, exported and reinstalled (a wallet's own bundle) installs
+  const grown = await nextEpoch(w.agg, 1000n, 4, 30);
+  const exported = await TrustInput.fromBundle(await grown.trust.history.exportBundle(), w.agg.pin);
+  assert.equal(exported.history.tipEpoch, 3n);
+  loadManifests(registry(entry(w)), artifacts).install(exported);
+  // another genesis is another trust input
+  throwsReason(() => loadManifests(registry(entry(w)), artifacts).install(other.trust), 'ErrTrustBaseDigest');
 });
 
 test('endpoints and locations are installation metadata, never verification inputs', async () => {

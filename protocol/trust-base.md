@@ -27,10 +27,10 @@ rule for both SDKs.
 every manifest entry's `trustBase.genesisEntryId` name it. Two histories are
 the same trust input exactly when they have the same network and genesis; the
 latest held entry is not part of the identity, so a history that has grown is
-still the one a proof names. The manifest's `trustBase.bundle` names, by
-exact-file digest, the release bundle the installation starts from: the
-installed bundle MUST be exactly that file (else `TrustBaseDigest`); it is never
-the pin. The wallet appends newer entries to the installed history afterwards.
+still the one a proof names. The manifest's `trustBase.bundle` names a release
+bundle an installation may start from by exact-file digest; it is installation
+metadata, never the pin. A newer release bundle of the same history, or a
+wallet's own exported history after appends, installs under the same pin.
 
 A digest and successful installation establish integrity, not authority:
 provisioning authenticates the genesis out of band (the manifest, an
