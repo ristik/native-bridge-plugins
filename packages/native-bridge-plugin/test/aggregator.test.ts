@@ -258,6 +258,8 @@ test('aggregator certificates are checked against the pinned partition and the S
   // an epoch the history does not hold yet is retryable; one before its genesis is not
   await rejects(aggErr((o) => void (o.uc.rootEpoch = 3n)), 'ErrNoEntryForEpoch');
   await rejects(aggErr((o) => void (o.uc.rootEpoch = 1n)), 'ErrSealEpoch');
+  // several faults: an epoch not held and a false seal root -- the epoch decides, as in the oracle
+  await rejects(aggErr((o) => void ((o.uc.rootEpoch = 3n), (o.uc.sealHash = new Uint8Array(32).fill(1)))), 'ErrNoEntryForEpoch');
 });
 
 test('deployment registry rejects duplicates', async () => {

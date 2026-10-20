@@ -171,6 +171,7 @@ impl NativeBridge {
         let g = token.genesis();
         check_leaf(
             dep,
+            &self.trust,
             g.inclusion_proof(),
             g.transaction(),
             leaves.next().ok_or(E::Shape)?,
@@ -179,6 +180,7 @@ impl NativeBridge {
         for t in token.transactions() {
             check_leaf(
                 dep,
+                &self.trust,
                 t.inclusion_proof(),
                 t.transaction(),
                 leaves.next().ok_or(E::Shape)?,
@@ -209,6 +211,7 @@ impl NativeBridge {
 /// stays the SDK's.
 pub fn check_leaf(
     dep: &Deployment,
+    trust: &TrustInput,
     proof: &InclusionProof,
     tx: &impl Transaction,
     leaf: &Leaf,
@@ -224,8 +227,9 @@ pub fn check_leaf(
     {
         return Err(E::CDMismatch);
     }
-    // The seal's network, epoch and round interval are checked by the SDK verification, against
-    // the held history.
+    // The seal epoch's committee first (protocol/trust-base.md order; the SDK token verification
+    // below checks the tree root before the epoch), so several faults get the oracle's verdict.
+    crate::trust::select_epoch(trust, uc)?;
     // Aggregator admission: the pinned policy names the partition only. The certificate authenticates its own historical shard and
     // configuration; the shard must be a canonical native ID whose prefix the leaf's state ID carries (the first `d` bits, `d` its
     // own depth).

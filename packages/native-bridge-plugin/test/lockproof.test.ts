@@ -231,6 +231,14 @@ test('several faults get the oracle verdict: the seal epoch first, then the conf
     mutated(async (_, p) => void (p.uc = await resignUc({ ...w, evm: next }, p, { rootEpoch: 3n, round: 1500n, sealHash: new Uint8Array(32).fill(1) })), undefined, w),
     'ErrNoEntryForEpoch',
   );
+  // an epoch the history does not hold and a configuration that is not the certificate's: the epoch decides (the lock path's own selection)
+  await rejects(
+    mutated(async (_, p) => {
+      p.uc = await resignUc({ ...w, evm: next }, p, { rootEpoch: 3n, round: 1500n });
+      p.pdr = flip(p.pdr, 3);
+    }, undefined, w),
+    'ErrNoEntryForEpoch',
+  );
   // a configuration that is not the certificate's and a short quorum: the configuration first
   await rejects(
     mutated(async (ww, p) => {

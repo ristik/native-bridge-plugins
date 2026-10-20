@@ -168,7 +168,8 @@ export class NativeBridge {
     if (proof.referenceTime !== leaf.referenceTime) fail('ErrCDMismatch');
     const sid = await StateId.fromCertificationData(proof.certificationData);
     if (!eq(sid.data, leaf.sid) || !eq(proof.certificationData.transactionHash.data, leaf.txHash)) fail('ErrCDMismatch');
-    // The seal's network, epoch and round interval are checked by the SDK verification below, against the held history.
+    // The seal epoch's committee first (protocol/trust-base.md order; the SDK token verification below checks the tree root before the epoch).
+    this.trust.selectEpoch(uc);
     // Aggregator admission: the pinned policy names the partition only. The certificate authenticates its own historical shard and
     // configuration; the shard must be a canonical native ID whose prefix the leaf's state ID carries (the first `d` bits, `d` its own depth).
     if (uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.policy.partition)) fail('ErrNotAdmitted');

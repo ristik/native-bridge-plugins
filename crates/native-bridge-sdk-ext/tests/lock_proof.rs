@@ -611,6 +611,14 @@ fn several_faults_get_the_oracle_verdict() {
     resign(&next, &mut parts.uc, 4);
     parts.uc.unicity_seal.hash[0] ^= 1;
     assert_eq!(run(&w, &s, &parts).unwrap_err(), E::NoEntryForEpoch);
+    // an epoch the history does not hold and a configuration that is not the certificate's: the
+    // epoch decides (lockproof's own epoch selection, before the PDR checks)
+    let mut parts = lock_parts(&w, &s);
+    parts.uc.unicity_seal.epoch = 3;
+    parts.uc.unicity_seal.root_chain_round_number = 1500;
+    resign(&next, &mut parts.uc, 4);
+    flip(&mut parts.pdr, 3);
+    assert_eq!(run(&w, &s, &parts).unwrap_err(), E::NoEntryForEpoch);
     // a configuration that is not the certificate's and a short quorum: the configuration first
     let e = mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 2);
