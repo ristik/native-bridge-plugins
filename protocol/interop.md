@@ -421,14 +421,17 @@ rule stands, and the plug-in never re-queries until responses happen to share
 a certificate. The master seal is an anchor like any other: its root round must
 be covered by the registry's usable origin O, so a fresh one is waited for.
 
-Per-SID path (the fallback). The plug-in assembles from per-SID proofs when
+Per-SID path (the fallback). A partition with more shards than the view
+admits (`MaxPartitionViewLeaves`, 8; the host's shard routing knows the
+partition's shard count) is assembled per SID without calling consolidation:
+the SDK would refuse that topology as an integrity error, not report it as
+unavailable. Otherwise the plug-in assembles from per-SID proofs when
 consolidation returns `unavailable`, whatever its reason and whether or not the
 SDK marks it retryable (the SDK's reasons: `busy`, `limit_exceeded`,
 `partition_view_unavailable`, `pending_publication`, `state_expired`,
 `state_not_in_root`, `state_pending`, `state_unknown`, `target_not_retained`,
-`unsupported_capability`, `unsupported_configuration`; a partition with more
-shards than the view admits is one of them), and keeps the SDK's retryable flag
-only as a hint for a later consolidation attempt. A failed consolidation is
+`unsupported_capability`, `unsupported_configuration`), and keeps the SDK's
+retryable flag only as a hint for a later consolidation attempt. A failed consolidation is
 not unavailability: every `ConsolidationError` (`cancelled`, `input`,
 `integrity`, `invalid_response`, `rejected`, `server`, `timeout`, `transport`)
 is the SDK's error, surfaced as it is and never a silent fallback. For each
