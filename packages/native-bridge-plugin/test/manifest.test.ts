@@ -130,7 +130,7 @@ test('the registry key must be the tokenTypeHex and a replaced vault may not equ
   assert.throws(() => loadManifests('{}', artifacts));
 });
 
-test('the pinned genesis must be the installed trust input\'s, and the bundle file is not the pin', async () => {
+test('the pinned genesis must be the installed trust input\'s, installed from the named bundle', async () => {
   const w = await makeWorld();
   const e = entry(w);
   e.trustBase.genesisEntryId = toHex(new Uint8Array(32).fill(9));
@@ -138,10 +138,10 @@ test('the pinned genesis must be the installed trust input\'s, and the bundle fi
   throwsReason(() => loaded.install(w.bridge.trust), 'ErrTrustBaseDigest');
   assert.deepEqual(manifestTrustBaseId(entry(w)), w.bridge.trust.id);
   assert.equal(validateManifest(entry(w), artifacts).deployments.length, 1);
-  // a newer release bundle of the same history (another file digest) installs under the same genesis pin
-  const newer = entry(w);
-  newer.trustBase.bundle.sha256 = toHex(new Uint8Array(32).fill(7));
-  loadManifests(registry(newer), artifacts).install(w.bridge.trust);
+  // the installation must start from exactly the named bundle: another file of the same history is refused
+  const other = entry(w);
+  other.trustBase.bundle.sha256 = toHex(new Uint8Array(32).fill(7));
+  throwsReason(() => loadManifests(registry(other), artifacts).install(w.bridge.trust), 'ErrTrustBaseDigest');
 });
 
 test('endpoints and locations are installation metadata, never verification inputs', async () => {

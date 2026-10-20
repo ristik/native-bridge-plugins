@@ -597,3 +597,59 @@ fn an_epoch_change_is_retryable_until_held_then_verified_under_its_own_committee
         assert_eq!(run(&held, &s, &parts).err(), expected);
     }
 }
+
+#[test]
+fn several_faults_get_the_oracle_verdict() {
+    // the seal epoch first, then the configuration, then the certificate
+    let w = make_world(20);
+    let next = next_epoch(&w.evm_root, 1000, 4, 30);
+    let s = spec(1);
+    // an epoch the history does not hold and a false root: retryable, never the root failure
+    let mut parts = lock_parts(&w, &s);
+    parts.uc.unicity_seal.epoch = 3;
+    parts.uc.unicity_seal.root_chain_round_number = 1500;
+    resign(&next, &mut parts.uc, 4);
+    parts.uc.unicity_seal.hash[0] ^= 1;
+    assert_eq!(run(&w, &s, &parts).unwrap_err(), E::NoEntryForEpoch);
+    // a configuration that is not the certificate's and a short quorum: the configuration first
+    let e = mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 2);
+        flip(&mut p.pdr, 3);
+    })
+    .unwrap_err();
+    assert_eq!(e, E::EvmConfigHash);
+}
+
+#[test]
+fn seal_signature_widths_follow_the_b1_profile_rule() {
+    // 64 bytes (r||s): accepted by the pre-scan and by the SDK verification, as by B1
+    mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 4);
+        for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
+            sig.truncate(64);
+        }
+    })
+    .unwrap();
+    // 65 bytes with the recovery byte swapped between 0 and 1: ignored
+    mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 4);
+        for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
+            sig[64] ^= 1;
+        }
+    })
+    .unwrap();
+    // recovery byte 2, and 63 bytes: refused by the pre-scan
+    for f in [
+        (|s: &mut Vec<u8>| s[64] = 2) as fn(&mut Vec<u8>),
+        |s: &mut Vec<u8>| s.truncate(63),
+    ] {
+        let e = mutated(|w, p, _| {
+            resign(&w.evm_root, &mut p.uc, 4);
+            for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
+                f(sig);
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e, E::UnsupportedCertificateEncoding);
+    }
+}

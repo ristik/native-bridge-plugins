@@ -223,7 +223,10 @@ pub fn verify(
         }
         uc
     };
-    trust::verify_embedded_uc(trust, &uc)?;
+    // The oracle's order (protocol/trust-base.md): the seal epoch's committee, then the pinned EVM
+    // partition, shard and configuration, then the certificate itself, so an input with several
+    // faults gets the oracle's verdict.
+    trust::select_epoch(trust, &uc)?;
     // Admitted EVM partition, shard and configuration: pinned, never taken from the UC tuple.
     if uc.unicity_tree_certificate.partition_identifier != dep.cfg.evm_partition {
         return Err(E::EvmPartition);
@@ -256,6 +259,7 @@ pub fn verify(
     if small_uint(elems[12]).map_err(|_| E::EvmConfigPin)? != uc.input_record.epoch {
         return Err(E::EvmConfigPin);
     }
+    trust::verify_embedded_uc(trust, &uc)?;
     // keccak256(headerRLP) == IR.blockHash and header.stateRoot == IR.hash: a signature over an
     // unrelated state root is insufficient.
     let block_hash = uc.input_record.block_hash.as_deref().ok_or(E::HeaderHash)?;

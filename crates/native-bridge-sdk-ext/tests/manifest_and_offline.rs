@@ -306,6 +306,19 @@ fn the_pinned_document_digest_must_be_the_installed_trust_input() {
         loaded.install(w.bridge.trust.clone()).unwrap_err(),
         E::TrustBaseDigest
     );
+    // the installation must start from exactly the named bundle: another file of the same history
+    let mut other = entry(&w);
+    other["trustBase"]["bundle"]["sha256"] = hex_lower(&[7u8; 32]).into();
+    let loaded = manifest::load(&registry(&other), Some(&artifacts)).unwrap();
+    assert_eq!(
+        loaded.install(w.bridge.trust.clone()).unwrap_err(),
+        E::TrustBaseDigest
+    );
+    // and the named one installs
+    manifest::load(&registry(&entry(&w)), Some(&artifacts))
+        .unwrap()
+        .install(w.bridge.trust.clone())
+        .unwrap();
 }
 
 #[test]

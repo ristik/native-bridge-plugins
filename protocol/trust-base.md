@@ -27,10 +27,10 @@ rule for both SDKs.
 every manifest entry's `trustBase.genesisEntryId` name it. Two histories are
 the same trust input exactly when they have the same network and genesis; the
 latest held entry is not part of the identity, so a history that has grown is
-still the one a proof names. The manifest's `trustBase.bundle` names a release
-bundle an installation may start from by exact-file digest; it is installation
-metadata, never the pin. A newer release bundle of the same history installs
-under the same pin.
+still the one a proof names. The manifest's `trustBase.bundle` names, by
+exact-file digest, the release bundle the installation starts from: the
+installed bundle MUST be exactly that file (else `TrustBaseDigest`); it is never
+the pin. The wallet appends newer entries to the installed history afterwards.
 
 A digest and successful installation establish integrity, not authority:
 provisioning authenticates the genesis out of band (the manifest, an
@@ -55,8 +55,21 @@ seal epoch e:
 6. the seal under e's committee with the native B1 rule: every signature is a
    valid one of a member of e (an unknown signer or an invalid signature fails
    the seal), at most 16 signatures, and the signers' weights reach e's
-   threshold `floor(2W/3)+1` (else `QuorumNotMet`; on the embedded certificate
-   the oracle names it `LockUC`).
+   threshold `floor(2W/3)+1` (else `QuorumNotMet`).
+
+The steps run in this order, so an input with several faults gets one verdict
+in every implementation: steps 1-4 select e before any structure, root or
+signature work. On the embedded EVM certificate the lock proof checks steps 1-4,
+then the pinned EVM partition, shard and configuration (the PDR), then steps 5
+and 6. The oracle names a failure of steps 5 or 6 on the embedded certificate
+`LockUC` (the plug-ins `CertStructure`, `SealRoot` or `QuorumNotMet`); the
+oracle's lock family is its own and the plug-ins do not replay it. Known naming
+differences with equal verdicts: a 65-byte signature with recovery byte above 1
+is `UnsupportedCertificateEncoding` in the plug-ins' pre-scan and `LockUC` in the
+oracle; a signature of another length is `UnsupportedCertificateEncoding`
+(invalid) in the plug-ins and `CertSigLength` (malformed) in the oracle; a 17th
+signature is malformed in the SDKs and an unknown signer in the oracle (an entry
+has at most 16 members).
 
 TS uses `UnicityCertificateVerifier.verifyCertificate(history, uc,
 { partitionId })` for the embedded certificate and the SDK token verifier for

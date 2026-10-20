@@ -27,6 +27,8 @@ export class TrustInput {
     public readonly history: TrustBaseHistory,
     /** The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal. */
     public readonly id: Uint8Array,
+    /** The release bundle it was installed from, exactly: the file a manifest's `trustBase.bundle` names by digest. */
+    public readonly bundle: Uint8Array,
   ) {}
 
   /**
@@ -40,7 +42,7 @@ export class TrustInput {
     } catch (e) {
       return fail(e instanceof TrustBaseError && e.reason === 'genesis' ? 'ErrTrustBaseDigest' : 'ErrTrustBase');
     }
-    return new TrustInput(history, pin.slice());
+    return new TrustInput(history, pin.slice(), bundle.slice());
   }
 
   public get network(): NetworkId {
@@ -53,12 +55,24 @@ export class TrustInput {
   }
 
   /**
-   * Verify an embedded certificate with the SDK's certificate verifier for its own partition (the EVM partition pin is the caller's):
-   * native format and structure, the tree path to the seal hash, and the seal under its epoch's committee (B1 rule).
+   * Select the committee of the certificate's seal epoch (protocol/trust-base.md steps 1-4, before any structure, root or signature check, as
+   * the oracle orders them): another network `ErrSealNetwork`, an epoch newer than the latest held `ErrNoEntryForEpoch`, before the genesis or
+   * outside the epoch's round interval `ErrSealEpoch`.
+   */
+  public selectEpoch(uc: UnicityCertificate): void {
+    if (!uc.unicitySeal.networkId.equals(this.history.networkId)) fail('ErrSealNetwork');
+    const committee = UnicitySealQuorumSignaturesVerificationRule.selectCommittee(this.history, uc.unicitySeal);
+    if (committee instanceof CertificateVerificationResult) fail(certificateFailure(committee) ?? 'ErrSealEpoch');
+  }
+
+  /**
+   * Verify an embedded certificate with the SDK's certificate verifier for its own partition (the EVM partition pin is the caller's): the seal
+   * epoch's committee first ({@link selectEpoch}), then native format and structure, the tree path to the seal hash, and the seal under that
+   * committee (B1 rule).
    */
   public async verifyEmbeddedUc(uc: UnicityCertificate): Promise<void> {
     preflightUc(uc.toCBOR());
-    if (!uc.unicitySeal.networkId.equals(this.history.networkId)) fail('ErrSealNetwork');
+    this.selectEpoch(uc);
     const verifier = new UnicityCertificateVerifier(new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier()));
     const r = await verifier.verifyCertificate(this.history, uc, { partitionId: uc.unicityTreeCertificate.partitionIdentifier });
     if (r.status !== VerificationStatus.OK) fail(certificateFailure(r) ?? 'ErrQuorumNotMet');

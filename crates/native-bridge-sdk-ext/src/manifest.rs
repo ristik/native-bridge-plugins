@@ -279,23 +279,26 @@ fn deployment(
 
 const MAX_POLICY_BODY: usize = crate::limits::MAX_POLICY_BYTES;
 
-/// `(networkId, rootGenesisHash, genesisEntryId)` of an entry's trust pin.
-pub type TrustPin = (u16, [u8; 32], [u8; 32]);
+/// `(networkId, rootGenesisHash, genesisEntryId, bundle sha256)` of an entry's trust pin.
+pub type TrustPin = (u16, [u8; 32], [u8; 32], [u8; 32]);
 
 /// A validated registry and the trust-base genesis pins it names.
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub registry: DeploymentRegistry,
-    /// `(networkId, rootGenesisHash, genesisEntryId)` per entry.
+    /// `(networkId, rootGenesisHash, genesisEntryId, bundle sha256)` per entry.
     pub trust_pins: Vec<TrustPin>,
 }
 
 impl Loaded {
     /// Install: every entry's pinned genesis must be exactly the installed trust input's, on its
-    /// network; the bridge then verifies under that history.
+    /// network, installed from the named bundle; the bridge then verifies under that history.
     pub fn install(&self, trust: TrustInput) -> Result<NativeBridge> {
-        for (network, _root, doc) in &self.trust_pins {
-            if *doc != trust.id() || *network != trust.network_id().id() {
+        for (network, _root, doc, bundle) in &self.trust_pins {
+            if *doc != trust.id()
+                || *network != trust.network_id().id()
+                || *bundle != h(trust.bundle())
+            {
                 return Err(E::TrustBaseDigest);
             }
         }
@@ -348,7 +351,7 @@ pub fn validate(
     {
         return Err(E::Manifest);
     }
-    hex_n::<32>(&t.bundle.sha256)?;
+    let bundle = hex_n::<32>(&t.bundle.sha256)?;
     let doc = hex_n::<32>(&t.genesis_entry_id)?;
     let c = Ctx {
         network,
@@ -370,7 +373,7 @@ pub fn validate(
             return Err(E::AmbiguousDeployment);
         }
     }
-    Ok((out, (network, root, doc)))
+    Ok((out, (network, root, doc, bundle)))
 }
 
 /// Parse a manifest registry (an object keyed by `tokenTypeHex`), validate every entry and return

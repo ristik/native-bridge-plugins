@@ -222,3 +222,21 @@ test('proof arity and version are exact', async () => {
 });
 
 test('DEFERRED: rotation, weighted and historical-committee scenarios are unsupported', { skip: 'common SDK trust-base work (bft-core#421)' }, () => undefined);
+
+test('several faults get the oracle verdict: the seal epoch first, then the configuration, then the certificate', async () => {
+  const w = await makeWorld();
+  const next = await nextEpoch(w.evm, 1000n, 4, 30);
+  // an epoch the history does not hold and a false root: retryable, never the root failure
+  await rejects(
+    mutated(async (_, p) => void (p.uc = await resignUc({ ...w, evm: next }, p, { rootEpoch: 3n, round: 1500n, sealHash: new Uint8Array(32).fill(1) })), undefined, w),
+    'ErrNoEntryForEpoch',
+  );
+  // a configuration that is not the certificate's and a short quorum: the configuration first
+  await rejects(
+    mutated(async (ww, p) => {
+      p.uc = await resignUc(ww, p, { signers: 2 });
+      p.pdr = flip(p.pdr, 3);
+    }),
+    'ErrEvmConfigHash',
+  );
+});

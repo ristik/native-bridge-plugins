@@ -9,6 +9,7 @@
  * proof's `trustBaseId`. `trustBase.bundle` names the release bundle (genesis and later entries)
  * an installation may start from, by exact-file digest. `proofEndpoints`, `rpcUrls` and artifact
  * locations are installation metadata for construction and refresh; verification never reads them.
+ * The trust input must be installed from exactly the named bundle; the wallet appends newer entries afterwards.
  *
  * Artifacts pinned by hash (`pdr`, `executionProfile`) are supplied by the installer through an
  * {@link Artifacts} resolver; a missing or mismatching one fails installation. The execution
@@ -138,6 +139,8 @@ export interface TrustPin {
   rootGenesis: Uint8Array;
   /** The EntryID of the trust base genesis entry. */
   genesisEntryId: Uint8Array;
+  /** SHA-256 of the release bundle the installation starts from. */
+  bundleSha256: Uint8Array;
 }
 
 const TRUST = ['networkId', 'rootGenesisHash', 'format', 'genesisEntryId', 'bundle'] as const;
@@ -169,8 +172,8 @@ export function validateManifest(raw: unknown, artifacts?: Artifacts): { deploym
   for (const k of ['proofEndpoints', 'rpcUrls'] as const) if (k in m && !Array.isArray(m[k])) fail('ErrManifest');
   const t = obj(m.trustBase, TRUST);
   if (t.format !== 'utb-release-bundle-v1' || t.networkId !== network || !eq(hexN(t.rootGenesisHash, 32), root)) fail('ErrManifest');
-  hexN(obj(t.bundle, ARTIFACT, ['location']).sha256, 32);
-  const pin: TrustPin = { network, rootGenesis: root, genesisEntryId: hexN(t.genesisEntryId, 32) };
+  const bundleSha256 = hexN(obj(t.bundle, ARTIFACT, ['location']).sha256, 32);
+  const pin: TrustPin = { network, rootGenesis: root, genesisEntryId: hexN(t.genesisEntryId, 32), bundleSha256 };
   const c: Ctx = { network, root, exec, chain, ty, aid };
   if (!Array.isArray(m.replacedDeployments)) fail('ErrManifest');
   const deployments = [deployment(c, m.activeDeployment, artifacts), ...(m.replacedDeployments as unknown[]).map((r) => deployment(c, r, artifacts))];
@@ -190,10 +193,10 @@ export class Loaded {
     public readonly trustPins: readonly TrustPin[],
   ) {}
 
-  /** Install: every entry's pinned genesis must be exactly the installed trust input's, on its network. */
+  /** Install: every entry's pinned genesis must be exactly the installed trust input's, on its network, installed from the named bundle. */
   public install(trust: TrustInput): NativeBridge {
     for (const p of this.trustPins) {
-      if (!eq(p.genesisEntryId, trust.id) || p.network !== trust.network.id) fail('ErrTrustBaseDigest');
+      if (!eq(p.genesisEntryId, trust.id) || p.network !== trust.network.id || !eq(p.bundleSha256, H(trust.bundle))) fail('ErrTrustBaseDigest');
     }
     return new NativeBridge(this.registry, trust);
   }

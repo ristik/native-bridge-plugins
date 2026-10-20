@@ -14,6 +14,8 @@ use unicity_token::api::bft::{HistoryError, TrustBaseHistory, UnicityCertificate
 use unicity_token::api::NetworkId;
 use unicity_token::verify::{verify_certificate_of_partition, SealSession, VerificationError};
 
+use alloc::vec::Vec;
+
 use crate::error::{NativeError as E, Result};
 
 /// The installed trust: the held SDK history and its genesis EntryID.
@@ -21,6 +23,7 @@ use crate::error::{NativeError as E, Result};
 pub struct TrustInput {
     history: TrustBaseHistory,
     id: [u8; 32],
+    bundle: Vec<u8>,
 }
 
 impl TrustInput {
@@ -31,7 +34,11 @@ impl TrustInput {
             HistoryError::PinMismatch => E::TrustBaseDigest,
             _ => E::TrustBase,
         })?;
-        Ok(TrustInput { history, id: *pin })
+        Ok(TrustInput {
+            history,
+            id: *pin,
+            bundle: bundle.to_vec(),
+        })
     }
 
     /// The held history (the wallet appends newer entries to its own copy and reinstalls).
@@ -41,6 +48,12 @@ impl TrustInput {
 
     pub fn network_id(&self) -> NetworkId {
         self.history.network_id()
+    }
+
+    /// The release bundle it was installed from, exactly: the file a manifest's `trustBase.bundle`
+    /// names by digest.
+    pub fn bundle(&self) -> &[u8] {
+        &self.bundle
     }
 
     /// The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal.
@@ -55,9 +68,7 @@ impl TrustInput {
 /// with the native (B1) rule, where an unknown signer or an invalid signature fails the seal.
 pub fn verify_embedded_uc(input: &TrustInput, uc: &UnicityCertificate) -> Result<()> {
     crate::resources::preflight_uc(&uc.to_cbor())?;
-    if uc.unicity_seal.network_id != input.network_id() {
-        return Err(E::SealNetwork);
-    }
+    select_epoch(input, uc)?;
     let mut session = SealSession::new(input.history());
     // the policy only namespaces the session's memo, which lives for this call alone
     verify_certificate_of_partition(
@@ -67,6 +78,20 @@ pub fn verify_embedded_uc(input: &TrustInput, uc: &UnicityCertificate) -> Result
         &[0; 32],
     )
     .map_err(|e| certificate_failure(&e).unwrap_or(E::CertStructure))
+}
+
+/// Select the committee of the certificate's seal epoch (protocol/trust-base.md steps 1-4, before
+/// any structure, root or signature check, as the oracle orders them): another network
+/// `SealNetwork`, an epoch newer than the latest held `NoEntryForEpoch`, before the genesis or
+/// outside the epoch's round interval `SealEpoch`.
+pub fn select_epoch(input: &TrustInput, uc: &UnicityCertificate) -> Result<()> {
+    if uc.unicity_seal.network_id != input.network_id() {
+        return Err(E::SealNetwork);
+    }
+    SealSession::new(input.history())
+        .authority_for(&uc.unicity_seal)
+        .map(|_| ())
+        .map_err(|e| certificate_failure(&e).unwrap_or(E::SealEpoch))
 }
 
 /// The sentinel of a certificate failure, as the TypeScript projection names it: an epoch newer
