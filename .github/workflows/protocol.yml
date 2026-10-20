@@ -40,6 +40,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo check --locked --no-default-features
+      # the consolidated redemption path builds without std (the SDK's client feature is alloc only)
+      - run: cargo check --locked -p native-bridge-sdk-ext --no-default-features --features alloc,consolidation
   corpus:
     runs-on: ubuntu-latest
     steps:
