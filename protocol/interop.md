@@ -421,11 +421,18 @@ rule stands, and the plug-in never re-queries until responses happen to share
 a certificate. The master seal is an anchor like any other: its root round must
 be covered by the registry's usable origin O, so a fresh one is waited for.
 
-Per-SID path (the fallback). When consolidation is `Unavailable` (retryable:
-view not retained, state pending, busy) or the partition has more shards than
-the view admits, the plug-in assembles from per-SID proofs; integrity, server
-and timeout failures of consolidation are errors as in the SDK, never a silent
-fallback. For each used shard it fetches, concurrently, only the existing
+Per-SID path (the fallback). The plug-in assembles from per-SID proofs when
+consolidation returns `unavailable`, whatever its reason and whether or not the
+SDK marks it retryable (the SDK's reasons: `busy`, `limit_exceeded`,
+`partition_view_unavailable`, `pending_publication`, `state_expired`,
+`state_not_in_root`, `state_pending`, `state_unknown`, `target_not_retained`,
+`unsupported_capability`, `unsupported_configuration`; a partition with more
+shards than the view admits is one of them), and keeps the SDK's retryable flag
+only as a hint for a later consolidation attempt. A failed consolidation is
+not unavailability: every `ConsolidationError` (`cancelled`, `input`,
+`integrity`, `invalid_response`, `rejected`, `server`, `timeout`, `transport`)
+is the SDK's error, surfaced as it is and never a silent fallback. For each
+used shard it fetches, concurrently, only the existing
 aggregator `get_inclusion_proof.v2(stateId)` and keeps each response's path and
 its UC as an inseparable pair, verifying locally the path against that UC's
 root and the returned CD and t against the original history. A path is never
