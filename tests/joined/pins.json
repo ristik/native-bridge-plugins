@@ -3,8 +3,8 @@
   "sources": {
     "plugins": "f4bc312e3044dcc1a5706c5838228313e5608e73",
     "ureth": "6e59b68cc29f196d54d3d6e28d6266a8c02d05a1",
-    "contracts": "19f3e2a81a2072784675c18883a685c33415ae6f",
-    "oracle": "323ee6c4cb3360301d3334dfed9f354c85f95be9",
+    "contracts": "1b235ae45055a08bb17c4d4320e262fcd3359e72",
+    "oracle": "ed4b71fbd047139bdd585c9dc50fe106dd83cdb3",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
