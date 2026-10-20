@@ -40,7 +40,7 @@ import { DeploymentRegistry, makeDeployment } from '../../packages/native-bridge
 import { configHashOfPdr, encodeJustification } from '../../packages/native-bridge-plugin/src/lockproof.js';
 import { buildReturnProof } from '../../packages/native-bridge-plugin/src/proof.js';
 import {
-  arr, decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, shardCovers, shardDepth, u, valueEnvelope,
+  arr, bs, decodeCfg, decodePolicy, deriveSalt, deriveTokenId, H, keccak256, lockDigest, lockRecord, returnReason, shardCovers, shardDepth, u, valueEnvelope,
 } from '../../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
 import { NativeBridge } from '../../packages/native-bridge-plugin/src/verifier.js';
@@ -95,9 +95,10 @@ function ctx(cfgPath: string) {
   // Several configured shards may cover one state ID (a parent and its child across a split): the deepest is the one serving it now. The route
   // is only where to ask: the anchor's shard, configuration and partition come from the UC the aggregator returns, and the verifier refuses
   // a UC whose shard does not cover the leaf.
-  const aggOf = (sid: StateId): AggregatorClient => shards.filter((s) => shardCovers(s.shard, sid.data))
+  const aggOfData = (data: Uint8Array): AggregatorClient => shards.filter((s) => shardCovers(s.shard, data))
     .sort((x, y) => shardDepth(y.shard) - shardDepth(x.shard))[0]?.client ?? fallback;
-  return { lane, eth, cast, aggOf };
+  const aggOf = (sid: StateId): AggregatorClient => aggOfData(sid.data);
+  return { lane, eth, cast, aggOf, aggOfData };
 }
 type Ctx = ReturnType<typeof ctx>;
 
@@ -166,33 +167,47 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
   const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.publicKey)).toCBOR();
   const amountWei = 10n ** 18n;
   const amount = unhex(amountWei.toString(16).padStart(16, '0'));
-  const sent = JSON.parse(c.cast('send', c.lane.vault, 'lock(bytes)(uint256)', `0x${hex(p0)}`, '--value', amountWei.toString(), '--private-key', DEPLOYER_KEY,
-    '--json', '--gas-limit', '2000000'));
-  assert.equal(sent.status, '0x1', `lock reverted: ${JSON.stringify(sent)}`);
-  const nonce = BigInt(sent.logs.find((l: { topics: string[] }) => l.topics.length === 3).topics[1]);
-  const proofPath = `${out}/lockproof-${nonce}.cbor`;
-  await until('the lock block to be certified and archived', 120_000, async () => {
-    try {
-      run(DNB_TOOL, ['lockproof', '--archive', c.lane.archive, '--block-hash', sent.blockHash, '--eth-url', c.eth, '--vault', c.lane.vault, '--nonce', nonce.toString(),
-        '--full-shard-conf', `${c.lane.dir}/evm-full-shard-conf.json`, '--trust-bundle', `${c.lane.dir}/trust-base.bundle.cbor`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-  const lockProof = Uint8Array.from(readFileSync(proofPath));
-  const salt = deriveSalt(dep.cfgHash, nonce);
-  const tokenId = deriveTokenId(salt, cfg.network);
-  assert.equal(hex(unhex(c.cast('call', c.lane.vault, 'lockDigest(uint256)(bytes32)', nonce.toString()))),
-    hex(lockDigest(dep.cfgHash, nonce, lockRecord(cfg.zeroAddress, cfg.ty, cfg.aid, amount, tokenId, sha256(p0)))), 'the vault stored the derived lock digest');
+  // With several aggregator shards the history must span them: the burn's StateId is fixed by the mint (its source state) and the mint's by the lock's nonce,
+  // so a lock whose mint and burn fall to the same shard is abandoned (its funds stay in the vault, unredeemed) and the next lock is tried.
+  const spans = (c.lane.aggShards?.length ?? 0) >= 2;
+  const lockAndMint = async () => {
+    const sent = JSON.parse(c.cast('send', c.lane.vault, 'lock(bytes)(uint256)', `0x${hex(p0)}`, '--value', amountWei.toString(), '--private-key', DEPLOYER_KEY,
+      '--json', '--gas-limit', '2000000'));
+    assert.equal(sent.status, '0x1', `lock reverted: ${JSON.stringify(sent)}`);
+    const nonce = BigInt(sent.logs.find((l: { topics: string[] }) => l.topics.length === 3).topics[1]);
+    const proofPath = `${out}/lockproof-${nonce}.cbor`;
+    await until('the lock block to be certified and archived', 120_000, async () => {
+      try {
+        run(DNB_TOOL, ['lockproof', '--archive', c.lane.archive, '--block-hash', sent.blockHash, '--eth-url', c.eth, '--vault', c.lane.vault, '--nonce', nonce.toString(),
+          '--full-shard-conf', `${c.lane.dir}/evm-full-shard-conf.json`, '--trust-bundle', `${c.lane.dir}/trust-base.bundle.cbor`, '--cfg', `0x${hex(dep.cfgHash)}`, '--out', proofPath]);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const lockProof = Uint8Array.from(readFileSync(proofPath));
+    const salt = deriveSalt(dep.cfgHash, nonce);
+    const tokenId = deriveTokenId(salt, cfg.network);
+    assert.equal(hex(unhex(c.cast('call', c.lane.vault, 'lockDigest(uint256)(bytes32)', nonce.toString()))),
+      hex(lockDigest(dep.cfgHash, nonce, lockRecord(cfg.zeroAddress, cfg.ty, cfg.aid, amount, tokenId, sha256(p0)))), 'the vault stored the derived lock digest');
 
-  // mint and burn, each certified by the live aggregator; the proofs are the ones returned at certification, never refreshed
-  const mint = await MintTransaction.create(NetworkId.fromId(cfg.network), SignaturePredicate.create(owner.publicKey), {
-    data: valueEnvelope(cfg.aid, amount), expiresAt: null, justification: encodeJustification(cfg.chainId, cfg.vault, cfg.zeroAddress, nonce, lockProof),
-    salt: TokenSalt.fromBytes(salt), tokenType: new TokenType(cfg.ty),
-  });
-  const mcd = await CertificationData.fromMintTransaction(mint);
-  const msid = await StateId.fromCertificationData(mcd);
+    // mint and burn, each certified by the live aggregator; the proofs are the ones returned at certification, never refreshed
+    const mint = await MintTransaction.create(NetworkId.fromId(cfg.network), SignaturePredicate.create(owner.publicKey), {
+      data: valueEnvelope(cfg.aid, amount), expiresAt: null, justification: encodeJustification(cfg.chainId, cfg.vault, cfg.zeroAddress, nonce, lockProof),
+      salt: TokenSalt.fromBytes(salt), tokenType: new TokenType(cfg.ty),
+    });
+    const mcd = await CertificationData.fromMintTransaction(mint);
+    const msid = await StateId.fromCertificationData(mcd);
+    return { nonce, lockProof, tokenId, mint, mcd, msid };
+  };
+  let first = await lockAndMint();
+  for (let attempt = 1; spans; attempt++) {
+    const burnSid = H(arr(first.mint.recipient.toCBOR(), bs((await first.mint.calculateStateHash()).data)));
+    if (c.aggOf(first.msid) !== c.aggOfData(burnSid)) break;
+    assert.ok(attempt < 16, 'no lock gave a mint and a burn on different aggregator shards in 16 attempts');
+    first = await lockAndMint();
+  }
+  const { nonce, lockProof, tokenId, mint, mcd, msid } = first;
   await c.aggOf(msid).submitCertificationRequest(mcd);
   const mproof = await until('the mint to be certified', 120_000, async () => (await c.aggOf(msid).getInclusionProof(msid)).inclusionProof ?? undefined);
   let tokenBytes = C.encodeTag(39040, arr(u(2), arr(mint.toCBOR(), mproof.toCBOR()), arr()));
@@ -201,6 +216,7 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
   const burn = await TransferTransaction.create(token, BurnPredicate.create(sha256(reason)), StateMask.generate(), { data: reason });
   const bcd = await CertificationData.fromTransaction(burn, await SignaturePredicateUnlockScript.create(burn, owner));
   const bsid = await StateId.fromCertificationData(bcd);
+  if (spans) assert.notEqual(c.aggOf(bsid), c.aggOf(msid), 'the burn went to the shard of the mint: the steering did not hold');
   await c.aggOf(bsid).submitCertificationRequest(bcd);
   const bproof = await until('the burn to be certified', 120_000, async () => (await c.aggOf(bsid).getInclusionProof(bsid)).inclusionProof ?? undefined);
   const genesis = CborDeserializer.decodeArray(token.genesis.toCBOR(), 2);
@@ -221,6 +237,7 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
     assert.equal(labels.size, 1, `anchor ${i}: its certificate occurrences disagree on epoch/round`);
     return { epoch: matching[0].unicitySeal.epoch, round: matching[0].unicitySeal.rootChainRoundNumber, shard: hex(a.shard), ucSha256: sha(a.uc) };
   });
+  if (spans) assert.equal(new Set(anchors.map((a) => a.shard)).size, c.lane.aggShards!.length, `the saved history must carry an anchor of each aggregator shard: ${anchors.map((a) => a.shard)}`);
   const head = await rpc(c.eth, 'eth_blockNumber', []);
   const saved = {
     lane: 'anyage', savedAtBlock: head, nonce, amountWei, recipient: RECIPIENT, nullifier: hex(ret.verified.outcome.nullifier),
