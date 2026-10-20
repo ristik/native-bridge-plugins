@@ -16,6 +16,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: alloc-only core builds for wasm
         run: cargo check --locked -p native-bridge-sdk-ext --no-default-features --target wasm32-unknown-unknown
+      - name: alloc-only core with the consolidated redemption path builds for wasm
+        run: cargo check --locked -p native-bridge-sdk-ext --no-default-features --features alloc,consolidation --target wasm32-unknown-unknown
       - name: receipt verification with the network namespace removed
         run: cargo test --locked -p native-bridge-sdk-ext --test manifest_and_offline receipt_verification_succeeds_with_the_network_disabled -- --exact --nocapture
   typescript:

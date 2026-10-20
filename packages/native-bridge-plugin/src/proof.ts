@@ -120,7 +120,9 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   // the best case is the fewest anchors under one seal: one per aggregator shard the leaves touch (`shards`, from the host's routing
   // of `leafStateIds`; 1 when unknown, since a single certificate may serve every leaf). It is a lower bound, not a promise: over 8
   // shards the consolidated bundle is not reachable, yet K = min(m, L) under one seal stays the best case there, since per-SID
-  // certificates may share a seal by chance
+  // certificates may share a seal by chance. It holds only while the topology does not merge: the redemption comes later, and a
+  // shard merge before it lowers the anchors the leaves need, so a host that may see a merge passes the merged count (or 1);
+  // over-counting `shards` could refuse a burn that would pass
   return checkBurnProjection(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, leaves, projectToken(token).length, Math.min(shards, leaves));
 }
 

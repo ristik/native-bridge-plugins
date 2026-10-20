@@ -175,6 +175,9 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
 /// [`preflight_burn`] when the host knows how many aggregator shards the leaves touch (its routing of
 /// [`leaf_state_ids`]): the best case is then the consolidated bundle, one anchor per shard (at most one per
 /// leaf) under one seal. With `shards` 1 it is `preflight_burn`: a single certificate may serve every leaf.
+/// The projection is a lower bound only while the topology does not merge: the redemption comes later, and a
+/// shard merge before it lowers the anchors the leaves need, so a host that may see a merge passes the merged
+/// count (or 1); over-counting `shards` could refuse a burn that would pass.
 pub fn preflight_burn_shards(bridge: &NativeBridge, token: &Token, shards: usize) -> Result<Gate> {
     let dep = deployment_of(bridge, token)?;
     let leaves = token.transactions().len() + 2; // the mint, every transfer and the burn
