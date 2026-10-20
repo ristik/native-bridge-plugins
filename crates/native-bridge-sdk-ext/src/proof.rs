@@ -18,7 +18,7 @@ use crate::envelope::{
     check_anchors, check_policy_body, plan_anchors, Anchor, Envelope, LeafProof,
 };
 use crate::error::{NativeError as E, Result};
-use crate::gas::{compute_gate, kernel_request_bytes, projected_gate, Gate};
+use crate::gas::{compute_gate, kernel_request_bytes, projected_gate_anchors, Gate};
 use crate::history::{self, History};
 use crate::limits::*;
 use crate::profile::h;
@@ -169,17 +169,24 @@ pub const BURN_HISTORY_BYTES: usize = 1024;
 /// bounds the answer is `GasBudget`/`TooManyTx`/`InputTooLarge` (BudgetExceeded), never a truncated
 /// history or a partial redemption. `token` is the held receipt the burn would spend.
 pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
+    preflight_burn_shards(bridge, token, 1)
+}
+
+/// [`preflight_burn`] when the host knows how many aggregator shards the leaves touch (its routing of
+/// [`leaf_state_ids`]): the best case is then the consolidated bundle, one anchor per shard (at most one per
+/// leaf) under one seal. With `shards` 1 it is `preflight_burn`: a single certificate may serve every leaf.
+pub fn preflight_burn_shards(bridge: &NativeBridge, token: &Token, shards: usize) -> Result<Gate> {
     let dep = deployment_of(bridge, token)?;
     let leaves = token.transactions().len() + 2; // the mint, every transfer and the burn
     if leaves > MAX_LEAVES {
         return Err(E::TooManyTx);
     }
-    // the fewest anchors any bundle can need is one: a single certificate may serve every leaf
-    check_burn_projection(
+    check_burn_projection_anchors(
         dep.cfg.to_bytes().len() as u64,
         dep.policy.to_bytes().len() as u64,
         leaves as u64,
         history::project(token).len(),
+        shards.min(leaves) as u64,
     )
 }
 
@@ -194,10 +201,22 @@ pub fn check_burn_projection(
     leaves: u64,
     history: usize,
 ) -> Result<Gate> {
+    check_burn_projection_anchors(cfg_len, policy_len, leaves, history, 1)
+}
+
+/// [`check_burn_projection`] with the best case of `anchors` anchors under one seal.
+pub fn check_burn_projection_anchors(
+    cfg_len: u64,
+    policy_len: u64,
+    leaves: u64,
+    history: usize,
+    anchors: u64,
+) -> Result<Gate> {
     if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
         return Err(E::InputTooLarge);
     }
-    let (gate, envelope) = projected_gate(cfg_len, policy_len, leaves, history as u64);
+    let (gate, envelope) =
+        projected_gate_anchors(cfg_len, policy_len, leaves, history as u64, anchors);
     if envelope > MAX_ENVELOPE_BYTES as u64 {
         return Err(E::InputTooLarge);
     }

@@ -22,7 +22,9 @@ import { BEST_UC_BYTES } from '../src/gas.js';
 import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
 import { cfgBytes } from '../src/profile.js';
 import { toHex } from '../src/bytes.js';
-import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, PAIR_RACE } from '../src/wallet.js';
+import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, MAX_VIEW_SHARDS, PAIR_RACE } from '../src/wallet.js';
+import { ConsolidationError } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationError.js';
+import type { ConsolidationResult } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationResult.js';
 import { DeploymentRegistry } from '../src/deployment.js';
 import { rejects, throwsReason } from './util.js';
 import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, rowOf, sha, shardOf, signer, spec, txStep, type World } from './world.js';
@@ -417,4 +419,64 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [long.token.genesis, ...long.token.transactions].map((c) => c.inclusionProof); };
   await rejects(buildNativeReturnProof(plugin, long.bytes, overBound), 'ErrTooManyTx');
   assert.ok(calls <= 1);
+});
+
+test('consolidation is the default path: its token is assembled as is; unavailable falls back to per-SID; a failure is not a fallback', async () => {
+  const w = await makeWorld();
+  const out = await ret(w);
+  const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
+  // the consolidated token: an ordinary token whose outer proofs came from one later certification
+  const merged = await refreshToken(out.token, await freshProofs(w, out, 0, UC_TS));
+  let fetched = 0;
+  const source = async (): Promise<InclusionProof[]> => (++fetched, freshProofs(w, out, 1, UC_TS));
+  const consolidated = async (): Promise<ConsolidationResult> => ({ status: 'consolidated', token: merged, summary: {} as never });
+  const a = await buildNativeReturnProof(plugin, out.bytes, source, { consolidate: consolidated, partitionShards: 2 });
+  assert.equal(a.path.kind, 'consolidated');
+  assert.equal(fetched, 0, 'the consolidated token is used as is: no per-SID fetch');
+  assert.deepEqual(a.tokenBytes, merged.toCBOR(), 'the token to persist with the pending redemption');
+  assert.deepEqual(a.encoded, (await buildReturnProof(w.bridge, merged)).encoded);
+
+  const unavailable = async (): Promise<ConsolidationResult> => ({ status: 'unavailable', reason: 'target_not_retained', retryable: true });
+  const b = await buildNativeReturnProof(plugin, out.bytes, source, { consolidate: unavailable, partitionShards: 2 });
+  assert.deepEqual(b.path, { kind: 'per-sid', unavailable: 'target_not_retained', retryable: true });
+  assert.equal(fetched, 1, 'the per-SID fallback fetched once');
+  assert.deepEqual(b.encoded, (await buildReturnProof(w.bridge, await refreshToken(out.token, await freshProofs(w, out, 1, UC_TS)))).encoded);
+
+  for (const err of [new ConsolidationError('integrity', 'forged', { outcome: 'unauthenticated' }), new ConsolidationError('timeout', 'late')]) {
+    fetched = 0;
+    const failing = async (): Promise<ConsolidationResult> => { throw err; };
+    const got = await buildNativeReturnProof(plugin, out.bytes, source, { consolidate: failing, partitionShards: 2 }).then(() => undefined, (e: unknown) => e);
+    assert.equal(got, err, `${err.kind} is thrown as the SDK threw it`);
+    assert.equal(fetched, 0, `${err.kind} is never a silent per-SID fallback`);
+  }
+  // the consolidator is untrusted host code: a token other than the held one is refused, never assembled, never a fallback
+  const other = await buildToken(w, spec(1), [txStep(3, 8, T0 + 11n), burnStep(T0 + 21n)], T0, UC_TS);
+  for (const bad of [other.token]) {
+    fetched = 0;
+    const lying = async (): Promise<ConsolidationResult> => ({ status: 'consolidated', token: bad, summary: {} as never });
+    await rejects(buildNativeReturnProof(plugin, out.bytes, source, { consolidate: lying, partitionShards: 2 }), 'ErrRefreshMismatch');
+    assert.equal(fetched, 0, 'a mismatch is an error, not a per-SID fallback');
+  }
+  // without a consolidator the per-SID path is the one taken
+  assert.deepEqual((await buildNativeReturnProof(plugin, out.bytes, source)).path, { kind: 'per-sid' });
+  // a partition over the view's limit is assembled per SID without calling the consolidator; at the limit it is consolidated
+  let called = 0;
+  const counting = async (): Promise<ConsolidationResult> => (++called, consolidated());
+  fetched = 0;
+  const over = await buildNativeReturnProof(plugin, out.bytes, source, { consolidate: counting, partitionShards: MAX_VIEW_SHARDS + 1 });
+  assert.deepEqual([over.path, called, fetched], [{ kind: 'per-sid', overViewLimit: true }, 0, 1]);
+  const at = await buildNativeReturnProof(plugin, out.bytes, source, { consolidate: counting, partitionShards: MAX_VIEW_SHARDS });
+  assert.deepEqual([at.path, called], [{ kind: 'consolidated' }, 1]);
+});
+
+test('the burn preflight projects one anchor per touched shard under one seal, and one when the shard count is unknown', async () => {
+  const w = await makeWorld();
+  const out = await ret(w);
+  const one = await preflightBurn(w.bridge, out.bytes);
+  const two = await preflightBurn(w.bridge, out.bytes, 2);
+  assert.equal(one.grouping.k, 1);
+  assert.equal(two.grouping.k, 2);
+  assert.deepEqual([two.grouping.e, two.grouping.s], [1, 1], 'one seal');
+  assert.ok(two.total > one.total);
+  assert.equal((await preflightBurn(w.bridge, out.bytes, 99)).grouping.k, out.token.transactions.length + 2, 'K <= L');
 });

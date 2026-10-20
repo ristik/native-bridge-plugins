@@ -135,3 +135,34 @@ fn the_gate_of_every_published_envelope_is_the_oracles_component_by_component() 
         }
     }
 }
+
+#[test]
+fn the_k_anchor_projection_is_a_lower_bound_of_every_consolidated_bundle() {
+    use native_bridge_sdk_ext::gas::{projected_gate, projected_gate_anchors};
+    let cs: Vec<Value> = cases("proof/cases.json", "gate")
+        .into_iter()
+        .filter(|c| {
+            let id = c["id"].as_str().unwrap();
+            id.strip_prefix("gate-consolidated-m")
+                .is_some_and(|r| r.starts_with(|ch: char| ch.is_ascii_digit()))
+                && id.ends_with("-exact")
+        })
+        .collect();
+    assert_eq!(cs.len(), 8, "m in {{1,2,4,8}} x committee {{4,16}}");
+    for c in &cs {
+        let cfg = cfg_of(c["cfg"].as_str().unwrap()).to_bytes().len() as u64;
+        let env = Envelope::decode(&from_hex(c["input"].as_str().unwrap()).unwrap()).unwrap();
+        let (k, l) = (env.anchors.len() as u64, env.leaf_proofs.len() as u64);
+        let (p, h) = (env.policy_body.len() as u64, env.history.len() as u64);
+        let exact: u64 = c["aux"]["budget"].as_str().unwrap().parse().unwrap();
+        let best = projected_gate_anchors(cfg, p, l, h, k).0.total;
+        assert!(best <= exact, "{}: {best} > {exact}", c["id"]);
+        if k > 1 {
+            assert!(best > projected_gate(cfg, p, l, h).0.total);
+        }
+        assert_eq!(
+            projected_gate_anchors(cfg, p, l, h, l + 5).0.total,
+            projected_gate_anchors(cfg, p, l, h, l).0.total
+        );
+    }
+}

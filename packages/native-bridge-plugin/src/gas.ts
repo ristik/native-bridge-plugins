@@ -144,21 +144,23 @@ export const BEST_UC_ITEMS = 39;
 
 /**
  * The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves (the burn included) and a
- * `historyBytes` history would need if everything the burn cannot yet know turns out as small as it can: ONE anchor (a single
- * certificate may serve every leaf, so the best case is never one anchor per shard), the smallest certificate and empty paths.
+ * `historyBytes` history would need if everything the burn cannot yet know turns out as small as it can: the consolidated bundle,
+ * `anchors` anchors (one per aggregator shard the leaves touch, at least 1, at most `leaves`) under ONE seal, the smallest
+ * certificates and empty paths. With the shard count unknown the best case is one anchor (a single certificate may serve every leaf).
  * The burn is refused, before any wallet burn is made, only when even this cannot pass the gas gate; whether the bundle that is
  * actually fetched passes is the gate's decision at redemption.
  */
-export function projectedGate(cfgBytes: number, policyBytes: number, leaves: number, historyBytes: number): { gate: Gate; envelopeBytes: number } {
+export function projectedGate(cfgBytes: number, policyBytes: number, leaves: number, historyBytes: number, anchors = 1): { gate: Gate; envelopeBytes: number } {
+  const k = Math.max(1, Math.min(anchors, leaves));
   const word = 32;
-  // abi.encode(bytes policy, bytes history, Anchor[] anchors, LeafProof[] leaves), best-case sizes, one anchor.
+  // abi.encode(bytes policy, bytes history, Anchor[] anchors, LeafProof[] leaves), best-case sizes, k anchors under one seal.
   const bytesField = (n: number): number => word + pad32(n);
   const anchorBytes = 7 * word + bytesField(1) + bytesField(BEST_UC_BYTES) + bytesField(BEST_IR_BYTES);
   const leafBytes = 3 * word + word;
   const envelope = 4 * word + bytesField(policyBytes) + bytesField(historyBytes) +
-    word + (word + anchorBytes) + word + leaves * (word + leafBytes);
-  const grouping: Counts = { k: 1, c: 4 + 106 + 1 + BEST_UC_BYTES, e: 1, s: 1, q: BEST_SIGNATURES, a: 1, p: 0, items: BEST_UC_ITEMS };
-  const j = fixedItems(1) + grouping.items;
+    word + k * (word + anchorBytes) + word + leaves * (word + leafBytes);
+  const grouping: Counts = { k, c: 4 + k * (106 + 1 + BEST_UC_BYTES), e: 1, s: 1, q: BEST_SIGNATURES, a: k, p: 0, items: k * BEST_UC_ITEMS };
+  const j = fixedItems(k) + grouping.items;
   const g: Gate = {
     intrinsic: intrinsicGas(cfgBytes, envelope),
     b2: b2Gas(kernelRequestBytes(cfgBytes, historyBytes), leaves),

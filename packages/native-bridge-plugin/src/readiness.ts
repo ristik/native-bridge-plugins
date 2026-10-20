@@ -16,7 +16,7 @@
 import { NativeError, fail } from './errors.js';
 import { buildReturnProof, refreshToken } from './proof.js';
 import { preflightToken } from './resources.js';
-import { PAIR_RACE, type NativeBridgePlugin, type ProofSource } from './wallet.js';
+import { PAIR_RACE, consolidatedProofs, type ConsolidationPath, type NativeBridgePlugin, type ProofSource, type ReturnProofPath } from './wallet.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 import { eq, toHex } from './bytes.js';
 import { MAX_ANCHORS } from './limits.js';
@@ -44,6 +44,12 @@ export interface ReadinessPolicy {
   /** The longest the origin is awaited, per attempt, when an anchor is newer than it. */
   maxOriginWaitMs: number;
   pollMs: number;
+  /**
+   * The consolidated path (the default when the host supplies it): its first attempt uses the consolidated token's outer proofs,
+   * re-attached to the held token; an unavailable consolidation, and every later attempt, fetch per SID from the source. The fresh
+   * master seal is awaited against the origin like any anchor.
+   */
+  consolidation?: ConsolidationPath;
   /** Test seams. */
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -77,6 +83,8 @@ export interface ReadyReturnProof {
   origin: bigint;
   /** Fetch rounds used (1 = the first fetch was ready). */
   attempts: number;
+  /** Whether the bundle came from the consolidated token or per-SID proofs. */
+  path: ReturnProofPath;
 }
 
 /**
@@ -97,13 +105,16 @@ export async function buildReadyReturnProof(
   const now = policy.now ?? Date.now;
   const held = await Token.fromCBOR(tokenBytes);
   checkPolicy(policy, sends);
+  // one consolidation attempt, before any per-SID fetch; a ConsolidationError propagates (never a fallback)
+  const consolidated = await consolidatedProofs(held, policy.consolidation);
   let cause = 'no attempt';
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
     let token: Token;
     let built: Awaited<ReturnType<typeof buildReturnProof>>;
     let fetched: Awaited<ReturnType<ProofSource>>;
+    const path: ReturnProofPath = attempt === 1 && consolidated.proofs ? consolidated.path : consolidated.proofs ? { kind: 'per-sid' } : consolidated.path;
     try {
-      fetched = await source(held);
+      fetched = attempt === 1 && consolidated.proofs ? consolidated.proofs : await source(held);
     } catch (e) {
       // the proof service did not answer: temporary witness unavailability, bounded by the attempts (a NativeError from the host's own source is its verdict)
       if (e instanceof NativeError) throw e;
@@ -155,7 +166,7 @@ export async function buildReadyReturnProof(
       verdict = classifyReadiness(rounds, origin);
     }
     if (lost) continue;
-    if (verdict === 'ok') return { encoded: built.encoded, nullifier: built.verified.outcome.nullifier, rounds, origin, attempts: attempt };
+    if (verdict === 'ok') return { encoded: built.encoded, nullifier: built.verified.outcome.nullifier, rounds, origin, attempts: attempt, path };
     cause = `${verdict} (rounds ${rounds.join(',')}, origin ${origin})`;
     break; // the registry has not imported the newest anchor within the wait: refetching cannot make it older
   }
