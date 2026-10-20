@@ -18,7 +18,7 @@ test('the committed fixtures are exactly what the TypeScript constructors genera
 
 test('every fixture replays to its recorded verdict', async () => {
   const f = JSON.parse(readFileSync(FILE, 'utf8')) as { cases: { name: string; expect: 'receipt' | 'return'; result: string; token: string }[] };
-  const w = makeWorld();
+  const w = await makeWorld();
   for (const c of f.cases) {
     let got = 'ok';
     try {

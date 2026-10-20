@@ -347,7 +347,7 @@ fn the_justification_hook_requires_the_bridge_history_genesis() {
     assert_eq!(v.last_error(), None);
     // The same network and committee, another genesis (epoch start 0): every certificate still
     // verifies, so only the hook's genesis check refuses it.
-    let g = w.bridge.trust.base();
+    let g = w.bridge.trust.history().genesis();
     let other = TrustBaseEntry::new(
         g.network_id,
         g.epoch,

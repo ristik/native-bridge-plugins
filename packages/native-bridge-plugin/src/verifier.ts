@@ -33,7 +33,7 @@ import { decodeHistory, checkJustification, checkMintData, projectToken, verifyH
 import { MAX_PATH_STEPS, MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
 import { parseJustification, verifyLockProof, type Justification, type VerifiedLock } from './lockproof.js';
 import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord, shardCovers, shardDepth } from './profile.js';
-import type { TrustInput } from './trust.js';
+import { certificateFailure, type TrustInput } from './trust.js';
 
 export type Expect = 'receipt' | 'return';
 
@@ -58,8 +58,6 @@ export function mapSdkFailure(r: VerificationResult<unknown>): NativeReason {
       case 'TRANSACTION_HASH_MISMATCH': return 'ErrCDMismatch';
       default:
     }
-    if (x.rule === 'UnicitySealHashMatchesWithRootHashRule' && String(x.status) === String(VerificationStatus.FAIL)) return 'ErrSealRoot';
-    if (x.rule === 'UnicitySealQuorumSignaturesVerificationRule' && String(x.status) === String(VerificationStatus.FAIL)) return 'ErrQuorumNotMet';
     if (x.rule === 'UnicitySealNetworkMatchesTrustBaseRule' && String(x.status) === String(VerificationStatus.FAIL)) return 'ErrSealNetwork';
     for (const c of x.results) {
       const m = walk(c);
@@ -67,7 +65,8 @@ export function mapSdkFailure(r: VerificationResult<unknown>): NativeReason {
     }
     return null;
   };
-  return walk(r) ?? 'ErrSdkVerification';
+  // certificate failures are named as for the embedded certificate: retryable missing epoch, structure, seal epoch, root, quorum
+  return walk(r) ?? certificateFailure(r) ?? 'ErrSdkVerification';
 }
 
 /** Whether two authorities are the same history: the same network and the same genesis entry. */
@@ -81,7 +80,7 @@ export class NativeBridge {
     public readonly trust: TrustInput,
   ) {
     for (const d of registry.deployments) {
-      if (d.cfg.network !== trust.base.networkId.id) fail('ErrNetworkMismatch');
+      if (d.cfg.network !== trust.network.id) fail('ErrNetworkMismatch');
     }
   }
 
@@ -153,7 +152,7 @@ export class NativeBridge {
     const outcome = await verifyHistory(dep, hist, expect === 'return');
     const lock = await verifyLockProof(dep, this.trust, parsed, outcome.lockDigest);
 
-    // Bridge-specific checks per leaf: fixed-profile guards, aggregator admission, path budget, t <= IR.
+    // Bridge-specific checks per leaf: aggregator admission, path budget, t <= IR.
     const steps = { n: 0 };
     const all = [g, ...token.transactions];
     for (let i = 0; i < all.length; i++) await this.checkLeaf(dep, all[i].inclusionProof, outcome.leaves[i], steps);
@@ -169,7 +168,8 @@ export class NativeBridge {
     if (proof.referenceTime !== leaf.referenceTime) fail('ErrCDMismatch');
     const sid = await StateId.fromCertificationData(proof.certificationData);
     if (!eq(sid.data, leaf.sid) || !eq(proof.certificationData.transactionHash.data, leaf.txHash)) fail('ErrCDMismatch');
-    this.trust.checkGuards(uc);
+    // The seal epoch's committee first (protocol/trust-base.md order; the SDK token verification below checks the tree root before the epoch).
+    this.trust.selectEpoch(uc);
     // Aggregator admission: the pinned policy names the partition only. The certificate authenticates its own historical shard and
     // configuration; the shard must be a canonical native ID whose prefix the leaf's state ID carries (the first `d` bits, `d` its own depth).
     if (uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.policy.partition)) fail('ErrNotAdmitted');

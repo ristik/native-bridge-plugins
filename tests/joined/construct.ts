@@ -15,7 +15,7 @@ import { arr, bs, cfgBytes, H, u, word } from '../../packages/native-bridge-plug
 import { buildReturnProof, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
 import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, ownerPredicate, sha, spec, txStep } from '../../packages/native-bridge-plugin/test/world.js';
 
-const w = makeWorld();
+const w = await makeWorld();
 const s = spec(1);
 const t = 1_700_000_040n;
 const ts = 1_700_000_900n;
@@ -102,6 +102,6 @@ falseResult.set(new TextEncoder().encode('UNICITY_TOKEN_SEMANTICS'));
 falseResult.set(word(96n), 64);
 falseResult.set(word(320n), 384);
 cases.push({ name: 'flipped-unlock-parity', request: toHex(request(2n, projectToken(bad.token))), expected: toHex(falseResult) });
-writeFileSync(process.argv[2], JSON.stringify({ kind: 'synthetic-component-join', trustDocument: toHex(w.agg.doc),
+writeFileSync(process.argv[2], JSON.stringify({ kind: 'synthetic-component-join', trustBundle: toHex(w.agg.bundle), trustPin: toHex(w.agg.pin),
   cfg: toHex(cfgBytes(w.dep.cfg)), cases, paths, tokenSha256: toHex(H(burned.bytes)), envelopeSha256: toHex(H(after.encoded)) }, null, 2) + '\n');
 console.log(`constructed ${cases.length} B2 requests and ${paths.length} SDK3 leaf paths; refresh preserves J/M/T/CD/t/nullifier`);

@@ -39,7 +39,7 @@ function sizedUc(base: Uint8Array, target: number): Uint8Array {
 }
 
 test('ordinary UC byte limit is enforced before SDK decoding and on decoded tokens', async () => {
-  const w = makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
+  const w = await makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
   const base = out.token.genesis.inclusionProof.unicityCertificate.toCBOR();
   const at = sizedUc(base, 16384), over = sizedUc(base, 16385);
   assert.equal(at.length, 16384); preflightUc(at); preflightToken(replaceUc(out.bytes, at));
@@ -53,7 +53,7 @@ test('ordinary UC byte limit is enforced before SDK decoding and on decoded toke
 });
 
 test('native UC sublimits apply equally to ordinary and standalone embedded UCs', async () => {
-  const w = makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
+  const w = await makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
   const base = out.token.genesis.inclusionProof.unicityCertificate.toCBOR();
   const mutations: ((k: Uint8Array[]) => void)[] = [
     k => { const ir = body(k[1]); ir[5] = bs(new Uint8Array(257)); k[1] = tagged(39002, ir); },
@@ -73,7 +73,7 @@ test('native UC sublimits apply equally to ordinary and standalone embedded UCs'
 });
 
 test('UC tree paths and RSMT paths share the full-token cumulative budget', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   // MAX_TRANSFERS transfers: MAX_LEAVES certificates of 32 unicity steps and 100 shard-tree siblings each.
   const out = await buildToken(w, spec(1), Array.from({length: MAX_TRANSFERS}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
   const token = body(out.bytes);
@@ -90,7 +90,7 @@ test('UC tree paths and RSMT paths share the full-token cumulative budget', asyn
 });
 
 test('nested payloads share depth and item budgets with the outer token', async () => {
-  const w = makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
+  const w = await makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
   const token = body(out.bytes), cert = D.decodeArray(token[1]), mint = body(cert[0]);
   // Each payload and the outer token is individually under the item limit.
   mint[5] = bs(arr(...Array.from({length:16400}, () => u(0))));
@@ -113,7 +113,7 @@ test('nested payloads share depth and item budgets with the outer token', async 
 
 
 test('an otherwise valid receipt cannot hide an oversized ordinary UC in unknown signatures', async () => {
-  const w = makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
+  const w = await makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
   const k = body(out.token.genesis.inclusionProof.unicityCertificate.toCBOR());
   const seal = body(k[6]);
   const entries = D.decodeMap(seal[7]).map(e => new CborMapEntry(e.key, e.value));
@@ -126,7 +126,7 @@ test('an otherwise valid receipt cannot hide an oversized ordinary UC in unknown
 
 
 test('the cumulative path boundary includes the immutable embedded certificate', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await buildToken(w, spec(1), Array.from({length: MAX_TRANSFERS}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
   const make = (extra: number): Uint8Array => {
     const token = body(out.bytes);

@@ -56,8 +56,8 @@ errors! {
     IssuanceReason => Invalid, IssuanceData => Invalid, IssuanceSplit => Invalid,
     UnknownDeployment => Invalid, AmbiguousDeployment => Invalid, NetworkMismatch => Invalid,
     // trust
-    TrustBase => Invalid, SdkVerification => Invalid, EpochMismatch => Invalid,
-    RoundBeforeEpochStart => Invalid, UnsupportedTrustBase => Invalid, TrustBaseDigest => Invalid,
+    TrustBase => Invalid, SdkVerification => Invalid, SealEpoch => Invalid,
+    NoEntryForEpoch => Unavailable, TrustBaseDigest => Invalid,
     UnsupportedCertificateEncoding => Invalid,
     SealNetwork => Invalid, SealRoot => Invalid, QuorumNotMet => Invalid, CertStructure => Invalid,
     NotAdmitted => Invalid, ShardMismatch => Invalid, PathInvalid => Invalid,

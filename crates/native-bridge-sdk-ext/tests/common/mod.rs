@@ -13,7 +13,7 @@ use unicity_token::api::bft::{
     InputRecord, ShardId, ShardTreeCertificate, UnicityCertificate, UnicitySeal,
     UnicityTreeCertificate,
 };
-use unicity_token::api::bft::{TrustBaseEntry, TrustBaseMember};
+use unicity_token::api::bft::{TrustBaseEntry, TrustBaseHistory, TrustBaseMember};
 use unicity_token::api::{
     CertificationData, InclusionCertificate, InclusionProof, NetworkId, StateId,
 };
@@ -237,42 +237,28 @@ pub fn header_rlp(state_root: &[u8; 32], number: u64, fields: usize) -> Vec<u8> 
 // ---- unicity certificates -----------------------------------------------------------------------
 
 pub struct Root {
+    /// The committee of the latest epoch: it signs this root's certificates.
     pub signers: Vec<(String, Secp256k1Signer)>,
-    pub tb: TrustBaseEntry,
+    /// Every entry from the genesis.
+    pub entries: Vec<TrustBaseEntry>,
+    /// The release bundle (tag 39015) of `entries`.
+    pub bundle: Vec<u8>,
+    /// The genesis EntryID: the trust pin and every lock proof's `trustBaseId`.
+    pub pin: [u8; 32],
 }
 
-/// The pinned document B: the SDK JSON representation in the SDK's emitted field order.
-pub fn trust_doc(r: &Root) -> Vec<u8> {
-    let nodes: Vec<String> =
-        r.tb.members
-            .iter()
-            .map(|n| {
-                format!(
-                    "{{\"nodeId\":\"{}\",\"sigKey\":\"{}\",\"stake\":\"{}\"}}",
-                    n.node_id,
-                    hex_lower(n.signing_key.as_bytes()),
-                    n.weight
-                )
-            })
-            .collect();
-    format!(
-        "{{\"changeRecordHash\":null,\"epoch\":\"{}\",\"epochStartRound\":\"{}\",\"networkId\":{},\"previousEntryHash\":null,\"quorumThreshold\":\"{}\",\"rootNodes\":[{}],\"signatures\":{{}},\"stateHash\":\"\",\"version\":\"1\"}}",
-        r.tb.epoch,
-        r.tb.epoch_start,
-        r.tb.network_id.id(),
-        r.tb.quorum_threshold,
-        nodes.join(",")
-    )
-    .into_bytes()
+impl Root {
+    /// The latest entry.
+    pub fn tb(&self) -> &TrustBaseEntry {
+        self.entries.last().unwrap()
+    }
 }
 
 pub fn trust_input(r: &Root) -> TrustInput {
-    let doc = trust_doc(r);
-    TrustInput::from_json(&doc, &sha(&doc)).unwrap()
+    TrustInput::from_bundle(&r.bundle, &r.pin).unwrap()
 }
 
-/// A unit-weight SDK trust base (the only model the SDK expresses today).
-pub fn make_root(epoch: u64, n: usize, seed: u8) -> Root {
+fn committee(n: usize, seed: u8) -> Vec<(String, Secp256k1Signer)> {
     let mut signers: Vec<(String, Secp256k1Signer)> = (0..n)
         .map(|i| {
             (
@@ -282,21 +268,90 @@ pub fn make_root(epoch: u64, n: usize, seed: u8) -> Root {
         })
         .collect();
     signers.sort_by(|a, b| a.0.cmp(&b.0));
-    let nodes = signers
+    signers
+}
+
+fn members(signers: &[(String, Secp256k1Signer)], weights: Option<&[u64]>) -> Vec<TrustBaseMember> {
+    signers
         .iter()
-        .map(|(id, s)| TrustBaseMember::new(id.clone(), s.public_key(), 1))
-        .collect();
-    let tb = TrustBaseEntry::new(
+        .enumerate()
+        .map(|(i, (id, s))| {
+            TrustBaseMember::new(id.clone(), s.public_key(), weights.map_or(1, |w| w[i]))
+        })
+        .collect()
+}
+
+fn root_of(signers: Vec<(String, Secp256k1Signer)>, entries: Vec<TrustBaseEntry>) -> Root {
+    let pin = entries[0].entry_id();
+    let bundle = TrustBaseHistory::from_trusted_chain(entries.clone())
+        .unwrap()
+        .to_bundle();
+    Root {
+        signers,
+        entries,
+        bundle,
+        pin,
+    }
+}
+
+fn entry_of(
+    epoch: u64,
+    start: u64,
+    members: Vec<TrustBaseMember>,
+    previous: [u8; 32],
+) -> TrustBaseEntry {
+    let total = members.iter().map(|m| m.weight).sum();
+    TrustBaseEntry::new(
         NetworkId::new(NETWORK).unwrap(),
         epoch,
-        1,
-        nodes,
-        (n as u64) * 2 / 3 + 1,
+        start,
+        members,
+        TrustBaseEntry::threshold_for(total).unwrap(),
         None,
         None,
-        [0; 32],
+        previous,
+    )
+}
+
+/// A trust base history holding only a genesis entry of epoch `epoch` (start round 1) with `n`
+/// members, unit weights.
+pub fn make_root(epoch: u64, n: usize, seed: u8) -> Root {
+    make_weighted_root(epoch, n, seed, None)
+}
+
+pub fn make_weighted_root(epoch: u64, n: usize, seed: u8, weights: Option<&[u64]>) -> Root {
+    let signers = committee(n, seed);
+    let genesis = entry_of(epoch, 1, members(&signers, weights), [0; 32]);
+    root_of(signers, vec![genesis])
+}
+
+/// The next epoch of `root` from root round `start`: a committee of `n` members (seed `seed`),
+/// witnessed by every member of the current one. Same pin, one more entry.
+pub fn next_epoch(root: &Root, start: u64, n: usize, seed: u8) -> Root {
+    let mut entries = root.entries.clone();
+    entries.push(successor_entry(root, start, n, seed, &root.signers));
+    root_of(committee(n, seed), entries)
+}
+
+/// The entry `next_epoch` appends, witnessed by `witnesses`.
+pub fn successor_entry(
+    root: &Root,
+    start: u64,
+    n: usize,
+    seed: u8,
+    witnesses: &[(String, Secp256k1Signer)],
+) -> TrustBaseEntry {
+    let tip = root.tb();
+    let mut next = entry_of(
+        tip.epoch + 1,
+        start,
+        members(&committee(n, seed), None),
+        tip.entry_id(),
     );
-    Root { signers, tb }
+    for (id, s) in witnesses {
+        next.sign(id, s);
+    }
+    next
 }
 
 pub struct UcSpec {

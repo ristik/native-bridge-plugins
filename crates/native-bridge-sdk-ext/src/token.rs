@@ -188,8 +188,8 @@ impl NativeBridge {
             )?;
         }
 
-        // The SDK's own ordinary token verification, with the same base throughout and the
-        // existing justification/data registries; it keeps its count-quorum behaviour.
+        // The SDK's own ordinary token verification against the held history (each certificate
+        // under its own epoch's committee), with the justification/data registries.
         let mut registry = MintJustificationRegistry::new();
         crate::verifier::install(Rc::new(self.clone()), &mut registry).map_err(|_| E::TrustBase)?;
         let policy = VerificationPolicy {
@@ -227,7 +227,9 @@ pub fn check_leaf(
     {
         return Err(E::CDMismatch);
     }
-    trust.check_guards(uc)?;
+    // The seal epoch's committee first (protocol/trust-base.md order; the SDK token verification
+    // below checks the tree root before the epoch), so several faults get the oracle's verdict.
+    crate::trust::select_epoch(trust, uc)?;
     // Aggregator admission: the pinned policy names the partition only. The certificate authenticates its own historical shard and
     // configuration; the shard must be a canonical native ID whose prefix the leaf's state ID carries (the first `d` bits, `d` its
     // own depth).
@@ -267,22 +269,20 @@ pub fn distinct_state_ids(token: &Token) -> bool {
 
 /// Name an SDK verification failure with the shared sentinel vocabulary.
 pub fn map_sdk(e: &VerificationError) -> E {
+    // certificate failures are named as for the embedded certificate
+    if let Some(c) = crate::trust::certificate_failure(e) {
+        return c;
+    }
     match e {
         VerificationError::Genesis(inner) => map_sdk(inner),
         VerificationError::Transfer { source, .. } => map_sdk(source),
         VerificationError::PathInvalid => E::PathInvalid,
-        VerificationError::QuorumNotMet => E::QuorumNotMet,
-        VerificationError::SealRootMismatch => E::SealRoot,
-        VerificationError::SealNetworkMismatch | VerificationError::NetworkMismatch => {
-            E::SealNetwork
-        }
+        VerificationError::NetworkMismatch => E::SealNetwork,
         VerificationError::ShardMismatch => E::ShardMismatch,
         VerificationError::RequestExpired => E::DeadlineExpired,
         VerificationError::CertificationDataMismatch
         | VerificationError::TransactionHashMismatch
         | VerificationError::ReferenceTimeMismatch => E::CDMismatch,
-        // the native seal rule: an unknown signer or an invalid signature fails the seal like a short quorum
-        VerificationError::SealSignerInvalid => E::QuorumNotMet,
         _ => E::SdkVerification,
     }
 }

@@ -433,6 +433,14 @@ fn refresh_that_changes_t_or_certification_data_is_rejected() {
 }
 
 fn agg_err(f: impl FnOnce(&World, &mut UcSpec)) -> E {
+    agg_err_with(f, |_| {})
+}
+
+/// `agg_err` with a hook on the built certificate.
+fn agg_err_with(
+    f: impl FnOnce(&World, &mut UcSpec),
+    g: impl FnOnce(&mut unicity_token::api::bft::UnicityCertificate),
+) -> E {
     let w = make_world(20);
     let s = spec(1);
     let out = build_token(&w, &s, &[], T0, UC_TS);
@@ -448,7 +456,8 @@ fn agg_err(f: impl FnOnce(&World, &mut UcSpec)) -> E {
         signers: 4,
     };
     f(&w, &mut u);
-    let uc = make_uc(&w.agg, &u);
+    let mut uc = make_uc(&w.agg, &u);
+    g(&mut uc);
     let p = out.token.genesis().inclusion_proof().clone();
     let proof = InclusionProof {
         unicity_certificate: uc,
@@ -490,4 +499,13 @@ fn deployment_registry_rejects_duplicates_and_ambiguity() {
         E::AmbiguousDeployment
     );
     assert!(DeploymentRegistry::new(vec![w.dep.clone()]).is_ok());
+}
+
+#[test]
+fn an_ordinary_proof_with_several_faults_gets_the_oracle_verdict() {
+    // an epoch the history does not hold and a false seal root: the epoch decides (retryable)
+    assert_eq!(
+        agg_err_with(|_, u| u.root_epoch = 3, |uc| uc.unicity_seal.hash[0] ^= 1),
+        E::NoEntryForEpoch
+    );
 }

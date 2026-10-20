@@ -50,7 +50,7 @@ test('readiness classification: the only advisory check is max(r) <= O; age neve
 });
 
 test('an already-old token: every leaf is refetched and the bundle is ready', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   assert.deepEqual(anchorRounds(out.token), [900n]);
@@ -64,7 +64,7 @@ test('an already-old token: every leaf is refetched and the bundle is ready', as
 });
 
 test('an old answer is not stale: any age passes the advisory check and is sent without waiting', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   let fetches = 0;
@@ -77,7 +77,7 @@ test('an old answer is not stale: any age passes the advisory check and is sent 
 });
 
 test('a future anchor waits for the origin (bounded)', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const source = (): Promise<InclusionProof[]> => proofsAt(w, out, 950n);
@@ -119,7 +119,7 @@ class Vault implements RedeemTransport {
 const rp = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...fast, maxSends: 3, receiptTimeoutMs: 10, now: (() => { let n = 0; return () => (n += 4); })(), ...over });
 
 test('redeem: a redemption the vault already credited is reported as such before any proof is fetched, whatever the proof service or the window say', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const done = new Vault([]);
@@ -140,7 +140,7 @@ test('redeem: a redemption the vault already credited is reported as such before
 });
 
 test('redeem: a revert refetches the same token and resends; a settled redemption is never sent again', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   let fetches = 0;
@@ -159,7 +159,7 @@ test('redeem: a revert refetches the same token and resends; a settled redemptio
 });
 
 test('redeem: an RPC timeout is not a revert (the vault state decides), and an unknown send is not repeated', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const source = (): Promise<InclusionProof[]> => proofsAt(w, out, 950n);
@@ -182,7 +182,7 @@ test('redeem: an RPC timeout is not a revert (the vault state decides), and an u
 });
 
 test('several certificates in different rounds: the NEWEST anchor decides readiness, over every leaf', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   // the genesis leaf is certified in the NEWER round: judging on the burn leaf's older anchor alone would accept
   const two = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => (i === 0 ? 905n : 900n) });
   assert.deepEqual(anchorRounds(two.token), [905n, 900n]);
@@ -196,7 +196,7 @@ test('several certificates in different rounds: the NEWEST anchor decides readin
 });
 
 test('a (path, UC) pair that raced a certificate is refetched, bounded, then unavailable with its cause', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const racing = async (): Promise<InclusionProof[]> => {
@@ -216,7 +216,7 @@ test('a (path, UC) pair that raced a certificate is refetched, bounded, then una
 });
 
 test('temporary witness or origin unavailability is retried within the bound, then unavailable with its cause', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   let calls = 0;
@@ -238,7 +238,7 @@ test('temporary witness or origin unavailability is retried within the bound, th
 });
 
 test('policy is checked before anything is fetched or sent', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   let fetched = 0;
@@ -253,7 +253,7 @@ test('policy is checked before anything is fetched or sent', async () => {
 });
 
 test('redeem: a revert that follows a redemption by someone else ends the call without another fetch or send', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   let fetches = 0;
@@ -268,7 +268,7 @@ test('redeem: a revert that follows a redemption by someone else ends the call w
 });
 
 test('redeem: an unconfirmed send exposes its hash, and a pending hash is checked before any new send', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const source = (): Promise<InclusionProof[]> => proofsAt(w, out, 950n);

@@ -4,10 +4,12 @@
  *
  * Structural validity is not authorisation: installation recomputes identifiers, `chainRef`,
  * Cfg/cfg, policy hashes and every pin, and cross-checks the artifacts the application installed.
- * JSON is never a hash preimage. `trustBase.document.sha256` is the exact-file digest of the one
- * pinned SDK `RootTrustBase` document `B`; it must equal the installed trust input and every lock
- * proof's `trustBaseId`. `proofEndpoints`, `rpcUrls` and artifact locations are installation
- * metadata for construction and refresh; verification never reads them.
+ * JSON is never a hash preimage. `trustBase.genesisEntryId` is the EntryID of the network's
+ * Unicity Trust Base genesis entry; it must equal the installed trust input's and every lock
+ * proof's `trustBaseId`. `trustBase.bundle` names the release bundle (genesis and later entries)
+ * an installation may start from, by exact-file digest. `proofEndpoints`, `rpcUrls` and artifact
+ * locations are installation metadata for construction and refresh; verification never reads them.
+ * The named bundle is where an installation may start; a history installed from any bundle of the same genesis is the same trust input.
  *
  * Artifacts pinned by hash (`pdr`, `executionProfile`) are supplied by the installer through an
  * {@link Artifacts} resolver; a missing or mismatching one fails installation. The execution
@@ -135,8 +137,11 @@ const ENTRY = ['schemaVersion', 'protocolVersion', 'family', 'sdkVersion', 'toke
 export interface TrustPin {
   network: number;
   rootGenesis: Uint8Array;
-  documentSha256: Uint8Array;
+  /** The EntryID of the trust base genesis entry. */
+  genesisEntryId: Uint8Array;
 }
+
+const TRUST = ['networkId', 'rootGenesisHash', 'format', 'genesisEntryId', 'bundle'] as const;
 
 /** Validate one entry (its registry key already matched) and return its deployments, active first. */
 export function validateManifest(raw: unknown, artifacts?: Artifacts): { deployments: Deployment[]; pin: TrustPin } {
@@ -163,10 +168,10 @@ export function validateManifest(raw: unknown, artifacts?: Artifacts): { deploym
   if (!eq(hexN(m.tokenTypeHex, 32), ty) || !eq(hexN(m.coinIdHex, 32), aid)) fail('ErrManifest');
   if (m.chainRef !== `eip155:${chain}` || m.asset !== '0'.repeat(40)) fail('ErrManifest');
   for (const k of ['proofEndpoints', 'rpcUrls'] as const) if (k in m && !Array.isArray(m[k])) fail('ErrManifest');
-  const t = obj(m.trustBase, ['networkId', 'rootGenesisHash', 'format', 'document']);
-  if (t.format !== 'sdk-root-trust-base-json-v1' || t.networkId !== network || !eq(hexN(t.rootGenesisHash, 32), root)) fail('ErrManifest');
-  const doc = obj(t.document, ARTIFACT, ['location']);
-  const pin: TrustPin = { network, rootGenesis: root, documentSha256: hexN(doc.sha256, 32) };
+  const t = obj(m.trustBase, TRUST);
+  if (t.format !== 'utb-release-bundle-v1' || t.networkId !== network || !eq(hexN(t.rootGenesisHash, 32), root)) fail('ErrManifest');
+  hexN(obj(t.bundle, ARTIFACT, ['location']).sha256, 32);
+  const pin: TrustPin = { network, rootGenesis: root, genesisEntryId: hexN(t.genesisEntryId, 32) };
   const c: Ctx = { network, root, exec, chain, ty, aid };
   if (!Array.isArray(m.replacedDeployments)) fail('ErrManifest');
   const deployments = [deployment(c, m.activeDeployment, artifacts), ...(m.replacedDeployments as unknown[]).map((r) => deployment(c, r, artifacts))];
@@ -179,17 +184,20 @@ export function validateManifest(raw: unknown, artifacts?: Artifacts): { deploym
   return { deployments, pin };
 }
 
-/** A validated registry and the single trust-document pins it names. */
+/** A validated registry and the trust-base genesis pins it names. */
 export class Loaded {
   public constructor(
     public readonly registry: DeploymentRegistry,
     public readonly trustPins: readonly TrustPin[],
   ) {}
 
-  /** Install: every entry's pinned document must be exactly the installed trust input. */
+  /**
+   * Install: every entry's pinned genesis must be exactly the installed trust input's, on its network. The history may have grown past the
+   * named bundle (a wallet's own exported history, a newer release): the authority is the genesis pin and the witnessed appends.
+   */
   public install(trust: TrustInput): NativeBridge {
     for (const p of this.trustPins) {
-      if (!eq(p.documentSha256, trust.id) || p.network !== trust.base.networkId.id) fail('ErrTrustBaseDigest');
+      if (!eq(p.genesisEntryId, trust.id) || p.network !== trust.network.id) fail('ErrTrustBaseDigest');
     }
     return new NativeBridge(this.registry, trust);
   }
@@ -219,8 +227,8 @@ export function loadManifests(json: string, artifacts?: Artifacts): Loaded {
   return new Loaded(new DeploymentRegistry(all), pins);
 }
 
-/** The pinned `trustBaseId` (document digest) of one manifest entry. */
+/** The pinned `trustBaseId` (trust base genesis EntryID) of one manifest entry. */
 export function manifestTrustBaseId(raw: unknown): Uint8Array {
   const m = obj(raw, ENTRY, ['proofEndpoints', 'rpcUrls']);
-  return hexN(obj(obj(m.trustBase, ['networkId', 'rootGenesisHash', 'format', 'document']).document, ARTIFACT, ['location']).sha256, 32);
+  return hexN(obj(m.trustBase, TRUST).genesisEntryId, 32);
 }

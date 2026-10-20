@@ -228,7 +228,12 @@ fn uc(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
         if pair[0].data.len() > 128 {
             return Err(E::ProofTooLarge);
         }
-        if pair[1].major != 2 || pair[1].data.len() != 65 || pair[1].data[64] > 1 {
+        // 64 bytes (r||s) or 65 with a 0/1 recovery suffix, as both SDKs and native B1
+        let sig = &pair[1];
+        if sig.major != 2
+            || !(sig.data.len() == 64 || sig.data.len() == 65)
+            || (sig.data.len() == 65 && sig.data[64] > 1)
+        {
             return Err(E::UnsupportedCertificateEncoding);
         }
     }

@@ -43,8 +43,8 @@ TS = [
     (T + "mpt.ts", "if (value.length === 0 || used !== nodes.length) fail('ErrMptMalformed');", "if (value.length === 0) fail('ErrMptMalformed');"),
     (T + "verifier.ts", "if (leaf.referenceTime > uc.inputRecord.timestamp) fail('ErrReferenceTimeFuture');", ""),
     (T + "verifier.ts", "if (uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.policy.partition) ||", "if (false &&  uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.policy.partition) ||"),
-    (T + "trust.ts", "if (seal.epoch !== this.base.epoch) fail('ErrEpochMismatch');", ""),
-    (T + "trust.ts", "if ((await rule.verify(this.base, uc.unicitySeal)).status !== VerificationStatus.OK) fail('ErrQuorumNotMet');", ""),
+    (T + "trust.ts", "if (!uc.unicitySeal.networkId.equals(this.history.networkId)) fail('ErrSealNetwork');", ""),
+    (T + "trust.ts", "if (CertificateVerificationResult.findMissingEpoch(r)) return 'ErrNoEntryForEpoch';", ""),
     (T + "envelope.ts", "if (!eq(H(a.inputRecord), a.expectedIRHash)) fail('ErrInputRecordMismatch');", ""),
     (T + "proof.ts", "if (!eq(old[i].certificationData.toCBOR(), fresh[i].certificationData.toCBOR()) || old[i].referenceTime !== fresh[i].referenceTime) {", "if (false) {"),
 ]

@@ -10,8 +10,11 @@ import { ShardTreeCertificate } from '@unicitylabs/state-transition-sdk/lib/api/
 import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
 import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicitySeal.js';
 import { UnicityTreeCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityTreeCertificate.js';
+import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
+import { TrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponse.js';
 import { InclusionCertificate } from '@unicitylabs/state-transition-sdk/lib/api/InclusionCertificate.js';
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
+import { DataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasher.js';
 import { DataHasherFactory } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasherFactory.js';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/HashAlgorithm.js';
 import { NodeDataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/NodeDataHasher.js';
@@ -165,22 +168,62 @@ export function headerRlp(stateRoot: Uint8Array, number: bigint, fields: 20 | 21
 // ---- unicity certificates ------------------------------------------------------------------------
 
 export interface Root {
+  /** The committee of the latest epoch: it signs this root's certificates. */
   signers: [string, SigningService][];
-  /** The pinned SDK trust document `B`. */
-  doc: Uint8Array;
+  /** Every entry from the genesis, canonical bytes. */
+  entries: Uint8Array[];
+  /** The release bundle (tag 39015) of {@link entries}. */
+  bundle: Uint8Array;
+  /** The genesis EntryID: the trust pin and every lock proof's `trustBaseId`. */
+  pin: Uint8Array;
   trust: TrustInput;
 }
 
-/** A unit-weight SDK trust base document in the SDK's emitted field order. */
-export function makeRoot(epoch: number, n: number, seed: number, stakes?: number[], threshold?: number): Root {
+const members = (signers: [string, SigningService][], weights?: number[]) =>
+  signers.map(([nodeId, s], i) => ({ nodeId, signingKey: s.publicKey, weight: BigInt(weights?.[i] ?? 1) }));
+const thresholdOf = (weights: bigint[]): bigint => (2n * weights.reduce((a, b) => a + b, 0n)) / 3n + 1n;
+
+function committee(n: number, seed: number): [string, SigningService][] {
   const signers: [string, SigningService][] = Array.from({ length: n }, (_, i) => [`root-${seed}-${String(i).padStart(2, '0')}`, signer(seed + i)] as [string, SigningService]);
-  signers.sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  const th = threshold ?? n - Math.floor((n - 1) / 3);
-  const nodes = signers.map(([id, s], i) => `{"nodeId":"${id}","sigKey":"${toHex(s.publicKey)}","stake":"${stakes?.[i] ?? 1}"}`);
-  const doc = text(
-    `{"changeRecordHash":null,"epoch":"${epoch}","epochStartRound":"1","networkId":${NETWORK},"previousEntryHash":null,"quorumThreshold":"${th}","rootNodes":[${nodes.join(',')}],"signatures":{},"stateHash":"","version":"1"}`,
-  );
-  return { signers, doc, trust: TrustInput.fromJson(doc, sha(doc)) };
+  return signers.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+}
+
+async function rootOf(signers: [string, SigningService][], entries: Uint8Array[], pin: Uint8Array): Promise<Root> {
+  const bundle = await TrustBaseResponse.encodeBundle(entries);
+  return { signers, entries, bundle, pin, trust: await TrustInput.fromBundle(bundle, pin) };
+}
+
+/** A trust base history holding only a genesis entry of epoch `epoch` (start round 1) with `n` members, unit weights unless given. */
+export async function makeRoot(epoch: number, n: number, seed: number, weights?: number[]): Promise<Root> {
+  const signers = committee(n, seed);
+  const rootNodes = members(signers, weights);
+  const genesis = RootTrustBaseV2.create({
+    changeRecordHash: null, epoch: BigInt(epoch), epochStartRound: 1n, networkId: NETWORK, previousEntryId: new Uint8Array(32),
+    quorumThreshold: thresholdOf(rootNodes.map((m) => m.weight)), rootNodes, stateHash: null,
+  });
+  return rootOf(signers, [genesis.toCBOR()], await genesis.entryId());
+}
+
+/**
+ * The next epoch of `root`, from root round `start`: a committee of `n` members (seed `seed`), witnessed by every member of the current one.
+ * Same pin, one more entry; the new committee signs the new root's certificates.
+ */
+export async function nextEpoch(root: Root, start: bigint, n: number, seed: number, weights?: number[]): Promise<Root> {
+  return rootOf(committee(n, seed), [...root.entries, await successorEntry(root, start, n, seed, weights)], root.pin);
+}
+
+/** The canonical bytes of the entry {@link nextEpoch} appends, witnessed by `witnesses` (the current committee unless given). */
+export async function successorEntry(root: Root, start: bigint, n: number, seed: number, weights?: number[], witnesses = root.signers): Promise<Uint8Array> {
+  const tip = RootTrustBaseV2.fromCBOR(root.entries[root.entries.length - 1]);
+  const rootNodes = members(committee(n, seed), weights);
+  const next = RootTrustBaseV2.create({
+    changeRecordHash: null, epoch: tip.epoch + 1n, epochStartRound: start, networkId: NETWORK, previousEntryId: await tip.entryId(),
+    quorumThreshold: thresholdOf(rootNodes.map((m) => m.weight)), rootNodes, stateHash: null,
+  });
+  const hash = await new DataHasher(HashAlgorithm.SHA256).update(next.sigBytes()).digest();
+  const signatures = new Map<string, Uint8Array>();
+  for (const [id, s] of witnesses) signatures.set(id, (await s.sign(hash)).encode());
+  return next.withSignatures(signatures).toCBOR();
 }
 
 export interface UcSpec {
@@ -245,9 +288,9 @@ export const shardOf = (w: Pick<World, 'depth'>, row: number): Uint8Array => FIX
 /** The fixture shard (row) a state ID falls in: the top `depth` bits. */
 export const rowOf = (w: Pick<World, 'depth'>, sid: Uint8Array): number => (w.depth === 0 ? 0 : sid[0] >> 7);
 
-export function makeWorld(headerFields: 20 | 21 = 20, depth: 0 | 1 = 0): World {
-  const agg = makeRoot(2, 4, 10);
-  const evm = makeRoot(2, 4, 10);
+export async function makeWorld(headerFields: 20 | 21 = 20, depth: 0 | 1 = 0): Promise<World> {
+  const agg = await makeRoot(2, 4, 10);
+  const evm = await makeRoot(2, 4, 10);
   const aggConfs = Array.from({ length: 1 << depth }, (_, i) => sha(text(`aggregator shard configuration ${i}`)));
   if (depth === 0) aggConfs[0] = sha(text('aggregator shard configuration'));
   const aggConf = aggConfs[0];

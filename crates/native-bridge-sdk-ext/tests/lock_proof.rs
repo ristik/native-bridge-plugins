@@ -14,7 +14,7 @@ mod common;
 use common::*;
 use native_bridge_sdk_ext::lockproof::parse_justification;
 use native_bridge_sdk_ext::profile::*;
-use native_bridge_sdk_ext::token::{Expect, VerifiedToken};
+use native_bridge_sdk_ext::token::{Expect, NativeBridge, VerifiedToken};
 use native_bridge_sdk_ext::NativeError as E;
 use unicity_token::crypto::signer::Signer;
 
@@ -558,4 +558,106 @@ fn certificates_outside_the_sdk_decodable_subset_are_unsupported() {
     })
     .unwrap_err();
     assert_eq!(e, E::UnsupportedCertificateEncoding);
+}
+
+#[test]
+fn an_epoch_change_is_retryable_until_held_then_verified_under_its_own_committee() {
+    let w = make_world(20);
+    // the root committee changes at round 1000 (epoch 3, witnessed by epoch 2's committee)
+    let next = next_epoch(&w.evm_root, 1000, 4, 30);
+    let old = make_root(2, 4, 10);
+    let s = spec(1);
+    let sealed = |root: &Root, epoch: u64, round: u64| {
+        let mut parts = lock_parts(&w, &s);
+        parts.uc.unicity_seal.epoch = epoch;
+        parts.uc.unicity_seal.root_chain_round_number = round;
+        resign(root, &mut parts.uc, 4);
+        parts
+    };
+    // the bridge still holds only epoch 2: retryable, never invalid
+    assert_eq!(
+        run(&w, &s, &sealed(&next, 3, 1500)).unwrap_err(),
+        E::NoEntryForEpoch
+    );
+    let cases = [
+        (sealed(&next, 3, 1500), None),
+        // before epoch 3's start
+        (sealed(&next, 3, 500), Some(E::SealEpoch)),
+        // epoch 3 signed by the old committee
+        (sealed(&old, 3, 1500), Some(E::QuorumNotMet)),
+        // epoch 2 has ended at round 1000
+        (sealed(&old, 2, 1500), Some(E::SealEpoch)),
+    ];
+    // the wallet appended epoch 3
+    let held = World {
+        bridge: NativeBridge::new(w.bridge.registry.clone(), trust_input(&next)).unwrap(),
+        ..w
+    };
+    for (parts, expected) in cases {
+        assert_eq!(run(&held, &s, &parts).err(), expected);
+    }
+}
+
+#[test]
+fn several_faults_get_the_oracle_verdict() {
+    // the seal epoch first, then the configuration, then the certificate
+    let w = make_world(20);
+    let next = next_epoch(&w.evm_root, 1000, 4, 30);
+    let s = spec(1);
+    // an epoch the history does not hold and a false root: retryable, never the root failure
+    let mut parts = lock_parts(&w, &s);
+    parts.uc.unicity_seal.epoch = 3;
+    parts.uc.unicity_seal.root_chain_round_number = 1500;
+    resign(&next, &mut parts.uc, 4);
+    parts.uc.unicity_seal.hash[0] ^= 1;
+    assert_eq!(run(&w, &s, &parts).unwrap_err(), E::NoEntryForEpoch);
+    // an epoch the history does not hold and a configuration that is not the certificate's: the
+    // epoch decides (lockproof's own epoch selection, before the PDR checks)
+    let mut parts = lock_parts(&w, &s);
+    parts.uc.unicity_seal.epoch = 3;
+    parts.uc.unicity_seal.root_chain_round_number = 1500;
+    resign(&next, &mut parts.uc, 4);
+    flip(&mut parts.pdr, 3);
+    assert_eq!(run(&w, &s, &parts).unwrap_err(), E::NoEntryForEpoch);
+    // a configuration that is not the certificate's and a short quorum: the configuration first
+    let e = mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 2);
+        flip(&mut p.pdr, 3);
+    })
+    .unwrap_err();
+    assert_eq!(e, E::EvmConfigHash);
+}
+
+#[test]
+fn seal_signature_widths_follow_the_b1_profile_rule() {
+    // 64 bytes (r||s): accepted by the pre-scan and by the SDK verification, as by B1
+    mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 4);
+        for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
+            sig.truncate(64);
+        }
+    })
+    .unwrap();
+    // 65 bytes with the recovery byte swapped between 0 and 1: ignored
+    mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 4);
+        for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
+            sig[64] ^= 1;
+        }
+    })
+    .unwrap();
+    // recovery byte 2, and 63 bytes: refused by the pre-scan
+    for f in [
+        (|s: &mut Vec<u8>| s[64] = 2) as fn(&mut Vec<u8>),
+        |s: &mut Vec<u8>| s.truncate(63),
+    ] {
+        let e = mutated(|w, p, _| {
+            resign(&w.evm_root, &mut p.uc, 4);
+            for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
+                f(sig);
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e, E::UnsupportedCertificateEncoding);
+    }
 }

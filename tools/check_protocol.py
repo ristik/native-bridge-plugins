@@ -12,10 +12,7 @@ import tomllib
 from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
-# the SDK 3.0.1 commits protocol/interop.md names as the protocol-4 wire reference
-JS_COMMIT = 'f5f0737306901215860aa920a6ab570b699efba8'
-RUST_COMMIT = '635011b3d7066db6f3296e9cb8d2f24d4bd1fec7'
-# the installed SDKs: the ristik forks (integration/enshrined-evm line), same token and predicate wire
+# the installed SDKs, the ones protocol/interop.md pins: the ristik lines (integration/enshrined-evm)
 SDK_JS_FORK_COMMIT = 'cc9a95bcf5e043770dfd1ae79e54516cf424e859'
 SDK_JS_FORK_VERSION = '4.0.0-utb.cc9a95b'
 SDK_RUST_FORK_COMMIT = '772be681c740442a35ecef35724a1545cf42b7f4'
@@ -81,53 +78,32 @@ def validate_manifest(registry):
             validate_policy(dep['aggregatorPolicy'])
             for data, expected in [(bytes.fromhex(dep['cfgHex']), dep['cfgHash']), (bytes.fromhex(dep['aggregatorPolicy']['bodyHex']), dep['aggregatorPolicy']['sha256'])]:
                 assert hashlib.sha256(data).hexdigest() == expected, 'canonical bytes digest mismatch'
-    # Full Cfg/Policy parsing, fixed SDK document loading/authentication, unit
-    # stakes and matching count quorum are mandatory PR3 installation gates.
-
-
-def validate_sdk_trust_document(data, expected_digest):
-    """Fixed-profile document checks only; never authenticates authority or UCs."""
-    assert hashlib.sha256(data).hexdigest() == expected_digest, 'SDK document digest mismatch'
-    doc = json.loads(data)
-    assert doc['version'] == '1', 'SDK document version'
-    assert all(node['stake'] == '1' for node in doc['rootNodes']), 'non-unit stake unsupported'
-    n = len(doc['rootNodes'])
-    assert n > 0 and doc['quorumThreshold'] == str(n - (n - 1) // 3), 'SDK count quorum mismatch'
-    for name in ('epoch', 'epochStartRound'):
-        value = doc[name]
-        assert isinstance(value, str) and value == str(int(value)) and 0 <= int(value) < 1 << 64, 'SDK epoch field outside uint64'
-    return doc
+    # Full Cfg/Policy parsing and installing the release bundle under
+    # genesisEntryId (the SDK verifies every link) are installation gates.
 
 
 def main():
     validator()
     abi = load('protocol/abi.json')
-    assert abi['protocolVersion'] == 4
+    assert abi['protocolVersion'] == 5
     assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
     assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v4.json')
-    assert profile['nativeBridgeProtocolVersion'] == 4 and profile['sdkVersion'] == '3.0.1'
+    profile = load('protocol/profile-v5.json')
+    assert profile['nativeBridgeProtocolVersion'] == 5 and profile['sdkVersion'] == '4.0.0'
     assert profile['limits']['semanticBytes'] == 16384 and profile['limits']['justificationBytes'] == 65536
-    assert profile['trustModel']['scope'] == 'fixed-sdk-root-trust-base'
-    assert profile['trustModel']['validatorStake'] == '1'
-    assert profile['trustModel']['verification'] == 'existing-sdk-3.0.1'
-    assert profile['trustModel']['deferredIssue'] == 'https://github.com/ristik/bft-core/issues/421'
+    assert profile['trustModel']['scope'] == 'unicity-trust-base-history'
+    assert profile['trustModel']['trustDocumentFormat'] == 'utb-release-bundle-v1 (tag 39015)'
+    assert profile['deferred'] == []
     for name, expected in profile['normativeArtifactSha256'].items():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, 'normative artifact digest mismatch'
-    fixture = ROOT / 'protocol/vectors/config/sdk-root-trust-base.json'
-    provenance = load('protocol/vectors/config/sdk-root-trust-base.provenance.json')
-    assert provenance['sha256'] == 'e5454ae4fe566b05dab8c1b15c88a05356b8816b1cd66a2b7adcce184af27fb5'
-    assert len(fixture.read_bytes()) == provenance['byteLength'] == 524
-    validate_sdk_trust_document(fixture.read_bytes(), provenance['sha256'])
-    subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs')], check=True)
-    if (ROOT / 'protocol/vectors/MANIFEST.sha256').exists():
-        subprocess.run(['node', str(ROOT / 'tools/sdk_trust_fixture.mjs'), '--corpus', str(ROOT / 'protocol/vectors')], check=True)
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=4' in (ROOT / 'protocol/interop.md').read_text()
-    assert JS_COMMIT in (ROOT / 'protocol/interop.md').read_text()
-    assert RUST_COMMIT in (ROOT / 'protocol/interop.md').read_text()
+    # every corpus trust input and the shared dev fixture install with the pinned SDK
+    subprocess.run(['node', str(ROOT / 'tools/utb_trust_fixture.mjs')], check=True)
+    interop = (ROOT / 'protocol/interop.md').read_text()
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=5' in interop
+    assert SDK_JS_FORK_COMMIT in interop and SDK_RUST_FORK_COMMIT in interop
     package = load('packages/native-bridge-plugin/package.json')
     assert package['private'] and package['license'] == 'MIT OR Apache-2.0'
     deps = package['dependencies']

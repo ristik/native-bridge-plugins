@@ -15,7 +15,7 @@ import { C } from './cbor.js';
 
 const T0 = 1_700_000_040n;
 const UC_TS = 1_700_000_900n;
-const w0 = makeWorld();
+const w0 = await makeWorld();
 
 const rec = (w: World, tw: Tweaks, s = spec(1), steps = [] as ReturnType<typeof txStep>[], expect: 'receipt' | 'return' = 'receipt') =>
   buildToken(w, s, steps, T0, UC_TS, tw).then((o) => w.bridge.verifyNativeToken(o.token, expect));
@@ -43,7 +43,7 @@ test('return with terminal burn commits the release and the nullifier', async ()
 });
 
 test('prague header with requestsHash verifies', async () => {
-  const w = makeWorld(21);
+  const w = await makeWorld(21);
   await w.bridge.verifyNativeToken((await buildToken(w, spec(1), [], T0, UC_TS)).token, 'receipt');
 });
 

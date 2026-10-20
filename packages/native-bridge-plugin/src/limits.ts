@@ -1,13 +1,13 @@
 /**
- * Named profile-v4 bounds and fixed protocol constants. The numbers of the first block are the
- * `limits` of `protocol/profile-v4.json` (the single source shared with the oracle and the contract;
+ * Named profile-v5 bounds and fixed protocol constants. The numbers of the first block are the
+ * `limits` of `protocol/profile-v5.json` (the single source shared with the oracle and the contract;
  * `test/limits.test.ts` pins them): a later profile version raises them together with the gas budget.
  * Limits are intersected, never additive entitlements, and every cumulative bound is checked before
  * allocation or cryptography.
  */
-export const NATIVE_BRIDGE_PROTO_VERSION = 4 as const;
+export const NATIVE_BRIDGE_PROTO_VERSION = 5 as const;
 
-// ---- profile parameters (profile-v4.json `limits`) -------------------------------------------------
+// ---- profile parameters (profile-v5.json `limits`) -------------------------------------------------
 /** Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle. */
 export const MAX_ANCHORS = 16;
 /** B2 leaves of one redemption: the mint, every transfer and the final burn. */
@@ -74,4 +74,4 @@ export const PRED_BURN = 2;
 
 export const NATIVE_BRIDGE_FAMILY = 'unicity-native' as const;
 export const FAMILY = NATIVE_BRIDGE_FAMILY;
-export const SDK_VERSION = '3.0.1' as const;
+export const SDK_VERSION = '4.0.0' as const;

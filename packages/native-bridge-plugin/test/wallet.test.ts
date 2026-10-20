@@ -62,7 +62,7 @@ class Backend implements NativeWalletBackend {
 const rev = { manifestRevision: 'm1', profileRevision: 'p2' };
 
 test('receive and export gate on full-history verification', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(1));
   const pay = new NativeBridgePayments(plugin, be, new MemoryRedemptionJournal());
@@ -77,7 +77,7 @@ test('receive and export gate on full-history verification', async () => {
 });
 
 test('validation cache is bound to token bytes, trust digest and revisions', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const a = createNativeBridgePlugin(w.bridge, rev);
   let count = 0;
   const orig = a.verifyNativeToken;
@@ -98,7 +98,7 @@ test('validation cache is bound to token bytes, trust digest and revisions', asy
 });
 
 test('burn is gated before the wallet acts and the burned blob is rechecked', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(2));
   const pay = new NativeBridgePayments(plugin, be, new MemoryRedemptionJournal());
@@ -120,7 +120,7 @@ test('burn is gated before the wallet acts and the burned blob is rechecked', as
 });
 
 test('burnForReturn journals the verified blob before the burn is acknowledged', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(2));
   const journal = new MemoryRedemptionJournal();
@@ -144,7 +144,7 @@ test('burnForReturn journals the verified blob before the burn is acknowledged',
 });
 
 test('burnForReturn does not acknowledge when the journal write fails', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(2));
   const pay = new NativeBridgePayments(plugin, be, new MemoryRedemptionJournal());
@@ -156,7 +156,7 @@ test('burnForReturn does not acknowledge when the journal write fails', async ()
 });
 
 test('recoverPendingBurns re-journals a settled burn after interruption', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(2));
   const journal = new MemoryRedemptionJournal();
@@ -173,7 +173,7 @@ test('recoverPendingBurns re-journals a settled burn after interruption', async 
 });
 
 test('recovery after a restart keeps a journalled redemption: state and sent hashes survive, nothing is reset to burned', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(2));
   const journal = new MemoryRedemptionJournal();
@@ -197,7 +197,7 @@ test('recovery after a restart keeps a journalled redemption: state and sent has
 });
 
 test('mint pre-check verifies the certified EVM lock before submission', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const s = spec(1);
   const be = new Backend(s.owner);
@@ -220,7 +220,7 @@ test('mint pre-check verifies the certified EVM lock before submission', async (
 });
 
 test('return proof assembly with an optional untrusted transport', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const burned = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS);
   const { encoded, nullifier } = await buildNativeReturnProof(plugin, burned.bytes);
@@ -234,14 +234,14 @@ test('return proof assembly with an optional untrusted transport', async () => {
 });
 
 test('SDK seam: NativeBridgeTokenVerifier composes SDK and strict verification', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
   const ctx = await w.bridge.context();
   const v = new NativeBridgeTokenVerifier(w.bridge);
   assert.equal((await v.verify(out.token, ctx)).status, VerificationStatus.OK);
   // A caller context with another base is outside the fixed profile.
-  const other = makeWorld();
-  const otherCtx = { ...ctx, trustBase: await (await import('./world.js')).makeRoot(3, 4, 20).trust.authority() } as typeof ctx;
+  const other = await makeWorld();
+  const otherCtx = { ...ctx, trustBase: await (await (await import('./world.js')).makeRoot(3, 4, 20)).trust.authority() } as typeof ctx;
   void other;
   assert.equal((await v.verify(out.token, otherCtx)).status, VerificationStatus.FAIL);
   assert.equal(v.lastError, 'ErrTrustBase');
@@ -252,7 +252,7 @@ test('SDK seam: NativeBridgeTokenVerifier composes SDK and strict verification',
 });
 
 test('SDK context registers the justification verifier and one issuance policy per type', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const out = await buildToken(w, spec(1), [], T0, UC_TS);
   // Through the SDK's own token verification with only this bridge's registrations.
   const r = await out.token.verify(await w.bridge.context());
@@ -292,7 +292,7 @@ test('claim calldata is the guarded pull payment selector and arguments', async 
 
 
 test('burn result must extend the requested token and credit the requested recipient', async () => {
-  const w = makeWorld();
+  const w = await makeWorld();
   const plugin = createNativeBridgePlugin(w.bridge, rev);
   const be = new Backend(signer(2));
   const journal = new MemoryRedemptionJournal();
@@ -329,7 +329,7 @@ test('durable handoff survives adapter restart, including interrupted burn recov
   const { join } = await import('node:path');
   const dir = await mkdtemp(join(tmpdir(), 'nbp-redemption-'));
   try {
-    const w = makeWorld();
+    const w = await makeWorld();
     const plugin = createNativeBridgePlugin(w.bridge, rev);
     const be = new Backend(signer(1));
     be.tokens.set('t1', (await buildToken(w, spec(1), [], T0, UC_TS)).bytes);

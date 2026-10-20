@@ -121,7 +121,9 @@ export async function verifyLockProof(dep: Deployment, trust: TrustInput, j: Jus
     if (e instanceof Error && e.name === 'NativeError') throw e;
     return fail('ErrUnsupportedCertificateEncoding');
   }
-  await trust.verifyEmbeddedUc(uc);
+  // The oracle's order (protocol/trust-base.md): the seal epoch's committee, then the pinned EVM partition, shard and configuration, then the
+  // certificate itself, so an input with several faults gets the oracle's verdict.
+  trust.selectEpoch(uc);
   // Admitted EVM partition, shard and configuration: pinned, never read from the UC tuple.
   if (uc.unicityTreeCertificate.partitionIdentifier !== BigInt(dep.cfg.evmPartition)) fail('ErrEvmPartition');
   if (!eq(uc.shardTreeCertificate.shard.encode(), dep.cfg.evmShard)) fail('ErrEvmShard');
@@ -146,6 +148,7 @@ export async function verifyLockProof(dep: Deployment, trust: TrustInput, j: Jus
   if (!eq(configHash(elems), dep.evmConfigHash)) fail('ErrEvmConfigPin');
   // The certified shard epoch must be the epoch the carried PDR describes.
   if (pdrEpoch !== uc.inputRecord.epoch) fail('ErrEvmConfigPin');
+  await trust.verifyEmbeddedUc(uc);
   // keccak256(headerRLP) == IR.blockHash and header.stateRoot == IR.hash.
   const blockHash = uc.inputRecord.blockHash;
   if (blockHash === null || blockHash.length !== 32 || uc.inputRecord.hash.length !== 32) fail('ErrHeaderHash');

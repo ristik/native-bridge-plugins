@@ -25,7 +25,7 @@ def synthetic():
     d = f'1:{h}:{h}:1:' + '0'*40
     ty = hashlib.sha256(('unicity-bridge:unicity-native:' + d).encode()).hexdigest()
     coin = hashlib.sha256(('unicity-bridge-coin:unicity-native:' + d).encode()).hexdigest()
-    e = {'schemaVersion': 1, 'protocolVersion': 4, 'family': 'unicity-native', 'sdkVersion': '3.0.1', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'document': artifact, 'format': 'sdk-root-trust-base-json-v1'}}
+    e = {'schemaVersion': 1, 'protocolVersion': 5, 'family': 'unicity-native', 'sdkVersion': '4.0.0', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'format': 'utb-release-bundle-v1', 'genesisEntryId': h, 'bundle': artifact}}
     return {ty: e}
 
 
@@ -116,14 +116,20 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'trust anchor mismatch'):
             p.validate_manifest(self.registry)
 
-    def test_old_epoch_bundle_rejected(self):
-        self.entry['trustBase']['bundle'] = self.entry['trustBase'].pop('document')
-        self.entry['trustBase']['format'] = 'native-epoch-indexed-v1'
+    def test_v4_sdk_document_rejected(self):
+        self.entry['trustBase']['document'] = self.entry['trustBase'].pop('bundle')
+        del self.entry['trustBase']['genesisEntryId']
+        self.entry['trustBase']['format'] = 'sdk-root-trust-base-json-v1'
         with self.assertRaises(ValidationError):
             p.validate_manifest(self.registry)
 
-    def test_trust_document_digest_required(self):
-        del self.entry['trustBase']['document']['sha256']
+    def test_trust_bundle_digest_required(self):
+        del self.entry['trustBase']['bundle']['sha256']
+        with self.assertRaises(ValidationError):
+            p.validate_manifest(self.registry)
+
+    def test_genesis_entry_id_required(self):
+        del self.entry['trustBase']['genesisEntryId']
         with self.assertRaises(ValidationError):
             p.validate_manifest(self.registry)
 

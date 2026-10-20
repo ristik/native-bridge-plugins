@@ -88,8 +88,8 @@ test('value envelope bytes are exact', () => {
   assert.deepEqual(valueEnvelope(aid, Uint8Array.of(3, 232)), Uint8Array.of(0xd9, 0x98, 0x8a, 0x83, 0x01, 0x81, 0x82, 0x58, 0x20, ...aid, 0x42, 0x03, 0xe8, 0xf6));
 });
 
-test('cfg and policy round trip; deployment construction rejects forged identity', () => {
-  const w = makeWorld();
+test('cfg and policy round trip; deployment construction rejects forged identity', async () => {
+  const w = await makeWorld();
   assert.deepEqual(decodeCfg(cfgBytes(w.dep.cfg)), w.dep.cfg);
   throwsReason(() => decodeCfg(Uint8Array.of(...cfgBytes(w.dep.cfg), 0)), 'ErrTrailing');
   assert.deepEqual(decodePolicy(policyBytes(w.policy)), w.policy);

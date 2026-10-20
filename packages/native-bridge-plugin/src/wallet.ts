@@ -166,7 +166,7 @@ export class NativeBridgePayments implements BridgePayments {
     const bridge = this.plugin.bridge;
     const j = request.justification ?? fail('ErrMintJustif');
     const parsed = parseJustification(j);
-    const dep = bridge.registry.find(bridge.trust.base.networkId.id, parsed.chainId, parsed.vault);
+    const dep = bridge.registry.find(bridge.trust.network.id, parsed.chainId, parsed.vault);
     if (!eq(request.tokenType, dep.cfg.ty)) fail('ErrMintType');
     const amount = checkMintData(dep, request.data);
     const nonce = checkJustification(dep, j);
