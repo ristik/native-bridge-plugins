@@ -14,7 +14,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { checkAnchors, checkPolicyBody, decodeEnvelope, encodeEnvelope, parseInputRecord, planAnchors } from '../src/envelope.js';
 import { measure } from '../src/certgroups.js';
 import { computeGate, kernelRequestBytes } from '../src/gas.js';
-import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../src/limits.js';
+import { MAX_ANCHORS, MAX_LEAVES } from '../src/limits.js';
 import { BURN_HISTORY_BYTES, buildReturnProof, leafStateIds, preflightBurn, refreshToken } from '../src/proof.js';
 import { projectToken } from '../src/history.js';
 import { NativeError, RETRYABLE } from '../src/errors.js';
@@ -45,7 +45,7 @@ test('return envelope round trips and passes policy, anchor and gate checks', as
   assert.deepEqual(plan.leafAnchor, [0, 0, 0]);
   const ir = checkAnchors(envelope, plan, verified.outcome.leaves.map((l) => l.referenceTime));
   assert.equal(ir[0].timestamp, UC_TS);
-  assert.ok(gate.total <= TX_GAS_BUDGET);
+  assert.ok(gate.total > 0);
   assert.deepEqual(computeGate(cfgBytes(w.dep.cfg), encoded.length, kernelRequestBytes(cfgBytes(w.dep.cfg).length, envelope.history.length), envelope), gate);
   assert.equal(gate.grouping.k, 1);
   assert.equal(gate.j, 17 + 4 + 12 + gate.grouping.items, 'J: Cfg, policy, one IR opening and the UC occurrences');
@@ -195,7 +195,7 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   assert.equal(two.envelope.anchors.length, 2);
   assert.deepEqual(two.envelope.leafProofs.map((l) => l.anchorIndex), [0, 1, 1]);
   assert.notDeepEqual(two.envelope.anchors[0].uc, two.envelope.anchors[1].uc);
-  // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
+  // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted, and priced (no gas ceiling, owner section 36)
   assert.equal(MAX_ANCHORS, 16);
   const perLeaf = (n: number) => buildToken(w, spec(1), Array.from({ length: n }, (_, i) => (i === n - 1 ? burnStep(T0 + 20n) : txStep(i + 2, 7, T0 + 10n + BigInt(i)))), T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
   for (const n of [1, 2]) {
@@ -203,15 +203,15 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
     assert.equal(out.ucs.length, n + 1);
     const ok = await buildReturnProof(w.bridge, out.token);
     assert.equal(ok.envelope.anchors.length, n + 1);
-    assert.ok(ok.gate.total <= TX_GAS_BUDGET);
+    assert.ok(ok.gate.total > 0);
   }
-  // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the gate,
-  // never truncated; one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused before the gate
+  // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted and priced, never
+  // truncated; one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused
   assert.ok(MAX_LEAVES > MAX_ANCHORS);
   const full = await perLeaf(MAX_ANCHORS - 1);
   assert.equal(full.ucs.length, MAX_ANCHORS);
   const sixteen = await buildReturnProof(w.bridge, full.token).then((r) => r.envelope.anchors.length, (e: unknown) => (e as NativeError).reason);
-  assert.ok(sixteen === MAX_ANCHORS || sixteen === 'ErrGasBudget', String(sixteen));
+  assert.equal(sixteen, MAX_ANCHORS);
   const over = await perLeaf(MAX_ANCHORS);
   assert.equal(over.ucs.length, MAX_ANCHORS + 1);
   await rejects(buildReturnProof(w.bridge, over.token), 'ErrTooManyPaths');
@@ -302,7 +302,7 @@ test('depth 1: one anchor per distinct UC in first-use order, each leaf under it
   // the depth of each anchor comes from its own shard ID, and its shard-tree sibling is a path step of the gate
   assert.equal(measure([envelope.anchors[0]]).p, 1);
   assert.throws(() => measure([{ ...envelope.anchors[0], shard: Uint8Array.of(0x80) }]), { reason: 'ErrShardMismatch' });
-  assert.ok(gate.total <= TX_GAS_BUDGET);
+  assert.ok(gate.total > 0);
   assert.deepEqual(decodeEnvelope(encoded), envelope);
   // routing: the state ID of every leaf is what the host asks its aggregator for; the anchors carry the shards the certificates name
   const sidsOf = await leafStateIds(out.token);
@@ -341,7 +341,7 @@ test('burn-time preflight admits a redeemable history and refuses one leaf more 
   const w = await makeWorld();
   const fits = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 2 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
   const gate = await preflightBurn(w.bridge, fits.bytes);
-  assert.ok(gate.total <= TX_GAS_BUDGET, String(gate.total));
+  assert.ok(gate.total > 0, String(gate.total));
   const tooLong = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 1 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
   await rejects(preflightBurn(w.bridge, tooLong.bytes), 'ErrTooManyTx');
 });
@@ -350,14 +350,14 @@ test('preflightBurn on a held token: a history within BURN_HISTORY_BYTES of the 
   const w = await makeWorld();
   const held = (n: number) => buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS, { mintData: new Uint8Array(n).fill(7) });
   const edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
-  // the projection grows one byte per data byte once the byte-string header width is fixed
-  const probe = 4096;
+  // the projection grows one byte per data byte once the byte-string header width is fixed (above 65,535 bytes: a 4-byte length)
+  const probe = 70_000;
   const base = projectToken((await held(probe)).token).length;
   const n = probe + (edge - base);
   const fits = await held(n);
   assert.equal(projectToken(fits.token).length, edge, 'the held history is exactly at the margin');
   const gate = await preflightBurn(w.bridge, fits.bytes);
-  assert.ok(gate.total <= TX_GAS_BUDGET);
+  assert.ok(gate.total > 0);
   await rejects(preflightBurn(w.bridge, (await held(n + 1)).bytes), 'ErrInputTooLarge');
 });
 

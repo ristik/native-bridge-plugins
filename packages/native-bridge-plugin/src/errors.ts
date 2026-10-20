@@ -14,7 +14,7 @@ const FAMILY = {
   ErrTruncated: M, ErrTrailing: M, ErrNonCanonical: M, ErrForbiddenCBOR: M, ErrShape: M, ErrTag: M,
   ErrVersion: M, ErrLength: M, ErrIntRange: M, ErrABIFraming: M, ErrBadOperation: M, ErrRlpMalformed: M,
   ErrMptMalformed: M, ErrSdkDecode: M,
-  ErrInputTooLarge: B, ErrTooManyTx: B, ErrTooManyItems: B, ErrTooDeep: B, ErrTooManyPaths: B, ErrProofTooLarge: B, ErrGasBudget: B,
+  ErrInputTooLarge: B, ErrTooManyTx: B, ErrTooManyItems: B, ErrTooDeep: B, ErrTooManyPaths: B, ErrProofTooLarge: B,
   ErrCfgMismatch: I, ErrPolicyHash: I, ErrPolicyTuple: I, ErrPolicyAnchors: I, ErrPolicyLeafIndex: I,
   ErrPolicyLeafCount: I, ErrPolicyPartition: I, ErrPathBitmap: I, ErrAnchorAuth: I, ErrPredicate: I, ErrMintShape: I, ErrMintJustif: I,
   ErrMintSalt: I, ErrMintType: I, ErrMintData: I, ErrTransferData: I, ErrCDMismatch: I, ErrUnlock: I,

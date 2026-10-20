@@ -16,7 +16,7 @@ import { checkAnchors, checkPolicyBody, encodeEnvelope, planAnchors, type Anchor
 import { computeGate, kernelRequestBytes, projectedGate, type Gate } from './gas.js';
 import { fail } from './errors.js';
 import { projectToken } from './history.js';
-import { MAX_ENVELOPE_BYTES, MAX_LEAVES, MAX_SEMANTIC_BYTES, TX_GAS_BUDGET } from './limits.js';
+import { MAX_ENVELOPE_BYTES, MAX_LEAVES, MAX_SEMANTIC_BYTES } from './limits.js';
 import { parseJustification } from './lockproof.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import type { Deployment } from './deployment.js';
@@ -51,8 +51,9 @@ export async function refreshToken(token: Token, fresh: InclusionProof[]): Promi
  * anchor), in first-use leaf order, each claim read from its own UC (its shard, shard configuration
  * hash and partition: the policy names only the partition, and the UC authenticates the rest). Nothing
  * here re-queries to make certificates converge: the pairs are used as fetched, and an envelope that
- * needs more anchors than the profile bound, or does not fit the shared gas gate, is `ErrTooManyPaths`
- * or `ErrGasBudget` (BudgetExceeded), never truncated or split.
+ * needs more anchors than the profile bound is `ErrTooManyPaths` (BudgetExceeded), never truncated or
+ * split. The returned `gate` is the gas estimate the redemption should be sent with; it is never a
+ * refusal (owner section 36).
  */
 export async function buildReturnProof(bridge: NativeBridge, token: Token): Promise<{ envelope: Envelope; encoded: Uint8Array; verified: VerifiedToken; gate: Gate }> {
   const verified = await bridge.verifyNativeToken(token, 'return');
@@ -89,7 +90,7 @@ export async function buildReturnProof(bridge: NativeBridge, token: Token): Prom
   const encoded = encodeEnvelope(envelope);
   if (encoded.length > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   // The composing verifier's own checks must pass on what we assembled, in its order: policy opening,
-  // anchor table, the shared gas gate, then every anchor's opening and every leaf's own anchor time.
+  // anchor table, the gas estimate, then every anchor's opening and every leaf's own anchor time.
   const sids = verified.outcome.leaves.map((l) => l.sid);
   const pol = checkPolicyBody(dep.cfg, envelope);
   const plan = planAnchors(pol, envelope, sids);
@@ -105,11 +106,11 @@ export async function buildReturnProof(bridge: NativeBridge, token: Token): Prom
 export const BURN_HISTORY_BYTES = 1024;
 
 /**
- * The burn-time preflight. A burn that could never be redeemed under the profile bounds and the shared
- * gas gate is refused before the wallet burns anything: more leaves than the profile admits, a history or
- * envelope over its bound, or an envelope that cannot pass the gas gate (`txGasBudget`) even in the best case. Beyond the bounds the
- * answer is `ErrGasBudget`/`ErrTooManyTx`/`ErrInputTooLarge` (BudgetExceeded), never a truncated history
- * or a partial redemption. `tokenBytes` is the held receipt the burn would spend.
+ * The burn-time preflight. A burn that could never be redeemed under the resource policy is refused before
+ * the wallet burns anything: more leaves than the native kernel admits, or a history or envelope over its
+ * bound (`ErrTooManyTx`/`ErrInputTooLarge`, BudgetExceeded), never a truncated history or a partial
+ * redemption. There is no gas ceiling (owner section 36): the returned best-case estimate is only that.
+ * `tokenBytes` is the held receipt the burn would spend.
  */
 export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array, shards = 1): Promise<Gate> {
   preflightToken(tokenBytes);
@@ -127,17 +128,15 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
 }
 
 /**
- * The size and gate refusals of the preflight, on the projection's inputs. The history bound is hard and
- * no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to `BURN_HISTORY_BYTES`. The
- * gate projection uses the known history only, a lower bound. The envelope bound cannot fire at the
- * best-case sizes (about 22 KB at the largest admitted shape against 65,536), so it is kept as a guard
- * only.
+ * The size refusals of the preflight and its best-case estimate, on the projection's inputs. The history
+ * bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to
+ * `BURN_HISTORY_BYTES`. The estimate uses the known history only, a lower bound. The envelope bound cannot
+ * fire at the best-case sizes, so it is kept as a guard only.
  */
 export function checkBurnProjection(cfgLen: number, policyLen: number, leaves: number, history: number, anchors = 1): Gate {
   if (history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
   const { gate, envelopeBytes } = projectedGate(cfgLen, policyLen, leaves, history, anchors);
   if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
-  if (gate.total > TX_GAS_BUDGET) fail('ErrGasBudget');
   return gate;
 }
 

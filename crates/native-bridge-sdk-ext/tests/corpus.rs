@@ -90,17 +90,13 @@ fn envelopes_are_framed_opened_and_planned_as_the_corpus_says() {
 }
 
 #[test]
-fn the_gate_of_every_published_envelope_is_the_oracles_component_by_component() {
+fn the_gas_estimate_of_every_published_envelope_is_the_oracles_component_by_component() {
     let cs = cases("proof/cases.json", "gate");
     assert!(cs.len() >= 14);
     for c in &cs {
         let cfg = cfg_of(c["cfg"].as_str().unwrap());
         let cfg_raw = cfg.to_bytes();
         let input = from_hex(c["input"].as_str().unwrap()).unwrap();
-        // the mint case carries no budget: the profile's own
-        let budget: u64 = c["aux"]["budget"]
-            .as_str()
-            .map_or(7_000_000, |b| b.parse().unwrap());
         let mut gate = None;
         let run = || -> Result<_, E> {
             let env = Envelope::decode(&input)?;
@@ -110,7 +106,6 @@ fn the_gate_of_every_published_envelope_is_the_oracles_component_by_component() 
                 input.len(),
                 kernel_request_bytes(cfg_raw.len() as u64, env.history.len() as u64),
                 &env,
-                budget,
             )
         };
         let r = run();
@@ -145,7 +140,6 @@ fn the_k_anchor_projection_is_a_lower_bound_of_every_consolidated_bundle() {
             let id = c["id"].as_str().unwrap();
             id.strip_prefix("gate-consolidated-m")
                 .is_some_and(|r| r.starts_with(|ch: char| ch.is_ascii_digit()))
-                && id.ends_with("-exact")
         })
         .collect();
     assert_eq!(cs.len(), 8, "m in {{1,2,4,8}} x committee {{4,16}}");
@@ -154,7 +148,11 @@ fn the_k_anchor_projection_is_a_lower_bound_of_every_consolidated_bundle() {
         let env = Envelope::decode(&from_hex(c["input"].as_str().unwrap()).unwrap()).unwrap();
         let (k, l) = (env.anchors.len() as u64, env.leaf_proofs.len() as u64);
         let (p, h) = (env.policy_body.len() as u64, env.history.len() as u64);
-        let exact: u64 = c["aux"]["budget"].as_str().unwrap().parse().unwrap();
+        let exact: u64 = c["expected"]["values"]["total"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
         let best = projected_gate_anchors(cfg, p, l, h, k).0.total;
         assert!(best <= exact, "{}: {best} > {exact}", c["id"]);
         if k > 1 {
@@ -165,4 +163,26 @@ fn the_k_anchor_projection_is_a_lower_bound_of_every_consolidated_bundle() {
             projected_gate_anchors(cfg, p, l, h, l).0.total
         );
     }
+}
+
+/// No gas ceiling (owner section 36): a bundle estimated above the former 7,000,000 is estimated, not refused.
+#[test]
+fn a_bundle_above_the_former_ceiling_is_estimated_not_refused() {
+    let c = cases("proof/cases.json", "gate")
+        .into_iter()
+        .find(|c| c["id"] == "gate-compose-leaves-max-two-anchors")
+        .unwrap();
+    assert_eq!(c["expected"]["status"], "ok");
+    let cfg_raw = cfg_of(c["cfg"].as_str().unwrap()).to_bytes();
+    let input = from_hex(c["input"].as_str().unwrap()).unwrap();
+    let env = Envelope::decode(&input).unwrap();
+    let g = compute_gate(
+        &cfg_raw,
+        input.len(),
+        kernel_request_bytes(cfg_raw.len() as u64, env.history.len() as u64),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(g.total, 7_206_166);
+    assert!(g.total > 7_000_000);
 }

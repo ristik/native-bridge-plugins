@@ -1,7 +1,9 @@
 //! The shared direct-call gas gate (interop.md "Direct-call gas gate"): the same formula, with the same constants, as the oracle
 //! (`bridgeprofile/gas.go`), the contract (`BridgeBounds.sol`, `CertGroups.sol`) and the TypeScript plug-in. Every term is the
 //! native price of a call the composing verifier makes, or the bounded execution of the verifier itself, computed from complete
-//! bounded scans, never from caller-declared costs. It is an admission rule, not a measured fit:
+//! bounded scans, never from caller-declared costs. It is a conservative estimate a wallet sets its gas limit from, never an
+//! admission rule: there is no fixed transaction budget (owner section 36), and a call with too little gas runs out of gas and
+//! reverts atomically:
 //!
 //! `G_gate = 21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1,000,000`
 
@@ -98,24 +100,23 @@ pub struct Gate {
     pub j: u64,
     /// The grouping the batch is priced by.
     pub grouping: Counts,
-    /// The gated sum including the fixed reserve.
+    /// The estimate including the fixed reserve.
     pub total: u64,
 }
 
-/// Price a complete bounded envelope against `budget`; above it is `GasBudget` (BudgetExceeded).
+/// Price a complete bounded envelope: the estimate, never a refusal.
 pub fn compute_gate(
     cfg: &[u8],
     envelope_bytes: usize,
     kernel_request: u64,
     env: &Envelope,
-    budget: u64,
 ) -> Result<Gate> {
     // J: the item occurrences of the Cfg, the policy body, every anchor IR opening and (counted by the batch scan) every anchor
-    // UC, each once, against the one shared budget. A malformed object is its own shape failure; crossing the budget is
-    // TooManyItems.
+    // UC, each once. There is no shared budget: each object is bounded by its own native scan (TooManyItems), and every item is
+    // charged. A malformed object is its own shape failure.
     let mut spent = 0usize;
     let mut take = |b: &[u8]| -> Result<()> {
-        match count_items(b, BRIDGE_CBOR_ITEMS - spent) {
+        match count_items(b, MAX_CBOR_ITEMS) {
             Ok(n) => {
                 spent += n;
                 Ok(())
@@ -130,7 +131,7 @@ pub fn compute_gate(
         take(&a.input_record)?;
     }
     // A malformed certificate is an anchor-authentication failure, an over-bound one a budget refusal.
-    let grouping = measure(&env.anchors, spent).map_err(|e| match e {
+    let grouping = measure(&env.anchors).map_err(|e| match e {
         E::TooManyItems | E::TooManyPaths => e,
         _ => E::AnchorAuth,
     })?;
@@ -141,9 +142,6 @@ pub fn compute_gate(
         let (gas, st) = leaf_path_gas(p)?;
         rsmt += gas;
         steps += st;
-    }
-    if steps > MAX_PATH_STEPS as u64 {
-        return Err(E::TooManyPaths);
     }
     let mut g = Gate {
         intrinsic: intrinsic_gas(cfg.len() as u64, envelope_bytes as u64),
@@ -157,9 +155,6 @@ pub fn compute_gate(
         total: 0,
     };
     g.total = g.intrinsic + g.b2 + g.batch + g.items + g.rsmt + GAS_RESERVE;
-    if g.total > budget {
-        return Err(E::GasBudget);
-    }
     Ok(g)
 }
 
@@ -186,8 +181,8 @@ pub fn projected_gate(
 /// The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves (the burn included) and a
 /// `history_bytes` history would need if everything the burn cannot yet know turns out as small as it can: the consolidated
 /// bundle, `anchors` anchors (one per aggregator shard the leaves touch, at least 1, at most `leaves`) under ONE seal, the smallest
-/// certificates and empty paths. The burn is refused only when even this cannot pass the gas gate; whether the bundle actually
-/// fetched passes is the gate's decision at redemption. Returns the gate and the projected envelope bytes.
+/// certificates and empty paths. It is the burn-time estimate only: nothing is refused for its size (owner section 36). Returns
+/// the estimate and the projected envelope bytes.
 pub fn projected_gate_anchors(
     cfg_bytes: u64,
     policy_bytes: u64,

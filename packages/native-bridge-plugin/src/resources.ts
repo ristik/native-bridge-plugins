@@ -3,16 +3,12 @@
  * Unicity path 32 steps; seal 64 signatures; signer ID 128 UTF-8 bytes.
  */
 import { NativeError, fail } from './errors.js';
-import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PATH_STEPS, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_TRANSFERS, MAX_UC_BYTES } from './limits.js';
+import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_TRANSFERS, MAX_UC_BYTES } from './limits.js';
 
 type Node = { major: number; arg: bigint; start: number; end: number; depth: number; data: Uint8Array; kids: Node[] };
+/** Items of the object being scanned. Paths are bounded per certificate and per proof, never in sum (owner section 36). */
 class Budget {
   items = 0;
-  paths = 0;
-  addPaths(n: number): void {
-    if (n > MAX_PATH_STEPS - this.paths) fail('ErrTooManyPaths');
-    this.paths += n;
-  }
 }
 function scan(b: Uint8Array, budget: Budget, depth = 0): Node {
   let pos = 0;
@@ -80,7 +76,6 @@ function uc(n: Node, budget: Budget): void {
   const ut = tagged(k[5], 39004n, 3); version(ut[0]); uint(ut[1], 0xffffffffn);
   const steps = array(ut[2]); if (steps.length > 32) fail('ErrProofTooLarge');
   for (const step of steps) { const x = array(step, 2); uint(x[0], 0xffffffffn); hash(x[1]); }
-  budget.addPaths(siblings.length + steps.length);
   const seal = tagged(k[6], 39005n, 8); version(seal[0]); uint(seal[1], 0xffffn); uint(seal[2]); uint(seal[3]); uint(seal[4]); hash(seal[5], true); hash(seal[6]);
   if (seal[7].major !== 5) unsupported();
   const sigs = seal[7].kids; if (sigs.length > 128) fail('ErrProofTooLarge');
@@ -128,7 +123,7 @@ function visit(n: Node, budget: Budget): void {
       if (n.arg === 39033n && k[3]?.major === 2) {
         const len = k[3].data.length;
         if (len < 32 || len % 32 !== 0) unsupported();
-        const paths = (len - 32) / 32; if (paths > 256) fail('ErrProofTooLarge'); budget.addPaths(paths);
+        const paths = (len - 32) / 32; if (paths > 256) fail('ErrProofTooLarge');
         if (k[4]) uc(k[4], budget); else unsupported();
         return; // UC paths have already been counted.
       }

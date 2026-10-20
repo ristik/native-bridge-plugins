@@ -14,19 +14,10 @@ struct Node<'a> {
     data: &'a [u8],
     kids: Vec<Node<'a>>,
 }
+/// Items of the object being scanned. Paths are bounded per certificate and per proof, never in sum (owner section 36).
 #[derive(Default)]
 struct Budget {
     items: usize,
-    paths: usize,
-}
-impl Budget {
-    fn add_paths(&mut self, n: usize) -> Result<()> {
-        if n > MAX_PATH_STEPS - self.paths {
-            return Err(E::TooManyPaths);
-        }
-        self.paths += n;
-        Ok(())
-    }
 }
 fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: usize) -> Result<Node<'a>> {
     fn read<'a>(b: &'a [u8], pos: &mut usize, budget: &mut Budget, d: usize) -> Result<Node<'a>> {
@@ -148,7 +139,7 @@ fn hash(n: &Node<'_>, nullable: bool) -> Result<()> {
     }
     Ok(())
 }
-fn uc(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
+fn uc(n: &Node<'_>) -> Result<()> {
     if n.end - n.start > MAX_UC_BYTES {
         return Err(E::ProofTooLarge);
     }
@@ -205,7 +196,6 @@ fn uc(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
         uint(&x[0], u32::MAX as u64)?;
         hash(&x[1], false)?;
     }
-    budget.add_paths(siblings.len() + steps.len())?;
     let seal = tagged(&k[6], 39005, 8)?;
     version(&seal[0])?;
     for i in [2, 3, 4] {
@@ -247,7 +237,7 @@ fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool, budget: &mut Budg
         match scan(x.data, budget, x.depth + 1) {
             Ok(root) => {
                 if certificate {
-                    uc(&root, budget)?;
+                    uc(&root)?;
                 } else {
                     visit(&root, budget)?;
                 }
@@ -265,7 +255,7 @@ fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool, budget: &mut Budg
 fn visit(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
     if n.major == 6 {
         if n.arg == 39001 {
-            return uc(n, budget);
+            return uc(n);
         }
         let body = &n.kids[0];
         if body.major == 4 {
@@ -324,9 +314,8 @@ fn visit(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
                         if paths > 256 {
                             return Err(E::ProofTooLarge);
                         }
-                        budget.add_paths(paths)?;
-                        uc(k.get(4).ok_or(E::UnsupportedCertificateEncoding)?, budget)?;
-                        return Ok(()); // UC paths have already been counted.
+                        uc(k.get(4).ok_or(E::UnsupportedCertificateEncoding)?)?;
+                        return Ok(()); // the UC has been scanned.
                     }
                 }
                 _ => {}
@@ -352,7 +341,7 @@ pub fn preflight_uc(bytes: &[u8]) -> Result<()> {
         return Err(E::ProofTooLarge);
     }
     let mut budget = Budget::default();
-    let checked = scan(bytes, &mut budget, 0).and_then(|n| uc(&n, &mut budget));
+    let checked = scan(bytes, &mut budget, 0).and_then(|n| uc(&n));
     checked.map_err(|e| {
         if e.family() == crate::error::Family::Budget {
             e

@@ -164,9 +164,8 @@ impl NativeBridge {
         // Positive, permanent, offline evidence of the lock.
         let lock = lockproof::verify(dep, &self.trust, &parsed, &outcome.lock_digest)?;
 
-        // Bridge-specific checks per certified leaf: fixed-profile guards, aggregator admission,
-        // path budget and the `t <= IR.timestamp` bound the Rust SDK lacks.
-        let mut steps = 0usize;
+        // Bridge-specific checks per certified leaf: fixed-profile guards, aggregator admission and the
+        // `t <= IR.timestamp` bound the Rust SDK lacks (no cumulative path budget, owner section 36).
         let mut leaves = outcome.leaves.iter();
         let g = token.genesis();
         check_leaf(
@@ -175,7 +174,6 @@ impl NativeBridge {
             g.inclusion_proof(),
             g.transaction(),
             leaves.next().ok_or(E::Shape)?,
-            &mut steps,
         )?;
         for t in token.transactions() {
             check_leaf(
@@ -184,7 +182,6 @@ impl NativeBridge {
                 t.inclusion_proof(),
                 t.transaction(),
                 leaves.next().ok_or(E::Shape)?,
-                &mut steps,
             )?;
         }
 
@@ -215,7 +212,6 @@ pub fn check_leaf(
     proof: &InclusionProof,
     tx: &impl Transaction,
     leaf: &Leaf,
-    steps: &mut usize,
 ) -> Result<()> {
     let uc = &proof.unicity_certificate;
     if proof.reference_time != leaf.reference_time {
@@ -241,11 +237,6 @@ pub fn check_leaf(
         || !crate::profile::shard_covers(&shard, &leaf.sid)
     {
         return Err(E::ShardMismatch);
-    }
-    let encoded = proof.inclusion_certificate.encode();
-    *steps += (encoded.len() - 32) / 32;
-    if *steps > MAX_PATH_STEPS {
-        return Err(E::TooManyPaths);
     }
     // The leaf cannot have been created after the round whose root authenticates it.
     if leaf.reference_time > uc.input_record.timestamp {

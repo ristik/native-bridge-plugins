@@ -95,7 +95,7 @@ fn every_token_level_run_is_planned_opened_batched_grouped_and_gated_as_the_go_p
             r["request"].as_str().unwrap(),
             "{id}: request"
         );
-        let n = measure(&env.anchors, 0).unwrap();
+        let n = measure(&env.anchors).unwrap();
         let g = &r["grouping"];
         for (k, v) in [
             ("C", n.c),
@@ -113,7 +113,6 @@ fn every_token_level_run_is_planned_opened_batched_grouped_and_gated_as_the_go_p
             encoded.len(),
             kernel_request_bytes(cfg_raw.len() as u64, env.history.len() as u64),
             &env,
-            7_000_000,
         )
         .unwrap();
         let want = &r["gate"];

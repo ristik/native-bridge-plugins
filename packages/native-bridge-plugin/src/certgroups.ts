@@ -8,12 +8,13 @@
  *   full UC bytes), P the shard siblings plus Unicity-tree steps of the distinct claims.
  *
  * Identity is exact bytes. A claim's shard-tree depth comes from its own native shard ID, never from a policy. `items` counts the
- * CBOR items of every UC occurrence before deduplication, against the bridge's shared 4,096 item budget.
+ * CBOR items of every UC occurrence before deduplication; there is no shared item budget (owner section 36): each UC is bounded by
+ * its own native scan (`MAX_CBOR_ITEMS`) and every item is charged.
  */
 import { concat, eq, toHex } from './bytes.js';
 import { fail } from './errors.js';
 import {
-  BRIDGE_CBOR_ITEMS, MAX_BATCH_BYTES, MAX_CBOR_DEPTH, MAX_RAW_STEPS, MAX_SIGS_PER_SEAL, MAX_TOTAL_SIGS, MAX_UNICITY_STEPS,
+  MAX_BATCH_BYTES, MAX_CBOR_ITEMS, MAX_CBOR_DEPTH, MAX_RAW_STEPS, MAX_SIGS_PER_SEAL, MAX_TOTAL_SIGS, MAX_UNICITY_STEPS,
 } from './limits.js';
 import { shardDepth } from './profile.js';
 
@@ -219,22 +220,19 @@ export function countItems(b: Uint8Array, left: number): number {
 const claimKey = (a: Claim): string =>
   [a.partition, toHex(a.shard), toHex(a.shardConfHash), toHex(a.expectedStateRoot), toHex(a.expectedIRHash), toHex(a.uc)].join('|');
 
-/**
- * Scan and group the claims of one batch. `spent` is what the caller has already used of the shared item budget on the Cfg, the
- * policy and the IR openings.
- */
-export function measure(claims: readonly Claim[], spent = 0): Counts {
+/** Scan and group the claims of one batch. Each UC occurrence is scanned within its own `MAX_CBOR_ITEMS`. */
+export function measure(claims: readonly Claim[]): Counts {
   const k = claims.length;
   if (k === 0 || k > MAX_CLAIMS) fail('ErrTooManyPaths');
-  if (spent > BRIDGE_CBOR_ITEMS) fail('ErrTooManyItems');
   const n: Counts = { k, c: 4, e: 0, s: 0, q: 0, a: 0, p: 0, items: 0 };
-  const bud: Budget = { limit: BRIDGE_CBOR_ITEMS - spent, items: 0, steps: 0 };
+  const bud: Budget = { limit: 0, items: 0, steps: 0 };
   const epochs = new Set<string>();
   const seals = new Set<string>();
   const seen = new Set<string>();
   for (const a of claims) {
     n.c += CLAIM_FIXED + a.shard.length + a.uc.length;
     if (n.c > MAX_BATCH_BYTES) fail('ErrTooManyPaths');
+    bud.limit = bud.items + MAX_CBOR_ITEMS;
     const o = scan(a, bud);
     if (!epochs.has(o.epoch.toString())) { epochs.add(o.epoch.toString()); n.e++; }
     const seal = toHex(a.uc.subarray(o.sealStart, o.sealStart + o.sealLen));

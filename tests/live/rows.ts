@@ -35,7 +35,7 @@ import { DeploymentRegistry, makeDeployment } from '../../packages/native-bridge
 import { encodeEnvelope } from '../../packages/native-bridge-plugin/src/envelope.js';
 import { encodeJustification, configHashOfPdr } from '../../packages/native-bridge-plugin/src/lockproof.js';
 import { projectToken } from '../../packages/native-bridge-plugin/src/history.js';
-import { MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET } from '../../packages/native-bridge-plugin/src/limits.js';
+import { MAX_ANCHORS, MAX_LEAVES } from '../../packages/native-bridge-plugin/src/limits.js';
 import { DEFAULT_REDEEM, redeemReturn, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../../packages/native-bridge-plugin/src/freshness.js';
 import { createNativeBridgePlugin, type ProofSource } from '../../packages/native-bridge-plugin/src/wallet.js';
 import { gasOneHolds, minimalGas } from './gassearch.js';
@@ -380,10 +380,10 @@ const distinctUcs = (token: Token): Uint8Array[] => {
 // Rows
 // =====================================================================================================================================
 
-/** Rows "1/2/3/4 anchors incl. several on one shard": the redemption succeeds, A calls to 0x0100 and L to 0x0102, the exact credit, gas inside 7M. */
+/** Rows "1/2/3/4 anchors incl. several on one shard": the redemption succeeds, A calls to 0x0100 and L to 0x0102, the exact credit, gas inside the 7M gas limit it is sent with. */
 async function acceptedRow(name: string, token: Token, wantAnchors: number): Promise<Outcome> {
   const o = await redeem(token);
-  const ok = o.receipt.status === '0x1' && o.anchors === wantAnchors && o.credited === amountWei && o.gasUsed < BigInt(TX_GAS_BUDGET) &&
+  const ok = o.receipt.status === '0x1' && o.anchors === wantAnchors && o.credited === amountWei && o.gasUsed < BigInt(REDEEM_GAS) &&
     o.calls !== null && o.calls.uc === wantAnchors && o.calls.rsmt === o.leaves; // an unavailable trace fails the row: the native call counts are part of its claim
   record(name, ok, { anchors: o.anchors, leaves: o.leaves, gasUsed: o.gasUsed, gateTotal: o.gate, credited: o.credited, nativeCalls: o.calls, tx: o.receipt.transactionHash, diag: o.diag });
   return o;
@@ -438,7 +438,7 @@ if (on('bound')) try {
   const b = await buildToken(MAX_LEAVES, 'same', Array.from({ length: MAX_LEAVES - 3 }, (_, i) => (i % 2 ? 'same' : 'other')));
   const t = await mix(b.token, Array(MAX_LEAVES).fill(true));
   const o = await acceptedRow(`leaves=${MAX_LEAVES} (the bound, worst real bundle)`, t, 2);
-  record('worst admitted real bundle: gas against the gate', o.gasUsed <= BigInt(o.gate), { gasUsed: o.gasUsed, gate: o.gate, budget: TX_GAS_BUDGET, reserveLeft: BigInt(o.gate) - o.gasUsed });
+  record('worst admitted real bundle: gas against the gate', o.gasUsed <= BigInt(o.gate), { gasUsed: o.gasUsed, gate: o.gate, gasLimit: REDEEM_GAS, reserveLeft: BigInt(o.gate) - o.gasUsed });
 } catch (e) { groupFailed('bound', e); }
 if (on('bound')) try {
   const b = await buildToken(MAX_LEAVES + 1, 'same', Array.from({ length: MAX_LEAVES - 2 }, (_, i) => (i % 2 ? 'same' : 'other')));
@@ -492,7 +492,7 @@ if (on('malformed')) try {
     const inWin = diag.anchors.every((x) => x.class === 'in-window');
     const calls = await nativeCallsOf(rc.transactionHash).catch(() => null);
     const callsOk = calls === null ? false : nCalls === null ? calls.every((c) => c.valid !== true) : calls.length === nCalls && calls[0].valid === true && calls[1].valid !== true;
-    record(`malformed final anchor (${what})`, rc.status === '0x0' && BigInt(rc.gasUsed) < BigInt(TX_GAS_BUDGET) && claimable() === before && revert === selector(want) && inWin && callsOk,
+    record(`malformed final anchor (${what})`, rc.status === '0x0' && BigInt(rc.gasUsed) < BigInt(REDEEM_GAS) && claimable() === before && revert === selector(want) && inWin && callsOk,
       { gasUsed: BigInt(rc.gasUsed), expectedRevert: `${want} ${selector(want)}`, revert, anchorsInWindowAtExecution: inWin, uc100Calls: calls, diag });
   }
 } catch (e) { groupFailed('malformed', e); }

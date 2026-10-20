@@ -60,8 +60,9 @@ pub fn refresh_token(token: &Token, fresh: &[InclusionProof]) -> Result<Token> {
 /// The anchor table is the profile's: one anchor per distinct complete UC (byte-identical UCs are one
 /// anchor), in first-use leaf order, each claim read from its own UC (its shard, shard configuration hash and
 /// partition: the policy names only the partition, and the UC authenticates the rest). Nothing here re-queries to make certificates converge: the pairs are used as fetched, and an
-/// envelope that needs more anchors than the profile bound, or does not fit the shared gas gate, is
-/// `PolicyAnchors` or `GasBudget` (BudgetExceeded), never truncated or split.
+/// envelope that needs more anchors than the profile bound is `PolicyAnchors` or `TooManyPaths`, never
+/// truncated or split. The returned `Gate` is the gas estimate the redemption should be sent with; it is
+/// never a refusal (owner section 36).
 pub fn build_return_proof(
     bridge: &NativeBridge,
     token: &Token,
@@ -138,7 +139,7 @@ pub fn build_return_proof(
         return Err(E::InputTooLarge);
     }
     // The composing verifier's own checks must pass on what we assembled, in its order: policy opening,
-    // anchor table, the shared gas gate, then every anchor's opening and every leaf's own anchor time.
+    // anchor table, the gas estimate, then every anchor's opening and every leaf's own anchor time.
     let sids: Vec<[u8; 32]> = verified.outcome.leaves.iter().map(|l| l.sid).collect();
     let pol = check_policy_body(&dep.cfg, &env)?;
     let plan = plan_anchors(&pol, &env, &sids)?;
@@ -147,7 +148,6 @@ pub fn build_return_proof(
         encoded.len(),
         kernel_request_bytes(dep.cfg.to_bytes().len() as u64, env.history.len() as u64),
         &env,
-        TX_GAS_BUDGET,
     )?;
     let times: Vec<u64> = verified
         .outcome
@@ -163,11 +163,11 @@ pub fn build_return_proof(
 /// certification data with its unlock script and the terminal return reason).
 pub const BURN_HISTORY_BYTES: usize = 1024;
 
-/// The burn-time preflight. A burn that could never be redeemed under the profile bounds and the
-/// shared gas gate is refused before the wallet burns anything: more leaves than the profile admits, a
-/// history or envelope over its bound, or an envelope that cannot pass the gas gate (`txGasBudget`) even in the best case. Beyond the
-/// bounds the answer is `GasBudget`/`TooManyTx`/`InputTooLarge` (BudgetExceeded), never a truncated
-/// history or a partial redemption. `token` is the held receipt the burn would spend.
+/// The burn-time preflight. A burn that could never be redeemed under the resource policy is refused
+/// before the wallet burns anything: more leaves than the native kernel admits, or a history or envelope
+/// over its bound (`TooManyTx`/`InputTooLarge`, BudgetExceeded), never a truncated history or a partial
+/// redemption. There is no gas ceiling (owner section 36): the returned best-case estimate is only that.
+/// `token` is the held receipt the burn would spend.
 pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
     preflight_burn_shards(bridge, token, 1)
 }
@@ -193,11 +193,10 @@ pub fn preflight_burn_shards(bridge: &NativeBridge, token: &Token, shards: usize
     )
 }
 
-/// The size and gate refusals of the preflight, on the projection's inputs. The history bound is hard and
-/// no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to `BURN_HISTORY_BYTES`. The
-/// gate projection uses the known history only, a lower bound. The envelope bound cannot fire at the
-/// best-case sizes (about 22 KB at the largest admitted shape against 65,536), so it is kept as a guard
-/// only.
+/// The size refusals of the preflight and its best-case estimate, on the projection's inputs. The history
+/// bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to
+/// `BURN_HISTORY_BYTES`. The estimate uses the known history only, a lower bound. The envelope bound cannot
+/// fire at the best-case sizes, so it is kept as a guard only.
 pub fn check_burn_projection(
     cfg_len: u64,
     policy_len: u64,
@@ -222,9 +221,6 @@ pub fn check_burn_projection_anchors(
         projected_gate_anchors(cfg_len, policy_len, leaves, history as u64, anchors);
     if envelope > MAX_ENVELOPE_BYTES as u64 {
         return Err(E::InputTooLarge);
-    }
-    if gate.total > TX_GAS_BUDGET {
-        return Err(E::GasBudget);
     }
     Ok(gate)
 }

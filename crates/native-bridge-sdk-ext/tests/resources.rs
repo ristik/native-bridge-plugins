@@ -153,7 +153,7 @@ fn native_uc_sublimits_on_ordinary_and_standalone_embedded_certificates() {
     }
 }
 #[test]
-fn uc_and_rsmt_paths_share_the_full_token_cumulative_budget() {
+fn uc_and_rsmt_paths_have_no_full_token_cumulative_budget() {
     let w = make_world(20);
     // MAX_TRANSFERS transfers: MAX_LEAVES certificates of 32 unicity steps and 100 shard-tree siblings.
     let steps: Vec<_> = (0..MAX_TRANSFERS as u8)
@@ -170,7 +170,9 @@ fn uc_and_rsmt_paths_share_the_full_token_cumulative_budget() {
         ];
         uc.shard_tree_certificate.sibling_hash_list = vec![vec![0; 32]; 100];
     });
-    rejects(&w, &token, E::TooManyPaths);
+    // 65 certificates of 132 steps each, far above the former 2,048: each within its own bounds, so the resource scan admits them
+    // (owner section 36)
+    preflight_token(&token.to_cbor()).unwrap();
 }
 fn nested_payloads(token: &Token, justification: &[u8], data: &[u8]) -> Vec<u8> {
     let bytes = token.to_cbor();
@@ -251,7 +253,7 @@ fn nested_payloads_share_depth_and_item_budgets_with_the_outer_token() {
 }
 
 #[test]
-fn cumulative_path_boundary_includes_the_immutable_embedded_certificate() {
+fn the_former_cumulative_path_boundary_with_the_embedded_certificate_no_longer_refuses() {
     let w = make_world(20);
     let steps: Vec<_> = (0..MAX_TRANSFERS as u8)
         .map(|i| tx_step(i + 2, i + 1, (i + 2) as u64))
@@ -288,5 +290,5 @@ fn cumulative_path_boundary_includes_the_immutable_embedded_certificate() {
         token
     };
     preflight_token(&make(0).to_cbor()).unwrap();
-    rejects(&w, &make(1), E::TooManyPaths);
+    preflight_token(&make(1).to_cbor()).unwrap();
 }

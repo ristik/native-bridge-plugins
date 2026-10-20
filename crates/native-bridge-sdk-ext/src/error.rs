@@ -39,7 +39,7 @@ errors! {
     RlpMalformed => Malformed, MptMalformed => Malformed, SdkDecode => Malformed,
     // budgets
     InputTooLarge => Budget, TooManyTx => Budget, TooManyItems => Budget, TooDeep => Budget,
-    TooManyPaths => Budget, ProofTooLarge => Budget, GasBudget => Budget,
+    TooManyPaths => Budget, ProofTooLarge => Budget,
     // profile relation
     CfgMismatch => Invalid, PolicyHash => Invalid, PolicyTuple => Invalid, PolicyAnchors => Invalid,
     PolicyLeafIndex => Invalid, PolicyLeafCount => Invalid, PolicyPartition => Invalid,

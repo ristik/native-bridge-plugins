@@ -14,7 +14,7 @@ use common::*;
 use native_bridge_sdk_ext::certgroups::measure;
 use native_bridge_sdk_ext::envelope::*;
 use native_bridge_sdk_ext::gas::{compute_gate, kernel_request_bytes};
-use native_bridge_sdk_ext::limits::{MAX_ANCHORS, MAX_LEAVES, TX_GAS_BUDGET};
+use native_bridge_sdk_ext::limits::{MAX_ANCHORS, MAX_LEAVES};
 use native_bridge_sdk_ext::proof::{build_return_proof, preflight_burn, refresh_token};
 use native_bridge_sdk_ext::token::Expect;
 use native_bridge_sdk_ext::NativeError as E;
@@ -55,7 +55,7 @@ fn return_envelope_round_trips_and_passes_policy_anchor_and_gate_checks() {
     let times: Vec<u64> = v.outcome.leaves.iter().map(|l| l.reference_time).collect();
     let ir = check_anchors(&back, &plan, &times).unwrap();
     assert_eq!(ir[0].timestamp, UC_TS);
-    assert!(gate.total <= TX_GAS_BUDGET);
+    assert!(gate.total > 0);
     assert_eq!(gate.grouping.k, 1);
     assert_eq!(
         gate.j,
@@ -69,7 +69,6 @@ fn return_envelope_round_trips_and_passes_policy_anchor_and_gate_checks() {
             bytes.len(),
             kernel_request_bytes(w.dep.cfg.to_bytes().len() as u64, back.history.len() as u64),
             &back,
-            TX_GAS_BUDGET
         )
         .unwrap(),
         gate
@@ -219,7 +218,7 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_malf
     assert_eq!(a.uc[head], 0x80, "an empty step list");
     let mut over = a.clone();
     over.uc = [&a.uc[..head], &[0x98, 33], &[0xf6u8; 33], &a.uc[head + 1..]].concat();
-    assert_eq!(measure(&[over], 0).unwrap_err(), E::TooManyItems);
+    assert_eq!(measure(&[over]).unwrap_err(), E::TooManyItems);
     // 17 seal signatures (the bound is 16): the scan reads only the map's header, so patch the one map(4) header of the seal
     let seal =
         a.uc.windows(4)
@@ -232,7 +231,7 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_malf
         }
         let mut sigs = a.clone();
         sigs.uc = [&a.uc[..i], &[0xb1], &a.uc[i + 1..]].concat();
-        if measure(&[sigs], 0) == Err(E::TooManyItems) {
+        if measure(&[sigs]) == Err(E::TooManyItems) {
             hit = true;
             break;
         }
@@ -244,7 +243,7 @@ fn an_over_bound_certificate_is_a_budget_refusal_any_other_shape_failure_is_malf
     let mut cut = a.clone();
     cut.uc.truncate(20);
     assert!(matches!(
-        measure(&[cut], 0).unwrap_err(),
+        measure(&[cut]).unwrap_err(),
         E::Truncated | E::Shape | E::NonCanonical | E::Tag
     ));
 }
@@ -292,17 +291,15 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
         assert_eq!(out.ucs.len(), n + 1);
         let (env, _, gate) = build_return_proof(&w.bridge, &out.token).unwrap();
         assert_eq!(env.anchors.len(), n + 1);
-        assert!(gate.total <= TX_GAS_BUDGET);
+        assert!(gate.total > 0);
     }
-    // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the
-    // gate, never truncated; one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused before the gate
+    // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted and priced, never
+    // truncated (no gas ceiling, owner section 36); one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused
     const { assert!(MAX_LEAVES > MAX_ANCHORS) };
     let full = per_leaf(MAX_ANCHORS - 1);
     assert_eq!(full.ucs.len(), MAX_ANCHORS);
-    match build_return_proof(&w.bridge, &full.token) {
-        Ok((env, _, _)) => assert_eq!(env.anchors.len(), MAX_ANCHORS),
-        Err(e) => assert_eq!(e, E::GasBudget),
-    }
+    let (env, _, _) = build_return_proof(&w.bridge, &full.token).unwrap();
+    assert_eq!(env.anchors.len(), MAX_ANCHORS);
     let over = per_leaf(MAX_ANCHORS);
     assert_eq!(over.ucs.len(), MAX_ANCHORS + 1);
     assert_eq!(
