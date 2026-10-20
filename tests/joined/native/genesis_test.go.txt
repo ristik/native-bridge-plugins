@@ -16,8 +16,10 @@ import (
 	"github.com/unicitynetwork/bft-core/b1registry"
 	"github.com/unicitynetwork/bft-core/bridgeprofile"
 	"github.com/unicitynetwork/bft-core/b1state"
+	"github.com/unicitynetwork/bft-core/internal/quorumweight"
 	"github.com/unicitynetwork/bft-core/q3format"
 	"github.com/unicitynetwork/bft-core/registrygenesis"
+	"github.com/unicitynetwork/bft-go-base/types"
 )
 
 func TestNBPPR6NativeGenesis(t *testing.T) {
@@ -27,7 +29,14 @@ func TestNBPPR6NativeGenesis(t *testing.T) {
 	}
 	d, err := bridgeprofile.NewDeployment()
 	require.NoError(t, err)
-	h, err := q3format.NewHistory(d.TB)
+	// The B1 registry genesis is built from the root's V1 genesis trust base: the corpus authority's one
+	// member (root-1), epoch 1 from round 0, signed by it (the bridge trust input is its V2 history, d.TB).
+	m := d.TB.RootNodes[0]
+	tb, err := quorumweight.NewTrustBase(d.TB.NetworkID, []*types.NodeInfo{{NodeID: m.NodeID, SigKey: m.SigKey, Stake: m.Stake}},
+		types.WithEpoch(1), types.WithEpochStart(0))
+	require.NoError(t, err)
+	require.NoError(t, tb.Sign(d.Auth.NodeID, d.Auth.Signer))
+	h, err := q3format.NewHistory(tb)
 	require.NoError(t, err)
 
 	const b = 2 // B, the epochs one block may install (the registry's measured cap)
