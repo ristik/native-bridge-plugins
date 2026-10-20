@@ -4,7 +4,7 @@
     "plugins": "f4bc312e3044dcc1a5706c5838228313e5608e73",
     "ureth": "6e59b68cc29f196d54d3d6e28d6266a8c02d05a1",
     "contracts": "316203f4414214a960ba681e08050fb7637034f5",
-    "oracle": "18b823124381718bcbae64773b52ba1a439c02a8",
+    "oracle": "f29dbccb2fda854815c60d9e6cd0e20436b419b0",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
