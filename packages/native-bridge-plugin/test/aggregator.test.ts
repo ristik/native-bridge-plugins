@@ -449,6 +449,14 @@ test('consolidation is the default path: its token is assembled as is; unavailab
     assert.equal(got, err, `${err.kind} is thrown as the SDK threw it`);
     assert.equal(fetched, 0, `${err.kind} is never a silent per-SID fallback`);
   }
+  // the consolidator is untrusted host code: a token other than the held one is refused, never assembled, never a fallback
+  const other = await buildToken(w, spec(1), [txStep(3, 8, T0 + 11n), burnStep(T0 + 21n)], T0, UC_TS);
+  for (const bad of [other.token]) {
+    fetched = 0;
+    const lying = async (): Promise<ConsolidationResult> => ({ status: 'consolidated', token: bad, summary: {} as never });
+    await rejects(buildNativeReturnProof(plugin, out.bytes, source, { consolidate: lying, partitionShards: 2 }), 'ErrRefreshMismatch');
+    assert.equal(fetched, 0, 'a mismatch is an error, not a per-SID fallback');
+  }
   // without a consolidator the per-SID path is the one taken
   assert.deepEqual((await buildNativeReturnProof(plugin, out.bytes, source)).path, { kind: 'per-sid' });
   // a partition over the view's limit is assembled per SID without calling the consolidator; at the limit it is consolidated

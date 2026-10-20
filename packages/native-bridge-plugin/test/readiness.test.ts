@@ -11,6 +11,8 @@ import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radi
 import { NativeError } from '../src/errors.js';
 import { anchorRounds, buildReadyReturnProof, classifyReadiness, redeemReturn, RedemptionUnconfirmed, type ChainReader, type RedeemPolicy, type RedeemTransport } from '../src/readiness.js';
 import { createNativeBridgePlugin } from '../src/wallet.js';
+import type { ConsolidationResult } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationResult.js';
+import { refreshToken } from '../src/proof.js';
 import { rejects } from './util.js';
 import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, sha, spec, txStep, type World } from './world.js';
 
@@ -294,4 +296,22 @@ test('redeem: an unconfirmed send exposes its hash, and a pending hash is checke
   const resent = await redeemReturn(plugin, out.bytes, source, chainAt([952n]), reverted, rp(), ['0x1']);
   assert.equal(resent.status, 'redeemed');
   assert.equal(reverted.sent.length, 2);
+});
+
+test('the consolidated path: the fresh master seal is awaited against the origin like any anchor, with no per-SID fetch', async () => {
+  const w = await makeWorld();
+  const out = await ret(w);
+  const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
+  const merged = await refreshToken(out.token, await proofsAt(w, out, 960n));
+  let fetches = 0;
+  let consolidations = 0;
+  const source = async (): Promise<InclusionProof[]> => (++fetches, proofsAt(w, out, 950n));
+  const consolidate = async (): Promise<ConsolidationResult> => (++consolidations, { status: 'consolidated', token: merged, summary: {} as never });
+  const lagging = chainAt([950n, 955n, 960n]);
+  const r = await buildReadyReturnProof(plugin, out.bytes, source, lagging, { ...fast, consolidation: { consolidate, partitionShards: 2 } });
+  assert.deepEqual([r.path, r.rounds, r.origin, fetches, consolidations, lagging.reads], [{ kind: 'consolidated' }, [960n], 960n, 0, 1, 3]);
+  // unavailable: per SID from the source, with its cause
+  const unavailable = async (): Promise<ConsolidationResult> => ({ status: 'unavailable', reason: 'busy', retryable: true });
+  const u = await buildReadyReturnProof(plugin, out.bytes, source, chainAt([952n]), { ...fast, consolidation: { consolidate: unavailable, partitionShards: 2 } });
+  assert.deepEqual([u.path, u.rounds, fetches], [{ kind: 'per-sid', unavailable: 'busy', retryable: true }, [950n], 1]);
 });

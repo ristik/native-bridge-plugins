@@ -542,10 +542,15 @@ fn consolidation_selects_the_consolidated_token_and_unavailable_selects_per_sid(
         certificates_derived: 1,
         admission: AdmissionWork::default(),
     };
-    match redeem_proofs(ConsolidationOutcome::Consolidated {
-        token: merged.clone(),
-        summary,
-    }) {
+    match redeem_proofs(
+        &out.token,
+        ConsolidationOutcome::Consolidated {
+            token: merged.clone(),
+            summary: summary.clone(),
+        },
+    )
+    .unwrap()
+    {
         RedeemProofs::Consolidated(t) => {
             assert_eq!(t, merged, "the consolidated token is assembled as is");
             let (_, _, g) = build_return_proof(&w.bridge, &t).unwrap();
@@ -553,11 +558,34 @@ fn consolidation_selects_the_consolidated_token_and_unavailable_selects_per_sid(
         }
         other => panic!("{other:?}"),
     }
+    // the host's consolidation is untrusted: another token is refused, never assembled
+    let other = build_token(
+        &w,
+        &spec(1),
+        &[tx_step(3, 8, T0 + 11), burn_step(T0 + 21)],
+        T0,
+        UC_TS,
+    );
     assert_eq!(
-        redeem_proofs(ConsolidationOutcome::Unavailable {
-            reason: UnavailableReason::TargetNotRetained,
-            retryable: true
-        }),
+        redeem_proofs(
+            &out.token,
+            ConsolidationOutcome::Consolidated {
+                token: other.token.clone(),
+                summary
+            }
+        )
+        .unwrap_err(),
+        E::RefreshMismatch
+    );
+    assert_eq!(
+        redeem_proofs(
+            &out.token,
+            ConsolidationOutcome::Unavailable {
+                reason: UnavailableReason::TargetNotRetained,
+                retryable: true
+            }
+        )
+        .unwrap(),
         RedeemProofs::PerSid {
             unavailable: UnavailableReason::TargetNotRetained,
             retryable: true

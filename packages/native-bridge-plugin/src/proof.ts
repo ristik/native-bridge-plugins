@@ -117,8 +117,10 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   const dep = deploymentOf(bridge, token);
   const leaves = token.transactions.length + 2; // the mint, every transfer and the burn
   if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
-  // the best case is the consolidated bundle: one anchor per aggregator shard the leaves touch (`shards`, from the host's routing
-  // of `leafStateIds`; 1 when unknown, since a single certificate may serve every leaf), all under one seal
+  // the best case is the fewest anchors under one seal: one per aggregator shard the leaves touch (`shards`, from the host's routing
+  // of `leafStateIds`; 1 when unknown, since a single certificate may serve every leaf). It is a lower bound, not a promise: over 8
+  // shards the consolidated bundle is not reachable, yet K = min(m, L) under one seal stays the best case there, since per-SID
+  // certificates may share a seal by chance
   return checkBurnProjection(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, leaves, projectToken(token).length, Math.min(shards, leaves));
 }
 

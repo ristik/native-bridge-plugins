@@ -265,8 +265,10 @@ export type ProofSource = (token: Token) => Promise<InclusionProof[]>;
 
 /**
  * The host's consolidation of a token (the SDK's uc-consolidation flow, `TokenProofClient.consolidate`, over the host's routing and
- * transport). It returns the SDK's result; a `ConsolidationError` (integrity, input, response, server, transport, timeout,
- * cancellation) is thrown as the SDK throws it and is never turned into a fallback.
+ * transport). It returns the SDK's result; a `ConsolidationError` of any kind (`cancelled`, `input`, `integrity`,
+ * `invalid_response`, `rejected`, `server`, `timeout`, `transport`) is thrown as the SDK throws it and is never turned into a
+ * fallback. Like a `ProofSource` it is host code and untrusted: only the outer proofs of its token are used, re-attached to the held
+ * token's own transactions (`refreshToken`), so a token other than the held one is `ErrRefreshMismatch`.
  */
 export type TokenConsolidator = (token: Token) => Promise<ConsolidationResult>;
 
@@ -286,6 +288,20 @@ export interface ConsolidationPath {
 export type ReturnProofPath =
   | { kind: 'consolidated' }
   | { kind: 'per-sid'; overViewLimit?: true; unavailable?: ProofUnavailableReason; retryable?: boolean };
+
+/**
+ * One consolidation attempt for `held`: the outer proofs of the consolidated token (to be re-attached to `held` with
+ * `refreshToken`), or none and the per-SID path with its cause (no consolidation configured, the partition over the view's shard
+ * limit, consolidation `unavailable`). A `ConsolidationError` propagates.
+ */
+export async function consolidatedProofs(held: Token, consolidation?: ConsolidationPath): Promise<{ proofs?: InclusionProof[]; path: ReturnProofPath }> {
+  if (!consolidation) return { path: { kind: 'per-sid' } };
+  // a partition over the view's shard limit is never consolidated (the SDK would refuse its topology as an integrity error)
+  if (consolidation.partitionShards > MAX_VIEW_SHARDS) return { path: { kind: 'per-sid', overViewLimit: true } };
+  const r = await consolidation.consolidate(held);
+  if (r.status === 'consolidated') return { proofs: [r.token.genesis, ...r.token.transactions].map((c) => c.inclusionProof), path: { kind: 'consolidated' } };
+  return { path: { kind: 'per-sid', unavailable: r.reason, retryable: r.retryable } };
+}
 
 /** Attempts at fetching and assembling one return proof before it is reported unavailable. */
 export const MAX_PROOF_ATTEMPTS = 3;
@@ -312,18 +328,14 @@ export async function buildNativeReturnProof(
   const held = await TokenClass.fromCBOR(tokenBytes);
   // The default: one consolidation attempt (the SDK makes two waves and never chases a newer seal). Its token is an ordinary token
   // whose outer proofs share one seal, so the anchor table is one anchor per shard; it is assembled as is, with no refetch. Only an
-  // `unavailable` result falls back to the per-SID path below. A partition over the view's shard limit is never consolidated (the
-  // SDK would refuse its topology as an integrity error, not report it unavailable).
-  let path: ReturnProofPath = { kind: 'per-sid' };
-  if (consolidation && consolidation.partitionShards > MAX_VIEW_SHARDS) {
-    path = { kind: 'per-sid', overViewLimit: true };
-  } else if (consolidation) {
-    const r = await consolidation.consolidate(held);
-    if (r.status === 'consolidated') {
-      const { encoded, verified } = await buildReturnProof(plugin.bridge, r.token);
-      return { encoded, nullifier: verified.outcome.nullifier, path: { kind: 'consolidated' }, tokenBytes: r.token.toCBOR() };
-    }
-    path = { kind: 'per-sid', unavailable: r.reason, retryable: r.retryable };
+  // `unavailable` result (or no consolidation, or a partition over the view's limit) falls back to the per-SID path below. The
+  // consolidated proofs are re-attached to the held token's own transactions, as a per-SID refresh is.
+  const c = await consolidatedProofs(held, consolidation);
+  const path = c.path;
+  if (c.proofs) {
+    const token = await refreshToken(held, c.proofs);
+    const { encoded, verified } = await buildReturnProof(plugin.bridge, token);
+    return { encoded, nullifier: verified.outcome.nullifier, path, tokenBytes: token.toCBOR() };
   }
   for (let attempt = 1; ; attempt++) {
     try {
