@@ -270,8 +270,22 @@ export type ProofSource = (token: Token) => Promise<InclusionProof[]>;
  */
 export type TokenConsolidator = (token: Token) => Promise<ConsolidationResult>;
 
-/** How a return proof was assembled: from the consolidated token (one seal), or per SID (consolidation unavailable or not used). */
-export type ReturnProofPath = { kind: 'consolidated' } | { kind: 'per-sid'; unavailable?: ProofUnavailableReason; retryable?: boolean };
+/** The partition view's V1 shard limit (`MaxPartitionViewLeaves`): a larger partition is never consolidated. */
+export const MAX_VIEW_SHARDS = 8;
+
+/** The consolidated path's inputs from the host: its consolidator and the aggregation partition's shard count (its routing). */
+export interface ConsolidationPath {
+  consolidate: TokenConsolidator;
+  partitionShards: number;
+}
+
+/**
+ * How a return proof was assembled: from the consolidated token (one seal), or per SID: consolidation not used, the partition
+ * over the view's shard limit (`overViewLimit`, consolidation not called), or consolidation `unavailable`.
+ */
+export type ReturnProofPath =
+  | { kind: 'consolidated' }
+  | { kind: 'per-sid'; overViewLimit?: true; unavailable?: ProofUnavailableReason; retryable?: boolean };
 
 /** Attempts at fetching and assembling one return proof before it is reported unavailable. */
 export const MAX_PROOF_ATTEMPTS = 3;
@@ -292,16 +306,19 @@ export async function buildNativeReturnProof(
   plugin: NativeBridgePlugin,
   tokenBytes: Uint8Array,
   source?: ProofSource,
-  consolidate?: TokenConsolidator,
+  consolidation?: ConsolidationPath,
 ): Promise<{ encoded: Uint8Array; nullifier: Uint8Array; path: ReturnProofPath; tokenBytes: Uint8Array }> {
   preflightToken(tokenBytes);
   const held = await TokenClass.fromCBOR(tokenBytes);
   // The default: one consolidation attempt (the SDK makes two waves and never chases a newer seal). Its token is an ordinary token
   // whose outer proofs share one seal, so the anchor table is one anchor per shard; it is assembled as is, with no refetch. Only an
-  // `unavailable` result falls back to the per-SID path below.
+  // `unavailable` result falls back to the per-SID path below. A partition over the view's shard limit is never consolidated (the
+  // SDK would refuse its topology as an integrity error, not report it unavailable).
   let path: ReturnProofPath = { kind: 'per-sid' };
-  if (consolidate) {
-    const r = await consolidate(held);
+  if (consolidation && consolidation.partitionShards > MAX_VIEW_SHARDS) {
+    path = { kind: 'per-sid', overViewLimit: true };
+  } else if (consolidation) {
+    const r = await consolidation.consolidate(held);
     if (r.status === 'consolidated') {
       const { encoded, verified } = await buildReturnProof(plugin.bridge, r.token);
       return { encoded, nullifier: verified.outcome.nullifier, path: { kind: 'consolidated' }, tokenBytes: r.token.toCBOR() };

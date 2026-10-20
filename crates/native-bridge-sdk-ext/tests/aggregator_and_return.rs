@@ -512,7 +512,14 @@ fn an_ordinary_proof_with_several_faults_gets_the_oracle_verdict() {
 
 #[test]
 fn consolidation_selects_the_consolidated_token_and_unavailable_selects_per_sid() {
-    use native_bridge_sdk_ext::consolidation::{redeem_proofs, RedeemProofs};
+    use native_bridge_sdk_ext::consolidation::{
+        consolidation_applies, redeem_proofs, RedeemProofs, MAX_VIEW_SHARDS,
+    };
+    assert!(consolidation_applies(1) && consolidation_applies(MAX_VIEW_SHARDS));
+    assert!(
+        !consolidation_applies(MAX_VIEW_SHARDS + 1),
+        "over the view's limit: per SID without calling consolidation"
+    );
     use unicity_token::client::{
         AdmissionWork, ConsolidationOutcome, ConsolidationSummary, UnavailableReason,
     };
