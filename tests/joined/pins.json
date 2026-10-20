@@ -4,7 +4,7 @@
     "plugins": "f4bc312e3044dcc1a5706c5838228313e5608e73",
     "ureth": "6e59b68cc29f196d54d3d6e28d6266a8c02d05a1",
     "contracts": "316203f4414214a960ba681e08050fb7637034f5",
-    "oracle": "18b823124381718bcbae64773b52ba1a439c02a8",
+    "oracle": "5c230725963cd364bdf7edabb7a9948cd824e4fd",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
@@ -20,5 +20,5 @@
     "old-J validity across rotation",
     "full B1/SDK seal-signature acceptance parity"
   ],
-  "pluginsTree": "c39c5597c7a94f3b03a91e8213e110bbbb40f75a84b442575d510a7add02e427"
+  "pluginsTree": "513eb6ef1dec6ada442b12296e1de080587e7352b9b2fefcd5a1a71faf6acc34"
 }

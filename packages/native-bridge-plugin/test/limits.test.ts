@@ -40,7 +40,8 @@ test('the shared gate prices its components exactly as the oracle and the contra
   // 21000 + 16*D_max + 80*B_env with D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)
   assert.equal(intrinsicGas(512, L.MAX_ENVELOPE_BYTES), 21_000 + 16 * (132 + 512 + 65_536) + 80 * 65_536);
   assert.equal(intrinsicGas(513, 100), 21_000 + 16 * (132 + 544 + 128) + 80 * 100, 'both lengths are padded to words');
-  assert.equal(b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES), 908_560);
+  // 26000 + 20*(160 + 16384 + 16384) + 14000*24
+  assert.equal(b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES), 1_020_560);
   assert.equal(itemGas(L.BRIDGE_CBOR_ITEMS), 4_096_000);
   // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P
   const n = { k: 3, c: 1000, e: 2, s: 2, q: 8, a: 3, p: 7, items: 0 };

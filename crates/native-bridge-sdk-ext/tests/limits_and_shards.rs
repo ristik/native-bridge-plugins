@@ -67,7 +67,7 @@ fn the_shared_gate_prices_its_components_as_the_oracle_and_the_contract_do() {
             kernel_request_bytes(MAX_SEMANTIC_BYTES as u64, MAX_SEMANTIC_BYTES as u64),
             MAX_LEAVES as u64
         ),
-        908_560
+        1_020_560 // 26000 + 20*(160 + 16384 + 16384) + 14000*24
     );
     assert_eq!(item_gas(BRIDGE_CBOR_ITEMS as u64), 4_096_000);
     // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P

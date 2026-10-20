@@ -294,14 +294,21 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
         assert_eq!(env.anchors.len(), n + 1);
         assert!(gate.total <= TX_GAS_BUDGET);
     }
-    // every leaf of a full 16-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the gate,
-    // never truncated
-    let full = per_leaf(MAX_LEAVES - 1);
+    // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the
+    // gate, never truncated; one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused before the gate
+    const { assert!(MAX_LEAVES > MAX_ANCHORS) };
+    let full = per_leaf(MAX_ANCHORS - 1);
     assert_eq!(full.ucs.len(), MAX_ANCHORS);
     match build_return_proof(&w.bridge, &full.token) {
         Ok((env, _, _)) => assert_eq!(env.anchors.len(), MAX_ANCHORS),
         Err(e) => assert_eq!(e, E::GasBudget),
     }
+    let over = per_leaf(MAX_ANCHORS);
+    assert_eq!(over.ucs.len(), MAX_ANCHORS + 1);
+    assert_eq!(
+        build_return_proof(&w.bridge, &over.token).unwrap_err(),
+        E::TooManyPaths
+    );
 }
 
 #[test]

@@ -205,11 +205,16 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
     assert.equal(ok.envelope.anchors.length, n + 1);
     assert.ok(ok.gate.total <= TX_GAS_BUDGET);
   }
-  // every leaf of a full 16-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the gate, never truncated
-  const full = await perLeaf(MAX_LEAVES - 1);
+  // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted or priced out by the gate,
+  // never truncated; one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused before the gate
+  assert.ok(MAX_LEAVES > MAX_ANCHORS);
+  const full = await perLeaf(MAX_ANCHORS - 1);
   assert.equal(full.ucs.length, MAX_ANCHORS);
   const sixteen = await buildReturnProof(w.bridge, full.token).then((r) => r.envelope.anchors.length, (e: unknown) => (e as NativeError).reason);
   assert.ok(sixteen === MAX_ANCHORS || sixteen === 'ErrGasBudget', String(sixteen));
+  const over = await perLeaf(MAX_ANCHORS);
+  assert.equal(over.ucs.length, MAX_ANCHORS + 1);
+  await rejects(buildReturnProof(w.bridge, over.token), 'ErrTooManyPaths');
 });
 
 test('consolidation (evidence 1c): re-proving the same token under one certificate changes the seals, never the transactions, IDs, times or the nullifier', async () => {

@@ -9,7 +9,7 @@
 /// Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle.
 pub const MAX_ANCHORS: usize = 16;
 /// B2 leaves of one redemption: the mint, every transfer and the final burn.
-pub const MAX_LEAVES: usize = 16;
+pub const MAX_LEAVES: usize = 24;
 pub const MAX_TRANSFERS: usize = MAX_LEAVES - 1;
 pub const MAX_SEMANTIC_BYTES: usize = 16 << 10;
 pub const MAX_ENVELOPE_BYTES: usize = 64 << 10;
