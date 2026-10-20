@@ -172,17 +172,30 @@ pub const BEST_SIGNATURES: u64 = 1;
 /// entry is two (key and value).
 pub const BEST_UC_ITEMS: u64 = 39;
 
-/// The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves (the burn included) and a
-/// `history_bytes` history would need if everything the burn cannot yet know turns out as small as it can: ONE anchor (a single
-/// certificate may serve every leaf, so the best case is never one anchor per shard), the smallest certificate and empty paths.
-/// The burn is refused only when even this cannot pass the gas gate; whether the bundle actually fetched passes is the gate's
-/// decision at redemption. Returns the gate and the projected envelope bytes.
+/// The burn-time best-case projection with the shard count unknown: one anchor (a single certificate may serve every leaf). See
+/// [`projected_gate_anchors`].
 pub fn projected_gate(
     cfg_bytes: u64,
     policy_bytes: u64,
     leaves: u64,
     history_bytes: u64,
 ) -> (Gate, u64) {
+    projected_gate_anchors(cfg_bytes, policy_bytes, leaves, history_bytes, 1)
+}
+
+/// The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves (the burn included) and a
+/// `history_bytes` history would need if everything the burn cannot yet know turns out as small as it can: the consolidated
+/// bundle, `anchors` anchors (one per aggregator shard the leaves touch, at least 1, at most `leaves`) under ONE seal, the smallest
+/// certificates and empty paths. The burn is refused only when even this cannot pass the gas gate; whether the bundle actually
+/// fetched passes is the gate's decision at redemption. Returns the gate and the projected envelope bytes.
+pub fn projected_gate_anchors(
+    cfg_bytes: u64,
+    policy_bytes: u64,
+    leaves: u64,
+    history_bytes: u64,
+    anchors: u64,
+) -> (Gate, u64) {
+    let k = anchors.min(leaves).max(1);
     let word = 32u64;
     let bytes_field = |n: u64| word + pad32(n);
     let anchor_bytes =
@@ -192,20 +205,20 @@ pub fn projected_gate(
         + bytes_field(policy_bytes)
         + bytes_field(history_bytes)
         + word
-        + (word + anchor_bytes)
+        + k * (word + anchor_bytes)
         + word
         + leaves * (word + leaf_bytes);
     let grouping = Counts {
-        k: 1,
-        c: 4 + 106 + 1 + BEST_UC_BYTES,
+        k,
+        c: 4 + k * (106 + 1 + BEST_UC_BYTES),
         e: 1,
         s: 1,
         q: BEST_SIGNATURES,
-        a: 1,
+        a: k,
         p: 0,
-        items: BEST_UC_ITEMS,
+        items: k * BEST_UC_ITEMS,
     };
-    let j = fixed_items(1) as u64 + grouping.items;
+    let j = fixed_items(k as usize) as u64 + grouping.items;
     let mut g = Gate {
         intrinsic: intrinsic_gas(cfg_bytes, envelope),
         b2: b2_gas(kernel_request_bytes(cfg_bytes, history_bytes), leaves),

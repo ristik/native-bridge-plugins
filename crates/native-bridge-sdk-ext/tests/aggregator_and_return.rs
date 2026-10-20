@@ -509,3 +509,76 @@ fn an_ordinary_proof_with_several_faults_gets_the_oracle_verdict() {
         E::NoEntryForEpoch
     );
 }
+
+#[test]
+fn consolidation_selects_the_consolidated_token_and_unavailable_selects_per_sid() {
+    use native_bridge_sdk_ext::consolidation::{redeem_proofs, RedeemProofs};
+    use unicity_token::client::{
+        AdmissionWork, ConsolidationOutcome, ConsolidationSummary, UnavailableReason,
+    };
+    let w = make_world(20);
+    let out = ret(&w);
+    let merged = refresh_token(&out.token, &fresh_proofs(&w, &out, 0, UC_TS)).unwrap();
+    let summary = ConsolidationSummary {
+        outer_proofs: 3,
+        outer_seals_before: 2,
+        outer_seals_after: 1,
+        already_shared: false,
+        shards: 1,
+        requests: 1,
+        master: None,
+        master_round: None,
+        required_round: 0,
+        consolidation_quorum_checks: 1,
+        input_quorum_checks: 0,
+        verification_quorum_checks: 1,
+        certificates_derived: 1,
+        admission: AdmissionWork::default(),
+    };
+    match redeem_proofs(ConsolidationOutcome::Consolidated {
+        token: merged.clone(),
+        summary,
+    }) {
+        RedeemProofs::Consolidated(t) => {
+            assert_eq!(t, merged, "the consolidated token is assembled as is");
+            let (_, _, g) = build_return_proof(&w.bridge, &t).unwrap();
+            assert_eq!((g.grouping.k, g.grouping.s), (1, 1));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        redeem_proofs(ConsolidationOutcome::Unavailable {
+            reason: UnavailableReason::TargetNotRetained,
+            retryable: true
+        }),
+        RedeemProofs::PerSid {
+            unavailable: UnavailableReason::TargetNotRetained,
+            retryable: true
+        }
+    );
+}
+
+#[test]
+fn the_burn_preflight_projects_one_anchor_per_touched_shard_under_one_seal() {
+    use native_bridge_sdk_ext::proof::preflight_burn_shards;
+    let w = make_world(20);
+    let out = ret(&w);
+    let one = preflight_burn(&w.bridge, &out.token).unwrap();
+    let two = preflight_burn_shards(&w.bridge, &out.token, 2).unwrap();
+    assert_eq!(one.grouping.k, 1);
+    assert_eq!(
+        (two.grouping.k, two.grouping.e, two.grouping.s),
+        (2, 1, 1),
+        "two anchors, one seal"
+    );
+    assert!(two.total > one.total);
+    let leaves = out.token.transactions().len() as u64 + 2;
+    assert_eq!(
+        preflight_burn_shards(&w.bridge, &out.token, 99)
+            .unwrap()
+            .grouping
+            .k,
+        leaves,
+        "K <= L"
+    );
+}

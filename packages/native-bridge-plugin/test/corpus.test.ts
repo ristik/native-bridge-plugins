@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { fromHex } from '../src/bytes.js';
 import { checkPolicyBody, decodeEnvelope, planAnchors } from '../src/envelope.js';
-import { computeGate, kernelRequestBytes } from '../src/gas.js';
+import { computeGate, kernelRequestBytes, projectedGate } from '../src/gas.js';
 import { NativeError } from '../src/errors.js';
 import { cfgBytes, decodeCfg, decodePolicy } from '../src/profile.js';
 
@@ -74,5 +74,24 @@ test('proof family: the gate of every published envelope is the oracle\'s, compo
       };
     });
     if (c.expected.status === 'ok') assert.deepEqual(values, c.expected.values, c.id);
+  }
+});
+
+test('the burn-time projection with K anchors under one seal is a lower bound of every consolidated bundle of the corpus', () => {
+  const cases = (load('proof/cases.json').cases as Case[]).filter((c) => c.op === 'gate' && /^gate-consolidated-m\d+-n\d+-exact$/.test(c.id));
+  assert.equal(cases.length, 8, 'm in {1,2,4,8} x committee {4,16}');
+  for (const c of cases) {
+    const cfg = cfgOf(c.cfg!);
+    const env = decodeEnvelope(fromHex(c.input)!);
+    const k = env.anchors.length;
+    const leaves = env.leafProofs.length;
+    const exact = BigInt(c.aux!.budget);
+    const best = projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length, k).gate.total;
+    const one = projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length).gate.total;
+    assert.ok(BigInt(best) <= exact, `${c.id}: projection ${best} above the bundle's gate ${exact}`);
+    if (k > 1) assert.ok(best > one, `${c.id}: ${k} anchors project above one`);
+    // more anchors than leaves cannot occur: the projection caps K at L
+    assert.equal(projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length, leaves + 5).gate.total,
+      projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length, leaves).gate.total);
   }
 });

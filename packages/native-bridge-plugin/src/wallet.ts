@@ -26,6 +26,7 @@ import {
   type WalletTokenPlugin,
 } from '@unicitylabs/bridge-core';
 import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
+import type { ConsolidationResult, ProofUnavailableReason } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationResult.js';
 import type { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 import { Token as TokenClass } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
@@ -262,6 +263,16 @@ export function recoverPendingBurns(plugin: NativeBridgePlugin, payments: Native
 /** Source of fresh aggregator proofs for one token, in history order (host transport; untrusted). */
 export type ProofSource = (token: Token) => Promise<InclusionProof[]>;
 
+/**
+ * The host's consolidation of a token (the SDK's uc-consolidation flow, `TokenProofClient.consolidate`, over the host's routing and
+ * transport). It returns the SDK's result; a `ConsolidationError` (integrity, input, response, server, transport, timeout,
+ * cancellation) is thrown as the SDK throws it and is never turned into a fallback.
+ */
+export type TokenConsolidator = (token: Token) => Promise<ConsolidationResult>;
+
+/** How a return proof was assembled: from the consolidated token (one seal), or per SID (consolidation unavailable or not used). */
+export type ReturnProofPath = { kind: 'consolidated' } | { kind: 'per-sid'; unavailable?: ProofUnavailableReason; retryable?: boolean };
+
 /** Attempts at fetching and assembling one return proof before it is reported unavailable. */
 export const MAX_PROOF_ATTEMPTS = 3;
 
@@ -277,14 +288,31 @@ export const PAIR_RACE: readonly NativeReason[] = ['ErrPathInvalid', 'ErrSdkVeri
  * Refresh keeps J/M/T/CD and the original `t`; a proof for another epoch is rejected by verification.
  * Every response keeps its own (path, UC) pair; assembly uses only what the transport returned.
  */
-export async function buildNativeReturnProof(plugin: NativeBridgePlugin, tokenBytes: Uint8Array, source?: ProofSource): Promise<{ encoded: Uint8Array; nullifier: Uint8Array }> {
+export async function buildNativeReturnProof(
+  plugin: NativeBridgePlugin,
+  tokenBytes: Uint8Array,
+  source?: ProofSource,
+  consolidate?: TokenConsolidator,
+): Promise<{ encoded: Uint8Array; nullifier: Uint8Array; path: ReturnProofPath; tokenBytes: Uint8Array }> {
   preflightToken(tokenBytes);
   const held = await TokenClass.fromCBOR(tokenBytes);
+  // The default: one consolidation attempt (the SDK makes two waves and never chases a newer seal). Its token is an ordinary token
+  // whose outer proofs share one seal, so the anchor table is one anchor per shard; it is assembled as is, with no refetch. Only an
+  // `unavailable` result falls back to the per-SID path below.
+  let path: ReturnProofPath = { kind: 'per-sid' };
+  if (consolidate) {
+    const r = await consolidate(held);
+    if (r.status === 'consolidated') {
+      const { encoded, verified } = await buildReturnProof(plugin.bridge, r.token);
+      return { encoded, nullifier: verified.outcome.nullifier, path: { kind: 'consolidated' }, tokenBytes: r.token.toCBOR() };
+    }
+    path = { kind: 'per-sid', unavailable: r.reason, retryable: r.retryable };
+  }
   for (let attempt = 1; ; attempt++) {
     try {
       const token = source ? await refreshToken(held, await source(held)) : held;
       const { encoded, verified } = await buildReturnProof(plugin.bridge, token);
-      return { encoded, nullifier: verified.outcome.nullifier };
+      return { encoded, nullifier: verified.outcome.nullifier, path, tokenBytes: token.toCBOR() };
     } catch (e) {
       if (!(e instanceof NativeError) || !PAIR_RACE.includes(e.reason)) throw e;
       // without a source nothing was refetched, so nothing raced: the held token's own failure stands. With one, the last reason is the cause.

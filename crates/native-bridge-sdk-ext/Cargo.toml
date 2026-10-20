@@ -8,8 +8,10 @@ publish.workspace = true
 description = "Native Unicity bridge extensions over the unicity-token SDK (v3.0.1): lock-proof verification, strict history semantics, return-proof assembly."
 
 [features]
-default = ["alloc", "host"]
+default = ["alloc", "host", "consolidation"]
 alloc = []
+# The redemption's consolidated path: the SDK's uc-consolidation outcome types (its `client` feature, alloc only).
+consolidation = ["alloc", "unicity-token/client"]
 # Host conveniences: std error integration, JSON trust-document and manifest loading.
 host = ["alloc", "unicity-token/std", "k256/std", "sha2/std", "sha3/std", "dep:serde", "dep:serde_json"]
 

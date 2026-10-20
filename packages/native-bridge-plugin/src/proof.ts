@@ -111,14 +111,15 @@ export const BURN_HISTORY_BYTES = 1024;
  * answer is `ErrGasBudget`/`ErrTooManyTx`/`ErrInputTooLarge` (BudgetExceeded), never a truncated history
  * or a partial redemption. `tokenBytes` is the held receipt the burn would spend.
  */
-export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array): Promise<Gate> {
+export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array, shards = 1): Promise<Gate> {
   preflightToken(tokenBytes);
   const token = await Token.fromCBOR(tokenBytes);
   const dep = deploymentOf(bridge, token);
   const leaves = token.transactions.length + 2; // the mint, every transfer and the burn
   if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
-  // the fewest anchors any bundle can need is one: a single certificate may serve every leaf
-  return checkBurnProjection(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, leaves, projectToken(token).length);
+  // the best case is the consolidated bundle: one anchor per aggregator shard the leaves touch (`shards`, from the host's routing
+  // of `leafStateIds`; 1 when unknown, since a single certificate may serve every leaf), all under one seal
+  return checkBurnProjection(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, leaves, projectToken(token).length, Math.min(shards, leaves));
 }
 
 /**
@@ -128,9 +129,9 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
  * best-case sizes (about 22 KB at the largest admitted shape against 65,536), so it is kept as a guard
  * only.
  */
-export function checkBurnProjection(cfgLen: number, policyLen: number, leaves: number, history: number): Gate {
+export function checkBurnProjection(cfgLen: number, policyLen: number, leaves: number, history: number, anchors = 1): Gate {
   if (history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
-  const { gate, envelopeBytes } = projectedGate(cfgLen, policyLen, leaves, history);
+  const { gate, envelopeBytes } = projectedGate(cfgLen, policyLen, leaves, history, anchors);
   if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   if (gate.total > TX_GAS_BUDGET) fail('ErrGasBudget');
   return gate;
