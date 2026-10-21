@@ -151,6 +151,8 @@ pub fn encode_justification(
 
 /// Parse J without a deployment, to find the one it names: bft-core `ParseJustification` with its configuration comparisons (chain,
 /// vault, zero address, the proof's cfg) left out. The caller keeps `j` alive for as long as the borrowed proof is used.
+/// Outside oracle parity: for a J that names no deployment and also has a malformed lock proof, this reports the proof's error where
+/// Go, parsing against one fixed cfg, would stop earlier at ErrMintJustif; the registry lookup it serves has no Go counterpart.
 pub fn parse_justification(j: &[u8]) -> Result<Justification<'_>> {
     parse(j, None)
 }

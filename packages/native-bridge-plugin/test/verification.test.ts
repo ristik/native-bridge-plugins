@@ -248,6 +248,16 @@ test('relation alone enforces certification data deadline equality', async () =>
   await rejects(relation(w0, await buildToken(w0, s2, [], T0, UC_TS, { cdDeadline: [[0, null]] })), 'ErrDeadlineMismatch');
 });
 
+// bft-core checkStep's order: the unlock is checked before expiry, so a leaf that is both expired and wrongly unlocked gets the unlock's
+// error (the corpus has no vector with both faults yet).
+test('relation checks the unlock before expiry', async () => {
+  const s = spec(1);
+  s.mintDeadline = T0;
+  await rejects(relation(w0, await buildToken(w0, s, [], T0, UC_TS, { unlock: [[0, (u) => u.slice(0, 64)]] })), 'ErrUnlockLength');
+  // Either fault alone is its own error.
+  await rejects(relation(w0, await buildToken(w0, s, [], T0, UC_TS)), 'ErrDeadlineExpired');
+});
+
 test('relation alone enforces t strictly below the deadline', async () => {
   for (const [e, ok] of [[T0 - 1n, false], [T0, false], [T0 + 1n, true]] as const) {
     const s = spec(1);

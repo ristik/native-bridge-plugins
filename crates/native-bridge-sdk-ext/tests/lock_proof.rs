@@ -549,6 +549,38 @@ fn proof_arity_is_exact_and_nodes_must_be_byte_strings() {
     assert_eq!(parse_justification(&j).unwrap_err(), E::LockProofShape);
 }
 
+/// The cfg and trustBaseId slots are the proof's own shape (bft-core decodeLockProof): a 31-byte value is ErrLockProofShape, not the
+/// scanner's generic error.
+#[test]
+fn proof_cfg_and_trust_base_id_of_the_wrong_width_are_the_proofs_shape() {
+    use unicity_token::cbor::*;
+    let w = make_world(20);
+    let good = lock_parts(&w, &spec(1)).encode();
+    for slot in [1, 2] {
+        let root = native_bridge_sdk_ext::scan::scan_one(&good).unwrap();
+        let mut raws: Vec<Vec<u8>> = root
+            .any_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.raw(&good).to_vec())
+            .collect();
+        raws[slot] = encode_byte_string(&[7; 31]);
+        let refs: Vec<&[u8]> = raws.iter().map(Vec::as_slice).collect();
+        let j = native_bridge_sdk_ext::lockproof::encode_justification(
+            CHAIN_ID,
+            &VAULT,
+            &[0; 20],
+            1,
+            &encode_array(&refs),
+        );
+        assert_eq!(
+            parse_justification(&j).unwrap_err(),
+            E::LockProofShape,
+            "slot {slot}"
+        );
+    }
+}
+
 #[test]
 fn certificates_outside_the_sdk_decodable_subset_are_unsupported() {
     // Garbage, and a canonical-looking shape the SDK codec would re-encode differently.
