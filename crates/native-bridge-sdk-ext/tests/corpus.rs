@@ -123,7 +123,7 @@ fn the_gas_estimate_of_every_published_envelope_is_the_oracles_component_by_comp
                 ("j", g.j),
                 ("rsmt", g.rsmt),
                 ("steps", g.steps),
-                ("total", g.total),
+                ("total", g.legacy_total),
             ] {
                 assert_eq!(want[k].as_str().unwrap(), v.to_string(), "{} {k}", c["id"]);
             }
@@ -153,14 +153,14 @@ fn the_k_anchor_projection_is_a_lower_bound_of_every_consolidated_bundle() {
             .unwrap()
             .parse()
             .unwrap();
-        let best = projected_gate_anchors(cfg, p, l, h, k).0.total;
+        let best = projected_gate_anchors(cfg, p, l, h, k).0.legacy_total;
         assert!(best <= exact, "{}: {best} > {exact}", c["id"]);
         if k > 1 {
-            assert!(best > projected_gate(cfg, p, l, h).0.total);
+            assert!(best > projected_gate(cfg, p, l, h).0.legacy_total);
         }
         assert_eq!(
-            projected_gate_anchors(cfg, p, l, h, l + 5).0.total,
-            projected_gate_anchors(cfg, p, l, h, l).0.total
+            projected_gate_anchors(cfg, p, l, h, l + 5).0.legacy_total,
+            projected_gate_anchors(cfg, p, l, h, l).0.legacy_total
         );
     }
 }
@@ -183,6 +183,91 @@ fn a_bundle_above_the_former_ceiling_is_estimated_not_refused() {
         &env,
     )
     .unwrap();
-    assert_eq!(g.total, 7_206_166);
-    assert!(g.total > 7_000_000);
+    assert_eq!(g.legacy_total, 7_206_166);
+    assert!(g.legacy_total > 7_000_000);
+}
+
+#[test]
+fn the_compose_status_table_is_the_corpus_append_only_table() {
+    use native_bridge_sdk_ext::compose::COMPOSE_STATUS;
+    let table = load("config/compose-status.json");
+    let rows = table.as_array().unwrap();
+    assert_eq!(rows.len(), COMPOSE_STATUS.len() + 1);
+    for (code, row) in rows.iter().enumerate() {
+        assert_eq!(row["code"].as_u64().unwrap(), code as u64);
+        let want = if code == 0 {
+            "ok"
+        } else {
+            COMPOSE_STATUS[code - 1]
+        };
+        assert_eq!(row["name"], want, "code {code}");
+    }
+}
+
+/// `abi.encode(uint8 op, bytes cfg, bytes envelope)` read back (the corpus input of a native-compose case).
+fn read_compose_input(b: &[u8]) -> (u8, Vec<u8>, Vec<u8>) {
+    let w = |o: usize| u64::from_be_bytes(b[o + 24..o + 32].try_into().unwrap()) as usize;
+    let field = |off: usize| b[off + 32..off + 32 + w(off)].to_vec();
+    (w(0) as u8, field(w(32)), field(w(64)))
+}
+
+#[test]
+fn every_native_compose_case_is_the_plug_in_estimate_when_it_succeeds() {
+    use native_bridge_sdk_ext::compose::{
+        compose_input, compose_output_status, compose_status_name, COMPOSE_OUTPUT_BYTES,
+    };
+    use native_bridge_sdk_ext::gas::compose_gas;
+    let cs = cases("proof/cases.json", "native-compose");
+    assert!(cs.len() >= cases("proof/cases.json", "compose").len() + 4);
+    let mut priced = 0;
+    for c in &cs {
+        let id = c["id"].as_str().unwrap();
+        let v = &c["expected"]["values"];
+        if c["expected"]["status"] == "halt" {
+            assert!(v["halt"] == "abi" || v["halt"] == "out-of-gas", "{id}");
+            continue;
+        }
+        assert_eq!(c["expected"]["status"], "ok", "{id}");
+        let input = from_hex(c["input"].as_str().unwrap()).unwrap();
+        let (op, cfg, envelope) = read_compose_input(&input);
+        assert_eq!(
+            compose_input(op, &cfg, &envelope),
+            input,
+            "{id}: canonical input"
+        );
+        let out = from_hex(c["expected"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(out.len(), COMPOSE_OUTPUT_BYTES, "{id}");
+        let status = compose_output_status(&out).unwrap();
+        assert_eq!(status.to_string(), v["status"].as_str().unwrap(), "{id}");
+        let want_name = if status == 0 {
+            "ok"
+        } else {
+            v["statusName"].as_str().unwrap()
+        };
+        assert_eq!(compose_status_name(status), Some(want_name), "{id}");
+        if status != 0 {
+            assert!(
+                out[64..].iter().all(|&x| x == 0),
+                "{id}: a status zeroes every field"
+            );
+            continue;
+        }
+        let env = Envelope::decode(&envelope).unwrap();
+        let g = compute_gate(
+            &cfg,
+            envelope.len(),
+            kernel_request_bytes(cfg.len() as u64, env.history.len() as u64),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(g.compose.b, input.len() as u64, "{id}: B");
+        assert_eq!(
+            compose_gas(&g.compose).to_string(),
+            v["gas"].as_str().unwrap(),
+            "{id}: gas"
+        );
+        assert_eq!(g.native, compose_gas(&g.compose));
+        priced += 1;
+    }
+    assert!(priced >= 10, "{priced}");
 }

@@ -61,7 +61,7 @@ test('tokenvec: every token-level run is planned, opened, batched, grouped and g
     const n = measure(env.anchors);
     assert.deepEqual([n.c, n.k, n.e, n.s, n.q, n.a, n.p], [r.grouping.C, r.grouping.K, r.grouping.E, r.grouping.S, r.grouping.Q, r.grouping.A, r.grouping.P], `${r.scenario}: grouping`);
     const g = computeGate(cfgRaw, encoded.length, kernelRequestBytes(cfgRaw.length, env.history.length), env);
-    assert.deepEqual({ b2: g.b2, batch: g.batch, intrinsic: g.intrinsic, items: g.items, j: g.j, rsmt: g.rsmt, steps: g.steps, total: g.total },
+    assert.deepEqual({ b2: g.b2, batch: g.batch, intrinsic: g.intrinsic, items: g.items, j: g.j, rsmt: g.rsmt, steps: g.steps, total: g.legacyTotal },
       { b2: r.gate.b2, batch: r.gate.batch, intrinsic: r.gate.intrinsic, items: r.gate.items, j: r.gate.j, rsmt: r.gate.rsmt, steps: r.gate.steps, total: r.gate.total },
       `${r.scenario}: gate`);
   }

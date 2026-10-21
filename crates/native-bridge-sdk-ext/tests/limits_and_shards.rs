@@ -101,9 +101,14 @@ fn the_gas_estimate_prices_its_components_as_the_oracle_and_the_contract_do() {
 fn the_best_case_projection_at_the_bounds_is_an_estimate_with_one_anchor() {
     let (gate, envelope) = projected_gate(300, 150, MAX_LEAVES as u64, MAX_SEMANTIC_BYTES as u64);
     assert!(
-        gate.total > 7_000_000,
-        "above the former 7M ceiling and not refused: {}",
-        gate.total
+        gate.legacy_total > 7_000_000,
+        "the protocol-5 composite is above the former 7M ceiling, and not refused: {}",
+        gate.legacy_total
+    );
+    assert_eq!(
+        gate.total,
+        21_000 + 16 * (132 + 320 + envelope) + gate.native + 1_000_000,
+        "calldata + BRIDGE_COMPOSE_V1 + reserve"
     );
     assert!(envelope <= MAX_ENVELOPE_BYTES as u64, "{envelope}");
     assert_eq!(
@@ -233,8 +238,8 @@ fn the_burn_preflight_refuses_only_a_history_near_the_bound_never_for_gas() {
     let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
     let ok = check_burn_projection(200, 300, MAX_LEAVES as u64, edge).unwrap();
     assert!(
-        ok.total > 7_000_000,
-        "exactly at the margin passes, priced above the former 7M"
+        ok.legacy_total > 7_000_000,
+        "exactly at the margin passes, its protocol-5 composite above the former 7M"
     );
     assert_eq!(
         check_burn_projection(200, 300, MAX_LEAVES as u64, edge + 1).unwrap_err(),
@@ -286,7 +291,7 @@ fn preflight_burn_prices_a_held_token_exactly() {
     // known history only
     assert_eq!(
         [
-            gate.total,
+            gate.legacy_total,
             gate.batch,
             gate.items,
             gate.b2,
@@ -294,6 +299,45 @@ fn preflight_burn_prices_a_held_token_exactly() {
             gate.rsmt
         ],
         [1_725_886, 107_896, 72_000, 125_600, 407_112, 13_278]
+    );
+    // BRIDGE_COMPOSE_V1: 100000 + 2*4480 + 20*72 + 16000*3 + 6000*1 + 29900*1 + 2000*1 (one claim, no grouping or path steps)
+    assert_eq!(
+        gate.compose,
+        native_bridge_sdk_ext::gas::ComposeDims {
+            b: 4480,
+            j: 72,
+            l: 3,
+            q: 1,
+            e: 1,
+            a: 1,
+            k: 1,
+            p: 0
+        }
+    );
+    assert_eq!(gate.native, 196_300);
+    assert_eq!(gate.total, 1_288_532, "calldata + native + reserve");
+}
+
+#[test]
+fn the_compose_schedule_is_bft_cores_compose_gas() {
+    use native_bridge_sdk_ext::gas::{compose_gas, compose_group_gas, ComposeDims};
+    assert_eq!(
+        [0, 1, 2, 3, 4, 16, 17].map(compose_group_gas),
+        [0, 0, 100, 300, 400, 3_200, 4_250]
+    );
+    let d = ComposeDims {
+        b: 1000,
+        j: 10,
+        l: 2,
+        q: 3,
+        e: 1,
+        a: 2,
+        k: 2,
+        p: 5,
+    };
+    assert_eq!(
+        compose_gas(&d),
+        100_000 + 2_000 + 200 + 32_000 + 18_000 + 29_900 + 4_000 + 1_250 + 100
     );
 }
 

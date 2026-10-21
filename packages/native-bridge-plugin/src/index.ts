@@ -6,6 +6,7 @@ export * from './deployment.js';
 export * from './envelope.js';
 export * from './readiness.js';
 export * from './gas.js';
+export * from './compose.js';
 export * from './header.js';
 export * from './history.js';
 export * from './lockproof.js';
