@@ -191,21 +191,22 @@ fn depth_one_one_anchor_per_distinct_uc_in_first_use_order_each_leaf_under_its_o
 }
 
 #[test]
-fn burn_time_preflight_admits_a_redeemable_history_and_refuses_one_leaf_more_than_the_bound() {
+fn burn_time_preflight_admits_a_history_above_the_standalone_kernels_leaf_bound() {
     let w = make_world(20);
     let steps = |n: usize| -> Vec<Step> {
         (0..n)
             .map(|i| tx_step(i as u8 + 2, i as u8 + 1, T0 + 1 + i as u64))
             .collect()
     };
-    let fits = build_token(&w, &spec(1), &steps(MAX_LEAVES - 2), T0, UC_TS);
-    let gate = preflight_burn(&w.bridge, &fits.token).unwrap();
-    assert!(gate.total > 0, "{}", gate.total);
-    let too_long = build_token(&w, &spec(1), &steps(MAX_LEAVES - 1), T0, UC_TS);
-    assert_eq!(
-        preflight_burn(&w.bridge, &too_long.token).unwrap_err(),
-        E::TooManyTx
+    // MAX_LEAVES (65) is the standalone 0x0104 kernel's; the composition streams the history, so one leaf more is estimated, not
+    // refused (bft-core briefs/dev4-b7-native-compose-spec.md section 7).
+    let at = build_token(&w, &spec(1), &steps(MAX_LEAVES - 2), T0, UC_TS);
+    let above = build_token(&w, &spec(1), &steps(MAX_LEAVES - 1), T0, UC_TS);
+    let (g0, g1) = (
+        preflight_burn(&w.bridge, &at.token).unwrap(),
+        preflight_burn(&w.bridge, &above.token).unwrap(),
     );
+    assert!(g1.total > g0.total, "{} {}", g0.total, g1.total);
 }
 
 #[test]
@@ -233,23 +234,46 @@ fn a_real_burn_leaf_adds_no_more_history_than_the_bound_and_the_best_case_is_a_l
     assert_eq!(E::TooManyPaths.family(), Family::Budget);
 }
 
+/// The largest history whose best-case envelope plus the burn margin fits the ingress bound.
+fn envelope_edge(cfg: u64, policy: u64, leaves: u64) -> usize {
+    let fits = |h: usize| {
+        projected_gate_anchors(cfg, policy, leaves, h as u64, 1).1 + BURN_HISTORY_BYTES as u64
+            <= MAX_ENVELOPE_BYTES as u64
+    };
+    let (mut lo, mut hi) = (0usize, MAX_ENVELOPE_BYTES);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 #[test]
-fn the_burn_preflight_refuses_only_a_history_near_the_bound_never_for_gas() {
-    let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
-    let ok = check_burn_projection(200, 300, MAX_LEAVES as u64, edge).unwrap();
+fn the_burn_preflight_refuses_only_an_envelope_over_the_ingress_bound_never_for_gas() {
+    let leaves = 2 * MAX_LEAVES as u64;
+    let edge = envelope_edge(200, 300, leaves);
+    assert!(
+        edge > MAX_SEMANTIC_BYTES,
+        "the former history bound is gone: {edge}"
+    );
+    let ok = check_burn_projection(200, 300, leaves, edge).unwrap();
     assert!(
         ok.legacy_total > 7_000_000,
         "exactly at the margin passes, its protocol-5 composite above the former 7M"
     );
     assert_eq!(
-        check_burn_projection(200, 300, MAX_LEAVES as u64, edge + 1).unwrap_err(),
+        check_burn_projection(200, 300, leaves, edge + 1).unwrap_err(),
         E::InputTooLarge
     );
     assert!(check_burn_projection(200, 300, 8, 500).unwrap().total > 0);
 }
 
 #[test]
-fn preflight_burn_on_a_held_token_refuses_a_history_within_the_burn_margin_of_the_bound() {
+fn preflight_burn_on_a_held_token_refuses_a_history_within_the_burn_margin_of_the_envelope() {
     use native_bridge_sdk_ext::history::project;
     let w = make_world(20);
     let held = |n: usize| {
@@ -268,8 +292,12 @@ fn preflight_burn_on_a_held_token_refuses_a_history_within_the_burn_margin_of_th
             UC_TS,
         )
     };
-    let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
-    // the projection grows one byte per data byte once the byte-string header width is fixed (above 65,535 bytes: a 4-byte length)
+    let (cfg, policy) = (
+        w.dep.cfg.to_bytes().len() as u64,
+        w.dep.policy.to_bytes().len() as u64,
+    );
+    let edge = envelope_edge(cfg, policy, 3); // the mint, the transfer and the burn
+                                              // the projection grows one byte per data byte once the byte-string header width is fixed (above 65,535 bytes: a 4-byte length)
     let probe = 70_000usize;
     let base = project(&held(probe).token).len();
     let n = probe + (edge - base);
@@ -353,10 +381,12 @@ fn plan_anchors_itself_refuses_more_than_the_ceiling_with_too_many_paths() {
     );
     let (env, v, _) = build_return_proof(&w.bridge, &out.token).unwrap();
     let pol = check_policy_body(&w.dep.cfg, &env).unwrap();
+    // MAX_ANCHORS is the u16 wire width; the count is refused before any anchor is read, so the padding anchors can be empty.
     let mut over = env.clone();
-    while over.anchors.len() <= MAX_ANCHORS {
-        over.anchors.push(over.anchors[0].clone());
-    }
+    let mut cheap = over.anchors[0].clone();
+    cheap.uc.clear();
+    cheap.input_record.clear();
+    over.anchors.resize(MAX_ANCHORS + 1, cheap);
     let sids: Vec<[u8; 32]> = v.outcome.leaves.iter().map(|l| l.sid).collect();
     assert_eq!(
         plan_anchors(&pol, &over, &sids).unwrap_err(),

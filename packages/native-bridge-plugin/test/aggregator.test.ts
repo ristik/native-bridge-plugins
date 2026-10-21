@@ -14,19 +14,19 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { checkAnchors, checkPolicyBody, decodeEnvelope, encodeEnvelope, parseInputRecord, planAnchors } from '../src/envelope.js';
 import { measure } from '../src/certgroups.js';
 import { computeGate, kernelRequestBytes } from '../src/gas.js';
-import { MAX_ANCHORS, MAX_LEAVES } from '../src/limits.js';
+import { MAX_ANCHORS, MAX_ENVELOPE_BYTES, MAX_LEAVES } from '../src/limits.js';
 import { BURN_HISTORY_BYTES, buildReturnProof, leafStateIds, preflightBurn, refreshToken } from '../src/proof.js';
-import { projectToken } from '../src/history.js';
+import { decodeHistory, projectToken } from '../src/history.js';
 import { NativeError, RETRYABLE } from '../src/errors.js';
 import { BEST_UC_BYTES } from '../src/gas.js';
-import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
-import { cfgBytes } from '../src/profile.js';
+import { COMPOSED_HISTORY, MAX_SEMANTIC_BYTES } from '../src/limits.js';
+import { cfgBytes, policyBytes } from '../src/profile.js';
 import { toHex } from '../src/bytes.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, MAX_VIEW_SHARDS, PAIR_RACE } from '../src/wallet.js';
 import { ConsolidationError } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationError.js';
 import type { ConsolidationResult } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationResult.js';
 import { DeploymentRegistry } from '../src/deployment.js';
-import { rejects, throwsReason } from './util.js';
+import { envelopeEdge, rejects, throwsReason } from './util.js';
 import { AGG_PARTITION, buildToken, burnStep, makeUc, makeWorld, rowOf, sha, shardOf, signer, spec, txStep, type World } from './world.js';
 
 const T0 = 1_700_000_040n;
@@ -183,7 +183,7 @@ test('refresh changing t or certification data is rejected', async () => {
   await rejects(refreshToken(out.token, f2.slice(0, 2)), 'ErrRefreshMismatch');
 });
 
-test('distinct certificates are distinct anchors, up to the profile bound', async () => {
+test('distinct certificates are distinct anchors, above the former B1 claim bound', async () => {
   const w = await makeWorld();
   // genesis certified in one round, the transfers in another: two UCs, two anchors, first-use order
   const a = await ret(w);
@@ -195,8 +195,8 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
   assert.equal(two.envelope.anchors.length, 2);
   assert.deepEqual(two.envelope.leafProofs.map((l) => l.anchorIndex), [0, 1, 1]);
   assert.notDeepEqual(two.envelope.anchors[0].uc, two.envelope.anchors[1].uc);
-  // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted, and priced (no gas ceiling, owner section 36)
-  assert.equal(MAX_ANCHORS, 16);
+  // one certificate per leaf: every distinct UC is an anchor, up to the u16 wire width, and priced (no gas ceiling, owner section 36)
+  assert.equal(MAX_ANCHORS, 65535);
   const perLeaf = (n: number) => buildToken(w, spec(1), Array.from({ length: n }, (_, i) => (i === n - 1 ? burnStep(T0 + 20n) : txStep(i + 2, 7, T0 + 10n + BigInt(i)))), T0, UC_TS, { ucRound: (i) => 900n + BigInt(i) });
   for (const n of [1, 2]) {
     const out = await perLeaf(n);
@@ -205,16 +205,18 @@ test('distinct certificates are distinct anchors, up to the profile bound', asyn
     assert.equal(ok.envelope.anchors.length, n + 1);
     assert.ok(ok.gate.total > 0);
   }
-  // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted and priced, never
-  // truncated; one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused
-  assert.ok(MAX_LEAVES > MAX_ANCHORS);
-  const full = await perLeaf(MAX_ANCHORS - 1);
-  assert.equal(full.ucs.length, MAX_ANCHORS);
-  const sixteen = await buildReturnProof(w.bridge, full.token).then((r) => r.envelope.anchors.length, (e: unknown) => (e as NativeError).reason);
-  assert.equal(sixteen, MAX_ANCHORS);
-  const over = await perLeaf(MAX_ANCHORS);
-  assert.equal(over.ucs.length, MAX_ANCHORS + 1);
-  await rejects(buildReturnProof(w.bridge, over.token), 'ErrTooManyPaths');
+  // every leaf of a 16-leaf history under its own certificate is 16 anchors, and one more leaf is 17, above the former B1 claim
+  // bound: both admitted and priced, never truncated (the composition streams the anchor table)
+  const FORMER = 16;
+  const full = await perLeaf(FORMER - 1);
+  assert.equal(full.ucs.length, FORMER);
+  const g16 = await buildReturnProof(w.bridge, full.token);
+  assert.equal(g16.envelope.anchors.length, FORMER);
+  const over = await perLeaf(FORMER);
+  assert.equal(over.ucs.length, FORMER + 1);
+  const g17 = await buildReturnProof(w.bridge, over.token);
+  assert.equal(g17.envelope.anchors.length, FORMER + 1);
+  assert.ok(g17.gate.native > g16.gate.native);
 });
 
 test('consolidation (evidence 1c): re-proving the same token under one certificate changes the seals, never the transactions, IDs, times or the nullifier', async () => {
@@ -337,19 +339,20 @@ test('depth 1: a certificate of the other shard does not cover the leaf', async 
 
 // ---- the burn-time preflight and the bounded retry ----------------------------------------------------
 
-test('burn-time preflight admits a redeemable history and refuses one leaf more than the profile bound', async () => {
+test('burn-time preflight admits a history above the standalone kernel leaf bound', async () => {
+  // MAX_LEAVES (65) is the standalone 0x0104 kernel's; the composition streams the history, so one leaf more is estimated, not refused
   const w = await makeWorld();
-  const fits = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 2 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
-  const gate = await preflightBurn(w.bridge, fits.bytes);
-  assert.ok(gate.total > 0, String(gate.total));
-  const tooLong = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 1 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
-  await rejects(preflightBurn(w.bridge, tooLong.bytes), 'ErrTooManyTx');
+  const at = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 2 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
+  const above = await buildToken(w, spec(1), Array.from({ length: MAX_LEAVES - 1 }, (_, i) => txStep(i + 2, i + 1, T0 + BigInt(i + 1))), T0, UC_TS);
+  const [g0, g1] = [await preflightBurn(w.bridge, at.bytes), await preflightBurn(w.bridge, above.bytes)];
+  assert.ok(g1.total > g0.total, `${g0.total} ${g1.total}`);
 });
 
-test('preflightBurn on a held token: a history within BURN_HISTORY_BYTES of the bound is refused, one byte less passes', async () => {
+test('preflightBurn on a held token: a history whose envelope is within BURN_HISTORY_BYTES of the ingress bound is refused, one byte less passes', async () => {
   const w = await makeWorld();
   const held = (n: number) => buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS, { mintData: new Uint8Array(n).fill(7) });
-  const edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
+  const edge = await envelopeEdge(cfgBytes(w.dep.cfg).length, policyBytes(w.dep.policy).length, 3); // the mint, the transfer and the burn
+  assert.ok(edge > MAX_SEMANTIC_BYTES, 'the former history bound is gone');
   // the projection grows one byte per data byte once the byte-string header width is fixed (above 65,535 bytes: a 4-byte length)
   const probe = 70_000;
   const base = projectToken((await held(probe)).token).length;
@@ -422,11 +425,11 @@ test('a racing (path, UC) pair is retried a bounded number of times, then retrya
   const bad = await buildNativeReturnProof(plugin, tampered).then(() => undefined, (e: unknown) => e);
   assert.ok(bad instanceof NativeError && PAIR_RACE.includes(bad.reason), String(bad));
   assert.equal(calls, MAX_PROOF_ATTEMPTS, 'no more than the bound, and no re-query to make certificates converge');
-  // a bound or profile failure is not retried: more leaves than the profile admits is refused before anything is fetched
+  // a bound failure is not retried: an envelope over the ingress bound is refused, with at most one fetch
   calls = 0;
-  const long = await buildToken(w, spec(1), [...Array.from({ length: MAX_LEAVES }, (_, i) => txStep(i + 2, 7 + i, T0 + 10n + BigInt(2 * i))), burnStep(T0 + 40n)], T0, UC_TS);
-  const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [long.token.genesis, ...long.token.transactions].map((c) => c.inclusionProof); };
-  await rejects(buildNativeReturnProof(plugin, long.bytes, overBound), 'ErrTooManyTx');
+  const big = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 40n)], T0, UC_TS, { mintData: new Uint8Array(MAX_ENVELOPE_BYTES).fill(7) });
+  const overBound = async (): Promise<InclusionProof[]> => { ++calls; return [big.token.genesis, ...big.token.transactions].map((c) => c.inclusionProof); };
+  await rejects(buildNativeReturnProof(plugin, big.bytes, overBound), 'ErrInputTooLarge');
   assert.ok(calls <= 1);
 });
 
@@ -488,4 +491,14 @@ test('the burn preflight projects one anchor per touched shard under one seal, a
   assert.deepEqual([two.grouping.e, two.grouping.s], [1, 1], 'one seal');
   assert.ok(two.total > one.total);
   assert.equal((await preflightBurn(w.bridge, out.bytes, 99)).grouping.k, out.token.transactions.length + 2, 'K <= L');
+});
+
+test('a composed history above the kernel 128 KiB decodes and is estimated while the kernel decode refuses it', async () => {
+  const w = await makeWorld();
+  const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS, { mintData: new Uint8Array(140_000).fill(7) });
+  const bytes = projectToken(held.token);
+  assert.ok(bytes.length > MAX_SEMANTIC_BYTES, String(bytes.length));
+  throwsReason(() => decodeHistory(bytes), 'ErrInputTooLarge');
+  assert.equal(decodeHistory(bytes, COMPOSED_HISTORY).transfers.length, 1);
+  assert.ok((await preflightBurn(w.bridge, held.bytes)).native > 0);
 });

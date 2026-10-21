@@ -5,10 +5,10 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { CborMap } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborMap.js';
 import { CborMapEntry } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborMapEntry.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
-import { MAX_TRANSFERS } from '../src/limits.js';
+import { MAX_CBOR_ITEMS, MAX_TRANSFERS } from '../src/limits.js';
 import { arr, bs, u } from '../src/profile.js';
 import { preflightToken, preflightUc } from '../src/resources.js';
-import { rejects } from './util.js';
+import { rejects, throwsReason } from './util.js';
 import { buildToken, makeWorld, spec, txStep } from './world.js';
 
 const body = (b: Uint8Array) => D.decodeArray(D.decodeTag(b).data);
@@ -89,14 +89,19 @@ test('UC tree paths and RSMT paths have no full-token cumulative budget (owner s
   preflightToken(bytes);
 });
 
-test('nested payloads share depth and item budgets with the outer token', async () => {
+test('nested payloads share depth with the outer token and each has its own item budget', async () => {
   const w = await makeWorld(); const out = await buildToken(w, spec(1), [], 1n, 2n);
   const token = body(out.bytes), cert = D.decodeArray(token[1]), mint = body(cert[0]);
-  // Each payload and the outer token is individually under the item limit.
+  // two payloads of 16,401 items each: over MAX_CBOR_ITEMS together, within it each (no token-wide item aggregate)
   mint[5] = bs(arr(...Array.from({length:16400}, () => u(0))));
   mint[6] = bs(arr(...Array.from({length:16400}, () => u(0))));
   cert[0] = tagged(39041, mint); token[1] = arr(...cert);
+  preflightToken(tagged(39040, token));
+  // one payload of MAX_CBOR_ITEMS + 1 items is over its own budget
+  mint[5] = bs(arr(...Array.from({length:MAX_CBOR_ITEMS}, () => u(0)))); mint[6] = C.encodeNull();
+  cert[0] = tagged(39041, mint); token[1] = arr(...cert);
   const many = tagged(39040, token);
+  throwsReason(() => preflightToken(many), 'ErrTooManyItems');
   await rejects(w.bridge.verifyNativeTokenBytes(many, 'receipt'), 'ErrTooManyItems');
   await rejects(w.bridge.verifyNativeToken(await Token.fromCBOR(many), 'receipt'), 'ErrTooManyItems');
   let nested = u(0); for (let i = 0; i < 11; i++) nested = arr(nested);

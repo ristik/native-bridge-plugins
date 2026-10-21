@@ -14,10 +14,19 @@ struct Node<'a> {
     data: &'a [u8],
     kids: Vec<Node<'a>>,
 }
-/// Items of the object being scanned. Paths are bounded per certificate and per proof, never in sum (owner section 36).
-#[derive(Default)]
+/// Items of the object being scanned, within its own limit. Paths are bounded per certificate and per proof, never in sum (owner
+/// section 36); a whole token has no item aggregate (only `MAX_TOKEN_BYTES`), each nested payload its own `MAX_CBOR_ITEMS`.
 struct Budget {
     items: usize,
+    limit: usize,
+}
+impl Budget {
+    const fn object() -> Self {
+        Budget {
+            items: 0,
+            limit: MAX_CBOR_ITEMS,
+        }
+    }
 }
 fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: usize) -> Result<Node<'a>> {
     fn read<'a>(b: &'a [u8], pos: &mut usize, budget: &mut Budget, d: usize) -> Result<Node<'a>> {
@@ -25,7 +34,7 @@ fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: usize) -> Result<Node<'a>> 
             return Err(E::TooDeep);
         }
         budget.items += 1;
-        if budget.items > MAX_CBOR_ITEMS {
+        if budget.items > budget.limit {
             return Err(E::TooManyItems);
         }
         let start = *pos;
@@ -70,7 +79,7 @@ fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: usize) -> Result<Node<'a>> 
                 let count = arg
                     .checked_mul(if major == 5 { 2 } else { 1 })
                     .ok_or(E::TooManyItems)?;
-                if count > (MAX_CBOR_ITEMS - budget.items) as u64 {
+                if count > (budget.limit - budget.items) as u64 {
                     return Err(E::TooManyItems);
                 }
                 if count > (b.len() - *pos) as u64 {
@@ -229,17 +238,18 @@ fn uc(n: &Node<'_>) -> Result<()> {
     }
     Ok(())
 }
-fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool, budget: &mut Budget) -> Result<()> {
+fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool) -> Result<()> {
     if let Some(x) = n.filter(|x| x.major == 2) {
         if x.data.len() > max {
             return Err(E::ProofTooLarge);
         }
-        match scan(x.data, budget, x.depth + 1) {
+        let mut own = Budget::object();
+        match scan(x.data, &mut own, x.depth + 1) {
             Ok(root) => {
                 if certificate {
                     uc(&root)?;
                 } else {
-                    visit(&root, budget)?;
+                    visit(&root)?;
                 }
             }
             Err(e) if e.family() != crate::error::Family::Budget => {
@@ -252,7 +262,7 @@ fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool, budget: &mut Budg
     }
     Ok(())
 }
-fn visit(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
+fn visit(n: &Node<'_>) -> Result<()> {
     if n.major == 6 {
         if n.arg == 39001 {
             return uc(n);
@@ -261,18 +271,12 @@ fn visit(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
         if body.major == 4 {
             let k = &body.kids;
             match n.arg {
-                39040
-                    if k.get(2)
-                        .is_some_and(|x| x.major == 4 && x.kids.len() > MAX_TRANSFERS) =>
-                {
-                    return Err(E::TooManyTx)
-                }
-                39032 => nested(k.get(1), MAX_TOKEN_BYTES, false, budget)?, // CBOR predicate code.
+                39032 => nested(k.get(1), MAX_TOKEN_BYTES, false)?, // CBOR predicate code.
                 39041 => {
-                    nested(k.get(5), MAX_JUSTIFICATION_BYTES, false, budget)?;
-                    nested(k.get(6), MAX_TOKEN_BYTES, false, budget)?;
+                    nested(k.get(5), MAX_JUSTIFICATION_BYTES, false)?;
+                    nested(k.get(6), MAX_TOKEN_BYTES, false)?;
                 }
-                39045 => nested(k.get(3), MAX_TOKEN_BYTES, false, budget)?,
+                39045 => nested(k.get(3), MAX_TOKEN_BYTES, false)?,
                 39049 => {
                     if let Some(lp) = k.get(5).filter(|x| x.major == 4) {
                         if lp
@@ -300,8 +304,8 @@ fn visit(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
                                 total += node.data.len();
                             }
                         }
-                        nested(lp.kids.get(3), MAX_PDR_BYTES, false, budget)?;
-                        nested(lp.kids.get(4), MAX_UC_BYTES, true, budget)?;
+                        nested(lp.kids.get(3), MAX_PDR_BYTES, false)?;
+                        nested(lp.kids.get(4), MAX_UC_BYTES, true)?;
                     }
                 }
                 39033 => {
@@ -323,7 +327,7 @@ fn visit(n: &Node<'_>, budget: &mut Budget) -> Result<()> {
         }
     }
     for child in &n.kids {
-        visit(child, budget)?;
+        visit(child)?;
     }
     Ok(())
 }
@@ -332,15 +336,18 @@ pub fn preflight_token(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_TOKEN_BYTES {
         return Err(E::InputTooLarge);
     }
-    let mut budget = Budget::default();
-    visit(&scan(bytes, &mut budget, 0)?, &mut budget)
+    let mut budget = Budget {
+        items: 0,
+        limit: usize::MAX,
+    };
+    visit(&scan(bytes, &mut budget, 0)?)
 }
 /// The native/SDK certificate intersection and native sublimits, for standalone embedded checks.
 pub fn preflight_uc(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_UC_BYTES {
         return Err(E::ProofTooLarge);
     }
-    let mut budget = Budget::default();
+    let mut budget = Budget::object();
     let checked = scan(bytes, &mut budget, 0).and_then(|n| uc(&n));
     checked.map_err(|e| {
         if e.family() == crate::error::Family::Budget {

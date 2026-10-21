@@ -30,7 +30,7 @@ import { eq, toHex } from './bytes.js';
 import type { Deployment, DeploymentRegistry } from './deployment.js';
 import { NativeError, fail, type NativeReason } from './errors.js';
 import { decodeHistory, checkJustification, checkMintData, projectToken, verifyHistory, type Leaf, type Outcome } from './history.js';
-import { MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
+import { COMPOSED_HISTORY, TAG_MINT_LOCK } from './limits.js';
 import { parseJustification, verifyLockProof, type Justification, type VerifiedLock } from './lockproof.js';
 import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord, shardCovers, shardDepth } from './profile.js';
 import { certificateFailure, type TrustInput } from './trust.js';
@@ -132,7 +132,6 @@ export class NativeBridge {
   }
 
   public async verifyNativeToken(token: Token, expect: Expect, parts?: Partial<Pick<IVerificationContext, 'predicateVerifier' | 'unicityCertificateVerifier'>>): Promise<VerifiedToken> {
-    if (token.transactions.length > MAX_TRANSFERS) fail('ErrTooManyTx');
     preflightToken(token.toCBOR());
     const g = token.genesis;
     // The generic data hook skips null data, so missing genesis data/justification is explicit here.
@@ -148,7 +147,7 @@ export class NativeBridge {
     const index = this.registry.index(g.networkId.id, parsed.chainId, parsed.vault);
     const dep = this.registry.deployments[index];
 
-    const hist = decodeHistory(projectToken(token));
+    const hist = decodeHistory(projectToken(token), COMPOSED_HISTORY);
     const outcome = await verifyHistory(dep, hist, expect === 'return');
     const lock = await verifyLockProof(dep, this.trust, parsed, outcome.lockDigest);
 

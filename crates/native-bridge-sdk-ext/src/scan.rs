@@ -28,12 +28,18 @@ pub enum Kind<'a> {
     Null,
 }
 
-/// Scan exactly one item spanning all of `b`.
+/// Scan exactly one item spanning all of `b`, within `MAX_CBOR_ITEMS`.
 pub fn scan_one(b: &[u8]) -> Result<Item<'_>> {
+    scan_one_within(b, MAX_CBOR_ITEMS)
+}
+
+/// [`scan_one`] within `max_items` items (the composed history is bounded by its bytes, not an item count).
+pub fn scan_one_within(b: &[u8], max_items: usize) -> Result<Item<'_>> {
     let mut s = Scanner {
         b,
         pos: 0,
         tokens: 0,
+        max_items,
     };
     let it = s.item(0)?;
     if s.pos != b.len() {
@@ -46,6 +52,7 @@ struct Scanner<'a> {
     b: &'a [u8],
     pos: usize,
     tokens: usize,
+    max_items: usize,
 }
 
 /// Read one head; returns `(major, argument)` and rejects non-shortest forms.
@@ -88,7 +95,7 @@ impl<'a> Scanner<'a> {
     fn item(&mut self, depth: usize) -> Result<Item<'a>> {
         let start = self.pos;
         self.tokens += 1;
-        if self.tokens > MAX_CBOR_ITEMS {
+        if self.tokens > self.max_items {
             return Err(E::TooManyItems);
         }
         if let Some(&ib) = self.b.get(self.pos) {

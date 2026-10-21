@@ -8,7 +8,7 @@
 import { concat, eq, toHex } from './bytes.js';
 import { NativeError, fail } from './errors.js';
 import {
-  MAX_ANCHORS, MAX_ANCHOR_UC_BYTES, MAX_ENVELOPE_BYTES, MAX_INPUT_RECORD_BYTES, MAX_IR_SUMMARY_BYTES, MAX_LEAVES, MAX_POLICY_BYTES,
+  MAX_ANCHORS, MAX_ANCHOR_UC_BYTES, MAX_ENVELOPE_BYTES, MAX_INPUT_RECORD_BYTES, MAX_IR_SUMMARY_BYTES, MAX_POLICY_BYTES,
   MAX_RSMT_SIBLINGS, TAG_INPUT_RECORD,
 } from './limits.js';
 import { H, decodePolicy, policyBytes, shardCovers, shardDepth, type Cfg, type Policy } from './profile.js';
@@ -118,7 +118,6 @@ function boundCounts(b: Uint8Array): void {
   }
   const nl = word(offLeaves);
   if (nl > n) fail('ErrABIFraming');
-  if (nl > BigInt(MAX_LEAVES)) fail('ErrTooManyPaths');
   // Every sibling is a 32-byte word of the envelope, so the declared siblings never exceed n/32 in sum: a count the bytes cannot
   // hold is refused before any allocation. This is the envelope's own bound, not a path budget (owner section 36).
   const room = n / 32n;

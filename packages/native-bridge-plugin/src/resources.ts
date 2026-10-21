@@ -3,18 +3,22 @@
  * Unicity path 32 steps; seal 64 signatures; signer ID 128 UTF-8 bytes.
  */
 import { NativeError, fail } from './errors.js';
-import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_TRANSFERS, MAX_UC_BYTES } from './limits.js';
+import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_UC_BYTES } from './limits.js';
 
 type Node = { major: number; arg: bigint; start: number; end: number; depth: number; data: Uint8Array; kids: Node[] };
-/** Items of the object being scanned. Paths are bounded per certificate and per proof, never in sum (owner section 36). */
+/**
+ * Items of the object being scanned, within its own limit. Paths are bounded per certificate and per proof, never in sum (owner
+ * section 36); a whole token has no item aggregate (only `MAX_TOKEN_BYTES`), each nested payload its own `MAX_CBOR_ITEMS`.
+ */
 class Budget {
   items = 0;
+  constructor(readonly limit: number = MAX_CBOR_ITEMS) {}
 }
 function scan(b: Uint8Array, budget: Budget, depth = 0): Node {
   let pos = 0;
   const read = (d: number): Node => {
     if (d > MAX_CBOR_DEPTH) fail('ErrTooDeep');
-    if (++budget.items > MAX_CBOR_ITEMS) fail('ErrTooManyItems');
+    if (++budget.items > budget.limit) fail('ErrTooManyItems');
     const start = pos;
     if (pos === b.length) fail('ErrTruncated');
     const ib = b[pos++], major = ib >> 5, ai = ib & 31;
@@ -36,7 +40,7 @@ function scan(b: Uint8Array, budget: Budget, depth = 0): Node {
       if (major === 3) { try { new TextDecoder('utf-8', { fatal: true }).decode(data); } catch { fail('ErrNonCanonical'); } }
     } else if (major === 4 || major === 5) {
       const count = arg * (major === 5 ? 2n : 1n);
-      if (count > BigInt(MAX_CBOR_ITEMS - budget.items)) fail('ErrTooManyItems');
+      if (count > BigInt(budget.limit - budget.items)) fail('ErrTooManyItems');
       if (count > BigInt(b.length - pos)) fail('ErrTruncated');
       for (let i = 0n; i < count; i++) kids.push(read(d + 1));
       if (major === 5) for (let i = 2; i < kids.length; i += 2) {
@@ -97,13 +101,13 @@ function visit(n: Node, budget: Budget): void {
         if (!x || x.major !== 2) return;
         if (x.data.length > max) fail('ErrProofTooLarge');
         let root: Node;
-        try { root = scan(x.data, budget, x.depth + 1); } catch (e) {
+        const own = new Budget();
+        try { root = scan(x.data, own, x.depth + 1); } catch (e) {
           if (e instanceof NativeError && e.family !== 'budget') { if (certificate) unsupported(); return; }
           throw e;
         }
-        if (certificate) uc(root, budget); else visit(root, budget);
+        if (certificate) uc(root, own); else visit(root, own);
       };
-      if (n.arg === 39040n && k[2]?.major === 4 && k[2].kids.length > MAX_TRANSFERS) fail('ErrTooManyTx');
       if (n.arg === 39032n) nested(k[1], MAX_TOKEN_BYTES); // The predicate code is CBOR in a bstr.
       if (n.arg === 39041n) { nested(k[5], MAX_JUSTIFICATION_BYTES); nested(k[6], MAX_TOKEN_BYTES); }
       if (n.arg === 39045n) nested(k[3], MAX_TOKEN_BYTES);
@@ -133,7 +137,7 @@ function visit(n: Node, budget: Budget): void {
 }
 export function preflightToken(bytes: Uint8Array): void {
   if (bytes.length > MAX_TOKEN_BYTES) fail('ErrInputTooLarge');
-  const budget = new Budget(); visit(scan(bytes, budget), budget);
+  const budget = new Budget(Number.MAX_SAFE_INTEGER); visit(scan(bytes, budget), budget);
 }
 export function preflightUc(bytes: Uint8Array): void {
   if (bytes.length > MAX_UC_BYTES) fail('ErrProofTooLarge');
