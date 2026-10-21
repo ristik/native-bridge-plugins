@@ -19,7 +19,7 @@ export const MAX_LEAVES = MAX_TRANSFERS + 1;
 /** Standalone B2 history and Cfg input (ureth b2 `MAX_HISTORY`). */
 export const MAX_SEMANTIC_BYTES = 128 << 10;
 /** Ingress: the composition's only aggregate byte bound. */
-export const MAX_ENVELOPE_BYTES = 512 << 10;
+export const MAX_ENVELOPE_BYTES = 2 << 20;
 export const MAX_ANCHOR_UC_BYTES = 8 << 10;
 export const MAX_RSMT_SIBLINGS = 32;
 export const MAX_POLICY_BYTES = 512;
