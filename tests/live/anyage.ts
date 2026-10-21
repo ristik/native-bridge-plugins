@@ -55,7 +55,7 @@ import {
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
 import { NativeBridge } from '../../packages/native-bridge-plugin/src/verifier.js';
 import { minimalGas } from './gassearch.js';
-import { hex, LaneConfig, loadConfig, rpc, run, sleep, until, unhex } from './lib.js';
+import { hex, LaneConfig, loadConfig, rpc, run, signLegacyTx, sleep, until, unhex } from './lib.js';
 
 // ---- lane parameters -------------------------------------------------------------------------------------------------------------------
 const DEPLOYER_KEY = process.env.DNB_DEPLOYER_KEY ?? '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
@@ -144,13 +144,16 @@ async function registryAt(c: Ctx, block: string, epochs: bigint[]): Promise<Json
   return out;
 }
 
-/** Sign once, publish to every validator's pool, wait for the receipt. */
+/** Sign once, publish to every validator's pool, wait for the receipt. Small calls only: the calldata is built by `cast calldata`; an envelope goes through sendData. */
 async function sendAll(c: Ctx, to: string, sig: string, args: string[], key: string, gas: string, value?: string) {
+  return sendData(c, to, sig ? run('cast', ['calldata', sig, ...args]) : '0x', key, gas, value);
+}
+
+/** sendAll for calldata of any size: signed in-process (signLegacyTx), never passed through a command line. */
+async function sendData(c: Ctx, to: string, data: string, key: string, gas: string, value?: string) {
   const sender = run('cast', ['wallet', 'address', '--private-key', key]);
-  const nonce = String(parseInt(await rpc(c.eth, 'eth_getTransactionCount', [sender, 'pending']), 16));
-  const raw = c.cast('mktx', to, ...(sig ? [sig, ...args] : []), ...(value ? ['--value', value] : []), '--private-key', key, '--gas-limit', gas,
-    '--nonce', nonce, '--chain', String(c.lane.chainId), '--legacy', '--gas-price', '2000000000');
-  const txHash = `0x${hex(keccak256(unhex(raw)))}`;
+  const nonce = BigInt(await rpc(c.eth, 'eth_getTransactionCount', [sender, 'pending']));
+  const { raw, hash: txHash } = signLegacyTx({ nonce, gasPrice: 2_000_000_000n, gas: BigInt(gas), to, value: BigInt(value ?? '0'), data: unhex(data), chainId: BigInt(c.lane.chainId) }, key);
   const accepted = await Promise.all(c.lane.ethUrls.map(async (url) => {
     try {
       await rpc(url, 'eth_sendRawTransaction', [raw]);
@@ -347,7 +350,7 @@ async function redeemAndClaim(c: Ctx, p: { envelope: Uint8Array; gateTotal: numb
   const gas = p.gasLimit?.toString() ?? String(Math.min(7_000_000, p.gateTotal + 200_000));
   const claimable = (): bigint => BigInt(c.cast('call', c.lane.vault, 'claimable(address)(uint256)', p.recipient).split(' ')[0]);
   const creditBefore = claimable();
-  const rc = await sendAll(c, c.lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(p.envelope)}`], THIRD_PARTY_KEY, gas);
+  const rc = await sendData(c, c.lane.vault, redeemCalldata(p.envelope), THIRD_PARTY_KEY, gas);
   assert.equal(rc.status, '0x1', `redeem reverted: ${JSON.stringify(rc).slice(0, 400)}`);
   const credited = claimable() - creditBefore;
   const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', String(p.nonce))));
@@ -543,7 +546,7 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   };
   const beforeBlock = await rpc(c.eth, 'eth_blockNumber', []);
   const vaultBefore = await vault(beforeBlock);
-  const low = await sendAll(c, c.lane.vault, 'redeem(bytes)(uint256)', [`0x${hex(ret.encoded)}`], THIRD_PARTY_KEY, underLimit.toString());
+  const low = await sendData(c, c.lane.vault, data, THIRD_PARTY_KEY, underLimit.toString());
   const vaultAfter = await vault(low.blockNumber);
   assert.equal(low.status, '0x0', `the underfunded redemption must revert: ${JSON.stringify(low).slice(0, 300)}`);
   assert.deepEqual(vaultAfter, vaultBefore, 'the underfunded redemption changed the vault');
