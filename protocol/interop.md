@@ -299,13 +299,13 @@ exported leaves. Mint (one leaf) has exactly one anchor. Apply this to mint and
 return alike. There is no convergence requirement: the plug-in submits whatever
 (path, UC) pairs it holds.
 
-The whole anchor table is authenticated by one `STATICCALL 0x0100`
-(`CERT_BATCH_V2`): `version 2 | flags 0 | K | Claim[K]`, K the table length,
-claims in table order, each `partition:u32 | shardLen:u16 | shard |
-shardConfHash | expectedStateRoot | expectedIRHash | ucLen:u32 | uc`; `0x0101`
-is never called. The call returns exactly 64 bytes `abi.encode(uint256(2),bool)`
-and the composition requires `(2,true)`: one verdict for the table, no partial
-success. Anchors may carry different root rounds, seals and epochs; B1 checks
+The whole anchor table is authenticated by one `CERT_BATCH_V2` evaluation (the
+0x0100 relation, run inside BRIDGE_COMPOSE_V1 over the same request bytes):
+`version 2 | flags 0 | K | Claim[K]`, K the table length, claims in table
+order, each `partition:u32 | shardLen:u16 | shard | shardConfHash |
+expectedStateRoot | expectedIRHash | ucLen:u32 | uc`; `0x0101` is never used.
+The composition requires the batch verdict true: one verdict for the table, no
+partial success. Anchors may carry different root rounds, seals and epochs; B1 checks
 each seal against its own epoch's permanent registry entry (any age: start <=
 round <= the usable origin round O, and round < end for a closed epoch), with no
 certificate-age window, common cut or EVM certificate at any anchor's round.
@@ -318,14 +318,15 @@ null or bstr32; summary null or bstr within B1's summary limit. Enforce all
 native B1 bounds, null/width/canonical rules. Require
 H(inputRecord)==expectedIRHash and stateHash==expectedStateRoot.
 
-Composition checks framing/budgets/Cfg/policy and obtains the kernel result,
-then derives and checks the anchor table above and the gas estimate below. The one
-B1 0x0100 batch MUST authenticate both expected root and expected IR hash of
-every anchor. Only after success may an anchor's opened timestamp authorize the
+Composition (one native call since B7 direct PR 2: BRIDGE_COMPOSE_V1 below)
+checks framing/budgets/Cfg/policy and obtains the kernel result, then derives
+and checks the anchor table above. The one CERT_BATCH_V2 evaluation (the 0x0100
+relation) MUST authenticate both expected root and expected IR hash of every
+anchor. Only after success may an anchor's opened timestamp authorize the
 t<=timestamp comparison of the leaves routed to it (each leaf against its OWN
-anchor only). For each ordered leaf call unchanged B1 0x0102 with sid, raw
-leafValue and the root/path of that leaf's own anchor. Each 0x0102 result MUST be exactly 64 bytes encoding
-(uint256(1),true), and the 0x0100 batch result (uint256(2),true); no partial success. The B1 profile hash is the
+anchor only). For each ordered leaf the RSMT membership (the 0x0102 relation)
+is checked with sid, raw leafValue and the root/path of that leaf's own anchor;
+no partial success. The B1 profile hash is the
 deployment's pinned any-age profile; do not invent one. Caller-supplied scalar
 timestamps or unauthenticated IR hashes cannot authorize time checks.
 
@@ -350,43 +351,75 @@ never exceed its bytes/32 in sum (refused before allocation). Bitmap popcount
 must equal the sibling count of every leaf path. Check counts overflow-safely
 before allocation.
 
-### Direct-call gas estimate
+### Native composition (BRIDGE_COMPOSE_V1, 0x0105)
 
-Native prices are the actual B1/B2 charges, with no shared or warm discount.
-The one 0x0100 batch over the anchor table is charged
-`G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P`,
-with C its request bytes, K the anchors, and E, S, Q, A, P its canonical
-first-use grouping (distinct declared epochs; distinct complete seals and their
-signature-map sizes; distinct claims and their shard-tree plus unicity steps),
-computed from the request bytes alone (bft-core `b1ref.Group`). For leaf i with
-`s_i` RSMT siblings: `G_leaf(i) = 2000 + 16*(136+32*s_i) + 250*(1+s_i)`. With
-`B_kernel = 160 + pad32(B_cfg) + pad32(B_history)` the kernel request bytes and L
-the exported leaf count: `G_kernel = 26000 + 20*B_kernel + 14000*L`. The
-call-data allowance is `D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)` (the
-two-bytes-argument TokenVerifier call) and the composing verifier's own
-execution is 80 per envelope byte plus `G_items = 1000*J`, J the bridge CBOR
-item occurrences: the item heads of the canonical Cfg, the policy body, every
-anchor UC and every anchor IR opening, each encoded occurrence counted once
-(tags and containers, scalar and string heads, every child and map key and
-value; the contents of a byte string are opaque; an IR opening and the IR inside
-its UC are two occurrences; repeated parser passes never add to J). The estimate
-is `21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1000000`.
-The fixed reserve covers Solidity scanning and copying, call and EIP-150
-headroom and vault accounting. The gate is computed from complete bounded
-scans, never from caller-declared costs, and is identical in the contract,
-oracle and plug-ins. Every native call is forwarded exactly its computed
-charge, so a malformed late call cannot consume the remaining transaction
-budget. The estimate is conservative, not a measured fit, and it is never an
+The redemption's whole composition is one native call, `BRIDGE_COMPOSE_V1` at
+`0x0000000000000000000000000000000000000105`, registered by the Unicity EVM
+factory like 0x0100/0x0102/0x0104 on every execution route; it reads the
+registry through the journal and is never result-cached. Its relation is
+bft-core `bridgeprofile.Compose` (executable reference `NativeCompose`), in
+order: the operation (mint or return), the Cfg and the envelope's framing and
+the resource bounds above; the policy body; the B2 kernel; the anchor plan; one
+CERT_BATCH_V2 evaluation of the anchor table against the registry; each
+anchor's IR opening and every leaf's time against its own anchor; one RSMT
+membership per leaf. The first failure decides the status.
+
+Input: `abi.encode(uint8 op, bytes cfg, bytes envelope)`, canonical; the
+envelope is the one above, unchanged. Output, always exactly 384 bytes on an
+EVM success: `abi.encode(bytes32 marker, uint256 status, bytes32 cfg,
+uint256 nonce, uint256 amount, bytes32 tokenId, bytes32 salt,
+bytes32 firstPredicateHash, bytes32 lockDigest, address releaseTo,
+bytes32 nullifier, uint256 leafCount)`, marker
+`bytes32("UNICITY_BRIDGE_COMPOSE_V1")`. Status 0 means the relation holds; any
+other value is the stable reason code of `config/compose-status.json` (the
+append-only status table: code i names the sentinel of the corpus reason
+order that `Compose` can return) and every result field is then zero. Only
+out-of-gas and an input that is not the canonical three-field ABI halt (all
+forwarded gas consumed); everything after the ABI decode is a status, charged
+for the work it caused. The Solidity wrapper keeps the configuration binding
+(the verifier address, the chain and the Cfg hash) and the vault's atomic
+lock/spent/credit/claim logic, forwards all remaining gas, decodes exactly 384
+bytes and reverts `BridgeRejected(uint256 status)` on a nonzero status; the
+vault ABI is unchanged. `prepareLock` still calls B2 at 0x0104 directly.
+
+### Gas schedule and estimate
+
+The native call charges the trial schedule (bft-core `ComposeGas`)
+`G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)`:
+B the input bytes; J the CBOR item heads of the Cfg, the policy body, the
+history, every anchor UC and every anchor IR opening, each encoded occurrence
+counted once (tags and containers, scalar and string heads, every child and map
+key and value; the contents of a byte string are opaque; an IR opening and the
+IR inside its UC are two occurrences); L the leaves; Q the signatures over the
+distinct seals, E the distinct declared epochs, A the distinct claims and K the
+claim occurrences of the anchor table's canonical first-use grouping (bft-core
+`b1ref.Group`); P the shard-tree plus unicity steps of the distinct claims plus
+every leaf's RSMT siblings. The grouping is sort-based, never pairwise. Each
+charge is taken before the work it pays for (`100000 + 2*B` before decoding,
+an object's J once it scans, `16000*L` once the kernel has counted the leaves,
+the batch terms once the batch is scanned and grouped, `250*s_i` before each
+RSMT path is hashed); a status is charged what was metered up to its failure,
+with no refund and no charge for work not done. On success the charge is the
+whole formula. It is a trial price to benchmark, not a measurement.
+
+The plug-ins compute the same dimensions from the same scans. Their
+transaction estimate is `21000 + 16*D_max + G_compose + 1000000`, with the
+call-data allowance `D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)` (the
+two-bytes-argument TokenVerifier call) and the fixed reserve for the wrapper,
+the call and EIP-150 headroom and vault accounting. The estimate is never an
 admission rule (owner section 36): a wallet sets the transaction gas limit from
 it, and a transaction with too little gas runs out of gas and reverts
 atomically. The only gas bound is the deployment's ordinary block capacity, an
 ordinary profile parameter (the pool admits one transaction of it). A bundle
-above a resource bound is BudgetExceeded or an input-size refusal before any
-native call, never truncates history, omits leaves, selects a latest UC or
-splits a redemption, and means "direct exit unavailable", not "token invalid".
-Bounds are not additive entitlements or measured activation
-prices. Freeze in canonical semantic profile/vectors before activation; native
-x86-64/arm64 full-transaction measurements and benchmarked native prices remain required.
+above a resource bound is BudgetExceeded or an input-size refusal, never
+truncates history, omits leaves, selects a latest UC or splits a redemption,
+and means "direct exit unavailable", not "token invalid". The corpus `gate`
+cases still publish the protocol-5 composite
+`21000 + 16*D_max + 80*B_env + 1000*J' + G_kernel + G_batch + sum_i G_leaf(i) + 1000000`
+(J' without the history; `G_batch`, `G_leaf`, `G_kernel` the per-call prices of
+0x0100, 0x0102 and 0x0104); it no longer prices a redemption. Bounds are not
+additive entitlements or measured activation prices; native x86-64/arm64
+full-transaction measurements and benchmarked native prices remain required.
 
 ### Assembly and refresh
 
