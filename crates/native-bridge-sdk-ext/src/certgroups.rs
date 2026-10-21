@@ -7,7 +7,8 @@
 //! tuple and full UC bytes), `P` the shard siblings plus Unicity-tree steps of the distinct claims.
 //!
 //! Identity is exact bytes. A claim's shard-tree depth comes from its own native shard ID, never from a policy. `items` counts the
-//! CBOR items of every UC occurrence before deduplication, against the bridge's shared 4,096 item budget.
+//! CBOR items of every UC occurrence before deduplication; there is no shared item budget (owner section 36): each UC is bounded
+//! by its own native scan (`MAX_CBOR_ITEMS`) and every item is charged.
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
@@ -305,15 +306,11 @@ fn claim_key(a: &Anchor) -> Vec<u8> {
     k
 }
 
-/// Scan and group the claims of one batch. `spent` is what the caller has already used of the shared item budget on the Cfg, the
-/// policy and the IR openings.
-pub fn measure(claims: &[Anchor], spent: usize) -> Result<Counts> {
+/// Scan and group the claims of one batch. Each UC occurrence is scanned within its own `MAX_CBOR_ITEMS`.
+pub fn measure(claims: &[Anchor]) -> Result<Counts> {
     let k = claims.len();
     if k == 0 || k > MAX_CLAIMS {
         return Err(E::TooManyPaths);
-    }
-    if spent > BRIDGE_CBOR_ITEMS {
-        return Err(E::TooManyItems);
     }
     let mut n = Counts {
         k: k as u64,
@@ -321,7 +318,7 @@ pub fn measure(claims: &[Anchor], spent: usize) -> Result<Counts> {
         ..Counts::default()
     };
     let mut bud = Budget {
-        limit: BRIDGE_CBOR_ITEMS - spent,
+        limit: 0,
         items: 0,
         steps: 0,
     };
@@ -333,6 +330,7 @@ pub fn measure(claims: &[Anchor], spent: usize) -> Result<Counts> {
         if n.c > MAX_BATCH_BYTES as u64 {
             return Err(E::TooManyPaths);
         }
+        bud.limit = bud.items + MAX_CBOR_ITEMS;
         let o = scan(a, &mut bud)?;
         if epochs.insert(o.epoch) {
             n.e += 1;

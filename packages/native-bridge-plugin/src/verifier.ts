@@ -30,7 +30,7 @@ import { eq, toHex } from './bytes.js';
 import type { Deployment, DeploymentRegistry } from './deployment.js';
 import { NativeError, fail, type NativeReason } from './errors.js';
 import { decodeHistory, checkJustification, checkMintData, projectToken, verifyHistory, type Leaf, type Outcome } from './history.js';
-import { MAX_PATH_STEPS, MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
+import { MAX_TRANSFERS, TAG_MINT_LOCK } from './limits.js';
 import { parseJustification, verifyLockProof, type Justification, type VerifiedLock } from './lockproof.js';
 import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord, shardCovers, shardDepth } from './profile.js';
 import { certificateFailure, type TrustInput } from './trust.js';
@@ -152,10 +152,9 @@ export class NativeBridge {
     const outcome = await verifyHistory(dep, hist, expect === 'return');
     const lock = await verifyLockProof(dep, this.trust, parsed, outcome.lockDigest);
 
-    // Bridge-specific checks per leaf: aggregator admission, path budget, t <= IR.
-    const steps = { n: 0 };
+    // Bridge-specific checks per leaf: aggregator admission, t <= IR (no cumulative path budget, owner section 36).
     const all = [g, ...token.transactions];
-    for (let i = 0; i < all.length; i++) await this.checkLeaf(dep, all[i].inclusionProof, outcome.leaves[i], steps);
+    for (let i = 0; i < all.length; i++) await this.checkLeaf(dep, all[i].inclusionProof, outcome.leaves[i]);
 
     // The SDK's own ordinary verification, with the same base throughout.
     const r = await new TokenVerifier().verify(token, await this.context(parts));
@@ -163,7 +162,7 @@ export class NativeBridge {
     return { outcome, lock, deployment: index };
   }
 
-  private async checkLeaf(dep: Deployment, proof: CertifiedMintTransaction['inclusionProof'], leaf: Leaf, steps: { n: number }): Promise<void> {
+  private async checkLeaf(dep: Deployment, proof: CertifiedMintTransaction['inclusionProof'], leaf: Leaf): Promise<void> {
     const uc = proof.unicityCertificate;
     if (proof.referenceTime !== leaf.referenceTime) fail('ErrCDMismatch');
     const sid = await StateId.fromCertificationData(proof.certificationData);
@@ -180,8 +179,6 @@ export class NativeBridge {
       fail('ErrShardMismatch');
     }
     if (!shardCovers(shard, leaf.sid)) fail('ErrShardMismatch');
-    steps.n += (proof.inclusionCertificate.encode().length - 32) / 32;
-    if (steps.n > MAX_PATH_STEPS) fail('ErrTooManyPaths');
     if (leaf.referenceTime > uc.inputRecord.timestamp) fail('ErrReferenceTimeFuture');
   }
 }

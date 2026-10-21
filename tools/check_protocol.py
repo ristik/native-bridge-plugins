@@ -93,7 +93,7 @@ def main():
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
     profile = load('protocol/profile-v5.json')
     assert profile['nativeBridgeProtocolVersion'] == 5 and profile['sdkVersion'] == '4.0.0'
-    assert profile['limits']['semanticBytes'] == 16384 and profile['limits']['justificationBytes'] == 65536
+    assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'unicity-trust-base-history'
     assert profile['trustModel']['trustDocumentFormat'] == 'utb-release-bundle-v1 (tag 39015)'
     assert profile['deferred'] == []

@@ -2,7 +2,8 @@
  * The shared direct-call gas gate (interop.md "Direct-call gas gate"): the same formula, with the same constants, as the oracle
  * (`bridgeprofile/gas.go`) and the contract (`BridgeBounds.sol`, `CertGroups.sol`). Every term is the native price of a call the
  * composing verifier makes, or the bounded execution of the verifier itself, computed from complete bounded scans, never from
- * caller-declared costs. It is an admission rule, not a measured fit:
+ * caller-declared costs. It is a conservative estimate a wallet sets its gas limit from, never an admission rule: there is no fixed
+ * transaction budget (owner section 36), and a call with too little gas runs out of gas and reverts atomically.
  *
  *   G_gate = 21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1,000,000
  */
@@ -10,7 +11,7 @@ import { fail } from './errors.js';
 import type { Envelope, LeafProof } from './envelope.js';
 import { batchGas, countItems, measure, type Counts } from './certgroups.js';
 import { NativeError } from './errors.js';
-import { BRIDGE_CBOR_ITEMS, BRIDGE_ITEM_GAS, GAS_RESERVE, MAX_PATH_STEPS, MAX_RSMT_SIBLINGS, TX_GAS_BUDGET } from './limits.js';
+import { BRIDGE_ITEM_GAS, GAS_RESERVE, MAX_CBOR_ITEMS, MAX_RSMT_SIBLINGS } from './limits.js';
 
 const INTRINSIC_BASE = 21_000;
 const PER_BYTE = 16;
@@ -85,19 +86,20 @@ export interface Gate {
   j: number;
   /** The grouping the batch is priced by. */
   grouping: Counts;
-  /** The gated sum including the fixed reserve. */
+  /** The estimate including the fixed reserve. */
   total: number;
 }
 
-/** Price a complete bounded envelope against `budget`; above it is `ErrGasBudget` (BudgetExceeded). */
-export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelRequest: number, e: Envelope, budget: number = TX_GAS_BUDGET): Gate {
+/** Price a complete bounded envelope: the estimate, never a refusal. */
+export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelRequest: number, e: Envelope): Gate {
   const cfgBytes = cfg.length;
   // J: the item occurrences of the Cfg, the policy body, every anchor UC (counted by the batch scan) and every anchor IR opening,
-  // each once, against the one shared budget. A malformed object is its own shape failure; crossing the budget is ErrTooManyItems.
+  // each once. There is no shared budget: each object is bounded by its own native scan (ErrTooManyItems), and every item is
+  // charged. A malformed object is its own shape failure.
   let spent = 0;
   const take = (b: Uint8Array, malformed: Parameters<typeof fail>[0]): void => {
     try {
-      spent += countItems(b, BRIDGE_CBOR_ITEMS - spent);
+      spent += countItems(b, MAX_CBOR_ITEMS);
     } catch (err) {
       if (err instanceof NativeError && err.reason === 'ErrTooManyItems') throw err;
       fail(malformed);
@@ -106,7 +108,7 @@ export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelReques
   take(cfg, 'ErrShape');
   take(e.policyBody, 'ErrShape');
   for (const a of e.anchors) take(a.inputRecord, 'ErrShape');
-  const grouping = measure(e.anchors, spent);
+  const grouping = measure(e.anchors);
   const j = spent + grouping.items;
   let rsmt = 0;
   let steps = grouping.p;
@@ -115,7 +117,6 @@ export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelReques
     rsmt += l.gas;
     steps += l.steps;
   }
-  if (steps > MAX_PATH_STEPS) fail('ErrTooManyPaths');
   const g: Gate = {
     intrinsic: intrinsicGas(cfgBytes, envelopeBytes),
     b2: b2Gas(kernelRequest, e.leafProofs.length),
@@ -128,7 +129,6 @@ export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelReques
     total: 0,
   };
   g.total = g.intrinsic + g.b2 + g.batch + g.items + g.rsmt + GAS_RESERVE;
-  if (g.total > budget) fail('ErrGasBudget');
   return g;
 }
 
@@ -147,8 +147,8 @@ export const BEST_UC_ITEMS = 39;
  * `historyBytes` history would need if everything the burn cannot yet know turns out as small as it can: the consolidated bundle,
  * `anchors` anchors (one per aggregator shard the leaves touch, at least 1, at most `leaves`) under ONE seal, the smallest
  * certificates and empty paths. With the shard count unknown the best case is one anchor (a single certificate may serve every leaf).
- * The burn is refused, before any wallet burn is made, only when even this cannot pass the gas gate; whether the bundle that is
- * actually fetched passes is the gate's decision at redemption.
+ * It is the burn-time estimate only: nothing is refused for its size (owner section 36); the bundle actually fetched is estimated at
+ * redemption.
  */
 export function projectedGate(cfgBytes: number, policyBytes: number, leaves: number, historyBytes: number, anchors = 1): { gate: Gate; envelopeBytes: number } {
   const k = Math.max(1, Math.min(anchors, leaves));
@@ -173,6 +173,5 @@ export function projectedGate(cfgBytes: number, policyBytes: number, leaves: num
     total: 0,
   };
   g.total = g.intrinsic + g.b2 + g.batch + g.items + g.rsmt + GAS_RESERVE;
-  void BRIDGE_CBOR_ITEMS;
   return { gate: g, envelopeBytes: envelope };
 }

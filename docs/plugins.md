@@ -21,7 +21,7 @@ state-transition SDK is forked or patched; both are consumed through public APIs
 `verifyNativeToken` / `verify_native_token`: bounded canonical decode → genesis data/reason present
 → deployment from the allow-list → compact-history relation (profile, deadlines, strict unlocks,
 lock digest) → offline lock proof → per-leaf bridge checks (fixed-profile guards, aggregator
-admission, path budget, `t ≤ IR.timestamp`) → **the SDK's own ordinary verification with the same
+admission, `t ≤ IR.timestamp`) → **the SDK's own ordinary verification with the same
 trust base** and this bridge's justification/issuance registrations. Nothing in these paths has a
 network capability (source scan + a sandboxed no-network run in both suites).
 
@@ -80,8 +80,8 @@ the same installed base is allowed. The TS adapter runs this check before persis
 Full-token scans run before SDK byte decoding and also gate decoded-token verification and
 refresh. Nested J/PDR/UC/value/reason/predicate-code CBOR shares the outer depth/item budget. Every ordinary and
 embedded UC has the 16 KiB limit, native summary/shard/path/signature/node-ID sublimits and the
-supported 65-byte signature encoding. Embedded UC, ordinary UC-tree paths and RSMT paths share
-one cumulative 2048-step budget. The independent constructor fixtures are separate from the released Go corpus;
+supported 65-byte signature encoding. There is no cumulative path budget (owner section 36): each UC and each
+RSMT path keeps its own bound. The independent constructor fixtures are separate from the released Go corpus;
 corpus integrity/regeneration and joined component CI check their respective boundaries.
 
 ## Host readiness contract for return proofs
@@ -95,23 +95,25 @@ spread rule, and the plug-in does not require the anchors to be close in round o
 `buildReadyReturnProof` and `redeemReturn` (TypeScript; `readiness::classify_readiness` in Rust) refetch every leaf for the SAME burned token
 (never rebuilding or re-burning, never to obtain matching certificates or fewer anchors), wait a bounded time for an origin that has not imported
 the newest anchor, and send within a bounded number of attempts. An exhausted wait or temporary witness unavailability is `ErrProofUnavailable`
-with a diagnostic cause (the unavailable family, retryable, pending state kept); an over-limit anchor count, gas or size stays BudgetExceeded and
+with a diagnostic cause (the unavailable family, retryable, pending state kept); an over-limit anchor count or size stays BudgetExceeded and
 is never retried. Before any resend the host checks the transaction's receipt and the
 vault's spent/credit state: an RPC timeout is not a revert, an unknown send is not repeated while it may be pending (`RedemptionUnconfirmed` carries the
 transaction hash; the caller passes it back as `pending` and its receipt is checked before any new send), and the wallet burn is never
 repeated. A revert is retried up to `maxSends` whatever its cause, so a deterministic refusal (a closed authority interval, bad backing) costs
 `maxSends` transactions. A proof service or chain reader that fails is retried within the attempt bound and reported as `ErrProofUnavailable` with
 the cause; the policy is range-checked before anything is fetched. The burn-time preflight is a feasibility filter, not a service guarantee: it
-prices the best case with ONE anchor, because a single certificate may serve every leaf; it never projects one anchor per shard. The burn is therefore refused only when even that best case cannot pass the gate; a bundle fetched later
-can still fail the gate (`ErrGasBudget`, "direct exit unavailable", not "token invalid").
+refuses only what the resource policy cannot carry (more leaves than the native kernel admits, a history or envelope over its bound), and
+returns a best-case gas estimate with ONE anchor, because a single certificate may serve every leaf. There is no gas ceiling (owner
+section 36): the gate is an estimate the redemption is sent with, and a transaction given too little gas runs out of gas and reverts
+atomically.
 
 ### The anchor table
 
 The aggregator policy names the partition only. Each anchor is read from its own UC (its shard, shard configuration hash and partition); the
 plug-in routes a leaf to an aggregator by its state ID, and whatever certificate the response carries is kept with its path. The depth of an anchor is
 the depth of its own shard ID, and every leaf's state ID must carry the prefix bits of the anchor it names. Parent and child shards of a topology
-split may both appear in one history. The gate is `21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum G_leaf + 1,000,000`, with `J`
-the CBOR item occurrences of the Cfg, the policy, every UC and every IR opening (at most 4,096) and `G_batch` the price of the one
+split may both appear in one history. The gas estimate is `21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum G_leaf + 1,000,000`, with `J`
+the CBOR item occurrences of the Cfg, the policy, every UC and every IR opening (each object within its own native scan, no shared budget) and `G_batch` the price of the one
 `CERT_BATCH_V2` call, grouped by `certgroups.ts` / `certgroups.rs` exactly as the contract and the oracle do.
 
 ## From burn to claimed native funds (wallet lifecycle)
@@ -136,6 +138,6 @@ The journal entry (`RedemptionEntry`) moves `burned` -> `submitted` -> `redeemed
   dead (the sender's nonce was used by another transaction, or it was replaced) and call `abandonAttempt` (a redeem hash, or the claim attempt); the entry then
   sends again. Wrongly abandoning a pending claim can pay twice, so this is the host's decision, not the plug-in's. The redeem side also recovers by itself once
   anyone redeems the nonce.
-- A bundle over the anchor, gas or size bound is a budget refusal and is not retried; the refusal carries the measured distinct-anchor count (for the anchor ceiling
+- A bundle over the anchor or size bound is a budget refusal and is not retried; the refusal carries the measured distinct-anchor count (for the anchor ceiling
   itself, "N distinct anchors fetched, ceiling 8").
   Without a proof source a held token that does not verify is reported as the failure it is, not as an unavailable service.

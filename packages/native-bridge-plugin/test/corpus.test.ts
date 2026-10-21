@@ -56,7 +56,7 @@ test('policy family: every envelope is framed, its policy opened and its anchor 
   }
 });
 
-test('proof family: the gate of every published envelope is the oracle\'s, component by component, at its exact budget and one less', () => {
+test('proof family: the gas estimate of every published envelope is the oracle\'s, component by component', () => {
   const cases = (load('proof/cases.json').cases as Case[]).filter((c) => c.op === 'gate');
   assert.ok(cases.length >= 14);
   for (const c of cases) {
@@ -67,7 +67,7 @@ test('proof family: the gate of every published envelope is the oracle\'s, compo
       const env = decodeEnvelope(fromHex(c.input)!);
       checkPolicyBody(cfg, env);
       const encodedLen = c.input.length / 2;
-      const g = computeGate(cfgRaw, encodedLen, kernelRequestBytes(cfgRaw.length, env.history.length), env, c.aux?.budget === undefined ? 7_000_000 : Number(c.aux.budget));
+      const g = computeGate(cfgRaw, encodedLen, kernelRequestBytes(cfgRaw.length, env.history.length), env);
       values = {
         b2: String(g.b2), batch: String(g.batch), intrinsic: String(g.intrinsic), items: String(g.items), j: String(g.j),
         rsmt: String(g.rsmt), steps: String(g.steps), total: String(g.total),
@@ -78,14 +78,14 @@ test('proof family: the gate of every published envelope is the oracle\'s, compo
 });
 
 test('the burn-time projection with K anchors under one seal is a lower bound of every consolidated bundle of the corpus', () => {
-  const cases = (load('proof/cases.json').cases as Case[]).filter((c) => c.op === 'gate' && /^gate-consolidated-m\d+-n\d+-exact$/.test(c.id));
+  const cases = (load('proof/cases.json').cases as Case[]).filter((c) => c.op === 'gate' && /^gate-consolidated-m\d+-n\d+$/.test(c.id));
   assert.equal(cases.length, 8, 'm in {1,2,4,8} x committee {4,16}');
   for (const c of cases) {
     const cfg = cfgOf(c.cfg!);
     const env = decodeEnvelope(fromHex(c.input)!);
     const k = env.anchors.length;
     const leaves = env.leafProofs.length;
-    const exact = BigInt(c.aux!.budget);
+    const exact = BigInt(c.expected.values!.total);
     const best = projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length, k).gate.total;
     const one = projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length).gate.total;
     assert.ok(BigInt(best) <= exact, `${c.id}: projection ${best} above the bundle's gate ${exact}`);
@@ -94,4 +94,14 @@ test('the burn-time projection with K anchors under one seal is a lower bound of
     assert.equal(projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length, leaves + 5).gate.total,
       projectedGate(cfgBytes(cfg).length, env.policyBody.length, leaves, env.history.length, leaves).gate.total);
   }
+});
+
+test('no gas ceiling (owner section 36): a bundle estimated above the former 7,000,000 is estimated, not refused', () => {
+  const c = (load('proof/cases.json').cases as Case[]).find((x) => x.id === 'gate-compose-leaves-max-two-anchors')!;
+  assert.equal(c.expected.status, 'ok');
+  const cfgRaw = cfgBytes(cfgOf(c.cfg!));
+  const env = decodeEnvelope(fromHex(c.input)!);
+  const g = computeGate(cfgRaw, c.input.length / 2, kernelRequestBytes(cfgRaw.length, env.history.length), env);
+  assert.equal(g.total, 7_206_166);
+  assert.ok(g.total > 7_000_000);
 });

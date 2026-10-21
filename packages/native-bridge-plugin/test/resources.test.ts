@@ -72,7 +72,7 @@ test('native UC sublimits apply equally to ordinary and standalone embedded UCs'
   }
 });
 
-test('UC tree paths and RSMT paths share the full-token cumulative budget', async () => {
+test('UC tree paths and RSMT paths have no full-token cumulative budget (owner section 36)', async () => {
   const w = await makeWorld();
   // MAX_TRANSFERS transfers: MAX_LEAVES certificates of 32 unicity steps and 100 shard-tree siblings each.
   const out = await buildToken(w, spec(1), Array.from({length: MAX_TRANSFERS}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
@@ -85,8 +85,8 @@ test('UC tree paths and RSMT paths share the full-token cumulative budget', asyn
     uc[5] = tagged(39004, ut); proof[4] = tagged(39001, uc); cert[1] = tagged(39033, proof); return arr(...cert);
   });
   token[1] = certs[0]; token[2] = arr(...certs.slice(1)); const bytes = tagged(39040, token);
-  await rejects(w.bridge.verifyNativeTokenBytes(bytes, 'receipt'), 'ErrTooManyPaths');
-  await rejects(w.bridge.verifyNativeToken(await Token.fromCBOR(bytes), 'receipt'), 'ErrTooManyPaths');
+  // 65 certificates of 132 steps each, far above the former 2,048: the resource scan admits them (each within its own bounds)
+  preflightToken(bytes);
 });
 
 test('nested payloads share depth and item budgets with the outer token', async () => {
@@ -125,7 +125,7 @@ test('an otherwise valid receipt cannot hide an oversized ordinary UC in unknown
 });
 
 
-test('the cumulative path boundary includes the immutable embedded certificate', async () => {
+test('the former cumulative path boundary, the immutable embedded certificate included, no longer refuses', async () => {
   const w = await makeWorld();
   const out = await buildToken(w, spec(1), Array.from({length: MAX_TRANSFERS}, (_, i) => txStep(i + 2, i + 1, BigInt(i + 2))), 1n, 100n);
   const make = (extra: number): Uint8Array => {
@@ -153,7 +153,5 @@ test('the cumulative path boundary includes the immutable embedded certificate',
     return tagged(39040, token);
   };
   preflightToken(make(0));
-  const over = make(1);
-  await rejects(w.bridge.verifyNativeTokenBytes(over, 'receipt'), 'ErrTooManyPaths');
-  await rejects(w.bridge.verifyNativeToken(await Token.fromCBOR(over), 'receipt'), 'ErrTooManyPaths');
+  preflightToken(make(1));
 });

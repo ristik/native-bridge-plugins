@@ -1,21 +1,25 @@
-//! Named profile-v5 bounds and fixed protocol bytes of the native profile (protocol version 4).
+//! The resource policy of the direct path (owner section 36, bft-core briefs/b7-direct-uncapped-design.md section 1) and fixed
+//! protocol bytes of the native profile (protocol version 4).
 //!
-//! The numbers of the first block are the `limits` of `protocol/profile-v5.json`, the single source
-//! shared with the oracle, the contract and the TypeScript plug-in (`tests/limits.rs` pins them). A
-//! later profile version raises them together with the gas budget. Limits are intersected, not
-//! additive entitlements: every cumulative bound is checked before allocation or cryptography.
+//! The numbers of the first block are the `limits` of `protocol/profile-v5.json`, the single source shared with the oracle, the
+//! contract and the TypeScript plug-in (`tests/limits_and_shards.rs` pins them). There is no gas ceiling and no bridge-specific
+//! history cap: the aggregate bounds are the native kernels' own (B2 transfers and history, B1 claims) until the native composition
+//! streams them; the envelope bound is the ingress bound the pool and RPC carry; the rest are per-object shape bounds. Every count is
+//! checked before allocation or cryptography.
 
 // ---- profile parameters (profile-v5.json `limits`) ----------------------------------------------
-/// Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle.
+/// Distinct UC anchors of one redemption (one per distinct complete UC): B1's claim bound.
 pub const MAX_ANCHORS: usize = 16;
-/// B2 leaves of one redemption: the mint, every transfer and the final burn.
-pub const MAX_LEAVES: usize = 24;
-pub const MAX_TRANSFERS: usize = MAX_LEAVES - 1;
-pub const MAX_SEMANTIC_BYTES: usize = 16 << 10;
-pub const MAX_ENVELOPE_BYTES: usize = 64 << 10;
+/// B2 transfers including the final burn (ureth b2 `MAX_TRANSFERS`).
+pub const MAX_TRANSFERS: usize = 64;
+/// B2 leaves of one redemption: the mint and every transfer (the kernel's result bound).
+pub const MAX_LEAVES: usize = MAX_TRANSFERS + 1;
+/// B2 history (ureth b2 `MAX_HISTORY`).
+pub const MAX_SEMANTIC_BYTES: usize = 128 << 10;
+/// Ingress: above every envelope the native bounds admit.
+pub const MAX_ENVELOPE_BYTES: usize = 512 << 10;
 pub const MAX_ANCHOR_UC_BYTES: usize = 8 << 10;
 pub const MAX_RSMT_SIBLINGS: usize = 32;
-pub const MAX_PATH_STEPS: usize = 2048;
 pub const MAX_POLICY_BYTES: usize = 512;
 /// B1's own sublimits, which the gate prices.
 pub const MAX_UNICITY_STEPS: usize = 32;
@@ -29,12 +33,9 @@ pub const MAX_SHARD_DEPTH: usize = 256;
 pub const MAX_BATCH_BYTES: usize = 262_144;
 pub const MAX_RAW_STEPS: usize = 4_608;
 
-// ---- the shared gas gate (interop.md "Direct-call gas gate") ------------------------------------
-/// DN-B ordinary transaction capacity.
-pub const TX_GAS_BUDGET: u64 = 7_000_000;
+// ---- the gas estimate (interop.md "Direct-call gas estimate") ------------------------------------
 pub const GAS_RESERVE: u64 = 1_000_000;
-/// The bridge's cumulative CBOR item budget (Cfg, policy, every UC and every IR opening) and its price per item.
-pub const BRIDGE_CBOR_ITEMS: usize = 4096;
+/// The price of one bridge CBOR item occurrence (Cfg, policy, every UC and every IR opening).
 pub const BRIDGE_ITEM_GAS: u64 = 1000;
 
 pub const MAX_CBOR_DEPTH: usize = 16;

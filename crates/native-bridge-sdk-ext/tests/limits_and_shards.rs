@@ -35,27 +35,37 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     assert_eq!(MAX_ENVELOPE_BYTES as u64, n("envelopeBytes"));
     assert_eq!(MAX_ANCHOR_UC_BYTES as u64, n("anchorUcBytes"));
     assert_eq!(MAX_RSMT_SIBLINGS as u64, n("rsmtSiblingsPerLeaf"));
-    assert_eq!(MAX_PATH_STEPS as u64, n("pathSteps"));
     assert_eq!(MAX_POLICY_BYTES as u64, n("policyBytes"));
     assert_eq!(MAX_UNICITY_STEPS as u64, n("unicityStepsPerUc"));
     assert_eq!(MAX_INPUT_RECORD_BYTES as u64, n("irBytes"));
-    assert_eq!(TX_GAS_BUDGET, n("txGasBudget"));
     assert_eq!(GAS_RESERVE, n("gasReserve"));
     assert_eq!(MAX_JUSTIFICATION_BYTES as u64, n("justificationBytes"));
     assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 5);
-    assert_eq!(BRIDGE_CBOR_ITEMS as u64, n("bridgeCborItems"));
     assert_eq!(BRIDGE_ITEM_GAS, n("bridgeItemGas"));
     assert_eq!(MAX_SHARD_DEPTH as u64, n("shardDepthMax"));
     assert_eq!(MAX_CBOR_ITEMS as u64, n("cborItems"));
+    // owner section 36: no gas ceiling, no cumulative path budget, no shared item budget
+    for gone in ["txGasBudget", "pathSteps", "bridgeCborItems"] {
+        assert!(l.get(gone).is_none(), "{gone}");
+    }
+    assert_eq!(
+        [
+            MAX_TRANSFERS,
+            MAX_LEAVES,
+            MAX_SEMANTIC_BYTES,
+            MAX_ENVELOPE_BYTES
+        ],
+        [64, 65, 131_072, 524_288]
+    );
 }
 
 #[test]
-fn the_shared_gate_prices_its_components_as_the_oracle_and_the_contract_do() {
+fn the_gas_estimate_prices_its_components_as_the_oracle_and_the_contract_do() {
     assert_eq!(rsmt_gas(MAX_RSMT_SIBLINGS as u64), 28_810);
     // 21000 + 16*D_max + 80*B_env with D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)
     assert_eq!(
         intrinsic_gas(512, MAX_ENVELOPE_BYTES as u64),
-        21_000 + 16 * (132 + 512 + 65_536) + 80 * 65_536
+        21_000 + 16 * (132 + 512 + 524_288) + 80 * 524_288
     );
     assert_eq!(
         intrinsic_gas(513, 100),
@@ -67,9 +77,9 @@ fn the_shared_gate_prices_its_components_as_the_oracle_and_the_contract_do() {
             kernel_request_bytes(MAX_SEMANTIC_BYTES as u64, MAX_SEMANTIC_BYTES as u64),
             MAX_LEAVES as u64
         ),
-        1_020_560 // 26000 + 20*(160 + 16384 + 16384) + 14000*24
+        6_182_080 // 26000 + 20*(160 + 131072 + 131072) + 14000*65
     );
-    assert_eq!(item_gas(BRIDGE_CBOR_ITEMS as u64), 4_096_000);
+    assert_eq!(item_gas(4096), 4_096_000);
     // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P
     let n = Counts {
         k: 3,
@@ -88,20 +98,19 @@ fn the_shared_gate_prices_its_components_as_the_oracle_and_the_contract_do() {
 }
 
 #[test]
-fn the_best_case_projection_fits_at_the_bounds_with_one_anchor() {
+fn the_best_case_projection_at_the_bounds_is_an_estimate_with_one_anchor() {
     let (gate, envelope) = projected_gate(300, 150, MAX_LEAVES as u64, MAX_SEMANTIC_BYTES as u64);
-    assert!(gate.total <= TX_GAS_BUDGET, "{}", gate.total);
+    assert!(
+        gate.total > 7_000_000,
+        "above the former 7M ceiling and not refused: {}",
+        gate.total
+    );
     assert!(envelope <= MAX_ENVELOPE_BYTES as u64, "{envelope}");
     assert_eq!(
         gate.grouping.k, 1,
         "a single certificate may serve every leaf: the best case is never one anchor per shard"
     );
 }
-
-/// The cumulative step bound cannot bind: the anchor, leaf and sibling bounds already imply it.
-const _: () = assert!(
-    MAX_ANCHORS * (1 + MAX_UNICITY_STEPS) + MAX_LEAVES * MAX_RSMT_SIBLINGS <= MAX_PATH_STEPS
-);
 
 /// A return whose leaves occupy both shards of the depth-1 world (the owner key moves the state IDs).
 fn two_shard_return(w: &World) -> TokenOut {
@@ -157,11 +166,11 @@ fn depth_one_one_anchor_per_distinct_uc_in_first_use_order_each_leaf_under_its_o
     let times: Vec<u64> = v.outcome.leaves.iter().map(|l| l.reference_time).collect();
     check_anchors(&env, &plan, &times).unwrap();
     // the depth of each anchor comes from its own shard ID, and its shard-tree sibling is a path step of the gate
-    assert_eq!(measure(&env.anchors[0..1], 0).unwrap().p, 1);
+    assert_eq!(measure(&env.anchors[0..1]).unwrap().p, 1);
     let mut wrong = env.anchors[0].clone();
     wrong.shard = vec![0x80];
-    assert_eq!(measure(&[wrong], 0).unwrap_err(), E::ShardMismatch);
-    assert!(gate.total <= TX_GAS_BUDGET);
+    assert_eq!(measure(&[wrong]).unwrap_err(), E::ShardMismatch);
+    assert!(gate.total > 0);
     assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
     // routing: the state ID of every leaf is what the host asks its aggregator for; the anchors carry the shards the certificates name
     assert_eq!(leaf_state_ids(&out.token), sids);
@@ -186,7 +195,7 @@ fn burn_time_preflight_admits_a_redeemable_history_and_refuses_one_leaf_more_tha
     };
     let fits = build_token(&w, &spec(1), &steps(MAX_LEAVES - 2), T0, UC_TS);
     let gate = preflight_burn(&w.bridge, &fits.token).unwrap();
-    assert!(gate.total <= TX_GAS_BUDGET, "{}", gate.total);
+    assert!(gate.total > 0, "{}", gate.total);
     let too_long = build_token(&w, &spec(1), &steps(MAX_LEAVES - 1), T0, UC_TS);
     assert_eq!(
         preflight_burn(&w.bridge, &too_long.token).unwrap_err(),
@@ -220,15 +229,18 @@ fn a_real_burn_leaf_adds_no_more_history_than_the_bound_and_the_best_case_is_a_l
 }
 
 #[test]
-fn the_burn_preflight_refuses_a_history_near_the_bound_and_a_best_case_the_gate_cannot_pass() {
+fn the_burn_preflight_refuses_only_a_history_near_the_bound_never_for_gas() {
     let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
     let ok = check_burn_projection(200, 300, MAX_LEAVES as u64, edge).unwrap();
-    assert!(ok.total <= TX_GAS_BUDGET, "exactly at the margin passes");
+    assert!(
+        ok.total > 7_000_000,
+        "exactly at the margin passes, priced above the former 7M"
+    );
     assert_eq!(
         check_burn_projection(200, 300, MAX_LEAVES as u64, edge + 1).unwrap_err(),
         E::InputTooLarge
     );
-    assert!(check_burn_projection(200, 300, 8, 500).unwrap().total <= TX_GAS_BUDGET);
+    assert!(check_burn_projection(200, 300, 8, 500).unwrap().total > 0);
 }
 
 #[test]
@@ -252,13 +264,13 @@ fn preflight_burn_on_a_held_token_refuses_a_history_within_the_burn_margin_of_th
         )
     };
     let edge = MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
-    // the projection grows one byte per data byte once the byte-string header width is fixed
-    let probe = 4096usize;
+    // the projection grows one byte per data byte once the byte-string header width is fixed (above 65,535 bytes: a 4-byte length)
+    let probe = 70_000usize;
     let base = project(&held(probe).token).len();
     let n = probe + (edge - base);
     let fits = held(n);
     assert_eq!(project(&fits.token).len(), edge, "exactly at the margin");
-    assert!(preflight_burn(&w.bridge, &fits.token).unwrap().total <= TX_GAS_BUDGET);
+    assert!(preflight_burn(&w.bridge, &fits.token).unwrap().total > 0);
     assert_eq!(
         preflight_burn(&w.bridge, &held(n + 1).token).unwrap_err(),
         E::InputTooLarge

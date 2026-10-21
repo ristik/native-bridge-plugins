@@ -247,6 +247,10 @@ fn bound_counts(b: &[u8]) -> Result<()> {
     if nl > MAX_LEAVES as u64 {
         return Err(E::TooManyPaths);
     }
+    // Every sibling is a 32-byte word of the envelope, so the declared siblings never exceed n/32 in sum: a count the bytes cannot
+    // hold is refused before any allocation. This is the envelope's own bound, not a path budget (owner section 36); the per-leaf
+    // MAX_RSMT_SIBLINGS is the estimate's (`leaf_path_gas`).
+    let room = n / 32;
     let mut steps = 0u64;
     for i in 0..nl {
         let rel = word(off_leaves + 32 + 32 * i).ok_or(E::ABIFraming)?;
@@ -254,7 +258,7 @@ fn bound_counts(b: &[u8]) -> Result<()> {
         let s_rel = t.checked_add(64).and_then(word).ok_or(E::ABIFraming)?;
         let s_off = t.checked_add(s_rel).ok_or(E::ABIFraming)?;
         let ns = word(s_off).ok_or(E::ABIFraming)?;
-        if ns > MAX_RSMT_SIBLINGS as u64 || ns > MAX_PATH_STEPS as u64 - steps {
+        if ns > room - steps {
             return Err(E::TooManyPaths);
         }
         steps += ns;

@@ -1,23 +1,26 @@
 /**
- * Named profile-v5 bounds and fixed protocol constants. The numbers of the first block are the
- * `limits` of `protocol/profile-v5.json` (the single source shared with the oracle and the contract;
- * `test/limits.test.ts` pins them): a later profile version raises them together with the gas budget.
- * Limits are intersected, never additive entitlements, and every cumulative bound is checked before
- * allocation or cryptography.
+ * The resource policy of the direct path (owner section 36, bft-core briefs/b7-direct-uncapped-design.md section 1) and fixed
+ * protocol constants. The numbers of the first block are the `limits` of `protocol/profile-v5.json` (the single source shared with
+ * the oracle and the contract; `test/limits.test.ts` pins them). There is no gas ceiling and no bridge-specific history cap: the
+ * aggregate bounds are the native kernels' own (B2 transfers and history, B1 claims) until the native composition streams them;
+ * the envelope bound is the ingress bound the pool and RPC carry; the rest are per-object shape bounds. Every count is checked
+ * before allocation or cryptography.
  */
 export const NATIVE_BRIDGE_PROTO_VERSION = 5 as const;
 
 // ---- profile parameters (profile-v5.json `limits`) -------------------------------------------------
-/** Distinct UC anchors of one redemption (one per distinct complete UC): a parser ceiling, the gas gate decides each bundle. */
+/** Distinct UC anchors of one redemption (one per distinct complete UC): B1's claim bound. */
 export const MAX_ANCHORS = 16;
-/** B2 leaves of one redemption: the mint, every transfer and the final burn. */
-export const MAX_LEAVES = 24;
-export const MAX_TRANSFERS = MAX_LEAVES - 1;
-export const MAX_SEMANTIC_BYTES = 16 << 10;
-export const MAX_ENVELOPE_BYTES = 64 << 10;
+/** B2 transfers including the final burn (ureth b2 `MAX_TRANSFERS`). */
+export const MAX_TRANSFERS = 64;
+/** B2 leaves of one redemption: the mint and every transfer (the kernel's result bound). */
+export const MAX_LEAVES = MAX_TRANSFERS + 1;
+/** B2 history (ureth b2 `MAX_HISTORY`). */
+export const MAX_SEMANTIC_BYTES = 128 << 10;
+/** Ingress: above every envelope the native bounds admit. */
+export const MAX_ENVELOPE_BYTES = 512 << 10;
 export const MAX_ANCHOR_UC_BYTES = 8 << 10;
 export const MAX_RSMT_SIBLINGS = 32;
-export const MAX_PATH_STEPS = 2048;
 export const MAX_POLICY_BYTES = 512;
 /** B1's own sublimits, which the gate prices. */
 export const MAX_UNICITY_STEPS = 32;
@@ -32,12 +35,9 @@ export const MAX_BATCH_BYTES = 262_144;
 export const MAX_RAW_STEPS = 4_608;
 export const MAX_BATCH_UC_BYTES = 24_576;
 
-// ---- the shared gas gate (interop.md "Direct-call gas gate") ----------------------------------------
-/** DN-B ordinary transaction capacity. */
-export const TX_GAS_BUDGET = 7_000_000;
+// ---- the gas estimate (interop.md "Direct-call gas estimate") ----------------------------------------
 export const GAS_RESERVE = 1_000_000;
-/** The bridge's cumulative CBOR item budget (Cfg, policy, every UC and every IR opening) and its price per item. */
-export const BRIDGE_CBOR_ITEMS = 4096;
+/** The price of one bridge CBOR item occurrence (Cfg, policy, every UC and every IR opening). */
 export const BRIDGE_ITEM_GAS = 1000;
 
 export const MAX_CBOR_DEPTH = 16;
