@@ -2,36 +2,33 @@
 //! protocol bytes of the native profile (protocol version 4).
 //!
 //! The numbers of the first block are the `limits` of `protocol/profile-v5.json`, the single source shared with the oracle, the
-//! contract and the TypeScript plug-in (`tests/limits_and_shards.rs` pins them). There is no gas ceiling and no bridge-specific
-//! history cap: the aggregate bounds are the native kernels' own (B2 transfers and history, B1 claims) until the native composition
-//! streams them; the envelope bound is the ingress bound the pool and RPC carry; the rest are per-object shape bounds. Every count is
-//! checked before allocation or cryptography.
+//! contract and the TypeScript plug-in (`tests/limits_and_shards.rs` pins them). There is no gas ceiling and no history cap: the
+//! composition (BRIDGE_COMPOSE_V1) streams the history and the anchor table, bounded by the envelope (the ingress bound the pool and
+//! RPC carry), the u16 anchor wire width and its gas (bft-core briefs/dev4-b7-native-compose-spec.md section 7). The transfer, leaf
+//! and semantic-byte bounds are the standalone B2 kernel's own (0x0104, which prepareLock calls); the rest are per-object shape
+//! bounds. Every count is checked before allocation or cryptography.
 
 // ---- profile parameters (profile-v5.json `limits`) ----------------------------------------------
-/// Distinct UC anchors of one redemption (one per distinct complete UC): B1's claim bound.
-pub const MAX_ANCHORS: usize = 16;
-/// B2 transfers including the final burn (ureth b2 `MAX_TRANSFERS`).
+/// Distinct UC anchors of one redemption: the wire width (the CERT_BATCH_V2 claim count and every anchorIndex are u16).
+pub const MAX_ANCHORS: usize = 65535;
+/// Standalone B2 transfers including the final burn (ureth b2 `MAX_TRANSFERS`).
 pub const MAX_TRANSFERS: usize = 64;
-/// B2 leaves of one redemption: the mint and every transfer (the kernel's result bound).
+/// Standalone B2 leaves: the mint and every transfer (the kernel's result bound).
 pub const MAX_LEAVES: usize = MAX_TRANSFERS + 1;
-/// B2 history (ureth b2 `MAX_HISTORY`).
+/// Standalone B2 history and Cfg input (ureth b2 `MAX_HISTORY`).
 pub const MAX_SEMANTIC_BYTES: usize = 128 << 10;
-/// Ingress: above every envelope the native bounds admit.
+/// Ingress: the composition's only aggregate byte bound.
 pub const MAX_ENVELOPE_BYTES: usize = 512 << 10;
 pub const MAX_ANCHOR_UC_BYTES: usize = 8 << 10;
 pub const MAX_RSMT_SIBLINGS: usize = 32;
 pub const MAX_POLICY_BYTES: usize = 512;
 /// B1's own sublimits, which the gate prices.
 pub const MAX_UNICITY_STEPS: usize = 32;
-/// Signatures of one seal and over one batch (`CERT_BATCH_V2`), contract section 4.
+/// Signatures of one seal (`CERT_BATCH_V2`, contract section 4).
 pub const MAX_SIGS_PER_SEAL: usize = 16;
-pub const MAX_TOTAL_SIGS: usize = 256;
 /// A native shard ID is 1..33 bytes (depth 0..256).
 pub const MAX_SHARD_BYTES: usize = 33;
 pub const MAX_SHARD_DEPTH: usize = 256;
-/// The batch request: bytes and the raw (pre-deduplication) path steps of all occurrences.
-pub const MAX_BATCH_BYTES: usize = 262_144;
-pub const MAX_RAW_STEPS: usize = 4_608;
 
 // ---- the gas estimate (interop.md "Direct-call gas estimate") ------------------------------------
 pub const GAS_RESERVE: u64 = 1_000_000;
@@ -42,6 +39,26 @@ pub const MAX_CBOR_DEPTH: usize = 16;
 pub const MAX_CBOR_ITEMS: usize = 32768;
 pub const MAX_RLP_DEPTH: usize = 16;
 pub const MAX_AMOUNT_BYTES: usize = 32;
+
+/// The aggregate bounds of one history decode: bytes, transfers (the final burn included) and the CBOR items of the whole history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryBounds {
+    pub bytes: usize,
+    pub transfers: usize,
+    pub items: usize,
+}
+/// The standalone kernel's (0x0104).
+pub const KERNEL_HISTORY: HistoryBounds = HistoryBounds {
+    bytes: MAX_SEMANTIC_BYTES,
+    transfers: MAX_TRANSFERS,
+    items: MAX_CBOR_ITEMS,
+};
+/// The composition's: the history is bounded by the envelope that carries it; every item and leaf is paid.
+pub const COMPOSED_HISTORY: HistoryBounds = HistoryBounds {
+    bytes: MAX_ENVELOPE_BYTES,
+    transfers: usize::MAX,
+    items: usize::MAX,
+};
 
 /// The mint justification J as carried in the SDK mint.
 pub const MAX_JUSTIFICATION_BYTES: usize = 64 << 10;

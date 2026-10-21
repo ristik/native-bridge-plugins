@@ -138,9 +138,10 @@ pub const fn calldata_gas(cfg_bytes: u64, envelope_bytes: u64) -> u64 {
     INTRINSIC_BASE + PER_BYTE * max_calldata(cfg_bytes, envelope_bytes)
 }
 
-/// The CBOR item heads of one object, 0 when it does not scan (bft-core charges an object's J only once it scans).
-fn items_or_zero(b: &[u8]) -> u64 {
-    count_items(b, MAX_CBOR_ITEMS).map_or(0, |n| n as u64)
+/// The history's J: its CBOR item heads with no item aggregate (the composition's history is bounded by its bytes), 0 when it does
+/// not scan (bft-core `historyItems` charges it only once it scans).
+fn history_items_or_zero(b: &[u8]) -> u64 {
+    count_items(b, COMPOSED_HISTORY.items).map_or(0, |n| n as u64)
 }
 
 /// The estimate of a redemption: the BRIDGE_COMPOSE_V1 dimensions and charge, the transaction estimate, and the protocol-5
@@ -220,7 +221,7 @@ pub fn compute_gate(
     let (cfg_bytes, env_bytes) = (cfg.len() as u64, envelope_bytes as u64);
     let compose = ComposeDims {
         b: kernel_request_bytes(cfg_bytes, env_bytes),
-        j: j + items_or_zero(&env.history),
+        j: j + history_items_or_zero(&env.history),
         l: env.leaf_proofs.len() as u64,
         q: grouping.q,
         e: grouping.e,

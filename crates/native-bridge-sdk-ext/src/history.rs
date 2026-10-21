@@ -22,7 +22,7 @@ use crate::error::{NativeError as E, Result};
 use crate::limits::*;
 use crate::lockproof::{encode_justification, parse_justification};
 use crate::profile::*;
-use crate::scan::{fixed, scan_one, Item, Kind};
+use crate::scan::{fixed, scan_one, scan_one_within, Item, Kind};
 use crate::unlock::{parse_key, verify_unlock};
 
 /// An admitted predicate.
@@ -177,16 +177,26 @@ pub struct History {
 }
 
 impl History {
-    /// Strictly decode a history; the transfer count is bounded before any transfer is decoded.
+    /// Strictly decode a history under the standalone kernel's bounds; the transfer count is bounded before any transfer is decoded.
     pub fn decode(b: &[u8]) -> Result<History> {
-        if b.len() > MAX_SEMANTIC_BYTES {
+        Self::decode_within(b, KERNEL_HISTORY)
+    }
+
+    /// Strictly decode a history as the composition does (`COMPOSED_HISTORY`: bounded by the envelope that carries it).
+    pub fn decode_composed(b: &[u8]) -> Result<History> {
+        Self::decode_within(b, COMPOSED_HISTORY)
+    }
+
+    /// [`History::decode`] under explicit aggregate bounds.
+    pub fn decode_within(b: &[u8], lim: HistoryBounds) -> Result<History> {
+        if b.len() > lim.bytes {
             return Err(E::InputTooLarge);
         }
-        let root = scan_one(b)?;
+        let root = scan_one_within(b, lim.items)?;
         let k = root.array(2).ok_or(E::Shape)?;
         let head = k[0].array(3).ok_or(E::Shape)?;
         let list = k[1].any_array().ok_or(E::Shape)?;
-        if list.len() > MAX_TRANSFERS {
+        if list.len() > lim.transfers {
             return Err(E::TooManyTx);
         }
         let mint = decode_mint(&head[0])?;
@@ -341,9 +351,10 @@ pub fn verify_return(dep: &Deployment, history: &[u8]) -> Result<Outcome> {
     verify_history(dep, &h)
 }
 
-/// The receipt relation: genesis plus zero or more signature transfers, no burn.
+/// The receipt relation: genesis plus zero or more signature transfers, no burn. A held receipt is bounded as the composition that
+/// will redeem it, not by the standalone kernel.
 pub fn verify_receipt(dep: &Deployment, history: &[u8]) -> Result<Outcome> {
-    verify_history_mode(dep, &History::decode(history)?, Mode::Receipt)
+    verify_history_mode(dep, &History::decode_composed(history)?, Mode::Receipt)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

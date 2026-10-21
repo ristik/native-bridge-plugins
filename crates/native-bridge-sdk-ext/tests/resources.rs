@@ -7,7 +7,7 @@
 )]
 mod common;
 use common::*;
-use native_bridge_sdk_ext::limits::MAX_TRANSFERS;
+use native_bridge_sdk_ext::limits::{MAX_CBOR_ITEMS, MAX_TRANSFERS};
 use native_bridge_sdk_ext::resources::{preflight_token, preflight_uc};
 use native_bridge_sdk_ext::token::Expect;
 use native_bridge_sdk_ext::NativeError as E;
@@ -198,12 +198,18 @@ fn nested_payloads(token: &Token, justification: &[u8], data: &[u8]) -> Vec<u8> 
     )
 }
 #[test]
-fn nested_payloads_share_depth_and_item_budgets_with_the_outer_token() {
+fn nested_payloads_share_depth_with_the_outer_token_and_each_has_its_own_item_budget() {
     let w = make_world(20);
     let out = build_token(&w, &spec(1), &[], 1, 2);
+    // two payloads of 16,401 items each: over MAX_CBOR_ITEMS together, within it each (no token-wide item aggregate)
     let zeros = vec![&[0u8][..]; 16400];
     let payload = encode_array(&zeros);
-    let bytes = nested_payloads(&out.token, &payload, &payload);
+    preflight_token(&nested_payloads(&out.token, &payload, &payload)).unwrap();
+    // one payload of MAX_CBOR_ITEMS + 1 items is over its own budget
+    let zeros = vec![&[0u8][..]; MAX_CBOR_ITEMS];
+    let payload = encode_array(&zeros);
+    let bytes = nested_payloads(&out.token, &payload, &[0xf6]);
+    assert_eq!(preflight_token(&bytes).unwrap_err(), E::TooManyItems);
     assert_eq!(
         w.bridge
             .verify_native_token_bytes(&bytes, Expect::Receipt)

@@ -71,7 +71,7 @@ pub fn build_return_proof(
     let dep: &Deployment = &bridge.registry.deployments()[verified.deployment];
     let history_bytes = history::project(token);
     // Decoding again keeps the exported bytes the single source of truth.
-    History::decode(&history_bytes)?;
+    History::decode_composed(&history_bytes)?;
 
     let g = token.genesis();
     let mut proofs: Vec<&InclusionProof> = alloc::vec![g.inclusion_proof()];
@@ -181,9 +181,6 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
 pub fn preflight_burn_shards(bridge: &NativeBridge, token: &Token, shards: usize) -> Result<Gate> {
     let dep = deployment_of(bridge, token)?;
     let leaves = token.transactions().len() + 2; // the mint, every transfer and the burn
-    if leaves > MAX_LEAVES {
-        return Err(E::TooManyTx);
-    }
     check_burn_projection_anchors(
         dep.cfg.to_bytes().len() as u64,
         dep.policy.to_bytes().len() as u64,
@@ -193,10 +190,10 @@ pub fn preflight_burn_shards(bridge: &NativeBridge, token: &Token, shards: usize
     )
 }
 
-/// The size refusals of the preflight and its best-case estimate, on the projection's inputs. The history
-/// bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to
-/// `BURN_HISTORY_BYTES`. The estimate uses the known history only, a lower bound. The envelope bound cannot
-/// fire at the best-case sizes, so it is kept as a guard only.
+/// The size refusal of the preflight and its best-case estimate, on the projection's inputs. The composition
+/// has no history bound of its own: the only refusal is the envelope (the ingress bound), which no refresh can
+/// fix, so it errs safe: the burn leaf is assumed to add up to `BURN_HISTORY_BYTES` to the best-case envelope.
+/// The estimate uses the known history only, a lower bound.
 pub fn check_burn_projection(
     cfg_len: u64,
     policy_len: u64,
@@ -214,12 +211,9 @@ pub fn check_burn_projection_anchors(
     history: usize,
     anchors: u64,
 ) -> Result<Gate> {
-    if history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES {
-        return Err(E::InputTooLarge);
-    }
     let (gate, envelope) =
         projected_gate_anchors(cfg_len, policy_len, leaves, history as u64, anchors);
-    if envelope > MAX_ENVELOPE_BYTES as u64 {
+    if envelope + BURN_HISTORY_BYTES as u64 > MAX_ENVELOPE_BYTES as u64 {
         return Err(E::InputTooLarge);
     }
     Ok(gate)

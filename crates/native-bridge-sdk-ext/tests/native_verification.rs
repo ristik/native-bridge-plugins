@@ -790,13 +790,21 @@ fn nullifier_excludes_time_paths_and_unlock_representation() {
 }
 
 #[test]
-fn too_many_transfers_is_a_budget_failure() {
+fn transfers_above_the_standalone_kernel_bound_verify() {
+    // MAX_TRANSFERS is the standalone 0x0104 kernel's; a held token is bounded as the composition that redeems it
     let w = make_world(20);
     let steps: Vec<Step> = (0..=MAX_TRANSFERS)
         .map(|i| tx_step(2 + (i % 2) as u8, i as u8, T0 + 1))
         .collect();
     let out = build_token(&w, &spec(1), &steps, T0, UC_TS);
-    assert_eq!(err(&w, &out, Expect::Receipt), E::TooManyTx);
+    verify(&w, &out, Expect::Receipt).unwrap_or_else(|e| panic!("{e}"));
+    // the standalone kernel's decode keeps its bound; the composition's does not
+    let bytes = history::project(&out.token);
+    assert_eq!(History::decode(&bytes).unwrap_err(), E::TooManyTx);
+    assert_eq!(
+        History::decode_composed(&bytes).unwrap().transfers.len(),
+        MAX_TRANSFERS + 1
+    );
 }
 
 #[test]

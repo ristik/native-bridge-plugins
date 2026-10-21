@@ -333,14 +333,22 @@ timestamps or unauthenticated IR hashes cannot authorize time checks.
 ## Resource and custody profile
 
 One resource policy (owner section 36; unsupported/budget-exceeded rejects
-offline, never fetches). There is no gas ceiling and no bridge-specific history
-cap. The aggregate bounds are the native kernels' own until the native
-composition streams them: <=64 transfers including burn and <=65 leaves (B2),
-semantic history<=131072 (B2), A<=A_max=16 distinct UC anchors (B1 claims);
-A<=L. Direct envelope<=524288 is the ingress bound the pool and RPC carry. The
-rest are per-object shape bounds: J<=65536; UC<=16384 plus B1's tighter
+offline, never fetches). There is no gas ceiling and no history cap. The
+composition (BRIDGE_COMPOSE_V1) streams the history and the anchor table: it is
+bounded by the direct envelope<=524288 (the ingress bound the pool and RPC
+carry), the u16 anchor wire width A<=65535 (the CERT_BATCH_V2 claim count and
+every anchorIndex; A<=L) and its gas. A redemption has no transfer, leaf,
+history-byte or anchor-count aggregate of its own, the anchor table's
+CERT_BATCH_V2 evaluation no request-byte, signature or raw-step aggregate, a
+held token none beyond its bytes (MAX_TOKEN_BYTES), and the history and the
+token no CBOR item aggregate; every item and leaf is paid. The standalone B2
+kernel (0x0104, which `prepareLock` calls) keeps its own bounds: <=64
+transfers including burn, <=65 leaves, semantic history<=131072; a standalone
+CERT_BATCH_V2 call keeps B1's (16 claims, 256 signatures). The rest are
+per-object shape bounds: J<=65536; UC<=16384 plus B1's tighter
 sublimits; PDR<=16384; header<=2048; each MPT<=65 nodes; node<=1024; combined
-MPT bytes<=24576; CBOR/RLP depth<=16, CBOR items<=32768 per object; anchor
+MPT bytes<=24576; CBOR/RLP depth<=16, CBOR items<=32768 per object (each UC,
+IR opening, Cfg, policy body and nested payload); anchor
 UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity steps and
 exactly d shard-tree siblings per UC (d its own shard's depth, the anchor's
 shard equal to the UC's); Cfg<=1024. These are the named parameters of
@@ -394,7 +402,7 @@ IR inside its UC are two occurrences); L the leaves; Q the signatures over the
 distinct seals, E the distinct declared epochs, A the distinct claims and K the
 claim occurrences of the anchor table's canonical first-use grouping (bft-core
 `b1ref.Group`); P the shard-tree plus unicity steps of the distinct claims plus
-every leaf's RSMT siblings. The grouping is sort-based, never pairwise. Each
+every leaf's RSMT siblings. The grouping is set/sort-based, never pairwise. Each
 charge is taken before the work it pays for (`100000 + 2*B` before decoding,
 an object's J once it scans, `16000*L` once the kernel has counted the leaves,
 the batch terms once the batch is scanned and grouped, `250*s_i` before each

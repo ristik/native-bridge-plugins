@@ -9,12 +9,14 @@
  *
  * Identity is exact bytes. A claim's shard-tree depth comes from its own native shard ID, never from a policy. `items` counts the
  * CBOR items of every UC occurrence before deduplication; there is no shared item budget (owner section 36): each UC is bounded by
- * its own native scan (`MAX_CBOR_ITEMS`) and every item is charged.
+ * its own native scan (`MAX_CBOR_ITEMS`) and every item is charged. The anchor table is grouped under the composition's limits
+ * (`b1ref.Composed`): up to the u16 wire count of claims, with no request-byte, raw-step or signature aggregate (bft-core
+ * briefs/dev4-b7-native-compose-spec.md section 7); each UC keeps its own bounds.
  */
 import { concat, eq, toHex } from './bytes.js';
 import { fail } from './errors.js';
 import {
-  MAX_BATCH_BYTES, MAX_CBOR_ITEMS, MAX_CBOR_DEPTH, MAX_RAW_STEPS, MAX_SIGS_PER_SEAL, MAX_TOTAL_SIGS, MAX_UNICITY_STEPS,
+  MAX_ANCHORS, MAX_CBOR_ITEMS, MAX_CBOR_DEPTH, MAX_SIGS_PER_SEAL, MAX_UNICITY_STEPS,
 } from './limits.js';
 import { shardDepth } from './profile.js';
 
@@ -28,7 +30,8 @@ export interface Claim {
   uc: Uint8Array;
 }
 
-export const MAX_CLAIMS = 16;
+/** The most claims one composed batch carries (`K`): the u16 wire count. */
+export const MAX_CLAIMS = MAX_ANCHORS;
 const CLAIM_FIXED = 106; // partition 4 + shardLen 2 + three hashes 96 + ucLen 4
 // ---- the frozen price schedule ----
 const SCAN_BASE = 60_000;
@@ -187,7 +190,6 @@ function scan(a: Claim, bud: Budget): Occurrence {
   pos = skipN(uc, steps.next, steps.n, bud, 5);
   const o: Occurrence = { epoch: 0n, sealStart: pos, sealLen: 0, sigs: 0, steps: sib.n + steps.n };
   bud.steps += o.steps;
-  if (bud.steps > MAX_RAW_STEPS) fail('ErrTooManyPaths');
   pos = tagged(uc, pos, TAG_SEAL, 8n, bud);
   pos = skip(uc, pos, bud, 4); // version
   pos = skip(uc, pos, bud, 4); // network
@@ -231,7 +233,6 @@ export function measure(claims: readonly Claim[]): Counts {
   const seen = new Set<string>();
   for (const a of claims) {
     n.c += CLAIM_FIXED + a.shard.length + a.uc.length;
-    if (n.c > MAX_BATCH_BYTES) fail('ErrTooManyPaths');
     bud.limit = bud.items + MAX_CBOR_ITEMS;
     const o = scan(a, bud);
     if (!epochs.has(o.epoch.toString())) { epochs.add(o.epoch.toString()); n.e++; }
@@ -240,7 +241,6 @@ export function measure(claims: readonly Claim[]): Counts {
     const key = claimKey(a);
     if (!seen.has(key)) { seen.add(key); n.a++; n.p += o.steps; }
   }
-  if (n.q > MAX_TOTAL_SIGS) fail('ErrTooManyItems');
   n.items = bud.items;
   return n;
 }

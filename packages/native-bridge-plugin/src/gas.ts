@@ -15,7 +15,7 @@ import { fail } from './errors.js';
 import type { Envelope, LeafProof } from './envelope.js';
 import { batchGas, countItems, measure, type Counts } from './certgroups.js';
 import { NativeError } from './errors.js';
-import { BRIDGE_ITEM_GAS, GAS_RESERVE, MAX_CBOR_ITEMS, MAX_RSMT_SIBLINGS } from './limits.js';
+import { BRIDGE_ITEM_GAS, COMPOSED_HISTORY, GAS_RESERVE, MAX_CBOR_ITEMS, MAX_RSMT_SIBLINGS } from './limits.js';
 
 const INTRINSIC_BASE = 21_000;
 const PER_BYTE = 16;
@@ -98,10 +98,13 @@ export const composeGas = (d: ComposeDims): number =>
   COMPOSE_BASE + COMPOSE_PER_BYTE * d.b + COMPOSE_PER_ITEM * d.j + COMPOSE_PER_LEAF * d.l + COMPOSE_PER_SIGNATURE * d.q +
   COMPOSE_PER_EPOCH * d.e + COMPOSE_PER_CLAIM * d.a + COMPOSE_PER_STEP * d.p + composeGroupGas(d.k);
 
-/** The CBOR item heads of one object, 0 when it does not scan (bft-core charges an object's J only once it scans). */
-const itemsOrZero = (b: Uint8Array): number => {
+/**
+ * The history's J: its CBOR item heads with no item aggregate (the composition's history is bounded by its bytes), 0 when it does
+ * not scan (bft-core `historyItems` charges it only once it scans).
+ */
+const historyItemsOrZero = (b: Uint8Array): number => {
   try {
-    return countItems(b, MAX_CBOR_ITEMS);
+    return countItems(b, COMPOSED_HISTORY.items);
   } catch {
     return 0;
   }
@@ -167,7 +170,7 @@ export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelReques
     steps += l.steps;
   }
   const compose: ComposeDims = {
-    b: kernelRequestBytes(cfgBytes, envelopeBytes), j: j + itemsOrZero(e.history), l: e.leafProofs.length,
+    b: kernelRequestBytes(cfgBytes, envelopeBytes), j: j + historyItemsOrZero(e.history), l: e.leafProofs.length,
     q: grouping.q, e: grouping.e, a: grouping.a, k: grouping.k, p: steps,
   };
   const g: Gate = {

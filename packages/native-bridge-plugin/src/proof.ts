@@ -16,7 +16,7 @@ import { checkAnchors, checkPolicyBody, encodeEnvelope, planAnchors, type Anchor
 import { computeGate, kernelRequestBytes, projectedGate, type Gate } from './gas.js';
 import { fail } from './errors.js';
 import { projectToken } from './history.js';
-import { MAX_ENVELOPE_BYTES, MAX_LEAVES, MAX_SEMANTIC_BYTES } from './limits.js';
+import { MAX_ENVELOPE_BYTES } from './limits.js';
 import { parseJustification } from './lockproof.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import type { Deployment } from './deployment.js';
@@ -107,9 +107,8 @@ export const BURN_HISTORY_BYTES = 1024;
 
 /**
  * The burn-time preflight. A burn that could never be redeemed under the resource policy is refused before
- * the wallet burns anything: more leaves than the native kernel admits, or a history or envelope over its
- * bound (`ErrTooManyTx`/`ErrInputTooLarge`, BudgetExceeded), never a truncated history or a partial
- * redemption. There is no gas ceiling (owner section 36): the returned best-case estimate is only that.
+ * the wallet burns anything: an envelope over the ingress bound (`ErrInputTooLarge`, BudgetExceeded), never a
+ * truncated history or a partial redemption. The composition streams the history, so no leaf count is refused. There is no gas ceiling (owner section 36): the returned best-case estimate is only that.
  * `tokenBytes` is the held receipt the burn would spend.
  */
 export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array, shards = 1): Promise<Gate> {
@@ -117,7 +116,6 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   const token = await Token.fromCBOR(tokenBytes);
   const dep = deploymentOf(bridge, token);
   const leaves = token.transactions.length + 2; // the mint, every transfer and the burn
-  if (leaves > MAX_LEAVES) fail('ErrTooManyTx');
   // the best case is the fewest anchors under one seal: one per aggregator shard the leaves touch (`shards`, from the host's routing
   // of `leafStateIds`; 1 when unknown, since a single certificate may serve every leaf). It is a lower bound, not a promise: over 8
   // shards the consolidated bundle is not reachable, yet K = min(m, L) under one seal stays the best case there, since per-SID
@@ -128,15 +126,14 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
 }
 
 /**
- * The size refusals of the preflight and its best-case estimate, on the projection's inputs. The history
- * bound is hard and no refresh can fix it, so it errs safe: the burn leaf is assumed to add up to
- * `BURN_HISTORY_BYTES`. The estimate uses the known history only, a lower bound. The envelope bound cannot
- * fire at the best-case sizes, so it is kept as a guard only.
+ * The size refusal of the preflight and its best-case estimate, on the projection's inputs. The composition
+ * has no history bound of its own: the only refusal is the envelope (the ingress bound), which no refresh can
+ * fix, so it errs safe: the burn leaf is assumed to add up to `BURN_HISTORY_BYTES` to the best-case envelope.
+ * The estimate uses the known history only, a lower bound.
  */
 export function checkBurnProjection(cfgLen: number, policyLen: number, leaves: number, history: number, anchors = 1): Gate {
-  if (history + BURN_HISTORY_BYTES > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
   const { gate, envelopeBytes } = projectedGate(cfgLen, policyLen, leaves, history, anchors);
-  if (envelopeBytes > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
+  if (envelopeBytes + BURN_HISTORY_BYTES > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
   return gate;
 }
 

@@ -14,7 +14,7 @@ use common::*;
 use native_bridge_sdk_ext::certgroups::measure;
 use native_bridge_sdk_ext::envelope::*;
 use native_bridge_sdk_ext::gas::{compute_gate, kernel_request_bytes};
-use native_bridge_sdk_ext::limits::{MAX_ANCHORS, MAX_LEAVES};
+use native_bridge_sdk_ext::limits::MAX_ANCHORS;
 use native_bridge_sdk_ext::proof::{build_return_proof, preflight_burn, refresh_token};
 use native_bridge_sdk_ext::token::Expect;
 use native_bridge_sdk_ext::NativeError as E;
@@ -272,8 +272,8 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
         vec![0, 1, 1]
     );
     assert_ne!(env.anchors[0].uc, env.anchors[1].uc);
-    // one certificate per leaf: up to MAX_ANCHORS distinct UCs are admitted when the gate passes
-    assert_eq!(MAX_ANCHORS, 16);
+    // one certificate per leaf: every distinct UC is an anchor, up to the u16 wire width
+    assert_eq!(MAX_ANCHORS, 65535);
     let per_leaf = |n: usize| {
         let tw = Tweaks {
             uc_round: Some(Box::new(|i| 900 + i as u64)),
@@ -293,19 +293,18 @@ fn distinct_certificates_are_distinct_anchors_up_to_the_profile_bound() {
         assert_eq!(env.anchors.len(), n + 1);
         assert!(gate.total > 0);
     }
-    // every leaf of a MAX_ANCHORS-leaf history under its own certificate is MAX_ANCHORS anchors: admitted and priced, never
-    // truncated (no gas ceiling, owner section 36); one more leaf (MAX_LEAVES > MAX_ANCHORS) needs one anchor too many and is refused
-    const { assert!(MAX_LEAVES > MAX_ANCHORS) };
-    let full = per_leaf(MAX_ANCHORS - 1);
-    assert_eq!(full.ucs.len(), MAX_ANCHORS);
-    let (env, _, _) = build_return_proof(&w.bridge, &full.token).unwrap();
-    assert_eq!(env.anchors.len(), MAX_ANCHORS);
-    let over = per_leaf(MAX_ANCHORS);
-    assert_eq!(over.ucs.len(), MAX_ANCHORS + 1);
-    assert_eq!(
-        build_return_proof(&w.bridge, &over.token).unwrap_err(),
-        E::TooManyPaths
-    );
+    // every leaf of a 16-leaf history under its own certificate is 16 anchors, and one more leaf is 17, above the former B1 claim
+    // bound: both admitted and priced, never truncated (no gas ceiling, owner section 36; the composition streams the anchor table)
+    const FORMER: usize = 16;
+    let full = per_leaf(FORMER - 1);
+    assert_eq!(full.ucs.len(), FORMER);
+    let (env, _, g16) = build_return_proof(&w.bridge, &full.token).unwrap();
+    assert_eq!(env.anchors.len(), FORMER);
+    let over = per_leaf(FORMER);
+    assert_eq!(over.ucs.len(), FORMER + 1);
+    let (env, _, g17) = build_return_proof(&w.bridge, &over.token).unwrap();
+    assert_eq!(env.anchors.len(), FORMER + 1);
+    assert!(g17.native > g16.native);
 }
 
 #[test]

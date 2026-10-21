@@ -8,7 +8,9 @@
 //!
 //! Identity is exact bytes. A claim's shard-tree depth comes from its own native shard ID, never from a policy. `items` counts the
 //! CBOR items of every UC occurrence before deduplication; there is no shared item budget (owner section 36): each UC is bounded
-//! by its own native scan (`MAX_CBOR_ITEMS`) and every item is charged.
+//! by its own native scan (`MAX_CBOR_ITEMS`) and every item is charged. The anchor table is grouped under the composition's limits
+//! (`b1ref.Composed`): up to the u16 wire count of claims, with no request-byte, raw-step or signature aggregate (bft-core
+//! briefs/dev4-b7-native-compose-spec.md section 7); each UC keeps its own bounds.
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
@@ -18,8 +20,8 @@ use crate::error::{NativeError as E, Result};
 use crate::limits::*;
 use crate::profile::shard_depth;
 
-/// The most claims one batch carries (`K`).
-pub const MAX_CLAIMS: usize = 16;
+/// The most claims one composed batch carries (`K`): the u16 wire count.
+pub const MAX_CLAIMS: usize = MAX_ANCHORS;
 const CLAIM_FIXED: usize = 106; // partition 4 + shardLen 2 + three hashes 96 + ucLen 4
 
 // ---- the frozen price schedule ----
@@ -247,9 +249,6 @@ fn scan(a: &Anchor, bud: &mut Budget) -> Result<Occurrence> {
     let seal_start = pos;
     let total = siblings + steps;
     bud.steps += total;
-    if bud.steps > MAX_RAW_STEPS {
-        return Err(E::TooManyPaths);
-    }
     pos = tagged(uc, pos, TAG_SEAL, 8, bud)?;
     pos = skip(uc, pos, bud, 4)?; // version
     pos = skip(uc, pos, bud, 4)?; // network
@@ -327,9 +326,6 @@ pub fn measure(claims: &[Anchor]) -> Result<Counts> {
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     for a in claims {
         n.c += (CLAIM_FIXED + a.shard.len() + a.uc.len()) as u64;
-        if n.c > MAX_BATCH_BYTES as u64 {
-            return Err(E::TooManyPaths);
-        }
         bud.limit = bud.items + MAX_CBOR_ITEMS;
         let o = scan(a, &mut bud)?;
         if epochs.insert(o.epoch) {
@@ -343,9 +339,6 @@ pub fn measure(claims: &[Anchor]) -> Result<Counts> {
             n.a += 1;
             n.p += o.steps as u64;
         }
-    }
-    if n.q > MAX_TOTAL_SIGS as u64 {
-        return Err(E::TooManyItems);
     }
     n.items = bud.items as u64;
     Ok(n)

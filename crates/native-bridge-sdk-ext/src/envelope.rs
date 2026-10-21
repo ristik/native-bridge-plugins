@@ -5,6 +5,7 @@
 //! bytes32 expectedIRHash, bytes uc, bytes inputRecord)`: the exact canonical native InputRecord
 //! opening is appended after `uc`, all earlier fields keep their order.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use crate::error::{NativeError as E, Result};
@@ -244,9 +245,6 @@ fn bound_counts(b: &[u8]) -> Result<()> {
         }
     }
     let nl = word(off_leaves).filter(|&v| v <= n).ok_or(E::ABIFraming)?;
-    if nl > MAX_LEAVES as u64 {
-        return Err(E::TooManyPaths);
-    }
     // Every sibling is a 32-byte word of the envelope, so the declared siblings never exceed n/32 in sum: a count the bytes cannot
     // hold is refused before any allocation. This is the envelope's own bound, not a path budget (owner section 36); the per-leaf
     // MAX_RSMT_SIBLINGS is the estimate's (`leaf_path_gas`).
@@ -316,16 +314,14 @@ pub fn plan_anchors(pol: &Policy, env: &Envelope, sids: &[[u8; 32]]) -> Result<A
     if env.anchors.is_empty() || env.anchors.len() > sids.len() {
         return Err(E::PolicyAnchors);
     }
-    let mut seen: Vec<[u8; 32]> = Vec::new();
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
     for a in &env.anchors {
         if shard_depth(&a.shard).is_err() || a.partition != pol.partition {
             return Err(E::PolicyTuple);
         }
-        let uc = h(&a.uc);
-        if seen.contains(&uc) {
+        if !seen.insert(h(&a.uc)) {
             return Err(E::PolicyAnchors);
         }
-        seen.push(uc);
     }
     let mut leaf_anchor = Vec::new();
     let mut next = 0usize;

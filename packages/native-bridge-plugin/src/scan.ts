@@ -31,12 +31,12 @@ function readHead(b: Uint8Array, p: { pos: number }): { major: number; arg: bigi
  * Strict scanner: shortest-form heads, definite lengths; text strings, maps, floats and every
  * simple value other than null are forbidden.
  */
-export function scanOne(b: Uint8Array): Item {
+export function scanOne(b: Uint8Array, maxItems: number = MAX_CBOR_ITEMS): Item {
   const p = { pos: 0 };
   let tokens = 0;
   const item = (depth: number): Item => {
     const start = p.pos;
-    if (++tokens > MAX_CBOR_ITEMS) fail('ErrTooManyItems');
+    if (++tokens > maxItems) fail('ErrTooManyItems');
     if (p.pos < b.length) {
       const mj = b[p.pos] >> 5;
       if (mj === 3 || mj === 5 || (mj === 7 && b[p.pos] !== 0xf6)) fail('ErrForbiddenCBOR');

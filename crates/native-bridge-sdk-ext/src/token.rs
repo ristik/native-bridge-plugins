@@ -18,7 +18,6 @@ use unicity_token::Token;
 use crate::deployment::{Deployment, DeploymentRegistry};
 use crate::error::{NativeError as E, Result};
 use crate::history::{self, History, Leaf, Outcome};
-use crate::limits::*;
 use crate::lockproof::{self, parse_justification, VerifiedLock};
 use crate::trust::TrustInput;
 use alloc::rc::Rc;
@@ -122,9 +121,6 @@ impl NativeBridge {
 
     /// Verify a decoded token over its whole history.
     pub fn verify_native_token(&self, token: &Token, expect: Expect) -> Result<VerifiedToken> {
-        if token.transactions().len() > MAX_TRANSFERS {
-            return Err(E::TooManyTx);
-        }
         crate::resources::preflight_token(&token.to_cbor())?;
         let mint = token.genesis().transaction();
         // The generic data hook skips null data, so missing genesis data and justification are
@@ -150,7 +146,7 @@ impl NativeBridge {
         let dep = &self.registry.deployments()[index];
 
         let hist_bytes = history::project(token);
-        let hist = History::decode(&hist_bytes)?;
+        let hist = History::decode_composed(&hist_bytes)?;
         let outcome = history::verify_history_as(dep, &hist, expect == Expect::Return)?;
         if expect == Expect::Receipt
             && hist

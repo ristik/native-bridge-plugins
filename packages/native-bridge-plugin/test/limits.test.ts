@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { BURN_HISTORY_BYTES, checkBurnProjection } from '../src/proof.js';
-import { throwsReason } from './util.js';
+import { envelopeEdge, throwsReason } from './util.js';
 import { batchGas } from '../src/certgroups.js';
 import { b2Gas, intrinsicGas, itemGas, kernelRequestBytes, projectedGate, rsmtGas } from '../src/gas.js';
 import * as L from '../src/limits.js';
@@ -56,10 +56,12 @@ test('the best-case projection at the bounds is an estimate with ONE anchor', ()
   assert.equal(fit.gate.grouping.k, 1, 'a single certificate may serve every leaf: the best case is never one anchor per shard');
 });
 
-test('the burn preflight refuses only a history within BURN_HISTORY_BYTES of the bound, never for gas', () => {
-  const edge = L.MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
-  assert.ok(checkBurnProjection(200, 300, L.MAX_LEAVES, edge).legacyTotal > 7_000_000, 'exactly at the margin passes, its protocol-5 composite above the former 7M');
-  throwsReason(() => checkBurnProjection(200, 300, L.MAX_LEAVES, edge + 1), 'ErrInputTooLarge');
+test('the burn preflight refuses only an envelope over the ingress bound, never for gas', async () => {
+  const leaves = 2 * L.MAX_LEAVES;
+  const edge = await envelopeEdge(200, 300, leaves);
+  assert.ok(edge > L.MAX_SEMANTIC_BYTES, `the former history bound is gone: ${edge}`);
+  assert.ok(checkBurnProjection(200, 300, leaves, edge).legacyTotal > 7_000_000, 'exactly at the margin passes, its protocol-5 composite above the former 7M');
+  throwsReason(() => checkBurnProjection(200, 300, leaves, edge + 1), 'ErrInputTooLarge');
   assert.ok(checkBurnProjection(200, 300, 8, 500).total > 0);
 });
 

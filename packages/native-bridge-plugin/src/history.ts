@@ -11,8 +11,8 @@ import { concat, eq, toHex } from './bytes.js';
 import type { Deployment } from './deployment.js';
 import { fail } from './errors.js';
 import {
-  MAX_AMOUNT_BYTES, MAX_SEMANTIC_BYTES, MAX_TRANSFERS, PRED_BURN, PRED_SIGNATURE, TAG_CERTIFICATION, TAG_MINT,
-  TAG_PREDICATE, TAG_RETURN_REASON, TAG_TRANSFER, TAG_WALLET_VALUE,
+  KERNEL_HISTORY, MAX_AMOUNT_BYTES, MAX_SEMANTIC_BYTES, PRED_BURN, PRED_SIGNATURE, TAG_CERTIFICATION, TAG_MINT,
+  TAG_PREDICATE, TAG_RETURN_REASON, TAG_TRANSFER, TAG_WALLET_VALUE, type HistoryBounds,
 } from './limits.js';
 import { encodeJustification, encodeLockProof, parseJustification } from './lockproof.js';
 import {
@@ -111,13 +111,16 @@ export interface History {
   transfersRaw: Uint8Array[];
 }
 
-/** Strictly decode `C([M,CD0,t0],[[T1,CD1,t1],...])`; the transfer count is bounded first. */
-export function decodeHistory(b: Uint8Array): History {
-  if (b.length > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
-  const k = arrayOf(scanOne(b), 2) ?? fail('ErrShape');
+/**
+ * Strictly decode `C([M,CD0,t0],[[T1,CD1,t1],...])`; the transfer count is bounded first. The default bounds are the standalone
+ * kernel's (`KERNEL_HISTORY`); a wallet decodes a held history as the composition does (`COMPOSED_HISTORY`).
+ */
+export function decodeHistory(b: Uint8Array, lim: HistoryBounds = KERNEL_HISTORY): History {
+  if (b.length > lim.bytes) fail('ErrInputTooLarge');
+  const k = arrayOf(scanOne(b, lim.items), 2) ?? fail('ErrShape');
   const head = arrayOf(k[0], 3) ?? fail('ErrShape');
   const list = arrayOf(k[1]) ?? fail('ErrShape');
-  if (list.length > MAX_TRANSFERS) fail('ErrTooManyTx');
+  if (list.length > lim.transfers) fail('ErrTooManyTx');
   const h: History = {
     mint: decodeMint(head[0]), mintRaw: raw(b, head[0]), mintCd: decodeCd(head[1]), mintT: uint(head[2]),
     transfers: [], cds: [], times: [], transfersRaw: [],
