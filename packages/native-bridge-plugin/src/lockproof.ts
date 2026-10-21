@@ -82,7 +82,15 @@ export function encodeJustification(chainId: bigint, vault: Uint8Array, zero: Ui
 
 export function parseJustification(j: Uint8Array): Justification {
   if (j.length > MAX_JUSTIFICATION_BYTES) fail('ErrInputTooLarge');
-  const k = arrayOf(tagContent(scanOne(j), TAG_MINT_LOCK), 6) ?? fail('ErrShape');
+  // The justification's own scan failing (depth and items included) is the justification's error (bft-core ParseJustification);
+  // a decode failure inside its lock proof keeps its own.
+  let root;
+  try {
+    root = scanOne(j);
+  } catch {
+    return fail('ErrMintJustif');
+  }
+  const k = arrayOf(tagContent(root, TAG_MINT_LOCK), 6) ?? fail('ErrShape');
   version(k[0], MINT_LOCK_VERSION);
   return { chainId: uint(k[1]), vault: bytesN(k[2], 20), zero: bytesN(k[3], 20), nonce: uint(k[4]), proof: parseLockProof(k[5]) };
 }

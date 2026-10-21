@@ -10,6 +10,8 @@ import { composeGas, computeGate, kernelRequestBytes, projectedGate } from '../s
 import { COMPOSE_OUTPUT_BYTES, COMPOSE_STATUS, composeInput, composeOutputStatus, composeStatusName } from '../src/compose.js';
 import { NativeError } from '../src/errors.js';
 import { cfgBytes, decodeCfg, decodePolicy } from '../src/profile.js';
+import { makeDeployment } from '../src/deployment.js';
+import { decodeHistory, verifyHistory } from '../src/history.js';
 
 /** The released protocol-4 corpus (`protocol/vectors`), replayed by an implementation independent of the Go oracle that generated it. */
 const VECTORS = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'vectors');
@@ -150,4 +152,23 @@ test('native-compose: every case\'s input, output status and, when it succeeds, 
     priced++;
   }
   assert.ok(priced >= 10, String(priced));
+});
+
+test('history family: a failure inside a nested object is that object\'s error, as the corpus says (bft-core spec section 8)', async () => {
+  const f = load('config/fixtures.json');
+  const dep = makeDeployment(cfgOf('dev'), fromHex(f.pins.dev.vaultCodeHash)!, new Uint8Array(32), { fields: 20 }, decodePolicy(fromHex(f.fixtures.dev.policyBody)!));
+  const cases = (load('history/cases.json').cases as Case[]).filter((c) => (c.op === 'mint' || c.op === 'return') && c.id.startsWith('nested-'));
+  assert.equal(cases.length, 12);
+  for (const c of cases) {
+    let got: { status: 'ok' | 'error'; family?: string; reason?: string } = { status: 'ok' };
+    try {
+      const h = decodeHistory(fromHex(c.input)!);
+      if (c.op === 'mint' && h.transfers.length !== 0) throw new NativeError('ErrHasTransfers');
+      await verifyHistory(dep, h, c.op === 'return');
+    } catch (e) {
+      if (!(e instanceof NativeError)) throw e;
+      got = { status: 'error', family: e.family, reason: e.reason };
+    }
+    assert.deepEqual(got, c.expected.status === 'ok' ? { status: 'ok' } : { status: 'error', family: c.expected.family, reason: c.expected.reason }, c.id);
+  }
 });

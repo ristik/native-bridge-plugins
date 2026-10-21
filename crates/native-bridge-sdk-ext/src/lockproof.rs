@@ -146,7 +146,9 @@ pub fn parse_justification(j: &[u8]) -> Result<Justification<'_>> {
     if j.len() > MAX_JUSTIFICATION_BYTES {
         return Err(E::InputTooLarge);
     }
-    let root = scan_one(j)?;
+    // The justification's own scan failing (depth and items included) is the justification's error (bft-core
+    // ParseJustification); a decode failure inside its lock proof keeps its own.
+    let root = scan_one(j).map_err(|_| E::MintJustif)?;
     let c = root.tag_content(TAG_MINT_LOCK)?;
     let k = c.array(6).ok_or(E::Shape)?;
     k[0].version(MINT_LOCK_VERSION)?;

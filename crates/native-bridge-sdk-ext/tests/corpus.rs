@@ -271,3 +271,41 @@ fn every_native_compose_case_is_the_plug_in_estimate_when_it_succeeds() {
     }
     assert!(priced >= 10, "{priced}");
 }
+
+/// The kernel relation's nested objects (bft-core spec section 8): a failure inside the justification, the mint data or the return
+/// reason is that object's error, depth and items included, and a malformed return amount is ErrReturnAmount before the fee slots.
+#[test]
+fn nested_object_failures_are_the_objects_error_as_the_corpus_says() {
+    use native_bridge_sdk_ext::deployment::Deployment;
+    use native_bridge_sdk_ext::header::HeaderProfile;
+    use native_bridge_sdk_ext::history::{verify_mint, verify_return};
+    let f = load("config/fixtures.json");
+    let d = &f["fixtures"]["dev"];
+    let policy = Policy::from_bytes(&from_hex(d["policyBody"].as_str().unwrap()).unwrap()).unwrap();
+    let code = from_hex(f["pins"]["dev"]["vaultCodeHash"].as_str().unwrap()).unwrap();
+    let dep = Deployment::new(
+        cfg_of("dev"),
+        code.try_into().unwrap(),
+        [0; 32],
+        HeaderProfile { fields: 20 },
+        policy,
+    )
+    .unwrap();
+    let mut n = 0;
+    for op in ["mint", "return"] {
+        for c in cases("history/cases.json", op) {
+            if !c["id"].as_str().unwrap().starts_with("nested-") {
+                continue;
+            }
+            let input = from_hex(c["input"].as_str().unwrap()).unwrap();
+            let got = if op == "mint" {
+                verify_mint(&dep, &input)
+            } else {
+                verify_return(&dep, &input)
+            };
+            check(&c, got.map(|_| ()));
+            n += 1;
+        }
+    }
+    assert_eq!(n, 12);
+}
