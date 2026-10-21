@@ -32,13 +32,13 @@ test('the named bounds are the limits of profile-v5.json, the one source of the 
   assert.equal(L.MAX_CBOR_ITEMS, lim.cborItems);
   // owner section 36: no gas ceiling, no cumulative path budget, no shared item budget
   for (const gone of ['txGasBudget', 'pathSteps', 'bridgeCborItems']) assert.equal(lim[gone], undefined, gone);
-  assert.deepEqual([L.MAX_TRANSFERS, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES, L.MAX_ENVELOPE_BYTES], [64, 65, 131_072, 524_288]);
+  assert.deepEqual([L.MAX_TRANSFERS, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES, L.MAX_ENVELOPE_BYTES], [64, 65, 131_072, 2_097_152]);
 });
 
 test('the gas estimate prices its components exactly as the oracle and the contract do', () => {
   assert.equal(rsmtGas(L.MAX_RSMT_SIBLINGS), 28_810);
   // 21000 + 16*D_max + 80*B_env with D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)
-  assert.equal(intrinsicGas(512, L.MAX_ENVELOPE_BYTES), 21_000 + 16 * (132 + 512 + 524_288) + 80 * 524_288);
+  assert.equal(intrinsicGas(512, L.MAX_ENVELOPE_BYTES), 21_000 + 16 * (132 + 512 + 2_097_152) + 80 * 2_097_152);
   assert.equal(intrinsicGas(513, 100), 21_000 + 16 * (132 + 544 + 128) + 80 * 100, 'both lengths are padded to words');
   // 26000 + 20*(160 + 131072 + 131072) + 14000*65
   assert.equal(b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES), 6_182_080);

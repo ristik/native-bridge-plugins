@@ -335,8 +335,10 @@ timestamps or unauthenticated IR hashes cannot authorize time checks.
 One resource policy (owner section 36; unsupported/budget-exceeded rejects
 offline, never fetches). There is no gas ceiling and no history cap. The
 composition (BRIDGE_COMPOSE_V1) streams the history and the anchor table: it is
-bounded by the direct envelope<=524288 (the ingress bound the pool and RPC
-carry), the u16 anchor wire width A<=65535 (the CERT_BATCH_V2 claim count and
+bounded by the direct envelope<=2097152 (the ingress bound the pool and RPC
+carry; B7 PR 3 measured the largest redemption, 1,000 leaves under original
+seals, at 1.45 MB and 48.0M transaction gas, which the 60M ordinary block
+capacity holds), the u16 anchor wire width A<=65535 (the CERT_BATCH_V2 claim count and
 every anchorIndex; A<=L) and its gas. A redemption has no transfer, leaf,
 history-byte or anchor-count aggregate of its own, the anchor table's
 CERT_BATCH_V2 evaluation no request-byte, signature or raw-step aggregate, a

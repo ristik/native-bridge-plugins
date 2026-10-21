@@ -55,7 +55,7 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
             MAX_SEMANTIC_BYTES,
             MAX_ENVELOPE_BYTES
         ],
-        [64, 65, 131_072, 524_288]
+        [64, 65, 131_072, 2_097_152]
     );
 }
 
@@ -65,7 +65,7 @@ fn the_gas_estimate_prices_its_components_as_the_oracle_and_the_contract_do() {
     // 21000 + 16*D_max + 80*B_env with D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)
     assert_eq!(
         intrinsic_gas(512, MAX_ENVELOPE_BYTES as u64),
-        21_000 + 16 * (132 + 512 + 524_288) + 80 * 524_288
+        21_000 + 16 * (132 + 512 + 2_097_152) + 80 * 2_097_152
     );
     assert_eq!(
         intrinsic_gas(513, 100),

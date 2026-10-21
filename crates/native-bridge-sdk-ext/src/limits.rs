@@ -18,7 +18,7 @@ pub const MAX_LEAVES: usize = MAX_TRANSFERS + 1;
 /// Standalone B2 history and Cfg input (ureth b2 `MAX_HISTORY`).
 pub const MAX_SEMANTIC_BYTES: usize = 128 << 10;
 /// Ingress: the composition's only aggregate byte bound.
-pub const MAX_ENVELOPE_BYTES: usize = 512 << 10;
+pub const MAX_ENVELOPE_BYTES: usize = 2 << 20;
 pub const MAX_ANCHOR_UC_BYTES: usize = 8 << 10;
 pub const MAX_RSMT_SIBLINGS: usize = 32;
 pub const MAX_POLICY_BYTES: usize = 512;
