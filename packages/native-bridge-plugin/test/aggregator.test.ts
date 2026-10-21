@@ -16,10 +16,10 @@ import { measure } from '../src/certgroups.js';
 import { computeGate, kernelRequestBytes } from '../src/gas.js';
 import { MAX_ANCHORS, MAX_ENVELOPE_BYTES, MAX_LEAVES } from '../src/limits.js';
 import { BURN_HISTORY_BYTES, buildReturnProof, leafStateIds, preflightBurn, refreshToken } from '../src/proof.js';
-import { projectToken } from '../src/history.js';
+import { decodeHistory, projectToken } from '../src/history.js';
 import { NativeError, RETRYABLE } from '../src/errors.js';
 import { BEST_UC_BYTES } from '../src/gas.js';
-import { MAX_SEMANTIC_BYTES } from '../src/limits.js';
+import { COMPOSED_HISTORY, MAX_SEMANTIC_BYTES } from '../src/limits.js';
 import { cfgBytes, policyBytes } from '../src/profile.js';
 import { toHex } from '../src/bytes.js';
 import { buildNativeReturnProof, createNativeBridgePlugin, MAX_PROOF_ATTEMPTS, MAX_VIEW_SHARDS, PAIR_RACE } from '../src/wallet.js';
@@ -491,4 +491,14 @@ test('the burn preflight projects one anchor per touched shard under one seal, a
   assert.deepEqual([two.grouping.e, two.grouping.s], [1, 1], 'one seal');
   assert.ok(two.total > one.total);
   assert.equal((await preflightBurn(w.bridge, out.bytes, 99)).grouping.k, out.token.transactions.length + 2, 'K <= L');
+});
+
+test('a composed history above the kernel 128 KiB decodes and is estimated while the kernel decode refuses it', async () => {
+  const w = await makeWorld();
+  const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS, { mintData: new Uint8Array(140_000).fill(7) });
+  const bytes = projectToken(held.token);
+  assert.ok(bytes.length > MAX_SEMANTIC_BYTES, String(bytes.length));
+  throwsReason(() => decodeHistory(bytes), 'ErrInputTooLarge');
+  assert.equal(decodeHistory(bytes, COMPOSED_HISTORY).transfers.length, 1);
+  assert.ok((await preflightBurn(w.bridge, held.bytes)).native > 0);
 });

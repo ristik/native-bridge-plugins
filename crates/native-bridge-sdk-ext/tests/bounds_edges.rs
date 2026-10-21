@@ -8,8 +8,9 @@ use native_bridge_sdk_ext::certgroups::{count_items, measure};
 use native_bridge_sdk_ext::compose::{compose_output_status, COMPOSE_MARKER, COMPOSE_OUTPUT_BYTES};
 use native_bridge_sdk_ext::envelope::*;
 use native_bridge_sdk_ext::gas::*;
+use native_bridge_sdk_ext::history::{project, History};
 use native_bridge_sdk_ext::limits::*;
-use native_bridge_sdk_ext::proof::build_return_proof;
+use native_bridge_sdk_ext::proof::{build_return_proof, preflight_burn};
 use native_bridge_sdk_ext::NativeError as E;
 
 const T0: u64 = 1_700_000_040;
@@ -144,4 +145,29 @@ fn an_output_status_above_64_bits_is_not_an_output() {
         compose_output_status(&out[..COMPOSE_OUTPUT_BYTES - 1]),
         None
     );
+}
+
+#[test]
+fn a_composed_history_above_the_kernels_128_kib_decodes_and_is_estimated_while_the_kernel_refuses_it(
+) {
+    let w = make_world(20);
+    let parts = lock_parts(&w, &spec(1));
+    let tw = Tweaks {
+        mint_data: Some(Some(vec![7u8; 140_000])),
+        ..Tweaks::default()
+    };
+    let held = build_token_with(
+        &w,
+        &spec(1),
+        &parts,
+        &tw,
+        &[tx_step(2, 7, T0 + 10)],
+        T0,
+        UC_TS,
+    );
+    let bytes = project(&held.token);
+    assert!(bytes.len() > MAX_SEMANTIC_BYTES, "{}", bytes.len());
+    assert_eq!(History::decode(&bytes).unwrap_err(), E::InputTooLarge);
+    assert_eq!(History::decode_composed(&bytes).unwrap().transfers.len(), 1);
+    assert!(preflight_burn(&w.bridge, &held.token).unwrap().native > 0);
 }
