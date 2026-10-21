@@ -20,7 +20,7 @@ use unicity_token::cbor::{encode_array, encode_byte_string, encode_tag, encode_u
 use crate::deployment::Deployment;
 use crate::error::{NativeError as E, Result};
 use crate::limits::*;
-use crate::lockproof::{encode_justification, parse_justification};
+use crate::lockproof::parse_justification_for;
 use crate::profile::*;
 use crate::scan::{fixed, scan_one, scan_one_within, Item, Kind};
 use crate::unlock::{parse_key, verify_unlock};
@@ -84,11 +84,14 @@ fn decode_predicate(it: &Item<'_>) -> Result<Pred> {
     })
 }
 
-/// A request deadline: null or an integer in `[1, 2^64-1]`.
+/// A request deadline: null or an integer in `[1, 2^64-1]`; anything else in the slot is ErrDeadline (bft-core `item.deadline`).
 fn deadline(it: &Item<'_>) -> Result<Option<u64>> {
-    match it.nullable_uint()? {
-        Some(0) => Err(E::IntRange),
-        e => Ok(e),
+    if it.is_null() {
+        return Ok(None);
+    }
+    match it.uint() {
+        Ok(e) if e != 0 => Ok(Some(e)),
+        _ => Err(E::Deadline),
     }
 }
 
@@ -365,32 +368,11 @@ enum Mode {
     Return,
 }
 
-/// Parse and cross-check the mint justification, returning the nonce. The lock proof's bytes are
-/// bounded and structurally parsed here; its cryptography needs the trust bundle.
+/// Parse and cross-check the mint justification against the deployment, returning the nonce (bft-core `ParseJustification`,
+/// in its order). The lock proof's bytes are bounded and structurally parsed here; its cryptography needs the trust bundle.
 pub fn check_justification(dep: &Deployment, j: Option<&[u8]>) -> Result<u64> {
     let j = j.ok_or(E::MintJustif)?;
-    let parsed = parse_justification(j).map_err(|e| match e {
-        E::InputTooLarge | E::ProofTooLarge | E::TooDeep | E::TooManyItems => e,
-        _ => E::MintJustif,
-    })?;
-    if parsed.chain_id != dep.cfg.chain_id
-        || parsed.vault != dep.cfg.vault
-        || parsed.zero != dep.cfg.zero_address
-        || parsed.nonce == 0
-    {
-        return Err(E::MintJustif);
-    }
-    if encode_justification(
-        parsed.chain_id,
-        &parsed.vault,
-        &parsed.zero,
-        parsed.nonce,
-        &parsed.proof.to_bytes(),
-    ) != j
-    {
-        return Err(E::MintJustif);
-    }
-    Ok(parsed.nonce)
+    Ok(parse_justification_for(&dep.cfg, &dep.cfg_hash, j)?.nonce)
 }
 
 /// Exactly `tag(39050,[1,[[b(aid),b(amount)]],null])`; one entry, no memo.
@@ -430,16 +412,21 @@ fn check_step(
         return Err(E::CDMismatch);
     }
     let tx_hash = h(tx_raw);
-    if cd.tx_hash != tx_hash || cd.expires_at != tx_deadline {
+    if cd.tx_hash != tx_hash {
         return Err(E::CDMismatch);
     }
+    // The CD deadline equals the transaction deadline exactly, null included (bft-core checkStep's order: the deadline
+    // binding, then the unlock, then expiry).
+    if cd.expires_at != tx_deadline {
+        return Err(E::DeadlineMismatch);
+    }
+    verify_unlock(key, source_hash, &tx_hash, &cd.unlock)?;
     // For an explicit deadline the leaf must have been created strictly before it.
     if let Some(e) = tx_deadline {
         if t >= e {
             return Err(E::DeadlineExpired);
         }
     }
-    verify_unlock(key, source_hash, &tx_hash, &cd.unlock)?;
     let sid = state_id(source, source_hash);
     if !seen.insert(sid) {
         return Err(E::RepeatedSID);

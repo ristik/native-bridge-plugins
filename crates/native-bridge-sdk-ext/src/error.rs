@@ -36,10 +36,10 @@ errors! {
     Truncated => Malformed, Trailing => Malformed, NonCanonical => Malformed,
     ForbiddenCBOR => Malformed, Shape => Malformed, Tag => Malformed, Version => Malformed,
     Length => Malformed, IntRange => Malformed, ABIFraming => Malformed, BadOperation => Malformed,
-    RlpMalformed => Malformed, MptMalformed => Malformed, SdkDecode => Malformed,
+    RlpMalformed => Malformed, MptMalformed => Malformed, SdkDecode => Malformed, Deadline => Malformed,
     // budgets
     InputTooLarge => Budget, TooManyTx => Budget, TooManyItems => Budget, TooDeep => Budget,
-    TooManyPaths => Budget, ProofTooLarge => Budget,
+    TooManyPaths => Budget, ProofTooLarge => Budget, JustificationTooLarge => Budget, LockProofTooLarge => Budget,
     // profile relation
     CfgMismatch => Invalid, PolicyHash => Invalid, PolicyTuple => Invalid, PolicyAnchors => Invalid,
     PolicyLeafIndex => Invalid, PolicyLeafCount => Invalid, PolicyPartition => Invalid,
@@ -50,7 +50,7 @@ errors! {
     UnlockKey => Invalid, MinterKey => Invalid, RepeatedSID => Invalid, NoTransfers => Invalid,
     HasTransfers => Invalid, BurnNotFinal => Invalid, NotBurn => Invalid, BurnReason => Invalid,
     ReturnData => Invalid, ReturnAmount => Invalid, ReturnRecip => Invalid, LockInput => Invalid,
-    ZeroDigest => Invalid, DeadlineExpired => Invalid, ReferenceTimeFuture => Invalid,
+    ZeroDigest => Invalid, DeadlineMismatch => Invalid, DeadlineExpired => Invalid, ReferenceTimeFuture => Invalid,
     InputRecordMismatch => Invalid, UnexpectedBurn => Invalid, RefreshMismatch => Invalid,
     // issuance policy and deployments
     IssuanceReason => Invalid, IssuanceData => Invalid, IssuanceSplit => Invalid,
@@ -62,7 +62,7 @@ errors! {
     SealNetwork => Invalid, SealRoot => Invalid, QuorumNotMet => Invalid, CertStructure => Invalid,
     NotAdmitted => Invalid, ShardMismatch => Invalid, PathInvalid => Invalid,
     // embedded lock proof
-    MissingBacking => Invalid, LockProofCfg => Invalid, LockProofTrust => Invalid,
+    MissingBacking => Invalid, LockProofShape => Invalid, LockProofCfg => Invalid, LockProofTrust => Invalid,
     EvmPartition => Invalid, EvmShard => Invalid, EvmConfigHash => Invalid, EvmConfigPin => Invalid,
     HeaderHash => Invalid, HeaderRoot => Invalid, HeaderProfile => Invalid,
     AccountProof => Invalid, AccountCode => Invalid, StorageProof => Invalid, StorageValue => Invalid,

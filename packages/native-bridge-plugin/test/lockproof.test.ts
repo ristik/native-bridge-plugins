@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
 
+import type { NativeReason } from '../src/errors.js';
 import { encodeJustification, parseJustification } from '../src/lockproof.js';
 import { accountTrieKey, keccak256 } from '../src/profile.js';
 import { decode } from '../src/rlp.js';
@@ -131,7 +132,7 @@ test('account and storage proofs: mutated, extra, missing, empty nodes', async (
   await rejects(mutated((_, p) => void (p.accountNodes[0] = flip(p.accountNodes[0], 10))), 'ErrAccountProof');
   await rejects(mutated((_, p) => void p.accountNodes.push(p.accountNodes[0])), 'ErrAccountProof');
   await rejects(mutated((_, p) => void p.accountNodes.pop()), 'ErrAccountProof');
-  await rejects(mutated((_, p) => void (p.accountNodes = [])), 'ErrAccountProof');
+  await rejects(mutated((_, p) => void (p.accountNodes = [])), 'ErrLockProofShape');
   await rejects(mutated(() => undefined, (s) => void (s.evm.vaultCodeHash = new Uint8Array(32).fill(0x77))), 'ErrAccountCode');
   await rejects(mutated((_, p) => void (p.storageNodes[0] = flip(p.storageNodes[0], 12))), 'ErrStorageProof');
   await rejects(mutated((_, p) => void p.storageNodes.push(p.storageNodes[0])), 'ErrStorageProof');
@@ -169,7 +170,7 @@ async function parse(f: (p: LockParts) => void): Promise<void> {
   parseJustification(encodeJustification(CHAIN_ID, VAULT, ZERO20, 1n, encodeParts(p)));
 }
 
-const parseRejects = (f: (p: LockParts) => void): Promise<void> => rejects(parse(f), 'ErrProofTooLarge');
+const parseRejects = (f: (p: LockParts) => void, reason: NativeReason = 'ErrLockProofTooLarge'): Promise<void> => rejects(parse(f), reason);
 
 test('node count, node size and combined bytes boundaries', async () => {
   const node = (n: number): Uint8Array => new Uint8Array(n).fill(1);
@@ -179,7 +180,7 @@ test('node count, node size and combined bytes boundaries', async () => {
   await parseRejects((p) => void (p.storageNodes = Array(66).fill(Uint8Array.of(0xc0))));
   await parse((p) => void (p.accountNodes = [node(1024)]));
   await parseRejects((p) => void (p.accountNodes = [node(1025)]));
-  await parseRejects((p) => void (p.storageNodes = [new Uint8Array()]));
+  await parseRejects((p) => void (p.storageNodes = [new Uint8Array()]), 'ErrLockProofShape');
   await parse((p) => {
     p.accountNodes = Array(12).fill(node(1024));
     p.storageNodes = Array(12).fill(node(1024));
@@ -197,7 +198,7 @@ test('certificate, header and PDR boundaries', async () => {
   await parseRejects((p) => void (p.header = new Uint8Array(2049).fill(1)));
   await parse((p) => void (p.pdr = new Uint8Array(16384).fill(1)));
   await parseRejects((p) => void (p.pdr = new Uint8Array(16385).fill(1)));
-  await parseRejects((p) => void (p.header = new Uint8Array()));
+  await parseRejects((p) => void (p.header = new Uint8Array()), 'ErrLockProofShape');
 });
 
 test('over-bound evidence never triggers online fallback; justification is bounded first', async () => {
@@ -206,7 +207,7 @@ test('over-bound evidence never triggers online fallback; justification is bound
   const p = await lockParts(w, s);
   p.accountNodes = Array(66).fill(Uint8Array.of(0xc0));
   await rejects(w.bridge.verifyNativeToken((await buildToken(w, s, [], T0, UC_TS, {}, p)).token, 'receipt'), 'ErrProofTooLarge');
-  assert.throws(() => parseJustification(new Uint8Array(64 * 1024 + 1)), /ErrInputTooLarge/);
+  assert.throws(() => parseJustification(new Uint8Array(64 * 1024 + 1)), /ErrJustificationTooLarge/);
 });
 
 test('proof arity and version are exact', async () => {
@@ -214,10 +215,10 @@ test('proof arity and version are exact', async () => {
   const p = await lockParts(w, spec(1));
   const good = encodeParts(p);
   const k = C.encodeArray(...[1, 2, 3, 4, 5, 6, 7].map((n) => C.encodeUnsignedInteger(n)));
-  assert.throws(() => parseJustification(encodeJustification(CHAIN_ID, VAULT, ZERO20, 1n, k)), /ErrShape/);
+  assert.throws(() => parseJustification(encodeJustification(CHAIN_ID, VAULT, ZERO20, 1n, k)), /ErrLockProofShape/);
   const v2 = good.slice();
   v2[1] = 0x02;
-  assert.throws(() => parseJustification(encodeJustification(CHAIN_ID, VAULT, ZERO20, 1n, v2)), /ErrVersion/);
+  assert.throws(() => parseJustification(encodeJustification(CHAIN_ID, VAULT, ZERO20, 1n, v2)), /ErrLockProofShape/);
   void accountTrieKey;
 });
 

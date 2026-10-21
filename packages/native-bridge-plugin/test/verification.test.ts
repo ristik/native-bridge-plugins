@@ -77,11 +77,11 @@ test('an old transaction never expires because the anchor is later', async () =>
 });
 
 test('certification data deadline must equal the transaction deadline, including null', async () => {
-  await rejects(rec(w0, { cdDeadline: [[0, T0 + 5n]] }), 'ErrCDMismatch', 'tx null, cd explicit');
+  await rejects(rec(w0, { cdDeadline: [[0, T0 + 5n]] }), 'ErrDeadlineMismatch', 'tx null, cd explicit');
   const s = spec(1);
   s.mintDeadline = T0 + 5n;
-  await rejects(rec(w0, { cdDeadline: [[0, null]] }, s), 'ErrCDMismatch', 'tx explicit, cd null');
-  await rejects(rec(w0, { cdDeadline: [[1, T0 + 99n]] }, spec(1), [txStep(2, 7, T0 + 10n)]), 'ErrCDMismatch', 'transfer');
+  await rejects(rec(w0, { cdDeadline: [[0, null]] }, s), 'ErrDeadlineMismatch', 'tx explicit, cd null');
+  await rejects(rec(w0, { cdDeadline: [[1, T0 + 99n]] }, spec(1), [txStep(2, 7, T0 + 10n)]), 'ErrDeadlineMismatch', 'transfer');
 });
 
 test('leaf time after the anchor is rejected, equal is accepted', async () => {
@@ -130,7 +130,7 @@ test('old and foreign justifications are rejected', async () => {
   const other = C.encodeTag(1330002, C.encodeArray(C.encodeUnsignedInteger(1)));
   await rejects(rec(w0, { mintJustification: other }), 'ErrMintJustif', 'foreign tag');
   const nullProof = C.encodeTag(39049, C.encodeArray(C.encodeUnsignedInteger(2), C.encodeUnsignedInteger(CHAIN_ID), C.encodeByteString(VAULT), C.encodeByteString(ZERO20), C.encodeUnsignedInteger(1), C.encodeNull()));
-  await rejects(rec(w0, { mintJustification: nullProof }), 'ErrMintJustif', 'no embedded proof');
+  await rejects(rec(w0, { mintJustification: nullProof }), 'ErrLockProofShape', 'no embedded proof');
 });
 
 test('justification fields name the allow-listed deployment', async () => {
@@ -242,10 +242,10 @@ const relation = async (w: World, out: Awaited<ReturnType<typeof buildToken>>) =
 
 test('relation alone enforces certification data deadline equality', async () => {
   const s = spec(1);
-  await rejects(relation(w0, await buildToken(w0, s, [], T0, UC_TS, { cdDeadline: [[0, T0 + 5n]] })), 'ErrCDMismatch');
+  await rejects(relation(w0, await buildToken(w0, s, [], T0, UC_TS, { cdDeadline: [[0, T0 + 5n]] })), 'ErrDeadlineMismatch');
   const s2 = spec(1);
   s2.mintDeadline = T0 + 5n;
-  await rejects(relation(w0, await buildToken(w0, s2, [], T0, UC_TS, { cdDeadline: [[0, null]] })), 'ErrCDMismatch');
+  await rejects(relation(w0, await buildToken(w0, s2, [], T0, UC_TS, { cdDeadline: [[0, null]] })), 'ErrDeadlineMismatch');
 });
 
 test('relation alone enforces t strictly below the deadline', async () => {

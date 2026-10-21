@@ -17,7 +17,7 @@ use crate::error::{NativeError as E, Result};
 use crate::header;
 use crate::limits::*;
 use crate::mpt;
-use crate::profile::{account_trie_key, h, keccak, lock_digest_slot, storage_trie_key};
+use crate::profile::{account_trie_key, h, keccak, lock_digest_slot, storage_trie_key, Cfg};
 use crate::rlp;
 use crate::scan::{fixed, pdr_elements, scan_one, Item};
 use crate::trust::{self, TrustInput};
@@ -44,47 +44,55 @@ pub struct Justification<'a> {
     pub proof: LockProof<'a>,
 }
 
-fn nodes<'a>(it: &Item<'a>, total: &mut usize) -> Result<Vec<&'a [u8]>> {
-    let list = it.any_array().ok_or(E::Shape)?;
-    if list.len() > MAX_MPT_NODES {
-        return Err(E::ProofTooLarge);
+/// A non-empty byte string of at most `max` bytes: anything else in the slot is the proof's shape, an oversized one its bound.
+fn blob<'a>(it: &Item<'a>, max: usize) -> Result<&'a [u8]> {
+    match it.bytes() {
+        Ok([]) => Err(E::LockProofShape),
+        Ok(b) if b.len() > max => Err(E::LockProofTooLarge),
+        Ok(b) => Ok(b),
+        Err(_) => Err(E::LockProofShape),
     }
-    let mut out = Vec::new();
+}
+
+/// A non-empty list of at most MAX_MPT_NODES nodes; `total` bounds both lists combined, checked node by node.
+fn nodes<'a>(it: &Item<'a>, total: &mut usize) -> Result<Vec<&'a [u8]>> {
+    let list = it.any_array().ok_or(E::LockProofShape)?;
+    if list.is_empty() {
+        return Err(E::LockProofShape);
+    }
+    if list.len() > MAX_MPT_NODES {
+        return Err(E::LockProofTooLarge);
+    }
+    let mut out = Vec::with_capacity(list.len());
     for n in list {
-        let b = n.bytes()?;
-        if b.is_empty() || b.len() > MAX_MPT_NODE_BYTES {
-            return Err(E::ProofTooLarge);
-        }
+        let b = blob(n, MAX_MPT_NODE_BYTES)?;
         *total += b.len();
+        if *total > MAX_MPT_TOTAL_BYTES {
+            return Err(E::LockProofTooLarge);
+        }
         out.push(b);
     }
     Ok(out)
 }
 
 impl<'a> LockProof<'a> {
-    /// Parse one scanned LockProof item, enforcing exact arity and every size bound before any
-    /// cryptography or allocation proportional to untrusted lengths.
+    /// Parse one scanned LockProof item (bft-core `decodeLockProof`, in its order): exact arity, literal version and every
+    /// component's bound before copying anything. A shape failure is ErrLockProofShape, a bound ErrLockProofTooLarge.
     pub fn parse(it: &Item<'a>) -> Result<Self> {
-        let k = it.array(8).ok_or(E::Shape)?;
-        k[0].version(LOCK_PROOF_VERSION)?;
-        let pdr = k[3].bytes()?;
-        let uc = k[4].bytes()?;
-        let header = k[5].bytes()?;
-        if pdr.is_empty() || pdr.len() > MAX_PDR_BYTES || uc.is_empty() || uc.len() > MAX_UC_BYTES {
-            return Err(E::ProofTooLarge);
-        }
-        if header.is_empty() || header.len() > MAX_HEADER_BYTES {
-            return Err(E::ProofTooLarge);
-        }
+        let k = it.array(8).ok_or(E::LockProofShape)?;
+        k[0].version(LOCK_PROOF_VERSION)
+            .map_err(|_| E::LockProofShape)?;
+        let cfg = fixed(&k[1]).map_err(|_| E::LockProofShape)?;
+        let trust_base_id = fixed(&k[2]).map_err(|_| E::LockProofShape)?;
+        let pdr = blob(&k[3], MAX_PDR_BYTES)?;
+        let uc = blob(&k[4], MAX_UC_BYTES)?;
+        let header = blob(&k[5], MAX_HEADER_BYTES)?;
         let mut total = 0usize;
         let account_nodes = nodes(&k[6], &mut total)?;
         let storage_nodes = nodes(&k[7], &mut total)?;
-        if total > MAX_MPT_TOTAL_BYTES {
-            return Err(E::ProofTooLarge);
-        }
         Ok(LockProof {
-            cfg: fixed(&k[1])?,
-            trust_base_id: fixed(&k[2])?,
+            cfg,
+            trust_base_id,
             pdr,
             uc,
             header,
@@ -141,25 +149,58 @@ pub fn encode_justification(
     )
 }
 
-/// Parse J. The caller keeps `j` alive for as long as the borrowed proof is used.
+/// Parse J without a deployment, to find the one it names: bft-core `ParseJustification` with its configuration comparisons (chain,
+/// vault, zero address, the proof's cfg) left out. The caller keeps `j` alive for as long as the borrowed proof is used.
 pub fn parse_justification(j: &[u8]) -> Result<Justification<'_>> {
+    parse(j, None)
+}
+
+/// Parse J for a deployment's configuration (bft-core `ParseJustification`, in its order): the size bound, then J's own scan and
+/// fields (all ErrMintJustif), then the embedded lock proof's shape and bounds, then its cfg, then the exact re-encoding.
+pub fn parse_justification_for<'j>(
+    cfg: &Cfg,
+    cfg_hash: &[u8; 32],
+    j: &'j [u8],
+) -> Result<Justification<'j>> {
+    parse(j, Some((cfg, cfg_hash)))
+}
+
+fn parse<'j>(j: &'j [u8], want: Option<(&Cfg, &[u8; 32])>) -> Result<Justification<'j>> {
     if j.len() > MAX_JUSTIFICATION_BYTES {
-        return Err(E::InputTooLarge);
+        return Err(E::JustificationTooLarge);
     }
-    // The justification's own scan failing (depth and items included) is the justification's error (bft-core
-    // ParseJustification); a decode failure inside its lock proof keeps its own.
+    // J's own scan failing (depth and items included) is J's error; a failure inside its lock proof keeps its own.
     let root = scan_one(j).map_err(|_| E::MintJustif)?;
-    let c = root.tag_content(TAG_MINT_LOCK)?;
-    let k = c.array(6).ok_or(E::Shape)?;
-    k[0].version(MINT_LOCK_VERSION)?;
-    let parsed = Justification {
-        chain_id: k[1].uint()?,
-        vault: fixed(&k[2])?,
-        zero: fixed(&k[3])?,
-        nonce: k[4].uint()?,
-        proof: LockProof::parse(&k[5])?,
-    };
-    Ok(parsed)
+    let c = root.tag_content(TAG_MINT_LOCK).map_err(|_| E::MintJustif)?;
+    let k = c.array(6).ok_or(E::MintJustif)?;
+    k[0].version(MINT_LOCK_VERSION).map_err(|_| E::MintJustif)?;
+    let chain_id = k[1].uint().map_err(|_| E::MintJustif)?;
+    if want.is_some_and(|(cfg, _)| chain_id != cfg.chain_id) {
+        return Err(E::MintJustif);
+    }
+    let vault: [u8; 20] = fixed(&k[2]).map_err(|_| E::MintJustif)?;
+    let zero: [u8; 20] = fixed(&k[3]).map_err(|_| E::MintJustif)?;
+    if want.is_some_and(|(cfg, _)| vault != cfg.vault || zero != cfg.zero_address) {
+        return Err(E::MintJustif);
+    }
+    let nonce = k[4].uint().map_err(|_| E::MintJustif)?;
+    if nonce == 0 {
+        return Err(E::MintJustif);
+    }
+    let proof = LockProof::parse(&k[5])?;
+    if want.is_some_and(|(_, hash)| proof.cfg != *hash) {
+        return Err(E::LockProofCfg);
+    }
+    if encode_justification(chain_id, &vault, &zero, nonce, &proof.to_bytes()) != j {
+        return Err(E::MintJustif);
+    }
+    Ok(Justification {
+        chain_id,
+        vault,
+        zero,
+        nonce,
+        proof,
+    })
 }
 
 pub(crate) fn config_hash(pdr_elems: &[&[u8]]) -> [u8; 32] {

@@ -137,13 +137,8 @@ export class NativeBridge {
     // The generic data hook skips null data, so missing genesis data/justification is explicit here.
     if (g.justification === null) fail('ErrMintJustif');
     if (g.data === null) fail('ErrMintData');
-    let parsed: Justification;
-    try {
-      parsed = parseJustification(g.justification as Uint8Array);
-    } catch (e) {
-      const r = reasonOf(e);
-      return fail(r === 'ErrInputTooLarge' || r === 'ErrProofTooLarge' || r === 'ErrTooDeep' || r === 'ErrTooManyItems' ? r : 'ErrMintJustif');
-    }
+    // J's errors are already the oracle's (bft-core ParseJustification), so they pass through unchanged.
+    const parsed: Justification = parseJustification(g.justification as Uint8Array);
     const index = this.registry.index(g.networkId.id, parsed.chainId, parsed.vault);
     const dep = this.registry.deployments[index];
 
@@ -196,13 +191,8 @@ export class NativeLockJustificationVerifier implements IMintJustificationVerifi
   public async check(genesis: CertifiedMintTransaction): Promise<void> {
     const j = genesis.justification;
     if (j === null) fail('ErrMintJustif');
-    let parsed: Justification;
-    try {
-      parsed = parseJustification(j as Uint8Array);
-    } catch (e) {
-      const r = reasonOf(e);
-      return fail(r === 'ErrInputTooLarge' || r === 'ErrProofTooLarge' || r === 'ErrTooDeep' || r === 'ErrTooManyItems' ? r : 'ErrMintJustif');
-    }
+    // J's errors are already the oracle's (bft-core ParseJustification), so they pass through unchanged.
+    const parsed: Justification = parseJustification(j as Uint8Array);
     const dep = this.bridge.registry.find(genesis.networkId.id, parsed.chainId, parsed.vault);
     if (!eq(genesis.tokenType.bytes, dep.cfg.ty)) fail('ErrMintType');
     const amount = checkMintData(dep, genesis.data);

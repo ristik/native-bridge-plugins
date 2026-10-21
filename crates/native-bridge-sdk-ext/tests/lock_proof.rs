@@ -309,7 +309,7 @@ fn a_missing_account_node_is_rejected() {
 fn an_empty_account_proof_is_rejected() {
     assert_eq!(
         mutated(|_, p, _| p.account_nodes.clear()).unwrap_err(),
-        E::AccountProof
+        E::LockProofShape
     );
 }
 
@@ -399,7 +399,7 @@ fn missing_embedded_proof_is_rejection_not_a_fetch() {
         w.bridge
             .verify_native_token(&out.token, Expect::Receipt)
             .unwrap_err(),
-        E::MintJustif
+        E::LockProofShape
     );
 }
 
@@ -454,12 +454,12 @@ fn node_count_boundary_is_sixty_five() {
     parse_ok(|p| p.account_nodes = vec![vec![0xc0]; 65]);
     assert_eq!(
         parse_err(|p| p.account_nodes = vec![vec![0xc0]; 66]),
-        E::ProofTooLarge
+        E::LockProofTooLarge
     );
     parse_ok(|p| p.storage_nodes = vec![vec![0xc0]; 65]);
     assert_eq!(
         parse_err(|p| p.storage_nodes = vec![vec![0xc0]; 66]),
-        E::ProofTooLarge
+        E::LockProofTooLarge
     );
 }
 
@@ -468,11 +468,11 @@ fn node_size_boundary_is_one_kibibyte() {
     parse_ok(|p| p.account_nodes = vec![vec![1; 1024]]);
     assert_eq!(
         parse_err(|p| p.account_nodes = vec![vec![1; 1025]]),
-        E::ProofTooLarge
+        E::LockProofTooLarge
     );
     assert_eq!(
         parse_err(|p| p.storage_nodes = vec![vec![]]),
-        E::ProofTooLarge
+        E::LockProofShape
     );
 }
 
@@ -489,7 +489,7 @@ fn combined_node_bytes_boundary_is_twenty_four_kibibytes() {
             p.storage_nodes = vec![vec![1; 1024]; 12];
             p.storage_nodes.push(vec![1]);
         }),
-        E::ProofTooLarge
+        E::LockProofTooLarge
     );
 }
 
@@ -498,16 +498,19 @@ fn certificate_header_and_pdr_boundaries() {
     parse_ok(|p| p.uc_raw = Some(vec![1; 16 * 1024]));
     assert_eq!(
         parse_err(|p| p.uc_raw = Some(vec![1; 16 * 1024 + 1])),
-        E::ProofTooLarge
+        E::LockProofTooLarge
     );
     parse_ok(|p| p.header = vec![1; 2048]);
-    assert_eq!(parse_err(|p| p.header = vec![1; 2049]), E::ProofTooLarge);
+    assert_eq!(
+        parse_err(|p| p.header = vec![1; 2049]),
+        E::LockProofTooLarge
+    );
     parse_ok(|p| p.pdr = vec![1; 16 * 1024]);
     assert_eq!(
         parse_err(|p| p.pdr = vec![1; 16 * 1024 + 1]),
-        E::ProofTooLarge
+        E::LockProofTooLarge
     );
-    assert_eq!(parse_err(|p| p.header = vec![]), E::ProofTooLarge);
+    assert_eq!(parse_err(|p| p.header = vec![]), E::LockProofShape);
 }
 
 #[test]
@@ -537,13 +540,13 @@ fn proof_arity_is_exact_and_nodes_must_be_byte_strings() {
     let j = native_bridge_sdk_ext::lockproof::encode_justification(
         CHAIN_ID, &VAULT, &[0; 20], 1, &seven,
     );
-    assert_eq!(parse_justification(&j).unwrap_err(), E::Shape);
+    assert_eq!(parse_justification(&j).unwrap_err(), E::LockProofShape);
     // Proof version 2.
     let mut v2 = good.clone();
     v2[1] = 0x02;
     let j =
         native_bridge_sdk_ext::lockproof::encode_justification(CHAIN_ID, &VAULT, &[0; 20], 1, &v2);
-    assert_eq!(parse_justification(&j).unwrap_err(), E::Version);
+    assert_eq!(parse_justification(&j).unwrap_err(), E::LockProofShape);
 }
 
 #[test]
