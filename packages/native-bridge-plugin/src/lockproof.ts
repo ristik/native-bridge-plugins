@@ -87,7 +87,9 @@ export function parseJustification(j: Uint8Array): Justification {
   let root;
   try {
     root = scanOne(j);
-  } catch {
+  } catch (e) {
+    // only the scanner's verdicts are the justification's error; anything else is a fault, not an input verdict
+    if (!(e instanceof Error && e.name === 'NativeError')) throw e;
     return fail('ErrMintJustif');
   }
   const k = arrayOf(tagContent(root, TAG_MINT_LOCK), 6) ?? fail('ErrShape');
