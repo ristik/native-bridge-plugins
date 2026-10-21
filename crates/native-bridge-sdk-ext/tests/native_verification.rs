@@ -959,6 +959,26 @@ fn relation_alone_enforces_t_strictly_below_the_deadline() {
     }
 }
 
+/// bft-core checkStep's order: the unlock is checked before expiry, so a leaf that is both expired and wrongly unlocked gets the
+/// unlock's error (the corpus has no vector with both faults yet).
+#[test]
+fn relation_checks_the_unlock_before_expiry() {
+    let w = make_world(20);
+    let mut s = spec(1);
+    s.mint_deadline = Some(T0);
+    let tw = Tweaks {
+        unlock: vec![(0, Box::new(|u: &mut Vec<u8>| u.truncate(64)))],
+        ..Default::default()
+    };
+    let out = build_token_with(&w, &s, &lock_parts(&w, &s), &tw, &[], T0, UC_TS);
+    assert_eq!(relation(&w, &out).unwrap_err(), E::UnlockLength);
+    // Either fault alone is its own error.
+    assert_eq!(
+        relation(&w, &build_token(&w, &s, &[], T0, UC_TS)).unwrap_err(),
+        E::DeadlineExpired
+    );
+}
+
 #[test]
 fn burn_request_binds_token_history_time_and_recipient_but_allows_refresh() {
     let w = make_world(20);
