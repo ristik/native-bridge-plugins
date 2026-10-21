@@ -14,7 +14,7 @@ import {
   KERNEL_HISTORY, MAX_AMOUNT_BYTES, MAX_SEMANTIC_BYTES, PRED_BURN, PRED_SIGNATURE, TAG_CERTIFICATION, TAG_MINT,
   TAG_PREDICATE, TAG_RETURN_REASON, TAG_TRANSFER, TAG_WALLET_VALUE, type HistoryBounds,
 } from './limits.js';
-import { encodeJustification, encodeLockProof, parseJustification } from './lockproof.js';
+import { parseJustificationFor } from './lockproof.js';
 import {
   H, arr, bs, burnId, deriveSalt, deriveTokenId, leafValue, lockDigest, lockRecord, nullifier, u, valueEnvelope,
 } from './profile.js';
@@ -45,10 +45,10 @@ function decodePredicate(it: Item): Pred {
   return { type: code[0], params };
 }
 
-/** A request deadline: null or an integer in [1, 2^64-1]. */
+/** A request deadline: null or an integer in [1, 2^64-1]; anything else in the slot is ErrDeadline (bft-core `item.deadline`). */
 function deadline(it: Item): bigint | null {
-  const e = nullableUint(it);
-  return e === 0n ? fail('ErrIntRange') : e;
+  if (it.kind === 'null') return null;
+  return it.kind === 'uint' && it.value !== 0n ? it.value : fail('ErrDeadline');
 }
 
 export interface Mint {
@@ -189,23 +189,11 @@ export function prepareLock(dep: Deployment, n: bigint, amount: Uint8Array, p0: 
   return { cfg: dep.cfgHash, nonce: n, amount, tokenId: id, salt, firstPredicateHash: first, lockDigest: digest, releaseTo: new Uint8Array(20), nullifier: new Uint8Array(32), leaves: [] };
 }
 
-/** Parse and cross-check the mint justification, returning the nonce. Structure only; the proof's
- * cryptography needs the trust input. */
+/** Parse and cross-check the mint justification against the deployment, returning the nonce (bft-core `ParseJustification`, in
+ * its order). Structure only; the proof's cryptography needs the trust input. */
 export function checkJustification(dep: Deployment, j: Uint8Array | null): bigint {
   if (j === null) return fail('ErrMintJustif');
-  let p;
-  try {
-    p = parseJustification(j);
-  } catch (e) {
-    const r = (e as { reason?: string }).reason;
-    if (r === 'ErrInputTooLarge' || r === 'ErrProofTooLarge' || r === 'ErrTooDeep' || r === 'ErrTooManyItems') throw e;
-    return fail('ErrMintJustif');
-  }
-  if (p.chainId !== dep.cfg.chainId || !eq(p.vault, dep.cfg.vault) || !eq(p.zero, dep.cfg.zeroAddress) || p.nonce === 0n) fail('ErrMintJustif');
-  const proof = p.proof;
-  const back = encodeJustification(p.chainId, p.vault, p.zero, p.nonce, encodeLockProof(proof));
-  if (!eq(back, j)) fail('ErrMintJustif');
-  return p.nonce;
+  return parseJustificationFor(dep.cfg, dep.cfgHash, j).nonce;
 }
 
 /** Exactly `tag(39050,[1,[[b(aid),b(amount)]],null])`; returns the amount. */
@@ -232,10 +220,13 @@ async function checkStep(
 ): Promise<Leaf> {
   if (!eq(predBytes(cd.source), predBytes(source)) || !eq(cd.sourceHash, sourceHash)) fail('ErrCDMismatch');
   const txHash = H(txRaw);
-  if (!eq(cd.txHash, txHash) || cd.expiresAt !== txDeadline) fail('ErrCDMismatch');
+  if (!eq(cd.txHash, txHash)) fail('ErrCDMismatch');
+  // The CD deadline equals the transaction deadline exactly, null included (bft-core checkStep's order: the deadline binding, then
+  // the unlock, then expiry).
+  if (cd.expiresAt !== txDeadline) fail('ErrDeadlineMismatch');
+  await verifyUnlock(key, sourceHash, txHash, cd.unlock);
   // For an explicit deadline the leaf must have been created strictly before it.
   if (txDeadline !== null && t >= txDeadline) fail('ErrDeadlineExpired');
-  await verifyUnlock(key, sourceHash, txHash, cd.unlock);
   const sid = stateId(source, sourceHash);
   const hex = toHex(sid);
   if (seen.has(hex)) fail('ErrRepeatedSID');

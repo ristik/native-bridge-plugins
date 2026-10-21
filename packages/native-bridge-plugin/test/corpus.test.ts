@@ -11,7 +11,7 @@ import { COMPOSE_OUTPUT_BYTES, COMPOSE_STATUS, composeInput, composeOutputStatus
 import { NativeError } from '../src/errors.js';
 import { cfgBytes, decodeCfg, decodePolicy } from '../src/profile.js';
 import { makeDeployment } from '../src/deployment.js';
-import { decodeHistory, verifyHistory } from '../src/history.js';
+import { checkJustification, decodeHistory, verifyHistory } from '../src/history.js';
 
 /** The released protocol-4 corpus (`protocol/vectors`), replayed by an implementation independent of the Go oracle that generated it. */
 const VECTORS = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'vectors');
@@ -154,17 +154,26 @@ test('native-compose: every case\'s input, output status and, when it succeeds, 
   assert.ok(priced >= 10, String(priced));
 });
 
-test('history family: a failure inside a nested object is that object\'s error, as the corpus says (bft-core spec section 8)', async () => {
+test('the kernel mirror gives every mint, return and justification case of every family the oracle\'s verdict (bft-core VerifyMint, VerifyReturn, ParseJustification)', async () => {
   const f = load('config/fixtures.json');
   const dep = makeDeployment(cfgOf('dev'), fromHex(f.pins.dev.vaultCodeHash)!, new Uint8Array(32), { fields: 20 }, decodePolicy(fromHex(f.fixtures.dev.policyBody)!));
-  const cases = (load('history/cases.json').cases as Case[]).filter((c) => (c.op === 'mint' || c.op === 'return') && c.id.startsWith('nested-'));
-  assert.equal(cases.length, 12);
+  const families = ['config', 'history', 'lock', 'policy', 'proof', 'return', 'unlock', 'vault', 'wire'];
+  const cases = families.flatMap((fam) => (load(`${fam}/cases.json`).cases as Case[]).filter((c) => c.op === 'mint' || c.op === 'return' || c.op === 'justification'));
+  assert.ok(cases.length >= 125, String(cases.length));
+  assert.equal(cases.filter((c) => c.id.startsWith('nested-')).length, 12);
   for (const c of cases) {
+    assert.equal(c.cfg, 'dev', c.id);
     let got: { status: 'ok' | 'error'; family?: string; reason?: string } = { status: 'ok' };
     try {
-      const h = decodeHistory(fromHex(c.input)!);
-      if (c.op === 'mint' && h.transfers.length !== 0) throw new NativeError('ErrHasTransfers');
-      await verifyHistory(dep, h, c.op === 'return');
+      if (c.op === 'justification') {
+        const nonce = checkJustification(dep, fromHex(c.input)!);
+        if (c.expected.status === 'ok') assert.equal(String(nonce), c.expected.values?.nonce, c.id);
+      } else {
+        const h = decodeHistory(fromHex(c.input)!);
+        if (c.op === 'mint' && h.transfers.length !== 0) throw new NativeError('ErrHasTransfers');
+        if (c.op === 'return' && h.transfers.length === 0) throw new NativeError('ErrNoTransfers');
+        await verifyHistory(dep, h, c.op === 'return');
+      }
     } catch (e) {
       if (!(e instanceof NativeError)) throw e;
       got = { status: 'error', family: e.family, reason: e.reason };

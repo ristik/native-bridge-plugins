@@ -58,10 +58,8 @@ impl NativeLockJustificationVerifier {
     pub fn check(&self, genesis: &CertifiedMintTransaction) -> Result<()> {
         let mint = genesis.transaction();
         let j = mint.justification().ok_or(E::MintJustif)?;
-        let parsed = parse_justification(j).map_err(|e| match e {
-            E::InputTooLarge | E::ProofTooLarge | E::TooDeep | E::TooManyItems => e,
-            _ => E::MintJustif,
-        })?;
+        // J's errors are already the oracle's (bft-core ParseJustification), so they pass through unchanged.
+        let parsed = parse_justification(j)?;
         let dep =
             self.bridge
                 .registry

@@ -272,13 +272,15 @@ fn every_native_compose_case_is_the_plug_in_estimate_when_it_succeeds() {
     assert!(priced >= 10, "{priced}");
 }
 
-/// The kernel relation's nested objects (bft-core spec section 8): a failure inside the justification, the mint data or the return
-/// reason is that object's error, depth and items included, and a malformed return amount is ErrReturnAmount before the fee slots.
+/// The kernel relation as the plug-ins mirror it (bft-core `VerifyMint`/`VerifyReturn`/`ParseJustification`): every mint and return
+/// case of every family and every justification case gets the oracle's verdict, sentinel and family. This includes the nested-object
+/// failures of spec section 8 (a failure inside the justification, the mint data or the return reason is that object's error) and
+/// the lock proof's own shape and bounds.
 #[test]
-fn nested_object_failures_are_the_objects_error_as_the_corpus_says() {
+fn the_kernel_mirror_gives_every_mint_return_and_justification_case_the_oracles_verdict() {
     use native_bridge_sdk_ext::deployment::Deployment;
     use native_bridge_sdk_ext::header::HeaderProfile;
-    use native_bridge_sdk_ext::history::{verify_mint, verify_return};
+    use native_bridge_sdk_ext::history::{check_justification, verify_mint, verify_return};
     let f = load("config/fixtures.json");
     let d = &f["fixtures"]["dev"];
     let policy = Policy::from_bytes(&from_hex(d["policyBody"].as_str().unwrap()).unwrap()).unwrap();
@@ -291,21 +293,43 @@ fn nested_object_failures_are_the_objects_error_as_the_corpus_says() {
         policy,
     )
     .unwrap();
-    let mut n = 0;
-    for op in ["mint", "return"] {
-        for c in cases("history/cases.json", op) {
-            if !c["id"].as_str().unwrap().starts_with("nested-") {
+    let (mut n, mut nested, mut fails) = (0, 0, Vec::new());
+    for fam in [
+        "config", "history", "lock", "policy", "proof", "return", "unlock", "vault", "wire",
+    ] {
+        for c in load(&format!("{fam}/cases.json"))["cases"]
+            .as_array()
+            .unwrap()
+        {
+            let op = c["op"].as_str().unwrap();
+            if !matches!(op, "mint" | "return" | "justification") {
                 continue;
             }
+            assert_eq!(c["cfg"], "dev");
             let input = from_hex(c["input"].as_str().unwrap()).unwrap();
-            let got = if op == "mint" {
-                verify_mint(&dep, &input)
-            } else {
-                verify_return(&dep, &input)
-            };
-            check(&c, got.map(|_| ()));
+            let verdict = std::panic::catch_unwind(|| {
+                let got = match op {
+                    "mint" => verify_mint(&dep, &input).map(|_| ()),
+                    "return" => verify_return(&dep, &input).map(|_| ()),
+                    _ => check_justification(&dep, Some(&input)).map(|nonce| {
+                        if c["expected"]["status"] == "ok" {
+                            assert_eq!(
+                                nonce.to_string(),
+                                c["expected"]["values"]["nonce"].as_str().unwrap()
+                            );
+                        }
+                    }),
+                };
+                check(c, got)
+            });
+            if verdict.is_err() {
+                fails.push(c["id"].as_str().unwrap().to_string());
+            }
             n += 1;
+            nested += c["id"].as_str().unwrap().starts_with("nested-") as usize;
         }
     }
-    assert_eq!(n, 12);
+    assert!(fails.is_empty(), "{} of {n} differ: {fails:?}", fails.len());
+    assert_eq!(nested, 12);
+    assert!(n >= 125, "{n}");
 }

@@ -175,7 +175,7 @@ fn zero_deadline_is_rejected_as_out_of_range() {
     s.mint_deadline = Some(0);
     assert_eq!(
         err(&w, &build_token(&w, &s, &[], T0, UC_TS), Expect::Receipt),
-        E::IntRange
+        E::Deadline
     );
 }
 
@@ -203,7 +203,7 @@ fn certification_data_deadline_must_equal_the_transaction_deadline_including_nul
     };
     let parts = lock_parts(&w, &s);
     let out = build_token_with(&w, &s, &parts, &tw, &[], T0, UC_TS);
-    assert_eq!(err(&w, &out, Expect::Receipt), E::CDMismatch);
+    assert_eq!(err(&w, &out, Expect::Receipt), E::DeadlineMismatch);
 
     let mut s2 = spec(1);
     s2.mint_deadline = Some(T0 + 5);
@@ -212,14 +212,14 @@ fn certification_data_deadline_must_equal_the_transaction_deadline_including_nul
         ..Default::default()
     };
     let out = build_token_with(&w, &s2, &lock_parts(&w, &s2), &tw, &[], T0, UC_TS);
-    assert_eq!(err(&w, &out, Expect::Receipt), E::CDMismatch);
+    assert_eq!(err(&w, &out, Expect::Receipt), E::DeadlineMismatch);
 
     let tw = Tweaks {
         cd_deadline: vec![(1, Some(T0 + 99))],
         ..Default::default()
     };
     let out = build_token_with(&w, &s, &parts, &tw, &[tx_step(2, 7, T0 + 10)], T0, UC_TS);
-    assert_eq!(err(&w, &out, Expect::Receipt), E::CDMismatch);
+    assert_eq!(err(&w, &out, Expect::Receipt), E::DeadlineMismatch);
 }
 
 #[test]
@@ -909,7 +909,10 @@ fn prepare_lock_binds_cfg_nonce_amount_id_and_recipient() {
 #[test]
 fn justification_is_bounded_before_parsing() {
     let big = vec![0u8; 64 * 1024 + 1];
-    assert_eq!(parse_justification(&big).unwrap_err(), E::InputTooLarge);
+    assert_eq!(
+        parse_justification(&big).unwrap_err(),
+        E::JustificationTooLarge
+    );
 }
 
 // ---- the pure relation, with no SDK in the loop (what ureth and the B2 kernel run) -------------
@@ -928,7 +931,7 @@ fn relation_alone_enforces_certification_data_deadline_equality() {
         ..Default::default()
     };
     let out = build_token_with(&w, &s, &parts, &tw, &[], T0, UC_TS);
-    assert_eq!(relation(&w, &out).unwrap_err(), E::CDMismatch);
+    assert_eq!(relation(&w, &out).unwrap_err(), E::DeadlineMismatch);
     let mut s2 = spec(1);
     s2.mint_deadline = Some(T0 + 5);
     let tw = Tweaks {
@@ -936,7 +939,7 @@ fn relation_alone_enforces_certification_data_deadline_equality() {
         ..Default::default()
     };
     let out = build_token_with(&w, &s2, &lock_parts(&w, &s2), &tw, &[], T0, UC_TS);
-    assert_eq!(relation(&w, &out).unwrap_err(), E::CDMismatch);
+    assert_eq!(relation(&w, &out).unwrap_err(), E::DeadlineMismatch);
 }
 
 #[test]

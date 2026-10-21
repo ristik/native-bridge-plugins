@@ -129,10 +129,8 @@ impl NativeBridge {
         if mint.data().is_none() {
             return Err(E::MintData);
         }
-        let parsed = parse_justification(j).map_err(|e| match e {
-            E::InputTooLarge | E::ProofTooLarge | E::TooDeep | E::TooManyItems => e,
-            _ => E::MintJustif,
-        })?;
+        // J's errors are already the oracle's (bft-core ParseJustification), so they pass through unchanged.
+        let parsed = parse_justification(j)?;
         let index = self
             .registry
             .deployments()

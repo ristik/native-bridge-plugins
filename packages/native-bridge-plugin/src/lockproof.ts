@@ -12,7 +12,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { preflightUc } from './resources.js';
 import { eq } from './bytes.js';
 import type { Deployment } from './deployment.js';
-import { fail } from './errors.js';
+import { NativeError, fail } from './errors.js';
 import { decodeHeader } from './header.js';
 import {
   LOCK_PROOF_VERSION, MAX_HEADER_BYTES, MAX_JUSTIFICATION_BYTES, MAX_MPT_NODE_BYTES, MAX_MPT_NODES,
@@ -42,31 +42,50 @@ export interface Justification {
   proof: LockProof;
 }
 
+/** A non-empty byte string of at most `max` bytes: anything else in the slot is the proof's shape, an oversized one its bound. */
+function blob(it: Item, max: number): Uint8Array {
+  if (it.kind !== 'bytes' || it.data.length === 0) fail('ErrLockProofShape');
+  if (it.data.length > max) fail('ErrLockProofTooLarge');
+  return it.data;
+}
+
+/** A non-empty list of at most MAX_MPT_NODES nodes; `total` bounds both lists combined, checked node by node. */
 function nodes(it: Item, total: { n: number }): Uint8Array[] {
-  const list = arrayOf(it) ?? fail('ErrShape');
-  if (list.length > MAX_MPT_NODES) fail('ErrProofTooLarge');
+  const list = arrayOf(it) ?? fail('ErrLockProofShape');
+  if (list.length === 0) fail('ErrLockProofShape');
+  if (list.length > MAX_MPT_NODES) fail('ErrLockProofTooLarge');
   return list.map((n) => {
-    const b = bytesAny(n);
-    if (b.length === 0 || b.length > MAX_MPT_NODE_BYTES) fail('ErrProofTooLarge');
+    const b = blob(n, MAX_MPT_NODE_BYTES);
     total.n += b.length;
+    if (total.n > MAX_MPT_TOTAL_BYTES) fail('ErrLockProofTooLarge');
     return b;
   });
 }
 
-/** Parse one scanned LockProof, enforcing exact arity and every size bound before any crypto. */
+/** The proof's shape: any decode failure of `f` is ErrLockProofShape. */
+function shaped<T>(f: () => T): T {
+  try {
+    return f();
+  } catch (e) {
+    if (!(e instanceof NativeError)) throw e;
+    return fail('ErrLockProofShape');
+  }
+}
+
+/** Parse one scanned LockProof (bft-core `decodeLockProof`, in its order): exact arity, literal version and every component's
+ * bound before any crypto. A shape failure is ErrLockProofShape, a bound ErrLockProofTooLarge. */
 export function parseLockProof(it: Item): LockProof {
-  const k = arrayOf(it, 8) ?? fail('ErrShape');
-  version(k[0], LOCK_PROOF_VERSION);
-  const pdr = bytesAny(k[3]);
-  const uc = bytesAny(k[4]);
-  const header = bytesAny(k[5]);
-  if (pdr.length === 0 || pdr.length > MAX_PDR_BYTES || uc.length === 0 || uc.length > MAX_UC_BYTES) fail('ErrProofTooLarge');
-  if (header.length === 0 || header.length > MAX_HEADER_BYTES) fail('ErrProofTooLarge');
+  const k = arrayOf(it, 8) ?? fail('ErrLockProofShape');
+  shaped(() => version(k[0], LOCK_PROOF_VERSION));
+  const cfg = shaped(() => bytesN(k[1], 32));
+  const trustBaseId = shaped(() => bytesN(k[2], 32));
+  const pdr = blob(k[3], MAX_PDR_BYTES);
+  const uc = blob(k[4], MAX_UC_BYTES);
+  const header = blob(k[5], MAX_HEADER_BYTES);
   const total = { n: 0 };
   const accountNodes = nodes(k[6], total);
   const storageNodes = nodes(k[7], total);
-  if (total.n > MAX_MPT_TOTAL_BYTES) fail('ErrProofTooLarge');
-  return { cfg: bytesN(k[1], 32), trustBaseId: bytesN(k[2], 32), pdr, uc, header, accountNodes, storageNodes };
+  return { cfg, trustBaseId, pdr, uc, header, accountNodes, storageNodes };
 }
 
 export function encodeLockProof(p: LockProof): Uint8Array {
@@ -80,21 +99,45 @@ export function encodeJustification(chainId: bigint, vault: Uint8Array, zero: Ui
   return C.encodeTag(TAG_MINT_LOCK, arr(u(MINT_LOCK_VERSION), u(chainId), bs(vault), bs(zero), u(nonce), lockProof));
 }
 
-export function parseJustification(j: Uint8Array): Justification {
-  if (j.length > MAX_JUSTIFICATION_BYTES) fail('ErrInputTooLarge');
-  // The justification's own scan failing (depth and items included) is the justification's error (bft-core ParseJustification);
-  // a decode failure inside its lock proof keeps its own.
-  let root;
+/** J's own fields: any decode failure of `f` is ErrMintJustif. */
+function justif<T>(f: () => T): T {
   try {
-    root = scanOne(j);
+    return f();
   } catch (e) {
-    // only the scanner's verdicts are the justification's error; anything else is a fault, not an input verdict
-    if (!(e instanceof Error && e.name === 'NativeError')) throw e;
+    // only the scanner's and decoders' verdicts are the justification's error; anything else is a fault, not an input verdict
+    if (!(e instanceof NativeError)) throw e;
     return fail('ErrMintJustif');
   }
-  const k = arrayOf(tagContent(root, TAG_MINT_LOCK), 6) ?? fail('ErrShape');
-  version(k[0], MINT_LOCK_VERSION);
-  return { chainId: uint(k[1]), vault: bytesN(k[2], 20), zero: bytesN(k[3], 20), nonce: uint(k[4]), proof: parseLockProof(k[5]) };
+}
+
+/** Parse J without a deployment, to find the one it names: bft-core `ParseJustification` with its configuration comparisons
+ * (chain, vault, zero address, the proof's cfg) left out. */
+export function parseJustification(j: Uint8Array): Justification {
+  return parse(j, null);
+}
+
+/** Parse J for a deployment's configuration (bft-core `ParseJustification`, in its order): the size bound, then J's own scan and
+ * fields (all ErrMintJustif), then the embedded lock proof's shape and bounds, then its cfg, then the exact re-encoding. */
+export function parseJustificationFor(cfg: Deployment['cfg'], cfgHash: Uint8Array, j: Uint8Array): Justification {
+  return parse(j, { cfg, cfgHash });
+}
+
+function parse(j: Uint8Array, want: { cfg: Deployment['cfg']; cfgHash: Uint8Array } | null): Justification {
+  if (j.length > MAX_JUSTIFICATION_BYTES) fail('ErrJustificationTooLarge');
+  // J's own scan failing (depth and items included) is J's error; a failure inside its lock proof keeps its own.
+  const k = justif(() => arrayOf(tagContent(scanOne(j), TAG_MINT_LOCK), 6) ?? fail('ErrMintJustif'));
+  justif(() => version(k[0], MINT_LOCK_VERSION));
+  const chainId = justif(() => uint(k[1]));
+  if (want !== null && chainId !== want.cfg.chainId) fail('ErrMintJustif');
+  const vault = justif(() => bytesN(k[2], 20));
+  const zero = justif(() => bytesN(k[3], 20));
+  if (want !== null && (!eq(vault, want.cfg.vault) || !eq(zero, want.cfg.zeroAddress))) fail('ErrMintJustif');
+  const nonce = justif(() => uint(k[4]));
+  if (nonce === 0n) fail('ErrMintJustif');
+  const proof = parseLockProof(k[5]);
+  if (want !== null && !eq(proof.cfg, want.cfgHash)) fail('ErrLockProofCfg');
+  if (!eq(encodeJustification(chainId, vault, zero, nonce, encodeLockProof(proof)), j)) fail('ErrMintJustif');
+  return { chainId, vault, zero, nonce, proof };
 }
 
 export function configHashOfPdr(pdr: Uint8Array): Uint8Array {
