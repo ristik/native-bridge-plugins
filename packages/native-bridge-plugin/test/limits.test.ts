@@ -50,14 +50,22 @@ test('the gas estimate prices its components exactly as the oracle and the contr
 
 test('the best-case projection at the bounds is an estimate with ONE anchor', () => {
   const fit = projectedGate(300, 150, L.MAX_LEAVES, L.MAX_SEMANTIC_BYTES);
-  assert.ok(fit.gate.total > 7_000_000, `above the former 7M ceiling and not refused: ${fit.gate.total}`);
+  assert.ok(fit.gate.legacyTotal > 7_000_000, `the protocol-5 composite is above the former 7M ceiling, and not refused: ${fit.gate.legacyTotal}`);
+  assert.equal(fit.gate.total, 21_000 + 16 * (132 + 320 + fit.envelopeBytes) + fit.gate.native + 1_000_000, 'calldata + BRIDGE_COMPOSE_V1 + reserve');
   assert.ok(fit.envelopeBytes <= L.MAX_ENVELOPE_BYTES, String(fit.envelopeBytes));
   assert.equal(fit.gate.grouping.k, 1, 'a single certificate may serve every leaf: the best case is never one anchor per shard');
 });
 
 test('the burn preflight refuses only a history within BURN_HISTORY_BYTES of the bound, never for gas', () => {
   const edge = L.MAX_SEMANTIC_BYTES - BURN_HISTORY_BYTES;
-  assert.ok(checkBurnProjection(200, 300, L.MAX_LEAVES, edge).total > 7_000_000, 'exactly at the margin passes, priced above the former 7M');
+  assert.ok(checkBurnProjection(200, 300, L.MAX_LEAVES, edge).legacyTotal > 7_000_000, 'exactly at the margin passes, its protocol-5 composite above the former 7M');
   throwsReason(() => checkBurnProjection(200, 300, L.MAX_LEAVES, edge + 1), 'ErrInputTooLarge');
   assert.ok(checkBurnProjection(200, 300, 8, 500).total > 0);
+});
+
+test('the BRIDGE_COMPOSE_V1 schedule is bft-core ComposeGas: 50*K*ceil(log2 K) grouping and the per-dimension prices', async () => {
+  const { composeGas, composeGroupGas } = await import('../src/gas.js');
+  assert.deepEqual([0, 1, 2, 3, 4, 16, 17].map(composeGroupGas), [0, 0, 100, 300, 400, 3_200, 4_250]);
+  const d = { b: 1000, j: 10, l: 2, q: 3, e: 1, a: 2, k: 2, p: 5 };
+  assert.equal(composeGas(d), 100_000 + 2_000 + 200 + 32_000 + 18_000 + 29_900 + 4_000 + 1_250 + 100);
 });

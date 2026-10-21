@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod certgroups;
+pub mod compose;
 #[cfg(feature = "consolidation")]
 pub mod consolidation;
 pub mod deployment;

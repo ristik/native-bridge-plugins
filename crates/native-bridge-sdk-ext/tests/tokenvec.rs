@@ -124,7 +124,7 @@ fn every_token_level_run_is_planned_opened_batched_grouped_and_gated_as_the_go_p
             ("j", gate.j),
             ("rsmt", gate.rsmt),
             ("steps", gate.steps),
-            ("total", gate.total),
+            ("total", gate.legacy_total),
         ] {
             assert_eq!(want[k].as_u64().unwrap(), v, "{id}: gate {k}");
         }

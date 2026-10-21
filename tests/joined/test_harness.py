@@ -90,9 +90,12 @@ class EvidenceGuards(unittest.TestCase):
         def calls(step):
             out = []
             for target, n in joined.NATIVE_STEP_CALLS.get(step, {}).items():
-                out += [{'target': target, 'nativePrecompile': True, 'ok': True} for _ in range(n)]
+                out += [{'target': target, 'nativePrecompile': True, 'ok': True, 'gasUsed': 7} for _ in range(n)]
             return out
         steps = [{'step': n, 'success': True, 'gasUsed': 1, 'nativeCalls': calls(n)} for n in joined.NATIVE_REQUIRED]
+        for s in steps:
+            if s['step'] in joined.NATIVE_COMPOSE_STEPS:
+                s['composeGas'] = 7
         steps[4].update(success=False, expectedRefusal='AlreadyRedeemed')
         report = {'steps': steps}
         mutate(report)
@@ -120,21 +123,30 @@ class EvidenceGuards(unittest.TestCase):
             joined.check_native_report(self.native_report(mutate))
 
     def test_native_coverage_is_per_step_not_a_union(self):
-        # verifyMint loses its 0x0100 call; redeem still supplies that address elsewhere in the report.
+        # verifyMint loses its 0x0105 call; redeem still supplies that address elsewhere in the report.
         def mutate(r):
             calls = self.step(r, 'verifyMint')['nativeCalls']
-            calls[:] = [c for c in calls if c['target'] != joined.NATIVE_UC]
-        with self.assertRaisesRegex(ValueError, 'verifyMint: expected 1 call.*0x0100'):
+            calls[:] = [c for c in calls if c['target'] != joined.NATIVE_COMPOSE]
+        with self.assertRaisesRegex(ValueError, 'verifyMint: expected exactly 1 call.*0x0105'):
             joined.check_native_report(self.native_report(mutate))
+        # a direct B1 call from the verifier besides the composition is refused (the PR 1 shape)
+        def direct(r):
+            self.step(r, 'redeem (third-party submitter)')['nativeCalls'].append({'target': joined.NATIVE_UC, 'nativePrecompile': True, 'ok': True})
+        with self.assertRaisesRegex(ValueError, 'redeem.*expected exactly 0 call.*0x0100'):
+            joined.check_native_report(self.native_report(direct))
 
     def test_native_report_refuses_an_empty_or_short_call_list(self):
-        with self.assertRaisesRegex(ValueError, 'lock: expected 1 call'):
+        with self.assertRaisesRegex(ValueError, 'lock: expected exactly 1 call'):
             joined.check_native_report(self.native_report(lambda r: self.step(r, 'lock').update(nativeCalls=[])))
-        def short(r):
+        def twice(r):
             calls = self.step(r, 'redeem (third-party submitter)')['nativeCalls']
-            calls.remove(next(c for c in calls if c['target'] == joined.NATIVE_MEMBER))
-        with self.assertRaisesRegex(ValueError, 'expected 3 call'):
-            joined.check_native_report(self.native_report(short))
+            calls.append(dict(next(c for c in calls if c['target'] == joined.NATIVE_COMPOSE)))
+        with self.assertRaisesRegex(ValueError, 'expected exactly 1 call'):
+            joined.check_native_report(self.native_report(twice))
+
+    def test_native_report_refuses_a_compose_charge_other_than_g_compose(self):
+        with self.assertRaisesRegex(ValueError, 'not the recorded G_compose'):
+            joined.check_native_report(self.native_report(lambda r: self.step(r, 'verifyMint').update(composeGas=8)))
 
     def test_native_report_refuses_a_missing_step(self):
         # Any exception is caught so that a bypassed guard (a KeyError further down) fails the assertions

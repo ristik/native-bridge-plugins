@@ -1,11 +1,15 @@
 /**
- * The shared direct-call gas gate (interop.md "Direct-call gas gate"): the same formula, with the same constants, as the oracle
- * (`bridgeprofile/gas.go`) and the contract (`BridgeBounds.sol`, `CertGroups.sol`). Every term is the native price of a call the
- * composing verifier makes, or the bounded execution of the verifier itself, computed from complete bounded scans, never from
- * caller-declared costs. It is a conservative estimate a wallet sets its gas limit from, never an admission rule: there is no fixed
- * transaction budget (owner section 36), and a call with too little gas runs out of gas and reverts atomically.
+ * The gas estimate of a redemption. Since B7 direct PR 2 the composition is one native call, BRIDGE_COMPOSE_V1 at 0x0105, and its
+ * charge is the trial schedule of bft-core `bridgeprofile/native.go` (`ComposeGas`), computed here from the same scans:
  *
- *   G_gate = 21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum_i G_leaf(i) + 1,000,000
+ *   G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)
+ *
+ * with B the native input bytes (`abi.encode(uint8 op, bytes cfg, bytes envelope)`), J the CBOR item heads of the Cfg, the policy
+ * body, the history, every anchor UC and every anchor IR opening, L the leaves, Q/E/A/K the CERT_BATCH_V2 grouping of the anchor
+ * table and P its certificate steps plus every leaf's RSMT siblings. The transaction estimate (`total`) adds the calldata intrinsic
+ * gas and the fixed reserve for the wrapper and the vault. It is a number a wallet sets its gas limit from, never an admission rule
+ * (owner section 36). The protocol-5 composite (`legacyTotal` and its components) is kept only because the corpus `gate` cases
+ * still publish it.
  */
 import { fail } from './errors.js';
 import type { Envelope, LeafProof } from './envelope.js';
@@ -73,7 +77,40 @@ export function leafPathGas(p: LeafProof): { gas: number; steps: number } {
   return { gas: rsmtGas(pop), steps: pop };
 }
 
+/** The dimensions the BRIDGE_COMPOSE_V1 schedule prices (bft-core `ComposeDims`). */
+export interface ComposeDims { b: number; j: number; l: number; q: number; e: number; a: number; k: number; p: number }
+
+export const COMPOSE_BASE = 100_000;
+export const COMPOSE_PER_BYTE = 2;
+export const COMPOSE_PER_ITEM = 20;
+export const COMPOSE_PER_LEAF = 16_000;
+export const COMPOSE_PER_SIGNATURE = 6_000;
+export const COMPOSE_PER_EPOCH = 29_900;
+export const COMPOSE_PER_CLAIM = 2_000;
+export const COMPOSE_PER_STEP = 250;
+export const COMPOSE_PER_GROUP_STEP = 50;
+
+/** `50*K*ceil(log2 K)`: sort-based grouping of K claim occurrences (zero for K <= 1). */
+export const composeGroupGas = (k: number): number => (k <= 1 ? 0 : COMPOSE_PER_GROUP_STEP * k * (k - 1).toString(2).length);
+
+/** The native charge of a BRIDGE_COMPOSE_V1 call that succeeds. */
+export const composeGas = (d: ComposeDims): number =>
+  COMPOSE_BASE + COMPOSE_PER_BYTE * d.b + COMPOSE_PER_ITEM * d.j + COMPOSE_PER_LEAF * d.l + COMPOSE_PER_SIGNATURE * d.q +
+  COMPOSE_PER_EPOCH * d.e + COMPOSE_PER_CLAIM * d.a + COMPOSE_PER_STEP * d.p + composeGroupGas(d.k);
+
+/** The CBOR item heads of one object, 0 when it does not scan (bft-core charges an object's J only once it scans). */
+const itemsOrZero = (b: Uint8Array): number => {
+  try {
+    return countItems(b, MAX_CBOR_ITEMS);
+  } catch {
+    return 0;
+  }
+};
+
 export interface Gate {
+  /** The BRIDGE_COMPOSE_V1 dimensions and their native charge. */
+  compose: ComposeDims;
+  native: number;
   intrinsic: number;
   b2: number;
   /** `G_batch`. */
@@ -86,11 +123,23 @@ export interface Gate {
   j: number;
   /** The grouping the batch is priced by. */
   grouping: Counts;
-  /** The estimate including the fixed reserve. */
+  /** The transaction estimate: `21000 + 16*D_max + G_compose + 1,000,000`. */
   total: number;
+  /** The protocol-5 composite of the corpus `gate` cases (`G_gate`). */
+  legacyTotal: number;
 }
 
-/** Price a complete bounded envelope: the estimate, never a refusal. */
+/** `21000 + 16*D_max`: the calldata intrinsic gas of the canonical two-bytes-argument call. */
+export const calldataGas = (cfgBytes: number, envelopeBytes: number): number => INTRINSIC_BASE + PER_BYTE * maxCalldata(cfgBytes, envelopeBytes);
+
+function finish(g: Gate, cfgBytes: number, envelopeBytes: number): Gate {
+  g.legacyTotal = g.intrinsic + g.b2 + g.batch + g.items + g.rsmt + GAS_RESERVE;
+  g.native = composeGas(g.compose);
+  g.total = calldataGas(cfgBytes, envelopeBytes) + g.native + GAS_RESERVE;
+  return g;
+}
+
+/** Estimate a complete bounded envelope (never a refusal): the native charge, the transaction estimate and the legacy composite. */
 export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelRequest: number, e: Envelope): Gate {
   const cfgBytes = cfg.length;
   // J: the item occurrences of the Cfg, the policy body, every anchor UC (counted by the batch scan) and every anchor IR opening,
@@ -117,7 +166,13 @@ export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelReques
     rsmt += l.gas;
     steps += l.steps;
   }
+  const compose: ComposeDims = {
+    b: kernelRequestBytes(cfgBytes, envelopeBytes), j: j + itemsOrZero(e.history), l: e.leafProofs.length,
+    q: grouping.q, e: grouping.e, a: grouping.a, k: grouping.k, p: steps,
+  };
   const g: Gate = {
+    compose,
+    native: 0,
     intrinsic: intrinsicGas(cfgBytes, envelopeBytes),
     b2: b2Gas(kernelRequest, e.leafProofs.length),
     batch: batchGas(grouping),
@@ -127,9 +182,9 @@ export function computeGate(cfg: Uint8Array, envelopeBytes: number, kernelReques
     j,
     grouping,
     total: 0,
+    legacyTotal: 0,
   };
-  g.total = g.intrinsic + g.b2 + g.batch + g.items + g.rsmt + GAS_RESERVE;
-  return g;
+  return finish(g, cfgBytes, envelopeBytes);
 }
 
 /**
@@ -143,7 +198,7 @@ export const BEST_SIGNATURES = 1;
 export const BEST_UC_ITEMS = 39;
 
 /**
- * The burn-time best-case projection: the gate of the redemption envelope a token with `leaves` leaves (the burn included) and a
+ * The burn-time best-case projection: the estimate of the redemption envelope a token with `leaves` leaves (the burn included) and a
  * `historyBytes` history would need if everything the burn cannot yet know turns out as small as it can: the consolidated bundle,
  * `anchors` anchors (one per aggregator shard the leaves touch, at least 1, at most `leaves`) under ONE seal, the smallest
  * certificates and empty paths. With the shard count unknown the best case is one anchor (a single certificate may serve every leaf).
@@ -161,7 +216,11 @@ export function projectedGate(cfgBytes: number, policyBytes: number, leaves: num
     word + k * (word + anchorBytes) + word + leaves * (word + leafBytes);
   const grouping: Counts = { k, c: 4 + k * (106 + 1 + BEST_UC_BYTES), e: 1, s: 1, q: BEST_SIGNATURES, a: k, p: 0, items: k * BEST_UC_ITEMS };
   const j = fixedItems(k) + grouping.items;
+  // The history's own items are not counted (a lower bound: the burn cannot see the final history's encoding).
+  const compose: ComposeDims = { b: kernelRequestBytes(cfgBytes, envelope), j, l: leaves, q: BEST_SIGNATURES, e: 1, a: k, k, p: 0 };
   const g: Gate = {
+    compose,
+    native: 0,
     intrinsic: intrinsicGas(cfgBytes, envelope),
     b2: b2Gas(kernelRequestBytes(cfgBytes, historyBytes), leaves),
     batch: batchGas(grouping),
@@ -171,7 +230,7 @@ export function projectedGate(cfgBytes: number, policyBytes: number, leaves: num
     j,
     grouping,
     total: 0,
+    legacyTotal: 0,
   };
-  g.total = g.intrinsic + g.b2 + g.batch + g.items + g.rsmt + GAS_RESERVE;
-  return { gate: g, envelopeBytes: envelope };
+  return { gate: finish(g, cfgBytes, envelope), envelopeBytes: envelope };
 }

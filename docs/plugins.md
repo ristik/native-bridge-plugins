@@ -112,9 +112,14 @@ atomically.
 The aggregator policy names the partition only. Each anchor is read from its own UC (its shard, shard configuration hash and partition); the
 plug-in routes a leaf to an aggregator by its state ID, and whatever certificate the response carries is kept with its path. The depth of an anchor is
 the depth of its own shard ID, and every leaf's state ID must carry the prefix bits of the anchor it names. Parent and child shards of a topology
-split may both appear in one history. The gas estimate is `21000 + 16*D_max + 80*B_env + 1000*J + G_kernel + G_batch + sum G_leaf + 1,000,000`, with `J`
-the CBOR item occurrences of the Cfg, the policy, every UC and every IR opening (each object within its own native scan, no shared budget) and `G_batch` the price of the one
-`CERT_BATCH_V2` call, grouped by `certgroups.ts` / `certgroups.rs` exactly as the contract and the oracle do.
+split may both appear in one history. The composition is one native call, BRIDGE_COMPOSE_V1 at 0x0105 (`compose.ts` / `compose.rs`:
+the input encoding, the 384-byte output and the status table). Its charge is the trial schedule
+`G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)` (`gas.compose`, `native`), with
+`B` the native input bytes, `J` the CBOR item heads of the Cfg, the policy, the history, every UC and every IR opening, `L` the leaves and
+`Q, E, A, K, P` the `CERT_BATCH_V2` grouping of the anchor table (`certgroups.ts` / `certgroups.rs`, exactly as the oracle) plus every
+leaf's RSMT siblings in `P`. The transaction estimate (`total`) is `21000 + 16*D_max + G_compose + 1,000,000`; the protocol-5 composite
+stays as `legacyTotal` / `legacy_total` for the corpus `gate` cases only. The corpus runners check that every successful `native-compose`
+case's gas is `G_compose` of the plug-in's own scans.
 
 ## From burn to claimed native funds (wallet lifecycle)
 

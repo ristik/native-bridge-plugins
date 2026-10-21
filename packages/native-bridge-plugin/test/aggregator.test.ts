@@ -366,7 +366,11 @@ test('preflightBurn prices a held token exactly (pins the best-case constants an
   const held = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n)], T0, UC_TS);
   const gate = await preflightBurn(w.bridge, held.bytes);
   // best case: ONE 445-byte one-signature certificate (39 items, depth 0, no shard sibling), an empty input record (12 items), the known history only
-  assert.deepEqual([gate.total, gate.batch, gate.items, gate.b2, gate.intrinsic, gate.rsmt], [1_725_886, 107_896, 72_000, 125_600, 407_112, 13_278]);
+  assert.deepEqual([gate.legacyTotal, gate.batch, gate.items, gate.b2, gate.intrinsic, gate.rsmt], [1_725_886, 107_896, 72_000, 125_600, 407_112, 13_278]);
+  // BRIDGE_COMPOSE_V1: 100000 + 2*4480 + 20*72 + 16000*3 + 6000*1 + 29900*1 + 2000*1 (one claim, no grouping or path steps)
+  assert.deepEqual(gate.compose, { b: 4480, j: 72, l: 3, q: 1, e: 1, a: 1, k: 1, p: 0 });
+  assert.equal(gate.native, 196_300);
+  assert.equal(gate.total, 1_288_532, 'calldata + native + reserve');
 });
 
 test('planAnchors itself refuses more than MAX_ANCHORS anchors with ErrTooManyPaths (not shadowed by checkPolicyBody)', async () => {

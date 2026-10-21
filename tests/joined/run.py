@@ -85,13 +85,18 @@ def compare_contracts(contracts, generated):
 
 
 NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER = 'B2 kernel 0x0104', 'B1 CERT_BATCH_V2 0x0100', 'B1 RSMT_MEMBER_V1 0x0102'
-NATIVE_TARGETS = {NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER}
-# Minimum native calls per step (redeem proves three leaves). Coverage is per step, never a union over the report.
+NATIVE_COMPOSE = 'BRIDGE_COMPOSE_V1 0x0105'
+NATIVE_TARGETS = {NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER, NATIVE_COMPOSE}
+# Exact native calls per step (B7 direct PR 2): prepareLock is one B2 kernel call; a mint or return is one BRIDGE_COMPOSE_V1 call and
+# no direct B1/B2 call. Coverage is per step, never a union over the report.
+_NONE = {NATIVE_KERNEL: 0, NATIVE_UC: 0, NATIVE_MEMBER: 0, NATIVE_COMPOSE: 0}
 NATIVE_STEP_CALLS = {
-    'lock': {NATIVE_KERNEL: 1},
-    'verifyMint': {NATIVE_KERNEL: 1, NATIVE_UC: 1, NATIVE_MEMBER: 1},
-    'redeem (third-party submitter)': {NATIVE_KERNEL: 1, NATIVE_UC: 1, NATIVE_MEMBER: 3},
+    'lock': {**_NONE, NATIVE_KERNEL: 1},
+    'verifyMint': {**_NONE, NATIVE_COMPOSE: 1},
+    'redeem (third-party submitter)': {**_NONE, NATIVE_COMPOSE: 1},
 }
+# Steps whose one 0x0105 call must have charged the plug-ins' G_compose (the driver records it as composeGas).
+NATIVE_COMPOSE_STEPS = ('verifyMint', 'redeem (third-party submitter)')
 NATIVE_REQUIRED = ['lock', 'verifyMint', 'redeem (third-party submitter)', 'claim', 'redeem again (duplicate burn)',
                    'conflicting burn (other recipient) after the first redeem',
                    'claim to a reverting payee (credit and P roll back)',
@@ -112,13 +117,17 @@ def check_native_report(path):
     for name, wanted in NATIVE_STEP_CALLS.items():
         for target, n in wanted.items():
             calls = [c for c in steps[name].get('nativeCalls', []) if c['target'] == target]
-            if len(calls) < n:
-                raise ValueError(f'{name}: expected {n} call(s) to {target}, recorded {len(calls)}')
+            if len(calls) != n:
+                raise ValueError(f'{name}: expected exactly {n} call(s) to {target}, recorded {len(calls)}')
             for c in calls:
                 if c.get('nativePrecompile') is not True:
                     raise ValueError(f'{name}: {target} did not execute as a native precompile')
                 if c.get('ok') is not True:
                     raise ValueError(f'{name}: {target} call did not succeed')
+    for name in NATIVE_COMPOSE_STEPS:
+        call = next((c for c in steps[name]['nativeCalls'] if c['target'] == NATIVE_COMPOSE), {})
+        if steps[name].get('composeGas') is None or call.get('gasUsed') != steps[name]['composeGas']:
+            raise ValueError(f'{name}: the 0x0105 charge is not the recorded G_compose')
     for s in report['steps']:
         for c in s.get('nativeCalls', []):
             if c.get('nativePrecompile') is False:
