@@ -1,7 +1,9 @@
 //! Native-call acceptance of the merged bridge vault: the real vault and verifier runtimes, the
-//! real registry genesis of the production B1 path and the Unicity node's EVM factory, with B1 at
-//! 0x0100/0x0102 and the B2 kernel at 0x0104 executing natively. Every call to those addresses is
-//! recorded by an inspector. Restart/reorg and a running aggregator are NOT covered here.
+//! real registry genesis of the production B1 path and the Unicity node's EVM factory, with the B2
+//! kernel at 0x0104 (prepareLock) and the native composition BRIDGE_COMPOSE_V1 at 0x0105 (mint and
+//! return, B7 direct PR 2) executing natively; B1 at 0x0100/0x0102 is recorded too, and the verifier
+//! must no longer call it directly. Every call to those addresses is recorded by an inspector.
+//! Restart/reorg and a running aggregator are NOT covered here.
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use alloy_primitives::{address, hex, keccak256, Address, TxKind, B256, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
@@ -32,7 +34,7 @@ const GENESIS_UC_TIME: u64 = 1000;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs};
 
-const NATIVE: [(Address, &str); 3] = [
+const NATIVE: [(Address, &str); 4] = [
     (
         address!("0000000000000000000000000000000000000100"),
         "B1 CERT_BATCH_V2 0x0100",
@@ -44,6 +46,10 @@ const NATIVE: [(Address, &str); 3] = [
     (
         address!("0000000000000000000000000000000000000104"),
         "B2 kernel 0x0104",
+    ),
+    (
+        address!("0000000000000000000000000000000000000105"),
+        "BRIDGE_COMPOSE_V1 0x0105",
     ),
 ];
 const DEPOSITOR: Address = address!("00000000000000000000000000000000000d0001");
@@ -411,6 +417,145 @@ fn snapshot(w: &World, at: Address) -> (U256, BTreeMap<U256, U256>) {
 const KERNEL: &str = "B2 kernel 0x0104";
 const UC: &str = "B1 CERT_BATCH_V2 0x0100";
 const MEMBER: &str = "B1 RSMT_MEMBER_V1 0x0102";
+const COMPOSE: &str = "BRIDGE_COMPOSE_V1 0x0105";
+/// The status codes of config/compose-status.json the refusals below expect (bft-core `ComposeStatus`).
+const STATUS_ANCHOR_AUTH: u64 = 61;
+const STATUS_LEAF_PROOF: u64 = 62;
+
+/// The wrapper's revert for a nonzero composition status: `BridgeRejected(uint256 status)`, as `revert_name` prints it.
+fn bridge_rejected(status: u64) -> String {
+    let sel = &keccak256(b"BridgeRejected(uint256)")[..4];
+    format!(
+        "BridgeRejected(uint256) {}{}",
+        h(sel),
+        hex::encode(U256::from(status).to_be_bytes::<32>())
+    )
+}
+
+/// A step made exactly `n` calls to each named native address (zero included), each a native precompile call that succeeded.
+fn require_exact(step: &str, o: &Out, want: &[(&str, usize)]) {
+    for (target, n) in want {
+        let got = o.native.iter().filter(|c| c["target"] == *target).count();
+        assert_eq!(
+            got, *n,
+            "{step}: expected exactly {n} call(s) to {target}, saw {got}"
+        );
+    }
+    require_native(step, o, want);
+}
+
+/// The CBOR item heads of one canonical definite-length object (tags and containers, scalar and string heads, every child and
+/// map key and value; the contents of a byte or text string are opaque): bft-core `BridgeItems`, the J of the history.
+fn cbor_items(b: &[u8]) -> u64 {
+    fn item(b: &[u8], pos: &mut usize) -> u64 {
+        let ib = b[*pos];
+        *pos += 1;
+        let (major, ai) = (ib >> 5, ib & 31);
+        let arg = match ai {
+            0..=23 => u64::from(ai),
+            24..=27 => {
+                let n = 1usize << (ai - 24);
+                let v = b[*pos..*pos + n]
+                    .iter()
+                    .fold(0u64, |a, &x| (a << 8) | u64::from(x));
+                *pos += n;
+                v
+            }
+            _ => panic!("indefinite or reserved CBOR head in the history"),
+        };
+        match major {
+            2 | 3 => {
+                *pos += arg as usize;
+                1
+            }
+            4 => 1 + (0..arg).map(|_| item(b, pos)).sum::<u64>(),
+            5 => 1 + (0..2 * arg).map(|_| item(b, pos)).sum::<u64>(),
+            6 => 1 + item(b, pos),
+            _ => 1,
+        }
+    }
+    let mut pos = 0;
+    let n = item(b, &mut pos);
+    assert_eq!(pos, b.len(), "trailing bytes after the history");
+    n
+}
+
+/// The one BRIDGE_COMPOSE_V1 call of a mint or return: its input is `abi.encode(op, cfg, envelope)` with the golden envelope, its
+/// 384-byte output carries the marker, status 0 and the golden result, and the gas it charged is the plug-ins' estimate
+/// `G_compose = 100000 + 2B + 20J + 16000L + 6000Q + 29900E + 2000A + 250P + 50K*ceil(log2 K)` computed from the golden scans (J
+/// of the Cfg, policy, UCs and IR openings from the gate components, plus the history's item heads). Returns the charged gas.
+fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
+    let c = o
+        .native
+        .iter()
+        .find(|c| c["target"] == COMPOSE)
+        .expect("compose call");
+    let input = hx(&c["input"]);
+    let word = |at: usize| U256::from_be_slice(&input[at..at + 32]).to::<usize>();
+    assert_eq!(word(0), usize::from(op), "{step}: compose operation");
+    let env_at = word(64);
+    let envelope = &input[env_at + 32..env_at + 32 + word(env_at)];
+    let e = &golden["envelope"];
+    assert_eq!(
+        envelope,
+        hx(&e["bytes"]).as_slice(),
+        "{step}: the compose envelope is the oracle's"
+    );
+    let out = hx(&c["output"]);
+    assert_eq!(out.len(), 384, "{step}: compose output bytes");
+    assert_eq!(
+        &out[..25],
+        b"UNICITY_BRIDGE_COMPOSE_V1",
+        "{step}: compose marker"
+    );
+    assert!(
+        out[25..32].iter().all(|&x| x == 0) && U256::from_be_slice(&out[32..64]).is_zero(),
+        "{step}: compose status 0"
+    );
+    let leaves = e["leaves"].as_array().unwrap().len() as u64;
+    assert_eq!(
+        U256::from_be_slice(&out[352..384]),
+        U256::from(leaves),
+        "{step}: leaf count"
+    );
+    assert_eq!(
+        B256::from_slice(&out[256..288]),
+        h32(&golden["result"]["lockDigest"]),
+        "{step}: lock digest"
+    );
+    assert_eq!(
+        B256::from_slice(&out[320..352]),
+        h32(&golden["result"]["nullifier"]),
+        "{step}: nullifier"
+    );
+    let g = &e["gate"];
+    let n = |k: &str| g[k].as_u64().unwrap();
+    let gr = |k: &str| g["grouping"][k].as_u64().unwrap();
+    let j_gate =
+        (n("total") - n("intrinsic") - n("b2") - n("batch") - n("rsmt") - n("reserve")) / 1000;
+    let j = j_gate + cbor_items(&hx(&golden["history"]));
+    let k = gr("k");
+    let group = if k <= 1 {
+        0
+    } else {
+        50 * k * u64::from(64 - (k - 1).leading_zeros())
+    };
+    let want = 100_000
+        + 2 * input.len() as u64
+        + 20 * j
+        + 16_000 * leaves
+        + 6_000 * gr("q")
+        + 29_900 * gr("e")
+        + 2_000 * gr("a")
+        + 250 * n("steps")
+        + group;
+    let charged = c["gasUsed"].as_u64().unwrap();
+    assert_eq!(
+        charged, want,
+        "{step}: 0x0105 charged the plug-ins' G_compose"
+    );
+    charged
+}
 
 /// A step must have made at least `n` calls to each named native address, each a native precompile
 /// call that succeeded; an empty or partial call list fails here instead of passing vacuously.
@@ -432,8 +577,8 @@ fn require_native(step: &str, o: &Out, want: &[(&str, usize)]) {
     }
 }
 
-/// The recorded native calls carry exactly the oracle's kernel request/result, UC request and RSMT requests.
-fn matches_oracle(step: &str, o: &Out, kernel: &Value, envelope: Option<&Value>) {
+/// The recorded 0x0104 call carries exactly the oracle's kernel request and result (prepareLock).
+fn matches_oracle(step: &str, o: &Out, kernel: &Value) {
     let k = o
         .native
         .iter()
@@ -449,30 +594,6 @@ fn matches_oracle(step: &str, o: &Out, kernel: &Value, envelope: Option<&Value>)
         kernel["kernelOutput"].as_str().unwrap().to_lowercase(),
         "{step}: kernel result"
     );
-    if let Some(e) = envelope {
-        // ONE 0x0100 CERT_BATCH_V2 call over the whole anchor table, with the oracle's batch request.
-        let ucs: Vec<&Value> = o.native.iter().filter(|c| c["target"] == UC).collect();
-        assert_eq!(
-            ucs.len(),
-            1,
-            "{step}: one batch call for the whole anchor table"
-        );
-        assert_eq!(
-            ucs[0]["input"],
-            e["batch"]["request"].as_str().unwrap().to_lowercase(),
-            "{step}: batch request"
-        );
-        let members: Vec<&Value> = o.native.iter().filter(|c| c["target"] == MEMBER).collect();
-        let want = e["members"].as_array().unwrap();
-        assert_eq!(members.len(), want.len(), "{step}: RSMT call count");
-        for (got, want) in members.iter().zip(want) {
-            assert_eq!(
-                got["input"],
-                want["request"].as_str().unwrap().to_lowercase(),
-                "{step}: RSMT request"
-            );
-        }
-    }
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> usize {
@@ -779,8 +900,12 @@ fn main() {
             .to_lowercase(),
         "kernel request equals the oracle's prepare request"
     );
-    require_native("lock", &o, &[(KERNEL, 1)]);
-    matches_oracle("lock", &o, &golden["prepare"], None);
+    require_exact(
+        "lock",
+        &o,
+        &[(KERNEL, 1), (COMPOSE, 0), (UC, 0), (MEMBER, 0)],
+    );
+    matches_oracle("lock", &o, &golden["prepare"]);
     let digest = w.view_b(vault_addr, lockDigestCall { n: U256::from(1) }.abi_encode());
     assert_eq!(
         digest,
@@ -790,7 +915,7 @@ fn main() {
     steps.push(tx_json(&w, "lock", &o, json!({"lockDigest": h(digest.as_slice()), "kernelRequestAndResultEqualOracle": true, "minGasLimit": bisect_min_gas(&w0, &t(DEPOSITOR, lockCall { p0: p0.clone().into() }.abi_encode(), WEI), false)})));
     let w1 = w.clone();
 
-    // ---- verifyMint (native 0x0100, 0x0102, 0x0104) ----
+    // ---- verifyMint (one native BRIDGE_COMPOSE_V1 call at 0x0105, no direct B1/B2 call) ----
     let vm = t(
         THIRD_PARTY,
         verifyMintCall {
@@ -802,19 +927,18 @@ fn main() {
     let o = w.run(&vm, false);
     assert!(o.ok, "verifyMint: {}", w.revert_name(&o));
     assert_eq!(U256::from_be_slice(&o.output), U256::from(1));
-    require_native("verifyMint", &o, &[(KERNEL, 1), (UC, 1), (MEMBER, 1)]);
-    matches_oracle(
+    require_exact(
         "verifyMint",
         &o,
-        &golden["mint"],
-        Some(&golden["mint"]["envelope"]),
+        &[(COMPOSE, 1), (KERNEL, 0), (UC, 0), (MEMBER, 0)],
     );
+    let compose_gas = matches_compose("verifyMint", &o, 1, &golden["mint"]);
     let min = bisect_min_gas(&w, &vm, false);
     steps.push(tx_json(
         &w,
         "verifyMint",
         &o,
-        json!({"returnedNonce": 1, "minGasLimit": min}),
+        json!({"returnedNonce": 1, "minGasLimit": min, "composeGas": compose_gas}),
     ));
 
     // ---- redeem by a third party (permissionless), then claim ----
@@ -828,13 +952,12 @@ fn main() {
     );
     let o = w.run(&rd, true);
     assert!(o.ok, "redeem: {}", w.revert_name(&o));
-    require_native("redeem", &o, &[(KERNEL, 1), (UC, 1), (MEMBER, 3)]);
-    matches_oracle(
+    require_exact(
         "redeem",
         &o,
-        &golden["return"],
-        Some(&golden["return"]["envelope"]),
+        &[(COMPOSE, 1), (KERNEL, 0), (UC, 0), (MEMBER, 0)],
     );
+    let compose_gas = matches_compose("redeem", &o, 2, &golden["return"]);
     let min = bisect_min_gas(&w1, &rd, false);
     let credit = w.view_u(vault_addr, claimableCall { a: recipient }.abi_encode());
     assert_eq!(credit, amount);
@@ -845,7 +968,7 @@ fn main() {
         ),
         h32(&golden["return"]["result"]["nullifier"])
     );
-    steps.push(tx_json(&w, "redeem (third-party submitter)", &o, json!({"creditedRecipient": h(recipient.as_slice()), "credit": credit.to_string(), "minGasLimit": min})));
+    steps.push(tx_json(&w, "redeem (third-party submitter)", &o, json!({"creditedRecipient": h(recipient.as_slice()), "credit": credit.to_string(), "minGasLimit": min, "composeGas": compose_gas})));
     let w2 = w.clone();
 
     let cl = Tx {
@@ -1046,7 +1169,7 @@ fn main() {
         } else {
             refused_at.get_or_insert(k);
             let name = x.revert_name(&o);
-            if name.starts_with("UCRejected") {
+            if name == bridge_rejected(STATUS_ANCHOR_AUTH) {
                 ucrejected_at.get_or_insert(k);
             }
             *reasons
@@ -1055,7 +1178,7 @@ fn main() {
         }
     }
     let _ = refused_at;
-    let k = ucrejected_at.expect("some certificate byte flip is a UCRejected verdict");
+    let k = ucrejected_at.expect("some certificate byte flip is an ErrAnchorAuth status");
     let mut bad = return_proof.clone();
     bad[base + k] ^= 1;
     refuse(
@@ -1067,7 +1190,7 @@ fn main() {
             redeemCall { proof: bad.into() }.abi_encode(),
             0,
         ),
-        "UCRejected",
+        &bridge_rejected(STATUS_ANCHOR_AUTH),
     );
     steps.push(json!({"step": "certificate single-byte flip scan", "certificateBytes": uc.len(), "flipsStillAccepted": accepted, "acceptedOffsets": accepted_offsets, "flipsRefused": uc.len() - accepted, "refusalReasons": reasons, "firstRefusedOffset": k}));
     let sib = &hx(&ret["members"][0]["request"])[hx(&ret["members"][0]["request"]).len() - 32..];
@@ -1083,7 +1206,7 @@ fn main() {
             redeemCall { proof: bad.into() }.abi_encode(),
             0,
         ),
-        "LeafNotIncluded",
+        &bridge_rejected(STATUS_LEAF_PROOF),
     );
     let mut no_registry = w1.clone();
     no_registry.db.cache.accounts.remove(&SEAL_REGISTRY);
