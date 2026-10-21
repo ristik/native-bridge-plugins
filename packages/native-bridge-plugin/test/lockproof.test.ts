@@ -210,6 +210,13 @@ test('over-bound evidence never triggers online fallback; justification is bound
   assert.throws(() => parseJustification(new Uint8Array(64 * 1024 + 1)), /ErrJustificationTooLarge/);
 });
 
+// The cfg and trustBaseId slots are the proof's own shape (bft-core decodeLockProof): a 31-byte value is ErrLockProofShape, not the
+// scanner's generic error.
+test('proof cfg and trustBaseId of the wrong width are the proof\'s shape', async () => {
+  await parseRejects((p) => void (p.cfg = new Uint8Array(31).fill(7)), 'ErrLockProofShape');
+  await parseRejects((p) => void (p.trustBaseId = new Uint8Array(31).fill(7)), 'ErrLockProofShape');
+});
+
 test('proof arity and version are exact', async () => {
   const w = await makeWorld();
   const p = await lockParts(w, spec(1));
