@@ -1,10 +1,10 @@
 {
   "profile": "utb-history-protocol-5",
   "sources": {
-    "plugins": "b5f08fe435a641cc4829d97222a21be7f7928e94",
-    "ureth": "4936d7579458ba055bd2d7092249dc0dc8b64a4d",
-    "contracts": "cfbe709bb5be5878cf101459211f78f906b62307",
-    "oracle": "fd9f223a360308ee5088c5dd9d5b9e3922958102",
+    "plugins": "9c21eb605faa0ea57651d6aa2c4f07b0fd78c202",
+    "ureth": "ef52f3c178ee3c4e6bc8827d1b6fd0b1d3652bc4",
+    "contracts": "fe5a6930f2c31c6e0f2d6ba479207e61f367dabf",
+    "oracle": "17dfe06becad1e3890f1f8bc233bf806d234bf02",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
