@@ -512,7 +512,7 @@ fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
         out[25..32].iter().all(|&x| x == 0) && U256::from_be_slice(&out[32..64]).is_zero(),
         "{step}: compose status 0"
     );
-    let leaves = e["leaves"].as_array().unwrap().len() as u64;
+    let leaves = e["leaves"].as_u64().unwrap();
     assert_eq!(
         U256::from_be_slice(&out[352..384]),
         U256::from(leaves),
