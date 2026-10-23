@@ -81,6 +81,21 @@ pub const TAG_MINT_LOCK: u64 = 39049;
 pub const TAG_RETURN_REASON: u64 = 39048;
 pub const TAG_WALLET_VALUE: u64 = 39050;
 pub const TAG_INPUT_RECORD: u64 = 39002;
+pub const TAG_TOKEN: u64 = 39040;
+pub const TAG_INCLUSION: u64 = 39033;
+pub const TOKEN_VERSION: u64 = 2;
+pub const INCLUSION_VERSION: u64 = 1;
+/// The SDK token decode (bft-core `DecodeToken`): a whole token and one proof's certificate. A nested ancestor also lies inside the
+/// envelope, so the envelope bound binds first.
+pub const MAX_DECODED_TOKEN_BYTES: usize = 4 << 20;
+pub const MAX_PROOF_UC_BYTES: usize = 24 << 10;
+
+// ---- protocol 6: split lineage (bft-core docs/design/bridge-split-lineage-spec.md) ----
+pub const SPLIT_PROTO_VERSION: u32 = 6;
+pub const TAG_SPLIT_JUSTIFICATION: u64 = 39044;
+pub const TAG_SPLIT_MANIFEST: u64 = 39046;
+/// One allocation-proof step per key bit.
+pub const MAX_SUM_PROOF_STEPS: usize = 256;
 
 pub const MINT_LOCK_VERSION: u64 = 2;
 pub const LOCK_PROOF_VERSION: u64 = 1;

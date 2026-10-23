@@ -72,6 +72,9 @@ errors! {
     // protocol 4 (the oracle's names): certificate scan, anchor openings and the leaf proof
     CertScan => Malformed, CertSigLength => Malformed, IROpening => Invalid, IRShape => Invalid,
     IRState => Invalid, IRTime => Invalid, LeafProof => Invalid,
+    // protocol 6 (split lineage)
+    SplitJustif => Invalid, SplitProofCount => Invalid, SplitProofShape => Invalid, SplitManifest => Invalid,
+    SplitBurn => Invalid, SplitProof => Invalid, SplitSum => Invalid,
 }
 
 impl core::fmt::Display for NativeError {

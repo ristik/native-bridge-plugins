@@ -26,6 +26,10 @@ pub enum Kind<'a> {
     Array(Vec<Item<'a>>),
     Tag(u64, Box<Item<'a>>),
     Null,
+    /// Only in a native scan ([`scan_native`]): the opaque certificate inside an SDK inclusion proof.
+    Text(&'a [u8]),
+    /// Only in a native scan: keys and values alternate.
+    Map(Vec<Item<'a>>),
 }
 
 /// Scan exactly one item spanning all of `b`, within `MAX_CBOR_ITEMS`.
@@ -35,17 +39,30 @@ pub fn scan_one(b: &[u8]) -> Result<Item<'_>> {
 
 /// [`scan_one`] within `max_items` items (the composed history is bounded by its bytes, not an item count).
 pub fn scan_one_within(b: &[u8], max_items: usize) -> Result<Item<'_>> {
+    Ok(scan_counted(b, max_items, false)?.0)
+}
+
+/// [`scan_one`] for items that embed a native certificate (bft-core `scanOneNative`): definite text strings and maps are admitted,
+/// which the profile's own objects never use but the certificate inside an SDK inclusion proof does. Canonical key order inside that
+/// certificate is the certificate scan's concern, not this scanner's.
+pub fn scan_native(b: &[u8]) -> Result<Item<'_>> {
+    Ok(scan_counted(b, MAX_CBOR_ITEMS, true)?.0)
+}
+
+/// The scan and its item count (bft-core `scanner.tokens`), which the composition charges per item.
+pub fn scan_counted(b: &[u8], max_items: usize, native: bool) -> Result<(Item<'_>, usize)> {
     let mut s = Scanner {
         b,
         pos: 0,
         tokens: 0,
         max_items,
+        native,
     };
     let it = s.item(0)?;
     if s.pos != b.len() {
         return Err(E::Trailing);
     }
-    Ok(it)
+    Ok((it, s.tokens))
 }
 
 struct Scanner<'a> {
@@ -53,6 +70,7 @@ struct Scanner<'a> {
     pos: usize,
     tokens: usize,
     max_items: usize,
+    native: bool,
 }
 
 /// Read one head; returns `(major, argument)` and rejects non-shortest forms.
@@ -100,7 +118,7 @@ impl<'a> Scanner<'a> {
         }
         if let Some(&ib) = self.b.get(self.pos) {
             let mj = ib >> 5;
-            if mj == 3 || mj == 5 || (mj == 7 && ib != 0xf6) {
+            if (!self.native && (mj == 3 || mj == 5)) || (mj == 7 && ib != 0xf6) {
                 return Err(E::ForbiddenCBOR);
             }
         }
@@ -108,13 +126,30 @@ impl<'a> Scanner<'a> {
         let rest = (self.b.len() - self.pos) as u64;
         let kind = match major {
             0 => Kind::Uint(arg),
-            2 => {
+            2 | 3 => {
                 if arg > rest {
                     return Err(E::Truncated);
                 }
                 let d = &self.b[self.pos..self.pos + arg as usize];
                 self.pos += arg as usize;
-                Kind::Bytes(d)
+                if major == 2 {
+                    Kind::Bytes(d)
+                } else {
+                    Kind::Text(d)
+                }
+            }
+            5 => {
+                if depth + 1 > MAX_CBOR_DEPTH {
+                    return Err(E::TooDeep);
+                }
+                if arg > rest || 2 * arg > rest {
+                    return Err(E::Truncated);
+                }
+                let mut kids = Vec::new();
+                for _ in 0..2 * arg {
+                    kids.push(self.item(depth + 1)?);
+                }
+                Kind::Map(kids)
             }
             4 => {
                 if depth + 1 > MAX_CBOR_DEPTH {

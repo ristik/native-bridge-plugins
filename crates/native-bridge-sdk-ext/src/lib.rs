@@ -19,6 +19,7 @@ pub mod gas;
 pub mod header;
 pub mod history;
 pub mod limits;
+pub mod lineage;
 pub mod lockproof;
 #[cfg(feature = "host")]
 pub mod manifest;
@@ -29,6 +30,8 @@ pub mod readiness;
 pub mod resources;
 pub mod rlp;
 pub mod scan;
+pub mod sdktoken;
+pub mod split;
 pub mod token;
 pub mod trust;
 pub mod unlock;

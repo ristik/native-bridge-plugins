@@ -58,7 +58,7 @@ impl Pred {
     }
 }
 
-fn decode_predicate(it: &Item<'_>) -> Result<Pred> {
+pub(crate) fn decode_predicate(it: &Item<'_>) -> Result<Pred> {
     let c = it.tag_content(TAG_PREDICATE)?;
     let k = c.array(3).ok_or(E::Shape)?;
     match k[0].kind {
@@ -126,7 +126,7 @@ pub struct Cd {
     pub unlock: Vec<u8>,
 }
 
-fn decode_cd(it: &Item<'_>) -> Result<Cd> {
+pub(crate) fn decode_cd(it: &Item<'_>) -> Result<Cd> {
     let c = it.tag_content(TAG_CERTIFICATION)?;
     let k = c.array(6).ok_or(E::Shape)?;
     k[0].version(2)?;
@@ -139,7 +139,7 @@ fn decode_cd(it: &Item<'_>) -> Result<Cd> {
     })
 }
 
-fn decode_mint(it: &Item<'_>) -> Result<Mint> {
+pub(crate) fn decode_mint(it: &Item<'_>) -> Result<Mint> {
     let c = it.tag_content(TAG_MINT)?;
     let k = c.array(8).ok_or(E::Shape)?;
     k[0].version(2)?;
@@ -154,7 +154,7 @@ fn decode_mint(it: &Item<'_>) -> Result<Mint> {
     })
 }
 
-fn decode_transfer(it: &Item<'_>) -> Result<Transfer> {
+pub(crate) fn decode_transfer(it: &Item<'_>) -> Result<Transfer> {
     let c = it.tag_content(TAG_TRANSFER)?;
     let k = c.array(5).ok_or(E::Shape)?;
     k[0].version(2)?;
@@ -175,8 +175,8 @@ pub struct History {
     pub transfers: Vec<Transfer>,
     pub cds: Vec<Cd>,
     pub times: Vec<u64>,
-    mint_raw: Vec<u8>,
-    transfers_raw: Vec<Vec<u8>>,
+    pub(crate) mint_raw: Vec<u8>,
+    pub(crate) transfers_raw: Vec<Vec<u8>>,
 }
 
 impl History {
@@ -286,7 +286,7 @@ pub fn mint_source_hash(id: &[u8; 32]) -> [u8; 32] {
     ]))
 }
 
-fn minter_key(id: &[u8; 32]) -> Result<SigningKey> {
+pub(crate) fn minter_key(id: &[u8; 32]) -> Result<SigningKey> {
     let k = h(&encode_array(&[
         &encode_byte_string(b"I_AM_UNIVERSAL_MINTER_FOR_"),
         &encode_byte_string(id),
@@ -398,7 +398,7 @@ pub fn check_mint_data(dep: &Deployment, d: Option<&[u8]>) -> Result<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check_step(
+pub(crate) fn check_step(
     source: &Pred,
     source_hash: &[u8; 32],
     tx_raw: &[u8],
@@ -438,6 +438,11 @@ fn check_step(
         value: leaf_value(&tx_hash, t),
         expires_at: tx_deadline,
     })
+}
+
+/// The exact predicate bytes of an encoded predicate, strictly decoded and re-encoded.
+pub fn decode_predicate_bytes(b: &[u8]) -> Result<Vec<u8>> {
+    Ok(decode_predicate(&scan_one(b)?)?.to_bytes())
 }
 
 /// The return relation over a decoded history (a terminal burn is required).
@@ -563,7 +568,7 @@ fn verify_history_mode(dep: &Deployment, hist: &History, mode: Mode) -> Result<O
     Ok(out)
 }
 
-fn check_return(cfg: &Cfg, out: &mut Outcome, t: &Transfer) -> Result<()> {
+pub(crate) fn check_return(cfg: &Cfg, out: &mut Outcome, t: &Transfer) -> Result<()> {
     if t.recipient.typ != PRED_BURN {
         return Err(E::NotBurn);
     }
