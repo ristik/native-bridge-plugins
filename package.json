@@ -12,8 +12,8 @@
   },
   "scripts": {
     "build": "npm run build --workspaces",
-    "typecheck": "npm run typecheck --workspaces",
-    "test": "node --test tests/interop/package.test.mjs && npm test -w @unicitylabs/native-bridge-plugin",
+    "typecheck": "npm run typecheck --workspaces && tsc -p tester/tsconfig.json",
+    "test": "node --test tests/interop/package.test.mjs && npm test -w @unicitylabs/native-bridge-plugin && tsx --test tester/*.test.ts",
     "check:protocol": "python3 tools/check_protocol.py",
     "vectors": "python3 tools/vectors.py check"
   },
