@@ -1,8 +1,7 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
 //! The wallet side of a split part (protocol 6) on real lineages in the test world: a lock-backed root split into two outputs, the
-//! outputs minted with certified proofs, a split of a split. The split itself is built here from the crate's own primitives (the
-//! pinned SDK's builder commits bare assets, not the bridge's envelope); the SDK's split verifier then checks it, so the two agree on
-//! the bytes.
+//! outputs minted with certified proofs, a split of a split. The split itself is built here from the crate's own primitives,
+//! independently of the SDK's builder; the SDK's split verifier then checks it, so the two agree on the bytes.
 
 mod common;
 use common::*;
@@ -127,6 +126,7 @@ fn mint_child(
 struct RootOpts {
     stored: Option<[u8; 32]>,
     uc_partition: Option<u32>,
+    uc_partition_at: Option<(usize, u32)>,
     steps: Vec<Step>,
 }
 
@@ -157,6 +157,7 @@ fn lineage(w: &World, child_steps: Vec<Step>, depth: u8, o: RootOpts) -> (TokenO
     let parts = lock_parts(w, &root);
     let tw = Tweaks {
         uc_partition: o.uc_partition,
+        uc_partition_at: o.uc_partition_at,
         ..Tweaks::default()
     };
     let burned = build_token_with(w, &root, &parts, &tw, &steps, T0, UC_TS);
@@ -356,6 +357,43 @@ fn an_ancestor_certified_in_another_partition_is_not_admitted() {
             .unwrap_err(),
         E::NotAdmitted
     );
+}
+
+/// Exactly one out-of-policy ancestor leaf: only the root's transfer (leaf 1), only its split burn (leaf 2) or only its mint (leaf 0).
+#[test]
+fn exactly_one_ancestor_leaf_in_another_partition_is_not_admitted() {
+    let w = make_world(20);
+    let transfer = || {
+        vec![Step::Transfer {
+            to: signer(7),
+            mask: 9,
+            deadline: None,
+            t: T0 + 5,
+        }]
+    };
+    for leaf in [1, 2, 0] {
+        let o = RootOpts {
+            uc_partition_at: Some((leaf, AGG_PARTITION + 1)),
+            steps: transfer(),
+            ..RootOpts::default()
+        };
+        let (_, child) = lineage(&w, vec![], 1, o);
+        assert_eq!(
+            w.bridge
+                .verify_native_token(&child.token, Expect::Receipt)
+                .unwrap_err(),
+            E::NotAdmitted,
+            "leaf {leaf}"
+        );
+    }
+    let control = RootOpts {
+        steps: transfer(),
+        ..RootOpts::default()
+    };
+    let (_, child) = lineage(&w, vec![], 1, control);
+    w.bridge
+        .verify_native_token(&child.token, Expect::Receipt)
+        .unwrap();
 }
 
 #[test]
@@ -636,4 +674,37 @@ fn a_depth_32_part_preflights_verifies_and_returns() {
             .unwrap()
             .1
     );
+}
+
+/// The SDK's split payload with the plug-in's own 39050 decoder (`wallet_value`, the decoder the issuance policy installs): the exact
+/// envelope is accepted; the same assets with a memo, or with a padded amount, never decode to a wallet value, so no output is built.
+#[test]
+fn the_plugins_value_decoder_refuses_a_split_output_with_a_memo() {
+    use native_bridge_sdk_ext::splitpart::wallet_value;
+    use unicity_token::cbor::{encode_array, encode_byte_string, encode_tag, encode_uint};
+    use unicity_token::payment::{Asset, AssetId, PaymentAssetCollection, SplitOutputPayload};
+    let w = make_world(20);
+    let aid = w.dep.cfg.aid;
+    let assets = || {
+        PaymentAssetCollection::create([Asset::new(
+            AssetId::new(aid.to_vec()),
+            BigUint::from(400u32),
+        )])
+        .unwrap()
+    };
+    let exact = value_envelope(&aid, &amt(400));
+    SplitOutputPayload::new(assets(), exact.clone(), wallet_value).unwrap();
+    let entry = encode_array(&[&encode_byte_string(&aid), &encode_byte_string(&amt(400))]);
+    let with_memo = encode_tag(
+        39050,
+        &encode_array(&[
+            &encode_uint(1),
+            &encode_array(&[&entry]),
+            &encode_byte_string(b"memo"),
+        ]),
+    );
+    assert!(wallet_value(&with_memo).is_err());
+    assert!(SplitOutputPayload::new(assets(), with_memo, wallet_value).is_err());
+    let padded = value_envelope(&aid, &[0, 1, 144]);
+    assert!(SplitOutputPayload::new(assets(), padded, wallet_value).is_err());
 }

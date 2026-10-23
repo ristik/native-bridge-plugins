@@ -396,6 +396,8 @@ export interface Tweaks {
   proofTime?: [number, bigint][];
   /** The root round of the certificate of leaf `i`; leaves of one shard in different rounds get different UCs. */
   ucRound?: (i: number) => bigint;
+  /** `[i, partition]`: leaf `i` alone is certified in `partition`, under its own certificate (every other leaf as below). */
+  ucPartitionAt?: [number, number];
   /** The aggregation partition every leaf is certified in (default the deployment's). */
   ucPartition?: number;
 }
@@ -485,7 +487,7 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
   items.forEach((it, i) => {
     const row = rowOf(w, it.sid);
     const round = tw.ucRound ? tw.ucRound(i) : 900n;
-    const key = `${row}:${round}`;
+    const key = tw.ucPartitionAt?.[0] === i ? `alone:${i}` : `${row}:${round}`;
     const g = groups.get(key) ?? { row, round, members: [] };
     g.members.push(i);
     groups.set(key, g);
@@ -497,7 +499,7 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
     for (const i of g.members) await smt.addLeaf(items[i].sid, values[i]);
     const root = await smt.calculateRoot();
     const uc = await makeUc(w.agg, {
-      partition: tw.ucPartition ?? AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
+      partition: tw.ucPartitionAt?.[0] === g.members[0] && g.members.length === 1 ? tw.ucPartitionAt[1] : tw.ucPartition ?? AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
       blockHash: null, signers: 4,
       shard: { bytes: shardOf(w, g.row), siblings: w.depth === 0 ? [] : [sha(text(`sibling of shard ${g.row}`))] },
     });

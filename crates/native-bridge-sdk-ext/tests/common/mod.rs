@@ -819,6 +819,8 @@ pub struct Tweaks {
     pub uc_round: Option<Box<dyn Fn(usize) -> u64>>,
     /// The aggregation partition every leaf is certified in (default the deployment's).
     pub uc_partition: Option<u32>,
+    /// `(i, partition)`: leaf `i` alone is certified in `partition`, under its own certificate (every other leaf as above).
+    pub uc_partition_at: Option<(usize, u32)>,
 }
 
 pub struct TokenOut {
@@ -1034,10 +1036,14 @@ pub fn assemble_token(
     // One tree and one certificate per (shard row, root round): leaves of a shard certified in
     // different rounds are separate anchors even when every other field is equal.
     let mut groups: Vec<(usize, u64, Vec<usize>)> = Vec::new();
+    let alone = |i: usize| tw.uc_partition_at.is_some_and(|(k, _)| k == i);
     for (i, l) in leaves.iter().enumerate() {
         let row = row_of(w, &l.0);
         let round = tw.uc_round.as_ref().map(|f| f(i)).unwrap_or(900);
-        match groups.iter_mut().find(|g| g.0 == row && g.1 == round) {
+        match groups
+            .iter_mut()
+            .find(|g| !alone(i) && !alone(g.2[0]) && g.0 == row && g.1 == round)
+        {
             Some(g) => g.2.push(i),
             None => groups.push((row, round, vec![i])),
         }
@@ -1055,7 +1061,10 @@ pub fn assemble_token(
         let uc = make_uc_in_shard(
             &w.agg,
             &UcSpec {
-                partition: tw.uc_partition.unwrap_or(AGG_PARTITION),
+                partition: match tw.uc_partition_at {
+                    Some((k, p)) if members[0] == k => p,
+                    _ => tw.uc_partition.unwrap_or(AGG_PARTITION),
+                },
                 conf: w.agg_confs[*row].to_vec(),
                 epoch_ir: 1,
                 root_epoch: 2,
