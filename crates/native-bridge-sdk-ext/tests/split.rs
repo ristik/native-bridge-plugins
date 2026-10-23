@@ -1,4 +1,4 @@
-//! The protocol 6 split corpus (bft-core `bridgeprofile/testdata/split-corpus`, development copy in `protocol/split-vectors-dev`),
+//! The protocol 6 split corpus (bft-core `bridgeprofile/testdata/split-corpus`, sealed under `protocol/vectors/split`),
 //! replayed by an implementation independent of the Go oracle that generated it (and of the TypeScript plug-in's).
 
 use std::collections::BTreeMap;
@@ -33,7 +33,7 @@ fn load(rel: &str) -> Value {
 }
 
 fn cases(family: &str) -> Vec<Value> {
-    load(&format!("split-vectors-dev/{family}/cases.json"))["cases"]
+    load(&format!("vectors/split/{family}/cases.json"))["cases"]
         .as_array()
         .unwrap()
         .clone()
@@ -91,30 +91,33 @@ fn verdict(r: Result<(), E>) -> (String, Option<&'static str>) {
 }
 
 #[test]
-fn the_development_copy_is_the_one_this_suite_names_unedited() {
-    let readme =
-        std::fs::read_to_string(format!("{}/split-vectors-dev/README.md", root())).unwrap();
-    let listed: Vec<(&str, &str)> = readme
+fn every_split_file_is_in_the_sealed_manifest_unedited() {
+    let sums = std::fs::read_to_string(format!("{}/vectors/SHA256SUMS", root())).unwrap();
+    let listed: Vec<(&str, &str)> = sums
         .lines()
         .filter_map(|l| {
             let (d, f) = l.split_once("  ")?;
-            (d.len() == 64 && d.bytes().all(|c| c.is_ascii_hexdigit())).then_some((f, d))
+            f.starts_with("split/").then_some((f, d))
         })
         .collect();
     assert_eq!(listed.len(), 6);
     for (file, digest) in listed {
         assert_eq!(
-            hex(&h(&std::fs::read(format!(
-                "{}/split-vectors-dev/{file}",
-                root()
-            ))
-            .unwrap())),
+            hex(&h(
+                &std::fs::read(format!("{}/vectors/{file}", root())).unwrap()
+            )),
             digest,
             "{file}"
         );
     }
     assert_eq!(
-        load("split-vectors-dev/config/fixtures.json")["nativeBridgeProtoVersion"],
+        hex(&h(sums.as_bytes())),
+        std::fs::read_to_string(format!("{}/vectors/MANIFEST.sha256", root()))
+            .unwrap()
+            .trim()
+    );
+    assert_eq!(
+        load("vectors/split/config/fixtures.json")["nativeBridgeProtoVersion"],
         6
     );
     assert_eq!(
@@ -290,7 +293,7 @@ fn every_lineage_case_gets_the_oracles_verdict_and_result() {
 
 #[test]
 fn the_v2_status_table_is_the_corpus_table() {
-    let table = load("split-vectors-dev/config/compose-status-v2.json");
+    let table = load("vectors/split/config/compose-status-v2.json");
     let table = table.as_array().unwrap();
     for e in table {
         let code = e["code"].as_u64().unwrap();
@@ -376,9 +379,9 @@ const ANCHOR_ORDER: [(&str, &str, &str); 4] = [
 #[test]
 fn every_mutation_gets_the_oracles_status_and_gas_wherever_the_plug_ins_decide() {
     let dep = dev();
-    let m = load("split-vectors-dev/mutation/cases.json");
+    let m = load("vectors/split/mutation/cases.json");
     assert_eq!(m["format"], "native-bridge-split-mutations/1");
-    let names: Vec<String> = load("split-vectors-dev/config/compose-status-v2.json")
+    let names: Vec<String> = load("vectors/split/config/compose-status-v2.json")
         .as_array()
         .unwrap()
         .iter()

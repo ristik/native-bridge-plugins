@@ -25,7 +25,7 @@ def synthetic():
     d = f'1:{h}:{h}:1:' + '0'*40
     ty = hashlib.sha256(('unicity-bridge:unicity-native:' + d).encode()).hexdigest()
     coin = hashlib.sha256(('unicity-bridge-coin:unicity-native:' + d).encode()).hexdigest()
-    e = {'schemaVersion': 1, 'protocolVersion': 5, 'family': 'unicity-native', 'sdkVersion': '4.0.0', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'format': 'utb-release-bundle-v1', 'genesisEntryId': h, 'bundle': artifact}}
+    e = {'schemaVersion': 1, 'protocolVersion': 6, 'family': 'unicity-native', 'sdkVersion': '4.0.0', 'tokenTypeHex': ty, 'coinIdHex': coin, 'symbol': 'TEST', 'decimals': 18, 'plugin': {'npm': {'name': '@unicitylabs/native-bridge-plugin', 'version': '0.1.0', 'integrity': 'sha512-'+'A'*86+'=='}, 'rust': {'crate': 'native-bridge-sdk-ext', 'version': '0.1.0', 'revision': 'b'*40}, 'protocolCommit': 'b'*40, 'vectorManifestSha256': h}, 'networkId': 1, 'rootGenesisHash': h, 'executionGenesisHash': h, 'evmChainId': '1', 'chainRef': 'eip155:1', 'asset': '0'*40, 'activeDeployment': dep, 'replacedDeployments': [], 'trustBase': {'networkId': 1, 'rootGenesisHash': h, 'format': 'utb-release-bundle-v1', 'genesisEntryId': h, 'bundle': artifact}}
     return {ty: e}
 
 

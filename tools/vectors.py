@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-FAMILIES = ('config', 'wire', 'unlock', 'policy', 'lock', 'history', 'proof', 'return', 'vault')
+FAMILIES = ('config', 'wire', 'unlock', 'policy', 'lock', 'history', 'proof', 'return', 'vault', 'split')
 CONTROL = {'VERSION', 'provenance.json', 'SHA256SUMS', 'MANIFEST.sha256'}
 PLACEHOLDERS = {'README.md'} | {f'{f}/.gitkeep' for f in FAMILIES}
 HEX = re.compile(r'^[0-9a-f]{64}$')
