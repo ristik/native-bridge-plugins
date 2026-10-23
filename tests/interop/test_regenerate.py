@@ -28,7 +28,7 @@ class RegenerateTests(unittest.TestCase):
             oracle, corpus = tmp / 'oracle', tmp / 'corpus'
             (oracle / 'cmd/test-generator').mkdir(parents=True)
             (oracle / 'go.mod').write_text('module test.invalid/oracle\n\ngo 1.22\n')
-            profile = (ROOT / 'protocol/profile-v5.json').read_bytes()
+            profile = (ROOT / 'protocol/profile-v6.json').read_bytes()
             files = {f'{family}/synthetic.json': '{}\n' for family in v.FAMILIES}
             files['config/semantic-profile.json'] = profile.decode()
             binary = trust_files()

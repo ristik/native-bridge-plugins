@@ -1,5 +1,5 @@
 {
-  "protocolVersion": 5,
+  "protocolVersion": 6,
   "kernelAddress": "0x0000000000000000000000000000000000000104",
   "reservedAddress": "0x0000000000000000000000000000000000000103",
   "input": [
@@ -146,5 +146,53 @@
     "intrinsicExecPerByte": 80,
     "perBridgeCborItem": 1000,
     "bridgeCborItemsMax": 4096
+  },
+  "compose": {
+    "address": "0x0000000000000000000000000000000000000105",
+    "operation": "BRIDGE_COMPOSE_V2",
+    "input": [
+      "uint8 operation",
+      "bytes cfg",
+      "bytes envelope"
+    ],
+    "operations": {
+      "mint": 1,
+      "return": 2
+    },
+    "markerAscii": "UNICITY_BRIDGE_COMPOSE_V2",
+    "output": [
+      "bytes32 marker",
+      "uint256 status",
+      "bytes32 cfg",
+      "uint256 nonce",
+      "uint256 amount",
+      "bytes32 tokenId",
+      "bytes32 salt",
+      "bytes32 firstPredicateHash",
+      "bytes32 lockDigest",
+      "address releaseTo",
+      "bytes32 nullifier",
+      "uint256 leafCount",
+      "bytes32 partTokenId",
+      "uint256 partAmount",
+      "uint256 splitDepth"
+    ],
+    "outputBytes": 480,
+    "rootFields": [
+      "nonce",
+      "amount",
+      "tokenId",
+      "salt",
+      "firstPredicateHash",
+      "lockDigest"
+    ],
+    "partFields": [
+      "releaseTo",
+      "nullifier",
+      "partTokenId",
+      "partAmount",
+      "splitDepth"
+    ],
+    "statusTable": "config/compose-status-v2.json"
   }
 }

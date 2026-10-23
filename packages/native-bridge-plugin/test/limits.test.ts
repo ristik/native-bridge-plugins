@@ -10,11 +10,11 @@ import { batchGas } from '../src/certgroups.js';
 import { b2Gas, intrinsicGas, itemGas, kernelRequestBytes, projectedGate, rsmtGas } from '../src/gas.js';
 import * as L from '../src/limits.js';
 
-const PROFILE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'profile-v5.json');
+const PROFILE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'profile-v6.json');
 
-test('the named bounds are the limits of profile-v5.json, the one source of the contract, oracle and plug-ins', () => {
+test('the named bounds are the limits of profile-v6.json, the one source of the contract, oracle and plug-ins', () => {
   const lim = (JSON.parse(readFileSync(PROFILE, 'utf8')) as { limits: Record<string, number> }).limits;
-  assert.equal(L.NATIVE_BRIDGE_PROTO_VERSION, 5);
+  assert.equal(L.NATIVE_BRIDGE_PROTO_VERSION, 6);
   assert.equal(L.MAX_ANCHORS, lim.aggregatorAnchors);
   assert.equal(L.MAX_LEAVES, lim.leaves);
   assert.equal(L.MAX_TRANSFERS, lim.transfers);

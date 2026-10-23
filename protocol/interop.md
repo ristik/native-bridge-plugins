@@ -1,15 +1,19 @@
 # Native bridge interoperability contract
 
-Status: protocol v5, development profile; implementation and activation gates
+Status: protocol v6, development profile; implementation and activation gates
 remain open. This document is the sole normative native byte contract.
-This unreleased v5 draft incorporates the Unicity Trust Base trust model in
+Protocol 6 adds split lineage (section "Split lineage" below; bft-core
+`docs/design/bridge-split-lineage-spec.md`): one part of a split token is
+redeemed against the original lock, through `BRIDGE_COMPOSE_V2`, by a fresh
+vault with per-part accounting. Protocol 5 bytes are unchanged at depth 0; a v5
+deployment is replaced, never upgraded. The v5 draft incorporated the Unicity Trust Base trust model in
 [trust-base.md](trust-base.md) (v4's fixed SDK 3.0.1 trust document is
 abandoned, without compatibility), the any-age registry-backed certificate
 batch of bft-core `briefs/b1-any-age-contract.md` (one `CERT_BATCH_V2` call over
 the anchor table) and the aggregation-partition policy below; the v3 sharded
 policy, per-anchor certificate calls and earlier assumptions are abandoned, with
 no compatibility, migration or acceptance promise.
-`NATIVE_BRIDGE_PROTO_VERSION=5` is independent of SDK Token.VERSION and the
+`NATIVE_BRIDGE_PROTO_VERSION=6` is independent of SDK Token.VERSION and the
 external bridge's BRIDGE_PROTO_VERSION. Any byte/derivation change MUST bump
 this version and semantic profile. Consensus parsers accept only this profile;
 there is no pre-3.0 decoder, migration or dual-format interpretation.
@@ -84,8 +88,8 @@ avoiding a code-hash/configuration cycle. Runtime chain/vault MUST match Cfg.
 ## SDK wire
 
 Pins: the ristik SDK lines (`integration/enshrined-evm`), JS
-`cc9a95bcf5e043770dfd1ae79e54516cf424e859` (4.0.0-utb), Rust
-`772be681c740442a35ecef35724a1545cf42b7f4` (unicity-token 4.0.0). The token,
+`6060f6cd86c19076ad83aea3ac9709f3657b24f0` (4.0.0-utb), Rust
+`a75f46ad56d09e402f67cd9e7353b490eaa022b1` (unicity-token 4.0.0). The token,
 predicate and certification wire below is unchanged from SDK 3.0.1; predicate
 version and tags are unchanged. No other SDK fork or patch is authorized.
 
@@ -103,7 +107,8 @@ Signature predicate type=1, params=valid compressed key33. Burn type=2,
 params=raw H(R). Built-in code bytes are 01/02, not strings. P is nested as a
 tagged item, not wrapped in a bstr. M data/J and T's nonnull data are bytes
 containing the exact tagged encodings. The asset collection is inline, exactly
-one entry; no memo, nested token, extra/foreign coin, split or merge exception.
+one entry; no memo, nested token, extra/foreign coin or merge exception. A split
+is admitted only as the lineage of section "Split lineage".
 Intermediate T data MUST be null; terminal burn data MUST equal R.
 
 Mint arity is 8, transfer 5, CD 6, proof 5. CD deadline precedes unlock;
@@ -153,7 +158,9 @@ LockProof = [1,b(cfg32),b(trustBaseId32),b(evmPDR),b(evmUC),b(headerRLP),
 
 J's body arity is 6, LockProof 8; LockProof is inline, not bstr-wrapped.
 Native tags stay 39049 lock / 39048 return; reject external 1330002, old
-pointer-only reasons, null/unknown/split reasons and detached backing evidence.
+pointer-only reasons, null/unknown reasons and detached backing evidence. A
+root mint's reason is J; a split part's mint reason is the split justification
+of section "Split lineage", whose ancestry ends in exactly one J.
 PDR and UC are complete canonical native encodings. UC contains InputRecord,
 shard-tree certificate, Unicity-tree certificate and quorum-signed root seal.
 `trustBaseId` is the EntryID of the genesis entry of the network's Unicity
@@ -222,8 +229,9 @@ registry, window and ABI.
 
 ## Whole-token history and return
 
-No split, merge, partial return, time/custom predicate, recursive token, foreign
-mint or burn-followed-by-transfer. P0 and all nonterminal owners are signature
+No merge, partial return (redeem a whole part: to return 3 of 10, split 3+7
+first), time/custom predicate, recursive token other than the split
+justification, foreign mint or burn-followed-by-transfer. P0 and all nonterminal owners are signature
 predicates; first burn is terminal. The universal minter secret is public and
 never authorizes issuance. Mandatory issuance policy claims exactly aid,
 requires the exact J/data and binding certified lock. Other token types claiming
@@ -239,7 +247,8 @@ eta = H(C(b("UNICITY_BR_NUL"),b(cfg),b(btid)))
 history = C([M,CD0,t0],[[T1,CD1,t1],...])
 ```
 
-R has 11 slots; recipient nonzero and not vault, amount equals genesis amount.
+R has 11 slots; recipient nonzero and not vault, amount equals the redeemed
+token's own genesis amount (the part's amount for a split part).
 Last three fee/deadline slots are fixed as shown; request e is separate.
 Projection tuples have three slots, unlike SDK certified transactions. Strictly
 decode the entire token before export; obtain t only from its proof. All times
@@ -251,6 +260,70 @@ before wallet acknowledgement, preserves original times and certificates and
 provides recoverPendingBurns. Acknowledgement is durable handoff, not payout.
 Return targets original vault and credits R.recipient, never submitter. Confirm
 receipts and on-chain spent/credit before recording settlement.
+
+## Split lineage
+
+A token minted from a lock may be split (the SDK's burn-and-mint `TokenSplit`)
+any number of times, and one part at a time is redeemed against the original
+lock. One asset, a single-parent chain of any depth, whole parts only; no joins,
+several locks or assets, fees or ZK. The wire formats are the SDK's, unchanged:
+
+```
+Manifest = tag(39046,[b(root32)])                      // one root: one asset
+leaf     = H(0x10 || key32 || data32 || u256(v))        // key = child token ID
+node     = H(0x11 || u8(depth) || hL || u256(sL) || hR || u256(sR))
+Proof    = [[depth,b(hash32),b(sum)],...]               // leaf first
+data     = H(C(b("UNICITY_SPLIT_OUTPUT"),b(parentId),network,b(P),b(salt),
+               b(childId),b(ty),b(exactChildMintData)))
+SplitJ   = tag(39044,[ParentToken,[Proof]])             // the child mint's J
+```
+
+Sums are checked in 256 bits, `1 <= v < 2^256`; a key's side at a node is bit
+`depth` of the key, MSB first. A proof has at most 256 steps, depths strictly
+decreasing in 0..255, each sum minimal positive big-endian of at most 32 bytes;
+the empty proof is the one-leaf tree. `P` is the child's first owner predicate
+item (tag 39032), `exactChildMintData` the child mint's data bytes (the value
+envelope tag 39050 with the child's amount), so the commitment is the child
+mint without its justification. `ParentToken` is the complete burned parent
+SDK token (tag 39040) as an inline item; SplitJ carries exactly one proof. The
+parent's terminal transfer is `Burn(H(Manifest))` with the manifest as its
+data. A child's salt is free and its ID `H(C(b(salt),network))`.
+
+Relation (`VerifyLineageReturn(cfg, history)`, bft-core `bridgeprofile`):
+`history` is the redeemed part's own projection (format unchanged); its
+ancestry is read from the exact justification bytes of its mint, nothing is
+duplicated. Walk part to root while the mint reason is SplitJ (strict decode of
+SplitJ and of the embedded token, then its projection); J ends the walk at the
+root; any other reason is `ErrMintJustif`. Verify root first with one state-ID
+set for the whole lineage (a repeated state anywhere, including a reused token
+ID, is `ErrRepeatedSID`): every token gets the whole-token mint and transfer
+checks of this document and at least one transfer; every token but the part
+ends in the manifest burn (`ErrSplitBurn`, `ErrSplitManifest`); the part ends in
+the return burn R with its own amount (`ErrReturnAmount` otherwise). Each edge
+verifies the child's proof for key=child ID, data=commitment, value=child amount
+against the parent's manifest root (`ErrSplitProof`), and the reconstructed sum
+must equal the parent's authenticated amount (`ErrSplitSum`). No time order
+between levels: each leaf is witnessed against its own anchor.
+
+Leaves are exported root first: for each token its mint leaf, then its
+transfers, the burn last; `L = sum(1 + transfers)`. The envelope ABI is
+unchanged and carries one LeafProof per leaf in that order, under the anchor
+rule below. An ancestor's embedded inclusion proofs are part of the child's
+committed mint and are never rewritten: the envelope witnesses every leaf of
+the lineage, so refresh rebuilds paths/UCs only in the envelope. The part's
+nullifier is `eta` of its own burn; the vault keys spending by (root nonce,
+part token ID). Depth is not capped: the lineage is bounded only by the
+envelope (2097152 bytes, which holds every nested token) and by its gas.
+
+Plug-in obligations (both stacks): the issuance policy fails closed and
+admits a split part only through the full lineage relation under the pinned
+configuration (a root through J, a part through SplitJ to exactly one J, the
+39050 value of exactly aid); split outputs are built from the SDK's frozen
+payment data (`paymentData.encode()` bytes are the committed mint data);
+before the parent's manifest burn the wallet prices the full redemption
+estimate of every part it intends to redeem; the split, the manifest burn and
+each child mint are journaled durably, each step resumable after a crash, and
+no step is acknowledged before its certified blob is stored.
 
 ## Cross-stack ABI
 
@@ -300,7 +373,7 @@ return alike. There is no convergence requirement: the plug-in submits whatever
 (path, UC) pairs it holds.
 
 The whole anchor table is authenticated by one `CERT_BATCH_V2` evaluation (the
-0x0100 relation, run inside BRIDGE_COMPOSE_V1 over the same request bytes):
+0x0100 relation, run inside BRIDGE_COMPOSE_V2 over the same request bytes):
 `version 2 | flags 0 | K | Claim[K]`, K the table length, claims in table
 order, each `partition:u32 | shardLen:u16 | shard | shardConfHash |
 expectedStateRoot | expectedIRHash | ucLen:u32 | uc`; `0x0101` is never used.
@@ -318,7 +391,7 @@ null or bstr32; summary null or bstr within B1's summary limit. Enforce all
 native B1 bounds, null/width/canonical rules. Require
 H(inputRecord)==expectedIRHash and stateHash==expectedStateRoot.
 
-Composition (one native call since B7 direct PR 2: BRIDGE_COMPOSE_V1 below)
+Composition (one native call: BRIDGE_COMPOSE_V2 below)
 checks framing/budgets/Cfg/policy and obtains the kernel result, then derives
 and checks the anchor table above. The one CERT_BATCH_V2 evaluation (the 0x0100
 relation) MUST authenticate both expected root and expected IR hash of every
@@ -334,7 +407,7 @@ timestamps or unauthenticated IR hashes cannot authorize time checks.
 
 One resource policy (owner section 36; unsupported/budget-exceeded rejects
 offline, never fetches). There is no gas ceiling and no history cap. The
-composition (BRIDGE_COMPOSE_V1) streams the history and the anchor table: it is
+composition (BRIDGE_COMPOSE_V2) streams the history and the anchor table: it is
 bounded by the direct envelope<=2097152 (the ingress bound the pool and RPC
 carry; B7 PR 3 measured the largest redemption, 1,000 leaves under original
 seals, at 1.45 MB and 48.0M transaction gas, which the 60M ordinary block
@@ -354,48 +427,60 @@ IR opening, Cfg, policy body and nested payload); anchor
 UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity steps and
 exactly d shard-tree siblings per UC (d its own shard's depth, the anchor's
 shard equal to the UC's); Cfg<=1024. These are the named parameters of
-`profile-v5.json` `limits` (the single source for contract, oracle and
+`profile-v6.json` `limits` (the single source for contract, oracle and
 plug-ins). There is no cumulative path-step budget and no shared CBOR item
 budget: path steps and items are charged. An envelope's declared RSMT siblings
 never exceed its bytes/32 in sum (refused before allocation). Bitmap popcount
 must equal the sibling count of every leaf path. Check counts overflow-safely
 before allocation.
 
-### Native composition (BRIDGE_COMPOSE_V1, 0x0105)
+### Native composition (BRIDGE_COMPOSE_V2, 0x0105)
 
-The redemption's whole composition is one native call, `BRIDGE_COMPOSE_V1` at
+The redemption's whole composition is one native call, `BRIDGE_COMPOSE_V2` at
 `0x0000000000000000000000000000000000000105`, registered by the Unicity EVM
 factory like 0x0100/0x0102/0x0104 on every execution route; it reads the
 registry through the journal and is never result-cached. Its relation is
-bft-core `bridgeprofile.Compose` (executable reference `NativeCompose`), in
-order: the operation (mint or return), the Cfg and the envelope's framing and
-the resource bounds above; the policy body; the B2 kernel; the anchor plan; one
-CERT_BATCH_V2 evaluation of the anchor table against the registry; each
-anchor's IR opening and every leaf's time against its own anchor; one RSMT
-membership per leaf. The first failure decides the status.
+bft-core `bridgeprofile.NativeComposeV2`, in order: the operation (mint or
+return), the Cfg and the envelope's framing and the resource bounds above; the
+policy body; the lineage relation of section "Split lineage" (depth 0 is the B2
+kernel's whole-token relation; the mint operation refuses a split reason,
+`ErrMintJustif`); the anchor plan over the lineage's leaves; one CERT_BATCH_V2
+evaluation of the anchor table against the registry; each anchor's IR opening
+and every leaf's time against its own anchor; one RSMT membership per leaf. The
+first failure decides the status. The protocol 5 composition
+(`BRIDGE_COMPOSE_V1`, 384 bytes) is not part of this profile: a protocol 6
+chain registers V2 at the address instead (a fresh deployment, nothing is
+upgraded in place).
 
-Input: `abi.encode(uint8 op, bytes cfg, bytes envelope)`, canonical; the
-envelope is the one above, unchanged. Output, always exactly 384 bytes on an
-EVM success: `abi.encode(bytes32 marker, uint256 status, bytes32 cfg,
+Input: `abi.encode(uint8 op, bytes cfg, bytes envelope)`, canonical, as in
+protocol 5; the envelope is the one above, unchanged. Output, always exactly 480
+bytes (fifteen words) on an EVM success: `abi.encode(bytes32 marker, uint256 status, bytes32 cfg,
 uint256 nonce, uint256 amount, bytes32 tokenId, bytes32 salt,
 bytes32 firstPredicateHash, bytes32 lockDigest, address releaseTo,
-bytes32 nullifier, uint256 leafCount)`, marker
-`bytes32("UNICITY_BRIDGE_COMPOSE_V1")`. Status 0 means the relation holds; any
-other value is the stable reason code of `config/compose-status.json` (the
-append-only status table: code i names the sentinel of the corpus reason
-order that `Compose` can return) and every result field is then zero. Only
-out-of-gas and an input that is not the canonical three-field ABI halt (all
-forwarded gas consumed); everything after the ABI decode is a status, charged
-for the work it caused. The Solidity wrapper keeps the configuration binding
-(the verifier address, the chain and the Cfg hash) and the vault's atomic
-lock/spent/credit/claim logic, forwards all remaining gas, decodes exactly 384
-bytes and reverts `BridgeRejected(uint256 status)` on a nonzero status; the
-vault ABI is unchanged. `prepareLock` still calls B2 at 0x0104 directly.
+bytes32 nullifier, uint256 leafCount, bytes32 partTokenId, uint256 partAmount,
+uint256 splitDepth)`, marker `bytes32("UNICITY_BRIDGE_COMPOSE_V2")`. Words 3..8 are the ROOT's (the lock nonce, the locked
+amount `lockDigest` commits, never the part's; its token ID, salt, first owner
+and lock digest); releaseTo and nullifier are the part's return; leafCount is L
+of the whole lineage; partTokenId and partAmount the redeemed token (equal to
+tokenId and amount at depth 0), splitDepth d (0 an ordinary redemption). Status
+0 means the relation holds; any other value is the stable reason code of
+`config/compose-status-v2.json` (protocol 5's append-only table, then
+`ErrSplitJustif`, `ErrSplitProofCount`, `ErrSplitProofShape`,
+`ErrSplitManifest`, `ErrSplitBurn`, `ErrSplitProof`, `ErrSplitSum`,
+`ErrCertScan`, `ErrCertSigLength`: an embedded ancestor certificate outside the
+native/SDK codec intersection is a status, never an unmapped error) and every
+result field is then zero. Only out-of-gas and an input that is not the
+canonical ABI halt (all forwarded gas consumed); everything after the ABI decode
+is a status, charged for the work it caused. The Solidity wrapper keeps the
+configuration binding (the verifier address, the chain and the Cfg hash) and the
+vault's atomic lock/redeem/credit/claim logic, forwards all remaining gas,
+decodes exactly 480 bytes and reverts `BridgeRejected(uint256 status)` on a
+nonzero status. `prepareLock` still calls B2 at 0x0104 directly (depth 0 only).
 
 ### Gas schedule and estimate
 
 The native call charges the trial schedule (bft-core `ComposeGas`)
-`G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)`:
+`G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K) + G_split`:
 B the input bytes; J the CBOR item heads of the Cfg, the policy body, the
 history, every anchor UC and every anchor IR opening, each encoded occurrence
 counted once (tags and containers, scalar and string heads, every child and map
@@ -411,6 +496,14 @@ the batch terms once the batch is scanned and grouped, `250*s_i` before each
 RSMT path is hashed); a status is charged what was metered up to its failure,
 with no refund and no charge for work not done. On success the charge is the
 whole formula. It is a trial price to benchmark, not a measurement.
+
+`G_split` is zero at depth 0 and is charged in walk order (part to root), each
+term before the work it pays for: `16*len(outer mint transaction)`; for each
+split justification descended into `16*len(justification)`, then `20*items` of
+it, then `16000*(1 + transfers)` of the parent (so L above counts every leaf of
+the lineage exactly once); for each edge `20000 + 1500*steps` of its proof. The
+16 gas/byte term pays the quadratic re-hashing of nested prefixes. Trial values
+as above (bft-core `docs/design/bridge-split-lineage-spec.md` section 6).
 
 The plug-ins compute the same dimensions from the same scans. Their
 transaction estimate is `21000 + 16*D_max + G_compose + 1000000`, with the
@@ -494,11 +587,22 @@ accepts each transaction's own authenticated historical UC and round under the
 historical-trust rules; refresh changes only external paths and UCs,
 preserving exact M/T/CD/t/J.
 
-Vault slots 0..7: lastNonce, locked L, credited D, paid P, entered,
-lockDigest mapping base5, spentNullifier mapping base6, claimable mapping base7.
+Vault slots 0..9: lastNonce, locked L, credited D, paid P, entered,
+lockDigest mapping base5, redeemedAmount mapping base6 (nonce => sum of
+redeemed part amounts), claimable mapping base7, lockedAmount mapping base8
+(nonce => amount), spentPart mapping base9 (nonce => partTokenId => eta).
 Nonce starts at 1, never wraps/reuses; locks remain permanently nonzero. No
-administrative withdrawal. Each nonce has one spent word, zero->eta atomically
-with recipient credit. Distinct competing burns contend on that same nonce.
+administrative withdrawal. A redemption requires the stored digest to equal the
+result's lockDigest, `amount == lockedAmount[nonce]`,
+`0 < partAmount <= lockedAmount - redeemedAmount` and
+`spentPart[nonce][partTokenId] == 0`; it then stores eta there, adds
+partAmount to redeemedAmount and credits partAmount to releaseTo, atomically.
+The part key comes from the verified result, never from the caller. Distinct
+burns of one part contend on its spent word; the parts of one lock together
+never exceed the lock. The vault emits
+`RedemptionCredited(uint256 indexed nonce, bytes32 indexed partId, address indexed recipient, bytes32 nullifier, uint256 amount, uint256 remaining)`
+and exposes `spentPart(nonce, partId)`, `redeemedAmount(nonce)`,
+`lockedAmount(nonce)`, `remaining(nonce)` and `lockComplete(nonce)`.
 `0<=P<=D<=L`, outstanding=L-D, claimable total=D-P,
 balance=L-P+X with donations/forced value X>=0. Donations never authorize mint.
 Claim requires caller credit>=amount>0 and to nonzero/not vault; under shared
@@ -526,7 +630,8 @@ protocol commit plus exact manifest digest, offline cache supported. Candidate
 pins may break bootstrap cycles before merge; releases require merged pins.
 Provenance, import and temporary regeneration rules are in vectors/README.md.
 CI must reject missing/wrong corpus digests. Required families are config, wire,
-unlock, policy, lock, history, proof, return and vault; cases carry preimages,
+unlock, policy, lock, history, proof, return, vault and split (the protocol 6
+lineage corpus: sum-tree, lineage, native V2 and mutation, under `split/`); cases carry preimages,
 bytes, digests, semantic outcomes, leaf obligations, B1 requests/results,
 version/profile and provenance. PR3 adds independent TS/Rust construction;
 reading Go JSON in both stacks alone is not independent construction.

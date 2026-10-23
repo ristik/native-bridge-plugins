@@ -85,14 +85,14 @@ def validate_manifest(registry):
 def main():
     validator()
     abi = load('protocol/abi.json')
-    assert abi['protocolVersion'] == 5
+    assert abi['protocolVersion'] == 6
     assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
     assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v5.json')
-    assert profile['nativeBridgeProtocolVersion'] == 5 and profile['sdkVersion'] == '4.0.0'
+    profile = load('protocol/profile-v6.json')
+    assert profile['nativeBridgeProtocolVersion'] == 6 and profile['sdkVersion'] == '4.0.0'
     assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'unicity-trust-base-history'
     assert profile['trustModel']['trustDocumentFormat'] == 'utb-release-bundle-v1 (tag 39015)'
@@ -102,7 +102,7 @@ def main():
     # every corpus trust input and the shared dev fixture install with the pinned SDK
     subprocess.run(['node', str(ROOT / 'tools/utb_trust_fixture.mjs')], check=True)
     interop = (ROOT / 'protocol/interop.md').read_text()
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=5' in interop
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=6' in interop
     assert SDK_JS_FORK_COMMIT in interop and SDK_RUST_FORK_COMMIT in interop
     package = load('packages/native-bridge-plugin/package.json')
     assert package['private'] and package['license'] == 'MIT OR Apache-2.0'

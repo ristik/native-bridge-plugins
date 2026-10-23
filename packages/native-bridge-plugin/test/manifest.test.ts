@@ -35,7 +35,7 @@ const rec = (w: World): Record<string, any> => ({
 });
 
 const entry = (w: World): Record<string, any> => ({
-  schemaVersion: 1, protocolVersion: 5, family: 'unicity-native', sdkVersion: '4.0.0',
+  schemaVersion: 1, protocolVersion: 6, family: 'unicity-native', sdkVersion: '4.0.0',
   tokenTypeHex: toHex(deriveType(NETWORK, ROOT_GENESIS, EXEC_GENESIS, CHAIN_ID)),
   coinIdHex: toHex(deriveAsset(NETWORK, ROOT_GENESIS, EXEC_GENESIS, CHAIN_ID)),
   symbol: 'UCT', decimals: 18,
