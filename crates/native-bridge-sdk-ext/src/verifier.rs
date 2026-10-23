@@ -22,7 +22,9 @@ use crate::history::{check_justification, check_mint_data};
 use crate::limits::TAG_MINT_LOCK;
 use crate::lockproof::{self, parse_justification};
 use crate::profile::{derive_salt, derive_token_id, h, lock_digest, lock_record};
+use crate::splitpart::{is_split_reason, root_justification, wallet_value};
 use crate::token::NativeBridge;
+use unicity_token::payment::SplitMintJustificationVerifier;
 
 fn map_error(e: E, malformed: VerificationError) -> VerificationError {
     match e.family() {
@@ -119,7 +121,10 @@ impl MintJustificationVerifier for NativeLockJustificationVerifier {
 }
 
 /// Claims exactly the native asset for one token type. It requires the exact native lock reason and
-/// the exact value envelope, and rejects null, unknown and split reasons: no split exception.
+/// the exact value envelope, and rejects null and unknown reasons. A split output (protocol 6) is
+/// admitted only when the root its reason walks down to is a lock of an allow-listed deployment of
+/// this type and its value is that deployment's exact envelope; the split verifier proves the
+/// allocation and the burned parent.
 pub struct BridgedTokenIssuancePolicy {
     bridge: Rc<NativeBridge>,
     token_type: TokenType,
@@ -142,7 +147,13 @@ impl BridgedTokenIssuancePolicy {
     pub fn check(&self, genesis: &CertifiedMintTransaction) -> Result<()> {
         let mint = genesis.transaction();
         let j = mint.justification().ok_or(E::IssuanceReason)?;
-        let parsed = parse_justification(j).map_err(|_| E::IssuanceReason)?;
+        let split = is_split_reason(Some(j));
+        let root = if split {
+            root_justification(Some(j)).map_err(|_| E::IssuanceReason)?
+        } else {
+            j.to_vec()
+        };
+        let parsed = parse_justification(&root).map_err(|_| E::IssuanceReason)?;
         let dep = self
             .bridge
             .registry
@@ -153,7 +164,9 @@ impl BridgedTokenIssuancePolicy {
         {
             return Err(E::MintType);
         }
-        check_justification(dep, Some(j)).map_err(|_| E::IssuanceReason)?;
+        if !split {
+            check_justification(dep, Some(j)).map_err(|_| E::IssuanceReason)?;
+        }
         check_mint_data(dep, mint.data()).map_err(|_| E::IssuanceData)?;
         Ok(())
     }
@@ -185,6 +198,11 @@ pub fn install(
     registry.register(Box::new(NativeLockJustificationVerifier::new(
         bridge.clone(),
     )))?;
+    // A split part's reason carries its burned parent: the SDK verifies the allocation and the parent recursively under this same
+    // registry, down to the root's lock reason; the issuance policies below admit a split output only of a deployment's own type.
+    registry.register(Box::new(
+        SplitMintJustificationVerifier::with_payment_decoder(wallet_value),
+    ))?;
     let mut types: Vec<[u8; 32]> = Vec::new();
     for d in bridge.registry.deployments() {
         if !types.contains(&d.cfg.ty) {

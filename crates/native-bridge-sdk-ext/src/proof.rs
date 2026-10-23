@@ -22,6 +22,7 @@ use crate::gas::{compute_gate, kernel_request_bytes, projected_gate_anchors, Gat
 use crate::history::{self, History};
 use crate::limits::*;
 use crate::profile::h;
+use crate::splitpart::{is_split_reason, lineage_proofs, root_justification, split_chain};
 use crate::token::{Expect, NativeBridge, VerifiedToken};
 
 /// Replace every aggregator inclusion proof of `token` with the freshly fetched proof for the same
@@ -67,17 +68,44 @@ pub fn build_return_proof(
     bridge: &NativeBridge,
     token: &Token,
 ) -> Result<(Envelope, VerifiedToken, Gate)> {
+    build_return_proof_with(bridge, token, None)
+}
+
+/// [`build_return_proof`] with optional fresh witnesses: one per leaf (for a split part, every leaf of the lineage, root first), each
+/// for the same certified leaf (the same certification data and reference time). They go into the envelope only: an ancestor's
+/// proofs inside its embedded token are never rewritten (that would change the descendant's mint hash). Their certificates are the
+/// chain's to authenticate (B1); the anchor plan and openings below check the rest.
+pub fn build_return_proof_with(
+    bridge: &NativeBridge,
+    token: &Token,
+    witnesses: Option<&[InclusionProof]>,
+) -> Result<(Envelope, VerifiedToken, Gate)> {
     let verified = bridge.verify_native_token(token, Expect::Return)?;
     let dep: &Deployment = &bridge.registry.deployments()[verified.deployment];
     let history_bytes = history::project(token);
     // Decoding again keeps the exported bytes the single source of truth.
     History::decode_composed(&history_bytes)?;
 
-    let g = token.genesis();
-    let mut proofs: Vec<&InclusionProof> = alloc::vec![g.inclusion_proof()];
-    for t in token.transactions() {
-        proofs.push(t.inclusion_proof());
-    }
+    // A split part's leaves are the whole lineage's, root first.
+    let embedded: Vec<InclusionProof> = if verified.lineage.is_some() {
+        lineage_proofs(&split_chain(token)?)
+    } else {
+        lineage_proofs(core::slice::from_ref(token))
+    };
+    let proofs: Vec<InclusionProof> = match witnesses {
+        None => embedded,
+        Some(fresh) => {
+            if fresh.len() != embedded.len()
+                || embedded.iter().zip(fresh).any(|(a, b)| {
+                    a.certification_data.to_cbor() != b.certification_data.to_cbor()
+                        || a.reference_time != b.reference_time
+                })
+            {
+                return Err(E::RefreshMismatch);
+            }
+            fresh.to_vec()
+        }
+    };
     let mut anchors: Vec<Anchor> = Vec::new();
     let mut ucs: Vec<Vec<u8>> = Vec::new();
     let mut leaf_proofs = Vec::new();
@@ -143,12 +171,17 @@ pub fn build_return_proof(
     let sids: Vec<[u8; 32]> = verified.outcome.leaves.iter().map(|l| l.sid).collect();
     let pol = check_policy_body(&dep.cfg, &env)?;
     let plan = plan_anchors(&pol, &env, &sids)?;
-    let gate = compute_gate(
+    let mut gate = compute_gate(
         &dep.cfg.to_bytes(),
         encoded.len(),
         kernel_request_bytes(dep.cfg.to_bytes().len() as u64, env.history.len() as u64),
         &env,
     )?;
+    // BRIDGE_COMPOSE_V2 also charges the lineage walk (spec section 6) on top of the schedule over every leaf
+    if let Some(l) = &verified.lineage {
+        gate.native += l.split_gas;
+        gate.total += l.split_gas;
+    }
     let times: Vec<u64> = verified
         .outcome
         .leaves
@@ -180,6 +213,9 @@ pub fn preflight_burn(bridge: &NativeBridge, token: &Token) -> Result<Gate> {
 /// count (or 1); over-counting `shards` could refuse a burn that would pass.
 pub fn preflight_burn_shards(bridge: &NativeBridge, token: &Token, shards: usize) -> Result<Gate> {
     let dep = deployment_of(bridge, token)?;
+    if is_split_reason(token.genesis().transaction().justification()) {
+        return preflight_split_burn(bridge, token, dep, shards);
+    }
     let leaves = token.transactions().len() + 2; // the mint, every transfer and the burn
     check_burn_projection_anchors(
         dep.cfg.to_bytes().len() as u64,
@@ -237,10 +273,34 @@ pub fn leaf_transactions(token: &Token) -> Vec<(Vec<u8>, [u8; 32])> {
     out
 }
 
+/// A split part's burn-time estimate: the whole lineage's leaves plus the burn, the part's history (its ancestry is inside its mint)
+/// and the walk's charge (spec section 6), which the burn does not change. The held part is verified first (the receipt relation): a
+/// part that could not be redeemed is never burned.
+fn preflight_split_burn(
+    bridge: &NativeBridge,
+    token: &Token,
+    dep: &Deployment,
+    shards: usize,
+) -> Result<Gate> {
+    let held = bridge.verify_native_token(token, Expect::Receipt)?;
+    let leaves = held.outcome.leaves.len() + 1;
+    let mut gate = check_burn_projection_anchors(
+        dep.cfg.to_bytes().len() as u64,
+        dep.policy.to_bytes().len() as u64,
+        leaves as u64,
+        history::project(token).len(),
+        shards.min(leaves) as u64,
+    )?;
+    let split = held.lineage.map_or(0, |l| l.split_gas);
+    gate.native += split;
+    gate.total += split;
+    Ok(gate)
+}
+
 fn deployment_of<'a>(bridge: &'a NativeBridge, token: &Token) -> Result<&'a Deployment> {
     let mint = token.genesis().transaction();
-    let j = mint.justification().ok_or(E::MintJustif)?;
-    let parsed = crate::lockproof::parse_justification(j)?;
+    let j = root_justification(mint.justification())?;
+    let parsed = crate::lockproof::parse_justification(&j)?;
     bridge
         .registry
         .find(mint.network_id().id(), parsed.chain_id, &parsed.vault)

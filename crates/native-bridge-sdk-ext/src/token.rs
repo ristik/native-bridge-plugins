@@ -18,7 +18,9 @@ use unicity_token::Token;
 use crate::deployment::{Deployment, DeploymentRegistry};
 use crate::error::{NativeError as E, Result};
 use crate::history::{self, History, Leaf, Outcome};
+use crate::lineage::{verify_lineage, LineageOutcome};
 use crate::lockproof::{self, parse_justification, VerifiedLock};
+use crate::splitpart::{is_split_reason, root_justification, split_chain};
 use crate::trust::TrustInput;
 use alloc::rc::Rc;
 use unicity_token::verify::{
@@ -37,10 +39,13 @@ pub enum Expect {
 /// The result of a successful full-history verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedToken {
+    /// For a split part, the lineage's root identity and every leaf of the lineage, root first (`lineage` below).
     pub outcome: Outcome,
     pub lock: VerifiedLock,
     /// Index of the allow-listed deployment the token was verified under.
     pub deployment: usize,
+    /// A split part's lineage (protocol 6): the part, the depth and the walk's charge; `None` for a lock-backed token.
+    pub lineage: Option<LineageOutcome>,
 }
 
 /// The installed trust: allow-listed deployments and the SDK trust base, used as is.
@@ -129,6 +134,9 @@ impl NativeBridge {
         if mint.data().is_none() {
             return Err(E::MintData);
         }
+        if is_split_reason(Some(j)) {
+            return self.verify_split_part(token, expect);
+        }
         // J's errors are already the oracle's (bft-core ParseJustification), so they pass through unchanged.
         let parsed = parse_justification(j)?;
         let index = self
@@ -193,6 +201,71 @@ impl NativeBridge {
             outcome,
             lock,
             deployment: index,
+            lineage: None,
+        })
+    }
+
+    /// A split part (protocol 6): the lineage relation over the part's projection (its ancestry read from the exact reason bytes),
+    /// the root's lock proof against the root's lock digest, every leaf of the lineage (root first) admitted under the deployment's
+    /// policy, then the SDK's own verification (the split verifier walks the same ancestry).
+    fn verify_split_part(&self, token: &Token, expect: Expect) -> Result<VerifiedToken> {
+        let mint = token.genesis().transaction();
+        let root_j = root_justification(mint.justification())?;
+        let parsed = parse_justification(&root_j)?;
+        let index = self
+            .registry
+            .deployments()
+            .iter()
+            .position(|d| {
+                d.cfg.network == mint.network_id().id()
+                    && d.cfg.chain_id == parsed.chain_id
+                    && d.cfg.vault == parsed.vault
+            })
+            .ok_or(E::UnknownDeployment)?;
+        let dep = &self.registry.deployments()[index];
+
+        let hist = History::decode_composed(&history::project(token))?;
+        let lineage = verify_lineage(dep, hist, expect == Expect::Return)?;
+        let lock = lockproof::verify(dep, &self.trust, &parsed, &lineage.outcome.lock_digest)?;
+
+        let chain = split_chain(token)?;
+        let mut leaves = lineage.outcome.leaves.iter();
+        for t in &chain {
+            let g = t.genesis();
+            check_leaf(
+                dep,
+                &self.trust,
+                g.inclusion_proof(),
+                g.transaction(),
+                leaves.next().ok_or(E::CDMismatch)?,
+            )?;
+            for c in t.transactions() {
+                check_leaf(
+                    dep,
+                    &self.trust,
+                    c.inclusion_proof(),
+                    c.transaction(),
+                    leaves.next().ok_or(E::CDMismatch)?,
+                )?;
+            }
+        }
+        if leaves.next().is_some() {
+            return Err(E::CDMismatch);
+        }
+
+        let mut registry = MintJustificationRegistry::new();
+        crate::verifier::install(Rc::new(self.clone()), &mut registry).map_err(|_| E::TrustBase)?;
+        let policy = VerificationPolicy {
+            require_token_data_verifier: true,
+            ..Default::default()
+        };
+        verify_token_with_policy(token, self.trust.history(), &registry, policy)
+            .map_err(|e| map_sdk(&e))?;
+        Ok(VerifiedToken {
+            outcome: lineage.outcome.clone(),
+            lock,
+            deployment: index,
+            lineage: Some(lineage),
         })
     }
 }

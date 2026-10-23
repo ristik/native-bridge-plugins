@@ -9,10 +9,9 @@ use native_bridge_sdk_ext::compose::{
 use native_bridge_sdk_ext::deployment::Deployment;
 use native_bridge_sdk_ext::envelope::{check_anchors, check_policy_body, plan_anchors, Envelope};
 use native_bridge_sdk_ext::error::Family;
-use native_bridge_sdk_ext::gas::{compute_gate, kernel_request_bytes};
 use native_bridge_sdk_ext::header::HeaderProfile;
 use native_bridge_sdk_ext::history::decode_predicate_bytes;
-use native_bridge_sdk_ext::lineage::{verify_lineage_return, LineageOutcome};
+use native_bridge_sdk_ext::lineage::{compose_offline_v2, verify_lineage_return};
 use native_bridge_sdk_ext::profile::{from_hex, h, Cfg, Policy};
 use native_bridge_sdk_ext::scan::scan_one;
 use native_bridge_sdk_ext::split::{
@@ -72,44 +71,6 @@ fn dev() -> Deployment {
         Policy::from_bytes(&hx(&d["policyBody"])).unwrap(),
     )
     .unwrap()
-}
-
-/// The composition's steps the plug-ins run offline, in its order: the input's own Cfg (decoded and validated), the envelope, the
-/// policy body, the lineage relation, the anchor plan, the anchor openings and the gas estimate. B1 (signatures, quorum, RSMT
-/// membership) is not here.
-fn compose_offline(
-    fixture: &Deployment,
-    cfg_b: &[u8],
-    envelope: &[u8],
-) -> Result<(LineageOutcome, u64), E> {
-    let cfg = Cfg::from_bytes(cfg_b)?;
-    Deployment::validate_cfg(&cfg)?;
-    let env = Envelope::decode(envelope)?;
-    let pol = check_policy_body(&cfg, &env)?;
-    let dep = Deployment {
-        cfg_hash: cfg.hash(),
-        cfg,
-        policy: pol.clone(),
-        ..fixture.clone()
-    };
-    let res = verify_lineage_return(&dep, &env.history)?;
-    let sids: Vec<[u8; 32]> = res.outcome.leaves.iter().map(|l| l.sid).collect();
-    let times: Vec<u64> = res
-        .outcome
-        .leaves
-        .iter()
-        .map(|l| l.reference_time)
-        .collect();
-    check_anchors(&env, &plan_anchors(&pol, &env, &sids)?, &times)?;
-    // the estimate walks every leaf path (a malformed bitmap is PathBitmap): the protocol 5 schedule plus the split terms
-    let g = compute_gate(
-        cfg_b,
-        envelope.len(),
-        kernel_request_bytes(cfg_b.len() as u64, env.history.len() as u64),
-        &env,
-    )?;
-    let gas = g.native + res.split_gas;
-    Ok((res, gas))
 }
 
 /// abi.encode(uint8 op, bytes cfg, bytes envelope) read back.
@@ -374,7 +335,7 @@ fn every_compose_v2_output_is_the_relation_result_and_every_success_its_gas() {
             input,
             "{id}: the canonical three-field input"
         );
-        let got = compose_offline(&dep, &cfg, &envelope);
+        let got = compose_offline_v2(&dep, &cfg, &envelope);
         if status != 0 {
             if !B1_ONLY.contains(&name) {
                 assert_eq!(
@@ -446,7 +407,7 @@ fn every_mutation_gets_the_oracles_status_and_gas_wherever_the_plug_ins_decide()
             .parse::<usize>()
             .unwrap()];
         let (_, cfg, envelope) = read_compose_input(&input);
-        let got = compose_offline(&dep, &cfg, &envelope);
+        let got = compose_offline_v2(&dep, &cfg, &envelope);
         let got_name = match &got {
             Ok(_) => "ok".to_string(),
             Err(e) => e.name().to_string(),
