@@ -12,7 +12,10 @@ import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/Unici
 import { UnicityTreeCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityTreeCertificate.js';
 import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
 import { TrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponse.js';
+import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import { InclusionCertificate } from '@unicitylabs/state-transition-sdk/lib/api/InclusionCertificate.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
+import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { DataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasher.js';
 import { DataHasherFactory } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasherFactory.js';
@@ -511,6 +514,20 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
   const bytes = C.encodeTag(39040, arr(u(2), certified[0], arr(...certified.slice(1))));
   const token = await Token.fromCBOR(bytes);
   return { token, bytes, uc: ucs[0], ucs, leaves: items.map((it, i) => [it.sid, values[i]]) };
+}
+
+/** Certify one request alone (one leaf, its own certificate): what a host's aggregator returns for a submitted request. */
+export async function certifyRequest(w: World, cd: CertificationData, t: bigint, ucTs: bigint, round = 900n): Promise<InclusionProof> {
+  const sid = (await StateId.fromCertificationData(cd)).data;
+  const smt = new SparseMerkleTree(new DataHasherFactory(HashAlgorithm.SHA256, NodeDataHasher));
+  await smt.addLeaf(sid, leafValue(cd.transactionHash.data, t));
+  const root = await smt.calculateRoot();
+  const row = rowOf(w, sid);
+  const uc = await makeUc(w.agg, {
+    partition: AGG_PARTITION, conf: w.aggConfs[row], epochIr: 1n, rootEpoch: 2n, round, timestamp: ucTs, stateHash: root.hash.data, blockHash: null, signers: 4,
+    shard: { bytes: shardOf(w, row), siblings: w.depth === 0 ? [] : [sha(text(`sibling of shard ${row}`))] },
+  });
+  return InclusionProof.fromCBOR(C.encodeTag(39033, arr(u(1), cd.toCBOR(), u(t), bs(InclusionCertificate.create(root, sid).encode()), uc.toCBOR())));
 }
 
 // The signer service for a SigningService key owner (identity).
