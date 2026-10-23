@@ -335,7 +335,16 @@ function loadSaved(savedPath: string) {
 async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'historical'): Promise<void> {
   const c = ctx(cfgPath);
   const { saved, dir, envelope, request } = loadSaved(savedPath);
-  const head = await rpc(c.eth, 'eth_blockNumber', []);
+  // the native batch verdict on the saved request: abi.encode(uint256 2, bool). A fresh anchor is admitted only once the registry's usable
+  // origin covers its round (round <= O), so wait for the verdict (bounded) and read everything else at that block.
+  let out = '';
+  const head = await until('the native CERT_BATCH_V2 verdict on the saved request is (2, true) (the usable origin covers every anchor)', 240_000, async () => {
+    const block = await rpc(c.eth, 'eth_blockNumber', []);
+    out = await rpc(c.eth, 'eth_call', [{ to: CERT_BATCH, data: `0x${hex(request)}` }, block]);
+    return BigInt(`0x${out.slice(2, 66)}`) === 2n && BigInt(`0x${out.slice(66, 130)}`) === 1n ? block : undefined;
+  }).catch((e: unknown) => {
+    throw new Error(`${String(e)}; the last verdict: ${out}`);
+  });
   const anchorEpochs = (saved.anchors as { epoch: string }[]).map((a) => BigInt(a.epoch));
   const reg = await registryAt(c, head, anchorEpochs);
   const usable = reg.usableEpoch as bigint;
@@ -353,8 +362,6 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   }
   const ages = (saved.anchors as { round: string }[]).map((a) => (reg.clockRound as bigint) - BigInt(a.round));
 
-  // the native batch verdict on the saved request: abi.encode(uint256 2, bool)
-  const out = await rpc(c.eth, 'eth_call', [{ to: CERT_BATCH, data: `0x${hex(request)}` }, head]);
   const version = BigInt(`0x${out.slice(2, 66)}`);
   const valid = BigInt(`0x${out.slice(66, 130)}`) === 1n;
   const batchGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ to: CERT_BATCH, data: `0x${hex(request)}` }, head]));
