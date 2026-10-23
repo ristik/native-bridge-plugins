@@ -94,6 +94,9 @@ const redeemCalldata = (envelope: Uint8Array): string => {
   padded.set(envelope);
   return `0x9945e3d3${hex(word(32n))}${hex(word(BigInt(envelope.length)))}${hex(padded)}`;
 };
+/** BridgeVault.redeem's return data, abi.encode(uint256 nonce, bytes32 partId) (protocol 6); undefined for any other length. */
+const redeemReturn = (out: string): { nonce: bigint; partId: string } | undefined =>
+  out.length === 2 + 128 ? { nonce: BigInt(`0x${out.slice(2, 66)}`), partId: out.slice(66, 130) } : undefined;
 /** An eth_call of the vault as the third-party submitter at BLOCK: its result, or its revert data (lib's rpc keeps only the message). */
 async function callVault(eth: string, vault: string, data: string, block: string): Promise<{ result?: string; revert?: string; message?: string }> {
   const res = await fetch(eth, { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -361,8 +364,9 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   const redeemData = redeemCalldata(envelope);
   const redeemOut = await rpc(c.eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]);
   const redeemGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]));
-  // BridgeVault.redeem returns the redeemed lock's nonce (the credited amount is checked by release on the real transaction)
-  assert.equal(BigInt(redeemOut), BigInt(saved.nonce), `the redeem eth_call must return the saved nonce: ${redeemOut}`);
+  // BridgeVault.redeem returns the redeemed lock's nonce and the part's token ID (the credited amount is checked by release on the real transaction)
+  const partId = hex((await Token.fromCBOR(Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`)))).id.bytes);
+  assert.deepEqual(redeemReturn(redeemOut), { nonce: BigInt(saved.nonce), partId }, `the redeem eth_call must return the saved (nonce, partId): ${redeemOut}`);
   const result = { epoch, block: head, registry: reg, anchorAges: ages, batch: { returndata: out, valid, estimatedGas: batchGas }, redeem: { returndata: redeemOut, estimatedGas: redeemGas } };
   writeFileSync(`${dir}/verify-${epoch}.json`, toJson(result));
   console.log(`VERIFIED ${epoch}`, toJson({ block: head, usableEpoch: usable, anchorEpochs, anchorAges: ages, batchGas, redeemGas }));
@@ -459,7 +463,7 @@ async function consolidateAndAccept(c: Ctx, bridge: NativeBridge, token: Token, 
   const accepted = await until(refusal ? `the vault to refuse the consolidated envelope with ${refusal.slice(0, 10)}` : 'the vault accepts the consolidated envelope (master round within the usable origin)', 240_000, async () => {
     const head = await rpc(c.eth, 'eth_blockNumber', []);
     last = await callVault(c.eth, c.lane.vault, redeemCalldata(ret.encoded), head);
-    const done = refusal ? last.revert === refusal : last.result !== undefined && BigInt(last.result) === nonce;
+    const done = refusal ? last.revert === refusal : last.result !== undefined && redeemReturn(last.result)?.nonce === nonce && redeemReturn(last.result)?.partId === hex(token.id.bytes);
     return done ? head : undefined;
   }).catch((e: unknown) => {
     throw new Error(`${String(e)}; the last eth_call: ${toJson(last)}`);
@@ -553,7 +557,8 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   const head = await rpc(c.eth, 'eth_blockNumber', []);
   const succeeds = async (gas: bigint): Promise<boolean> => {
     try {
-      return BigInt(await rpc(c.eth, 'eth_call', [{ from, to: c.lane.vault, data, gas: `0x${gas.toString(16)}` }, head])) === nonce;
+      const r = redeemReturn(await rpc(c.eth, 'eth_call', [{ from, to: c.lane.vault, data, gas: `0x${gas.toString(16)}` }, head]));
+      return r?.nonce === nonce && r.partId === hex(token.id.bytes);
     } catch {
       return false;
     }
