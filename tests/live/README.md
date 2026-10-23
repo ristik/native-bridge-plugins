@@ -20,6 +20,13 @@ protocol-4 plug-in (partition-only policy, one `CERT_BATCH_V2` over the anchor t
 * `anyage.ts release <lane-config.json> <saved.json>` sends the one redemption of the saved envelope, checks the credit and the
   recorded nullifier, claims to a payee, and writes `release.json` (receipt, gas, nullifier, balance delta, registry at the redeem
   block).
+* `anyage.ts negatives <lane-config.json> <saved.json>`, after the release, sends nothing to the vault. It runs two refusals (bft-core #438):
+  - A conflicting burn: the pre-burn state, burned again to another address, is submitted to the aggregator. The proof served for that state ID
+    must still be the first burn's, and the plug-in must refuse to build a return proof of the conflicting burn.
+  - A replay with a fresh proof: the redeemed burn is consolidated again under a seal newer than every saved anchor. The vault must refuse it
+    as `AlreadyRedeemed(nonce)` with the saved nullifier, so a replay is refused on the nullifier whatever the age of its proof.
+
+  It writes `negatives.json`.
 
 Shard routing is host knowledge: `lane-config.json` may carry `aggShards: [{shard, url}]`. A leaf goes to the deepest configured shard
 whose prefix its state ID carries, otherwise to `aggUrl`. The anchor's shard and configuration come from the UC, and the verifier refuses
