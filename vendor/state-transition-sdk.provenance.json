@@ -1,15 +1,15 @@
 {
   "repository": "https://github.com/ristik/state-transition-sdk-js.git",
-  "commit": "cc9a95bcf5e043770dfd1ae79e54516cf424e859",
+  "commit": "6060f6cd86c19076ad83aea3ac9709f3657b24f0",
   "directory": ".",
   "name": "@unicitylabs/state-transition-sdk",
-  "version": "4.0.0-utb.cc9a95b",
-  "tarball": "unicitylabs-state-transition-sdk-4.0.0-utb.cc9a95b.tgz",
-  "sha256": "37c57d98d932420d5204b07a8bde7efb6e67b9e90a3f355088067a75f5619e8d",
-  "integrity": "sha512-wZB9zQHSBABD9sGnhnjievjddz4YchN2iFyvhzqS9o0ndOk7spw+5rJ2RdWWbkDywqVtHoUtTeyAES7X39jcig==",
+  "version": "4.0.0-utb.6060f6c",
+  "tarball": "unicitylabs-state-transition-sdk-4.0.0-utb.6060f6c.tgz",
+  "sha256": "2f764baeeb6954fbf7403eb840107b77904584adc97a120d123c84e84a91491e",
+  "integrity": "sha512-+PnrdqMSjenQtIASAll6Ik/V98Jf2IwB+4qwSMCjGZbySLocGbEkRwtwqsRLwJvIsrXG3yl41Dp6ar8KTYzZwQ==",
   "build": [
     "git archive <commit> | tar -x",
-    "npm pkg set version=4.0.0-utb.cc9a95b",
+    "npm pkg set version=4.0.0-utb.6060f6c",
     "npm ci --ignore-scripts",
     "npm run build",
     "npm pack --ignore-scripts"

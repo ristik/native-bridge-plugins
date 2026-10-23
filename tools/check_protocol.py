@@ -13,9 +13,9 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
 # the installed SDKs, the ones protocol/interop.md pins: the ristik lines (integration/enshrined-evm)
-SDK_JS_FORK_COMMIT = 'cc9a95bcf5e043770dfd1ae79e54516cf424e859'
-SDK_JS_FORK_VERSION = '4.0.0-utb.cc9a95b'
-SDK_RUST_FORK_COMMIT = '772be681c740442a35ecef35724a1545cf42b7f4'
+SDK_JS_FORK_COMMIT = '6060f6cd86c19076ad83aea3ac9709f3657b24f0'
+SDK_JS_FORK_VERSION = '4.0.0-utb.6060f6c'
+SDK_RUST_FORK_COMMIT = 'a75f46ad56d09e402f67cd9e7353b490eaa022b1'
 
 
 def load(path):

@@ -24,6 +24,6 @@
     "@unicitylabs/state-transition-sdk": "$@unicitylabs/state-transition-sdk"
   },
   "dependencies": {
-    "@unicitylabs/state-transition-sdk": "file:vendor/unicitylabs-state-transition-sdk-4.0.0-utb.cc9a95b.tgz"
+    "@unicitylabs/state-transition-sdk": "file:vendor/unicitylabs-state-transition-sdk-4.0.0-utb.6060f6c.tgz"
   }
 }
