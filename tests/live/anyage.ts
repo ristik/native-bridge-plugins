@@ -18,7 +18,7 @@
  *   anyage.ts negatives <lane-config.json> <saved.json>                       (bft-core #438) after the saved token's release: a conflicting burn of its pre-burn state
  *                                                                              (another recipient) is not certified, the aggregator serves the first burn's proof for that
  *                                                                              state; and a fresh proof of the redeemed burn (consolidated now, under a newer seal) is refused
- *                                                                              by the vault as AlreadyRedeemed, with the saved nullifier. Writes negatives.json; sends nothing
+ *                                                                              by the vault as PartAlreadyRedeemed, with the saved nullifier. Writes negatives.json; sends nothing
  *                                                                              to the vault
  *
  * Nothing is refreshed: the saved envelope is the one the plug-in assembled from the proofs the aggregator returned when each transition
@@ -72,8 +72,8 @@ const THIRD_PARTY_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a
 const PAYEE = '0x000000000000000000000000000000000000bEEF';
 const REGISTRY = '0xff00000000000000000000000000000000000002';
 const CERT_BATCH = '0x0000000000000000000000000000000000000100';
-/** BridgeVault's AlreadyRedeemed(uint256) (`cast sig`, contracts pin) */
-const ALREADY_REDEEMED = '0xd36d946d';
+/** BridgeVault's PartAlreadyRedeemed(uint256,bytes32) (protocol 6: spent state per (lock nonce, part token ID); `cast sig`, contracts pin) */
+const PART_ALREADY_REDEEMED = '0xe8f8709e';
 /** The owner keys a token passes through (the mint's first, then each transfer to the next, cyclically): `negatives` re-derives the holder. */
 const ownerKey = (i: number): SigningService => new SigningService(sha256(text(i === 0 ? 'anyage-owner' : `anyage-owner-${i}`)));
 const OWNERS = 4;
@@ -83,6 +83,8 @@ const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const sha = (b: Uint8Array): string => hex(sha256(b));
 const toJson = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x), 2);
 const word = (n: bigint): Uint8Array => unhex(n.toString(16).padStart(64, '0'));
+/** A token amount: minimal big-endian, no leading zero byte (interop.md "Canonical primitives"). */
+const amountBytes = (n: bigint): Uint8Array => unhex(n.toString(16).length % 2 ? `0${n.toString(16)}` : n.toString(16));
 /** ABI calldata of `redeem(bytes)` (selector 0x9945e3d3), encoded here: `cast calldata` is offline (no --rpc-url, so not c.cast) and a
  * large envelope would exceed the per-argument limit of a subprocess. */
 const redeemCalldata = (envelope: Uint8Array): string => {
@@ -196,7 +198,7 @@ async function burnedToken(c: Ctx, out: string, transfers = 0) {
   const owner = ownerKey(0);
   const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.publicKey)).toCBOR();
   const amountWei = 10n ** 18n;
-  const amount = unhex(amountWei.toString(16).padStart(16, '0'));
+  const amount = amountBytes(amountWei);
   // With several aggregator shards the history must span them: the burn's StateId is fixed by the mint (its source state) and the mint's by the lock's nonce,
   // so a lock whose mint and burn fall to the same shard is abandoned (its funds stay in the vault, unredeemed) and the next lock is tried.
   const spans = (c.lane.aggShards?.length ?? 0) >= 2;
@@ -366,14 +368,14 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
 
 // ---- release (the one redemption, then the claim) -----------------------------------------------------------------------------------------
 /** The one vault redemption of an envelope by the third-party submitter, then the claim; every effect asserted. */
-async function redeemAndClaim(c: Ctx, p: { envelope: Uint8Array; gateTotal: number; nonce: bigint | string; nullifier: string; amountWei: bigint; recipient: string; epochs: bigint[]; gasLimit?: bigint }) {
+async function redeemAndClaim(c: Ctx, p: { envelope: Uint8Array; gateTotal: number; nonce: bigint | string; partId: string; nullifier: string; amountWei: bigint; recipient: string; epochs: bigint[]; gasLimit?: bigint }) {
   const gas = p.gasLimit?.toString() ?? String(Math.min(7_000_000, p.gateTotal + 200_000));
   const claimable = (): bigint => BigInt(c.cast('call', c.lane.vault, 'claimable(address)(uint256)', p.recipient).split(' ')[0]);
   const creditBefore = claimable();
   const rc = await sendData(c, c.lane.vault, redeemCalldata(p.envelope), THIRD_PARTY_KEY, gas);
   assert.equal(rc.status, '0x1', `redeem reverted: ${JSON.stringify(rc).slice(0, 400)}`);
   const credited = claimable() - creditBefore;
-  const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', String(p.nonce))));
+  const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentPart(uint256,bytes32)(bytes32)', String(p.nonce), `0x${p.partId}`)));
   assert.equal(credited, p.amountWei, 'the recipient is credited with exactly the locked amount by this redemption');
   assert.equal(recorded, p.nullifier, 'the vault recorded the saved nullifier');
   const claim = await sendAll(c, c.lane.vault, 'claim(uint256,address)', [p.amountWei.toString(), PAYEE], RECIPIENT_KEY, '500000');
@@ -393,7 +395,8 @@ async function release(cfgPath: string, savedPath: string): Promise<void> {
   const c = ctx(cfgPath);
   const { saved, dir, envelope } = loadSaved(savedPath);
   const result = await redeemAndClaim(c, {
-    envelope, gateTotal: Number(saved.gate.total), nonce: saved.nonce, nullifier: saved.nullifier, amountWei: BigInt(saved.amountWei), recipient: saved.recipient,
+    envelope, gateTotal: Number(saved.gate.total), nonce: saved.nonce, partId: hex((await Token.fromCBOR(Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`)))).id.bytes),
+    nullifier: saved.nullifier, amountWei: BigInt(saved.amountWei), recipient: saved.recipient,
     epochs: (saved.anchors as { epoch: string }[]).map((a) => BigInt(a.epoch)),
   });
   writeFileSync(`${dir}/release.json`, toJson(result));
@@ -500,7 +503,7 @@ async function consolidated(cfgPath: string, outDir?: string): Promise<void> {
   const perEst = await estimate(per.encoded);
 
   const result = await redeemAndClaim(c, {
-    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
+    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, partId: hex(token.id.bytes), nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
     epochs: conAnchors.map((a) => BigInt(a.epoch)),
   });
   const record = {
@@ -562,7 +565,8 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   const vault = async (block: string) => {
     const at = (sig: string, ...args: string[]): string => c.cast('call', c.lane.vault, sig, ...args, '--block', block).split(' ')[0];
     return {
-      lockDigest: at('lockDigest(uint256)(bytes32)', nonce.toString()), spentNullifier: at('spentNullifier(uint256)(bytes32)', nonce.toString()),
+      lockDigest: at('lockDigest(uint256)(bytes32)', nonce.toString()), spentPart: at('spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(token.id.bytes)}`),
+      redeemedAmount: at('redeemedAmount(uint256)(uint256)', nonce.toString()),
       claimable: at('claimable(address)(uint256)', RECIPIENT), balance: BigInt(await rpc(c.eth, 'eth_getBalance', [c.lane.vault, block])).toString(),
     };
   };
@@ -575,7 +579,7 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
 
   // funded: the wallet's estimate, then the claim
   const release = await redeemAndClaim(c, {
-    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
+    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, partId: hex(token.id.bytes), nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
     epochs: conAnchors.map((a) => BigInt(a.epoch)), gasLimit: estimatedGas,
   });
   const record = {
@@ -601,12 +605,12 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   const tokenBytes = Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`));
   assert.equal(sha(tokenBytes), saved.token.sha256, 'token.cbor changed since it was saved');
   const nonce = BigInt(saved.nonce);
-  assert.equal(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString()).toLowerCase(), `0x${saved.nullifier}`.toLowerCase(),
-    'run after the release: the vault has spent this lock');
   const { cfg, bridge } = await installedBridge(c);
   const token = await Token.fromCBOR(tokenBytes);
+  assert.equal(c.cast('call', c.lane.vault, 'spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(token.id.bytes)}`).toLowerCase(), `0x${saved.nullifier}`.toLowerCase(),
+    'run after the release: the vault has spent this token');
   const burn = token.transactions[token.transactions.length - 1];
-  const amount = unhex(BigInt(saved.amountWei).toString(16).padStart(16, '0'));
+  const amount = amountBytes(BigInt(saved.amountWei));
 
   // 1. a conflicting burn of the same pre-burn state, returning the token to another address: the state is spent, so the aggregator certifies
   // only the first burn. Whatever it answers to the submission, the proof it serves for that state ID is the first burn's.
@@ -635,8 +639,8 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   console.log(`CONFLICTING BURN submission ${submitted}; the first burn's proof is served; the plug-in refuses: ${conflictingRefused}`);
 
   // 2. a fresh proof of the redeemed burn: consolidated now, under a seal newer than every saved anchor. The vault refuses it on the nullifier
-  // (AlreadyRedeemed of this nonce), not for its certificate, so a replay does not depend on the age of the proof.
-  const refusal = ALREADY_REDEEMED + hex(word(nonce));
+  // (PartAlreadyRedeemed of this nonce and token), not for its certificate, so a replay does not depend on the age of the proof.
+  const refusal = PART_ALREADY_REDEEMED + hex(word(nonce)) + hex(token.id.bytes);
   const { ret, conAnchors, accepted } = await consolidateAndAccept(c, bridge, token, nonce, labelByCertificate, refusal);
   assert.equal(hex(ret.verified.outcome.nullifier), saved.nullifier, 'the fresh proof carries the redeemed burn\'s nullifier');
   const newest = (saved.anchors as { round: string }[]).reduce((m, a) => (BigInt(a.round) > m ? BigInt(a.round) : m), 0n);

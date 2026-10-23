@@ -27,12 +27,13 @@ The wallet is a directory: `--wallet`, or `BRIDGE_TESTER_WALLET`, and `./bridge-
 | `lock --amount 0.5` | locks the amount (ether, or `Nwei`) in the vault for a new token, owned by a fresh Unicity key of the wallet. At most 2^64 − 1 wei, about 18.4 ETH, per lock. |
 | `mint` | fetches the lock's proof from the lock-proof endpoint and mints the token on the aggregator. Fetch it soon: the endpoint serves a lock only within its proof window (about 64 blocks on the testnet package). |
 | `transfer [--count n]` | `n` certified transfers, each to a fresh key of the wallet. |
-| `burn [--recipient 0x..]` | burns the token for its return to an EVM address, this wallet's by default. |
-| `redeem` | builds the return proof and sends the redemption, which credits the burn's recipient. The aggregator consolidates the history under one seal, so a long history still makes a one-anchor proof. |
+| `split --amounts a,b[,...]` | splits the token into parts (at least two, adding up to exactly its amount), each owned by a fresh key of the wallet. Each part is a token of its own, `--token <id>.1`, `<id>.2`, ...: transfer it, split it again or burn and redeem it against the original lock. Before burning, it prints the least gas each part's redemption will need. The split is journaled (`split.json`): after a crash, run the same command again. |
+| `burn [--recipient 0x..]` | burns the token (or a part) for its return to an EVM address, this wallet's by default. |
+| `redeem` | builds the return proof and sends the redemption, which credits the burn's recipient with the token's (the part's) amount. The aggregator consolidates the history under one seal, so a long history still makes a one-anchor proof. |
 | `claim [--to 0x..]` | withdraws the wallet's whole vault credit to an address, its own by default. |
-| `status` | the wallet's tokens, its balance and credit, and the vault's view of each lock (locked, redeemed). |
+| `status` | the wallet's tokens and parts, its balance and credit, and the vault's view: what each lock has left, and whether each token or part is redeemed. |
 
-Every command except `init`, `status` and `claim` takes `--token <nonce>`, the newest token by default. A step out of order is refused,
+Every command except `init`, `status` and `claim` takes `--token <nonce>` (or a part, e.g. `--token 5.2`), the newest token by default. A step out of order is refused,
 and the error names the next step.
 
 ## The configuration
