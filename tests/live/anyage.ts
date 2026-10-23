@@ -3,16 +3,16 @@
  * is saved once and later verified unchanged, first while its anchors' epoch is still the usable one and again after a root epoch
  * handoff has made that epoch historical, and then released exactly once. Three separate commands, never interleaved by the lane:
  *
- *   anyage.ts save    <lane-config.json> [<out-dir>]                          lock, mint, burn; save the exact proof bytes, hashes and the
+ *   anyage.ts save    <lane-config.json> [<out-dir>]                          lock, mint, SAVE_TRANSFERS transfers (default 0), burn; save the exact proof bytes, hashes and the
  *                                                                              registry interval each anchor was made under
  *   anyage.ts verify  <lane-config.json> <saved.json> --epoch current|historical
  *                                                                              non-mutating eth_call of the saved bytes: the native
  *                                                                              CERT_BATCH_V2 verdict and the vault's whole redeem relation
  *   anyage.ts release <lane-config.json> <saved.json>                         the one vault redemption of the saved bytes, then the claim
- *   anyage.ts consolidated <lane-config.json> [<out-dir>]                     (multi-shard lane) a second token burned over the shards, consolidated by the SDK (K = m anchors
+ *   anyage.ts consolidated <lane-config.json> [<out-dir>]                     a second token burned over the shards, consolidated by the SDK (K = m anchors, m = 1 unsharded
  *                                                                              under one seal), redeemed once and claimed; the per-SID envelope of the same token is
  *                                                                              built and priced as the control (#526 step 4)
- *   anyage.ts long-history <lane-config.json> [<out-dir>]                     (multi-shard lane, B7 PR 3) a token transferred LONG_TRANSFERS times (default 320) through the
+ *   anyage.ts long-history <lane-config.json> [<out-dir>]                     (B7 PR 3) a token transferred LONG_TRANSFERS times (default 320) through the
  *                                                                              live aggregators, burned and consolidated (K = m); redeemed first one gas below the least
  *                                                                              limit that succeeds (mined, reverts, the vault unchanged), then at the estimate, and claimed
  *
@@ -261,7 +261,10 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
   const c = ctx(cfgPath);
   const out = outDir ?? `${c.lane.dir}/anyage`;
   mkdirSync(out, { recursive: true });
-  const { bridge, token, tokenBytes, nonce, amountWei, spans } = await burnedToken(c, out);
+  // SAVE_TRANSFERS live signature transfers between the mint and the burn (default none)
+  const transfers = Number(process.env.SAVE_TRANSFERS ?? '0');
+  assert.ok(Number.isInteger(transfers) && transfers >= 0, `SAVE_TRANSFERS must be a whole number: ${process.env.SAVE_TRANSFERS}`);
+  const { bridge, token, tokenBytes, nonce, amountWei, spans } = await burnedToken(c, out, transfers);
 
   // the return proof, assembled once and saved byte for byte, with the batch request the verifier will make from it
   const ret = await buildReturnProof(bridge, token);
@@ -280,7 +283,7 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
   if (spans) assert.equal(new Set(anchors.map((a) => a.shard)).size, c.lane.aggShards!.length, `the saved history must carry an anchor of each aggregator shard: ${anchors.map((a) => a.shard)}`);
   const head = await rpc(c.eth, 'eth_blockNumber', []);
   const saved = {
-    lane: 'anyage', savedAtBlock: head, nonce, amountWei, recipient: RECIPIENT, nullifier: hex(ret.verified.outcome.nullifier),
+    lane: 'anyage', savedAtBlock: head, transfers, nonce, amountWei, recipient: RECIPIENT, nullifier: hex(ret.verified.outcome.nullifier),
     token: { file: 'token.cbor', sha256: sha(tokenBytes) }, envelope: { file: 'envelope.bin', sha256: sha(ret.encoded), bytes: ret.encoded.length },
     batchRequest: { file: 'batch-request.bin', sha256: sha(request), bytes: request.length }, grouping: counts, gate: ret.gate, anchors,
     registry: await registryAt(c, head, anchors.map((a) => a.epoch)),
@@ -386,8 +389,11 @@ type Labeller = (tk: Token, anchors: readonly { uc: Uint8Array; shard: Uint8Arra
 /** The consolidation of a burned token over the lane's shards (the SDK's two waves over the deployment's shard routing; one attempt per call, retried only when it is
  * unavailable AND retryable), its envelope (K = m anchors under one seal), and the block from which the vault accepts it (the master seal's round within the usable origin). */
 async function consolidateAndAccept(c: Ctx, bridge: NativeBridge, token: Token, nonce: bigint, label: Labeller) {
-  const endpoints = (c.lane.aggShards ?? []).map((sh) => ({ client: new AggregatorClient(sh.url), shard: ShardId.decode(unhex(sh.shard)) }));
-  const routing = new ShardRouting({ endpoints, scheme: endpoints.map((e) => e.shard) });
+  // an unsharded aggregation layer (no aggShards: the testnet package's single aggregator) is one root-shard endpoint, the SDK's single routing
+  const endpoints = c.lane.aggShards?.length
+    ? c.lane.aggShards.map((sh) => ({ client: new AggregatorClient(sh.url), shard: ShardId.decode(unhex(sh.shard)) }))
+    : [{ client: new AggregatorClient(c.lane.aggUrl), shard: ShardId.ROOT }];
+  const routing = c.lane.aggShards?.length ? new ShardRouting({ endpoints, scheme: endpoints.map((e) => e.shard) }) : ShardRouting.single(endpoints[0].client);
   const proofClient = new TokenProofClient({ routing, verificationContext: await bridge.context() });
   let summary: Record<string, unknown> | undefined;
   const t0 = Date.now();
@@ -435,8 +441,6 @@ async function consolidated(cfgPath: string, outDir?: string): Promise<void> {
   const c = ctx(cfgPath);
   const out = outDir ?? `${c.lane.dir}/anyage-consolidated`;
   mkdirSync(out, { recursive: true });
-  const shardsCfg = c.lane.aggShards ?? [];
-  assert.ok(shardsCfg.length >= 2, 'the consolidated step needs a multi-shard lane (aggShards in the lane config)');
   const { bridge, token, tokenBytes, nonce, amountWei } = await burnedToken(c, out);
 
   // the labels of an envelope's anchors: each anchor's UC is one of the token's certificates (byte for byte)
@@ -501,7 +505,6 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   const c = ctx(cfgPath);
   const out = outDir ?? `${c.lane.dir}/anyage-long-history`;
   mkdirSync(out, { recursive: true });
-  assert.ok((c.lane.aggShards ?? []).length >= 2, 'the long-history step needs a multi-shard lane (aggShards in the lane config)');
   const transfers = Number(process.env.LONG_TRANSFERS ?? '320');
   assert.ok(transfers > 64, `LONG_TRANSFERS must exceed the former 64-transfer bound: ${transfers}`);
   const { bridge, token, tokenBytes, nonce, amountWei } = await burnedToken(c, out, transfers);
