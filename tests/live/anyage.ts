@@ -15,6 +15,11 @@
  *   anyage.ts long-history <lane-config.json> [<out-dir>]                     (B7 PR 3) a token transferred LONG_TRANSFERS times (default 320) through the
  *                                                                              live aggregators, burned and consolidated (K = m); redeemed first one gas below the least
  *                                                                              limit that succeeds (mined, reverts, the vault unchanged), then at the estimate, and claimed
+ *   anyage.ts negatives <lane-config.json> <saved.json>                       (bft-core #438) after the saved token's release: a conflicting burn of its pre-burn state
+ *                                                                              (another recipient) is not certified, the aggregator serves the first burn's proof for that
+ *                                                                              state; and a fresh proof of the redeemed burn (consolidated now, under a newer seal) is refused
+ *                                                                              by the vault as AlreadyRedeemed, with the saved nullifier. Writes negatives.json; sends nothing
+ *                                                                              to the vault
  *
  * Nothing is refreshed: the saved envelope is the one the plug-in assembled from the proofs the aggregator returned when each transition
  * was certified, and every later command checks its sha256 before use. Protocol 4 (any-age registry, one CERT_BATCH_V2 call over the
@@ -67,6 +72,11 @@ const THIRD_PARTY_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a
 const PAYEE = '0x000000000000000000000000000000000000bEEF';
 const REGISTRY = '0xff00000000000000000000000000000000000002';
 const CERT_BATCH = '0x0000000000000000000000000000000000000100';
+/** BridgeVault's AlreadyRedeemed(uint256) (`cast sig`, contracts pin) */
+const ALREADY_REDEEMED = '0xd36d946d';
+/** The owner keys a token passes through (the mint's first, then each transfer to the next, cyclically): `negatives` re-derives the holder. */
+const ownerKey = (i: number): SigningService => new SigningService(sha256(text(i === 0 ? 'anyage-owner' : `anyage-owner-${i}`)));
+const OWNERS = 4;
 
 type Json = Record<string, unknown>;
 const text = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -80,6 +90,13 @@ const redeemCalldata = (envelope: Uint8Array): string => {
   padded.set(envelope);
   return `0x9945e3d3${hex(word(32n))}${hex(word(BigInt(envelope.length)))}${hex(padded)}`;
 };
+/** An eth_call of the vault as the third-party submitter at BLOCK: its result, or its revert data (lib's rpc keeps only the message). */
+async function callVault(eth: string, vault: string, data: string, block: string): Promise<{ result?: string; revert?: string; message?: string }> {
+  const res = await fetch(eth, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ from: THIRD_PARTY_ADDR, to: vault, data }, block] }) });
+  const body = (await res.json()) as { result?: string; error?: { message: string; data?: string } };
+  return body.error ? { revert: body.error.data, message: body.error.message } : { result: body.result };
+}
 
 /** One lane configuration, with an optional aggregator per shard: protocol 4 names no shard table, so a leaf goes to the aggregator whose
  * shard prefix its state ID carries (`shardCovers`), and to `aggUrl` when no shard list is given. */
@@ -176,7 +193,7 @@ async function burnedToken(c: Ctx, out: string, transfers = 0) {
   for (const a of [RECIPIENT, THIRD_PARTY_ADDR]) await sendAll(c, a, '', [], DEPLOYER_KEY, '100000', '1000000000000000000');
 
   // lock, and its proof from the archived certificate of the lock block
-  const owner = new SigningService(sha256(text('anyage-owner')));
+  const owner = ownerKey(0);
   const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.publicKey)).toCBOR();
   const amountWei = 10n ** 18n;
   const amount = unhex(amountWei.toString(16).padStart(16, '0'));
@@ -228,7 +245,7 @@ async function burnedToken(c: Ctx, out: string, transfers = 0) {
   let token = await Token.fromCBOR(tokenBytes);
   const genesisPair = CborDeserializer.decodeArray(token.genesis.toCBOR(), 2);
   const certified: Uint8Array[] = [];
-  const owners = [owner, ...[1, 2, 3].map((i) => new SigningService(sha256(text(`anyage-owner-${i}`))))];
+  const owners = Array.from({ length: OWNERS }, (_, i) => ownerKey(i));
   let holder = owner;
   for (let i = 0; i < transfers; i++) {
     const next = owners[(i + 1) % owners.length];
@@ -385,10 +402,19 @@ async function release(cfgPath: string, savedPath: string): Promise<void> {
 
 
 type Labeller = (tk: Token, anchors: readonly { uc: Uint8Array; shard: Uint8Array }[]) => { epoch: bigint; round: bigint; shard: string; ucSha256: string }[];
+/** Each anchor labelled by the token certificate it carries (byte for byte). */
+const labelByCertificate: Labeller = (tk, anchors) => {
+  const certs = [tk.genesis, ...tk.transactions].map((t) => t.inclusionProof.unicityCertificate);
+  return anchors.map((a, i) => {
+    const m = certs.filter((uc) => hex(uc.toCBOR()) === hex(a.uc));
+    assert.ok(m.length > 0, `anchor ${i}: its UC is not one of the token's certificates`);
+    return { epoch: m[0].unicitySeal.epoch, round: m[0].unicitySeal.rootChainRoundNumber, shard: hex(a.shard), ucSha256: sha(a.uc) };
+  });
+};
 
 /** The consolidation of a burned token over the lane's shards (the SDK's two waves over the deployment's shard routing; one attempt per call, retried only when it is
  * unavailable AND retryable), its envelope (K = m anchors under one seal), and the block from which the vault accepts it (the master seal's round within the usable origin). */
-async function consolidateAndAccept(c: Ctx, bridge: NativeBridge, token: Token, nonce: bigint, label: Labeller) {
+async function consolidateAndAccept(c: Ctx, bridge: NativeBridge, token: Token, nonce: bigint, label: Labeller, refusal?: string) {
   // an unsharded aggregation layer (no aggShards: the testnet package's single aggregator) is one root-shard endpoint, the SDK's single routing
   const endpoints = c.lane.aggShards?.length
     ? c.lane.aggShards.map((sh) => ({ client: new AggregatorClient(sh.url), shard: ShardId.decode(unhex(sh.shard)) }))
@@ -420,17 +446,18 @@ async function consolidateAndAccept(c: Ctx, bridge: NativeBridge, token: Token, 
   assert.equal(new Set(conAnchors.map((a) => `${a.epoch}/${a.round}`)).size, 1, 'S = 1: every anchor is under the identical seal');
   assert.equal(conAnchors.length, new Set(conAnchors.map((a) => a.shard)).size, 'one anchor per shard');
 
-  // the master seal must satisfy the registry (round <= the usable origin): wait for the redeem relation to accept the consolidated envelope, recording the rounds
+  // the master seal must satisfy the registry (round <= the usable origin): wait for the redeem relation to accept the consolidated envelope, recording the rounds.
+  // With REFUSAL (revert data), wait instead until the vault gets that far and refuses it so: until then a refusal for the seal's round is the registry's, not the verdict.
   const masterRound = BigInt(conAnchors[0].round);
   const regBefore = await registryAt(c, await rpc(c.eth, 'eth_blockNumber', []), [conAnchors[0].epoch]);
-  const accepted = await until('the vault accepts the consolidated envelope (master round within the usable origin)', 240_000, async () => {
+  let last: Awaited<ReturnType<typeof callVault>> | undefined;
+  const accepted = await until(refusal ? `the vault to refuse the consolidated envelope with ${refusal.slice(0, 10)}` : 'the vault accepts the consolidated envelope (master round within the usable origin)', 240_000, async () => {
     const head = await rpc(c.eth, 'eth_blockNumber', []);
-    try {
-      const r = await rpc(c.eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemCalldata(ret.encoded) }, head]);
-      return BigInt(r) === nonce ? head : undefined;
-    } catch {
-      return undefined;
-    }
+    last = await callVault(c.eth, c.lane.vault, redeemCalldata(ret.encoded), head);
+    const done = refusal ? last.revert === refusal : last.result !== undefined && BigInt(last.result) === nonce;
+    return done ? head : undefined;
+  }).catch((e: unknown) => {
+    throw new Error(`${String(e)}; the last eth_call: ${toJson(last)}`);
   });
   const regAt = await registryAt(c, accepted, [conAnchors[0].epoch]);
   return { endpoints, cons, summary, t0, consolidatedToken, ret, conAnchors, conCounts, masterRound, regBefore, regAt, accepted };
@@ -508,17 +535,9 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   const transfers = Number(process.env.LONG_TRANSFERS ?? '320');
   assert.ok(transfers > 64, `LONG_TRANSFERS must exceed the former 64-transfer bound: ${transfers}`);
   const { bridge, token, tokenBytes, nonce, amountWei } = await burnedToken(c, out, transfers);
-  const label: Labeller = (tk, anchors) => {
-    const certs = [tk.genesis, ...tk.transactions].map((t) => t.inclusionProof.unicityCertificate);
-    return anchors.map((a, i) => {
-      const m = certs.filter((uc) => hex(uc.toCBOR()) === hex(a.uc));
-      assert.ok(m.length > 0, `anchor ${i}: its UC is not one of the token's certificates`);
-      return { epoch: m[0].unicitySeal.epoch, round: m[0].unicitySeal.rootChainRoundNumber, shard: hex(a.shard), ucSha256: sha(a.uc) };
-    });
-  };
   // consolidateAndAccept asserts K = m (one anchor per aggregator shard), so the history spans every shard; the per-SID control is not built (one
   // anchor per certification round would exceed the envelope bound)
-  const { cons, summary, t0, consolidatedToken, ret, conAnchors, conCounts, masterRound, accepted } = await consolidateAndAccept(c, bridge, token, nonce, label);
+  const { cons, summary, t0, consolidatedToken, ret, conAnchors, conCounts, masterRound, accepted } = await consolidateAndAccept(c, bridge, token, nonce, labelByCertificate);
   const leaves = ret.verified.outcome.leaves.length;
   assert.equal(leaves, transfers + 2, 'the leaves are the mint, every transfer and the burn');
   const data = redeemCalldata(ret.encoded);
@@ -575,6 +594,65 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   console.log('LONG-HISTORY', toJson({ transfers, leaves, envelopeBytes: ret.encoded.length, K: conCounts.k, estimatedGas, underLimit, lowStatus: low.status, gasUsed: release.redeem.gasUsed }));
 }
 
+// ---- negatives (bft-core #438: duplicate and replayed burns, live) -----------------------------------------------------------------------------
+async function negatives(cfgPath: string, savedPath: string): Promise<void> {
+  const c = ctx(cfgPath);
+  const { saved, dir } = loadSaved(savedPath);
+  const tokenBytes = Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`));
+  assert.equal(sha(tokenBytes), saved.token.sha256, 'token.cbor changed since it was saved');
+  const nonce = BigInt(saved.nonce);
+  assert.equal(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString()).toLowerCase(), `0x${saved.nullifier}`.toLowerCase(),
+    'run after the release: the vault has spent this lock');
+  const { cfg, bridge } = await installedBridge(c);
+  const token = await Token.fromCBOR(tokenBytes);
+  const burn = token.transactions[token.transactions.length - 1];
+  const amount = unhex(BigInt(saved.amountWei).toString(16).padStart(16, '0'));
+
+  // 1. a conflicting burn of the same pre-burn state, returning the token to another address: the state is spent, so the aggregator certifies
+  // only the first burn. Whatever it answers to the submission, the proof it serves for that state ID is the first burn's.
+  const [version, genesis, txs] = CborDeserializer.decodeArray(CborDeserializer.decodeTag(tokenBytes).data, 3);
+  const preBurn = await Token.fromCBOR(C.encodeTag(39040, arr(version, genesis, arr(...CborDeserializer.decodeArray(txs).slice(0, -1)))));
+  const holder = ownerKey(Number(saved.transfers) % OWNERS);
+  const reason = returnReason(cfg.chainId, cfg.vault, cfg.zeroAddress, cfg.ty, cfg.aid, unhex(THIRD_PARTY_ADDR), amount);
+  const conflicting = await TransferTransaction.create(preBurn, BurnPredicate.create(sha256(reason)), StateMask.generate(), { data: reason });
+  const ccd = await CertificationData.fromTransaction(conflicting, await SignaturePredicateUnlockScript.create(conflicting, holder));
+  const csid = await StateId.fromCertificationData(ccd);
+  const firstProof = burn.inclusionProof;
+  assert.equal(hex(csid.data), hex((await StateId.fromCertificationData(firstProof.certificationData)).data), 'the conflicting burn spends the same state as the first');
+  assert.notEqual(hex(ccd.transactionHash.data), hex(firstProof.certificationData.transactionHash.data), 'the conflicting burn is another transaction');
+  // the answer is recorded, not asserted: a server may accept it into its queue, refuse it, or fail the call
+  const submitted = await c.aggOf(csid).submitCertificationRequest(ccd).then((r) => r.status, (e: unknown) => `error: ${String(e).slice(0, 200)}`);
+  const served = await until('the proof the aggregator serves for the burned state', 120_000, async () => (await c.aggOf(csid).getInclusionProof(csid)).inclusionProof ?? undefined);
+  assert.equal(hex(served.certificationData.transactionHash.data), hex(firstProof.certificationData.transactionHash.data),
+    'the aggregator certifies only the first burn: the conflicting one is never certified');
+  let conflictingRefused = '';
+  try {
+    await buildReturnProof(bridge, await Token.fromCBOR(C.encodeTag(39040, arr(version, genesis, arr(...CborDeserializer.decodeArray(txs).slice(0, -1), arr(conflicting.toCBOR(), served.toCBOR()))))));
+  } catch (e) {
+    conflictingRefused = String(e).slice(0, 300);
+  }
+  assert.ok(conflictingRefused, 'the plug-in refuses to build a return proof of the conflicting burn with the served proof');
+  console.log(`CONFLICTING BURN submission ${submitted}; the first burn's proof is served; the plug-in refuses: ${conflictingRefused}`);
+
+  // 2. a fresh proof of the redeemed burn: consolidated now, under a seal newer than every saved anchor. The vault refuses it on the nullifier
+  // (AlreadyRedeemed of this nonce), not for its certificate, so a replay does not depend on the age of the proof.
+  const refusal = ALREADY_REDEEMED + hex(word(nonce));
+  const { ret, conAnchors, accepted } = await consolidateAndAccept(c, bridge, token, nonce, labelByCertificate, refusal);
+  assert.equal(hex(ret.verified.outcome.nullifier), saved.nullifier, 'the fresh proof carries the redeemed burn\'s nullifier');
+  const newest = (saved.anchors as { round: string }[]).reduce((m, a) => (BigInt(a.round) > m ? BigInt(a.round) : m), 0n);
+  assert.ok(BigInt(conAnchors[0].round) > newest, `the fresh proof's seal (round ${conAnchors[0].round}) is newer than every saved anchor (${newest})`);
+  assert.notEqual(sha(ret.encoded), saved.envelope.sha256, 'the fresh envelope is not the saved one');
+
+  const record = {
+    nonce, nullifier: saved.nullifier,
+    conflictingBurn: { stateId: hex(csid.data), recipient: THIRD_PARTY_ADDR, submission: submitted, servedTransactionHash: hex(served.certificationData.transactionHash.data),
+      conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefused },
+    freshReplay: { anchors: conAnchors, newestSavedRound: newest, envelopeSha256: sha(ret.encoded), envelopeBytes: ret.encoded.length, refusedAtBlock: accepted, revertData: refusal },
+  };
+  writeFileSync(`${dir}/negatives.json`, toJson(record));
+  console.log('NEGATIVES', toJson({ conflictingSubmission: submitted, freshSeal: conAnchors[0], refusedAtBlock: accepted }));
+}
+
 const [cmd, cfgPath, arg3, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case 'save':
@@ -596,6 +674,9 @@ switch (cmd) {
   case 'long-history':
     await longHistory(cfgPath, arg3);
     break;
+  case 'negatives':
+    await negatives(cfgPath, arg3);
+    break;
   default:
-    throw new Error('usage: anyage.ts save <lane-config> [<out-dir>] | verify <lane-config> <saved.json> --epoch current|historical | release <lane-config> <saved.json> | consolidated <lane-config> [<out-dir>] | long-history <lane-config> [<out-dir>]');
+    throw new Error('usage: anyage.ts save <lane-config> [<out-dir>] | verify <lane-config> <saved.json> --epoch current|historical | release <lane-config> <saved.json> | consolidated <lane-config> [<out-dir>] | long-history <lane-config> [<out-dir>] | negatives <lane-config> <saved.json>');
 }
