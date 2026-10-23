@@ -23,6 +23,28 @@ pub struct Deployment {
 }
 
 impl Deployment {
+    /// The configuration's own consistency (bft-core `Cfg.Validate`): identifiers recomputed from the bridge identity family, a
+    /// zero native address and a vault.
+    pub fn validate_cfg(cfg: &Cfg) -> Result<()> {
+        let ty = derive_type(
+            cfg.network,
+            &cfg.root_genesis,
+            &cfg.execution_genesis,
+            cfg.chain_id,
+        );
+        let aid = derive_asset(
+            cfg.network,
+            &cfg.root_genesis,
+            &cfg.execution_genesis,
+            cfg.chain_id,
+        );
+        if cfg.ty != ty || cfg.aid != aid || cfg.zero_address != [0u8; 20] || cfg.vault == [0u8; 20]
+        {
+            return Err(E::CfgMismatch);
+        }
+        Ok(())
+    }
+
     /// Validate a deployment: identifiers recomputed from the bridge identity family, the policy
     /// hash bound into Cfg, and the aggregator partition distinct from the EVM partition.
     pub fn new(

@@ -149,7 +149,11 @@ fn hash(n: &Node<'_>, nullable: bool) -> Result<()> {
     Ok(())
 }
 fn uc(n: &Node<'_>) -> Result<()> {
-    if n.end - n.start > MAX_UC_BYTES {
+    uc_within(n, MAX_UC_BYTES)
+}
+
+fn uc_within(n: &Node<'_>, max_bytes: usize) -> Result<()> {
+    if n.end - n.start > max_bytes {
         return Err(E::ProofTooLarge);
     }
     let k = tagged(n, 39001, 7)?;
@@ -342,6 +346,13 @@ pub fn preflight_token(bytes: &[u8]) -> Result<()> {
     };
     visit(&scan(bytes, &mut budget, 0)?)
 }
+/// The native certificate sublimit scan alone (the step bft-core `scanCertificate` takes from `b1ref.ScanUC`), with the B1 byte cap
+/// `max_bytes`; any failure is the caller's to classify.
+pub fn native_uc_scan(bytes: &[u8], max_bytes: usize) -> Result<()> {
+    let mut budget = Budget::object();
+    uc_within(&scan(bytes, &mut budget, 0)?, max_bytes)
+}
+
 /// The native/SDK certificate intersection and native sublimits, for standalone embedded checks.
 pub fn preflight_uc(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_UC_BYTES {
