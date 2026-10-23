@@ -6,14 +6,16 @@
  * ordinary full redemption.
  */
 import { eq } from './bytes.js';
-import type { Deployment } from './deployment.js';
+import { validateCfg, type Deployment } from './deployment.js';
+import { checkAnchors, checkPolicyBody, decodeEnvelope, planAnchors } from './envelope.js';
+import { computeGate, kernelRequestBytes } from './gas.js';
 import { fail } from './errors.js';
 import {
   checkJustification, checkMintData, checkReturn, checkStep, decodeHistory, mintSourceHash, minterKey, predBytes, resultState,
   type History, type Leaf, type Outcome, type Transfer,
 } from './history.js';
 import { COMPOSED_HISTORY, PRED_BURN, PRED_SIGNATURE, TAG_MINT_LOCK, TAG_SPLIT_JUSTIFICATION, type HistoryBounds } from './limits.js';
-import { H, burnId, deriveSalt, deriveTokenId, lockDigest, lockRecord, nullifier } from './profile.js';
+import { H, burnId, cfgHash, decodeCfg, deriveSalt, deriveTokenId, lockDigest, lockRecord, nullifier } from './profile.js';
 import {
   beToBigint, decodeSplitJustification, decodeSplitManifest, justificationTag, splitManifestBytes, splitOutputCommitment,
   verifySumProof, type SplitJustification,
@@ -66,8 +68,12 @@ export async function verifyLineageReturn(dep: Deployment, history: Uint8Array, 
   return verifyLineage(dep, h);
 }
 
-/** The walk (part first), then the verification (root first). */
-export async function verifyLineage(dep: Deployment, h: History): Promise<LineageOutcome> {
+/**
+ * The walk (part first), then the verification (root first). `wantReturn` selects the return relation (the part ends in its return
+ * burn: the composition's) or the receipt relation a wallet checks a held part with (every transfer of the part a signature transfer
+ * with no data, none required; no releaseTo or nullifier).
+ */
+export async function verifyLineage(dep: Deployment, h: History, wantReturn = true): Promise<LineageOutcome> {
   const chain: History[] = [h];
   const just: SplitJustification[] = []; // just[i] is chain[i]'s reason; chain[i+1] is its burned token
   let splitGas = SPLIT_PER_BYTE * h.mintRaw.length;
@@ -96,13 +102,16 @@ export async function verifyLineage(dep: Deployment, h: History): Promise<Lineag
   };
   let parent: LevelState | undefined;
   for (let i = d; i >= 0; i--) {
-    const lv = await verifyLevel(dep, chain[i], i === d, seen);
+    const lv = await verifyLevel(dep, chain[i], i === d, seen, i === 0 && !wantReturn);
     if (i < d) splitGas += checkSplitEdge(parent!, lv, chain[i], just[i]);
     out.leaves.push(...lv.leaves);
     out.levels.push({ tokenId: lv.id, amount: lv.amount, leaves: lv.leaves.length });
     const last = lv.leaves[lv.leaves.length - 1];
     const lastT = chain[i].transfers[chain[i].transfers.length - 1];
-    if (i === 0) {
+    if (i === 0 && !wantReturn) {
+      out.partTokenId = lv.id;
+      out.partAmount = lv.amount;
+    } else if (i === 0) {
       const rr = { ...out, amount: lv.amount };
       checkReturn(dep, rr, lastT);
       out.releaseTo = rr.releaseTo;
@@ -134,7 +143,7 @@ export async function verifyLineage(dep: Deployment, h: History): Promise<Lineag
  * classifies. A root's mint reason is the lock reason with the derived salt; a child's is the split reason, checked against its
  * parent by {@link checkSplitEdge}, and its salt is free (its ID derives from it).
  */
-async function verifyLevel(dep: Deployment, h: History, root: boolean, seen: Set<string>): Promise<LevelState> {
+async function verifyLevel(dep: Deployment, h: History, root: boolean, seen: Set<string>, heldPart = false): Promise<LevelState> {
   const cfg = dep.cfg;
   const m = h.mint;
   if (m.network !== cfg.network || m.recipient.type !== PRED_SIGNATURE) fail('ErrMintShape');
@@ -146,7 +155,8 @@ async function verifyLevel(dep: Deployment, h: History, root: boolean, seen: Set
   }
   const id = deriveTokenId(m.salt, cfg.network);
   const amount = checkMintData(dep, m.data);
-  if (h.transfers.length === 0) fail('ErrNoTransfers');
+  // a held part (the receipt relation) needs no transfer; every other token ends in its burn
+  if (h.transfers.length === 0 && !heldPart) fail('ErrNoTransfers');
   const mk = minterKey(id);
   const h0 = mintSourceHash(id);
   const leaves: Leaf[] = [await checkStep({ type: PRED_SIGNATURE, params: mk }, h0, h.mintRaw, m.expiresAt, h.mintCd, h.mintT, mk, seen)];
@@ -156,8 +166,8 @@ async function verifyLevel(dep: Deployment, h: History, root: boolean, seen: Set
     const t = h.transfers[i];
     // the owner is a signature predicate: the mint recipient or the previous intermediate recipient
     leaves.push(await checkStep(owner, state, h.transfersRaw[i], t.expiresAt, h.cds[i], h.times[i], parseKey(owner.params), seen));
-    if (i < h.transfers.length - 1) {
-      if (t.recipient.type !== PRED_SIGNATURE) fail('ErrBurnNotFinal');
+    if (heldPart || i < h.transfers.length - 1) {
+      if (t.recipient.type !== PRED_SIGNATURE) fail(heldPart && i === h.transfers.length - 1 ? 'ErrUnexpectedBurn' : 'ErrBurnNotFinal');
       if (t.data !== null) fail('ErrTransferData');
     }
     state = resultState(state, t.mask);
@@ -191,4 +201,22 @@ function checkSplitEdge(parent: LevelState, child: LevelState, h: History, sj: S
   if (sum === null) fail('ErrSplitProof');
   if (sum !== beToBigint(parent.amount)) fail('ErrSplitSum');
   return SPLIT_EDGE_BASE + SPLIT_PER_STEP * sj.proof.length;
+}
+
+/**
+ * BRIDGE_COMPOSE_V2's steps a wallet can run offline, in the composition's order, on the exact call it would send: the input's own Cfg
+ * (decoded and validated), the envelope, the policy body, the lineage relation, the anchor plan, the anchor openings and the gas
+ * estimate (the protocol 5 schedule over every leaf plus the walk's charge: the native charge of a successful call). B1 (certificate
+ * signatures and quorum, RSMT membership) is the chain's. `fixture` supplies the deployment's other pins.
+ */
+export async function composeOfflineV2(fixture: Deployment, cfgB: Uint8Array, envelope: Uint8Array): Promise<LineageOutcome & { gas: number }> {
+  const cfg = decodeCfg(cfgB);
+  validateCfg(cfg);
+  const env = decodeEnvelope(envelope);
+  const pol = checkPolicyBody(cfg, env);
+  const res = await verifyLineageReturn({ ...fixture, cfg, cfgHash: cfgHash(cfg), policy: pol }, env.history);
+  checkAnchors(env, planAnchors(pol, env, res.leaves.map((l) => l.sid)), res.leaves.map((l) => l.referenceTime));
+  // the estimate walks every leaf path (a malformed bitmap is ErrPathBitmap)
+  const g = computeGate(cfgB, envelope.length, kernelRequestBytes(cfgB.length, env.history.length), env);
+  return { ...res, gas: g.native + res.splitGas };
 }

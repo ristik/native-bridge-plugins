@@ -5,14 +5,14 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { fromHex, toHex } from '../src/bytes.js';
-import { makeDeployment, validateCfg, type Deployment } from '../src/deployment.js';
+import { makeDeployment } from '../src/deployment.js';
 import { COMPOSE_OUTPUT_BYTES_V2, COMPOSE_STATUS_V2, composeInput, composeStatusNameV2, decodeComposeOutputV2 } from '../src/compose.js';
 import { checkAnchors, checkPolicyBody, decodeEnvelope, planAnchors } from '../src/envelope.js';
 import { computeGate, kernelRequestBytes } from '../src/gas.js';
 import { NativeError } from '../src/errors.js';
 import { decodePredicateBytes } from '../src/history.js';
-import { verifyLineageReturn, type LineageOutcome } from '../src/lineage.js';
-import { cfgHash, decodeCfg, decodePolicy, H } from '../src/profile.js';
+import { composeOfflineV2, verifyLineageReturn, type LineageOutcome } from '../src/lineage.js';
+import { decodeCfg, decodePolicy, H } from '../src/profile.js';
 import { scanOne } from '../src/scan.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { arr, u } from '../src/profile.js';
@@ -168,22 +168,6 @@ test('compose status table V2: config/compose-status-v2.json is the plug-ins\' a
   assert.deepEqual(table, [{ code: 0, name: 'ok' }, ...COMPOSE_STATUS_V2.map((name, i) => ({ code: i + 1, name }))]);
 });
 
-/**
- * The composition's steps the plug-ins run offline, in its order: the input's own Cfg (decoded and validated), the envelope, the
- * policy body, the lineage relation, the anchor plan, the anchor openings and the gas estimate. B1 (signatures, quorum, RSMT membership) is not here.
- */
-async function composeOffline(fixture: Deployment, cfgB: Uint8Array, envelope: Uint8Array): Promise<LineageOutcome & { gas: number }> {
-  const cfg = decodeCfg(cfgB);
-  validateCfg(cfg);
-  const env = decodeEnvelope(envelope);
-  const pol = checkPolicyBody(cfg, env);
-  const res = await verifyLineageReturn({ ...fixture, cfg, cfgHash: cfgHash(cfg), policy: pol }, env.history);
-  checkAnchors(env, planAnchors(pol, env, res.leaves.map((l) => l.sid)), res.leaves.map((l) => l.referenceTime));
-  // the estimate walks every leaf path (a malformed bitmap is ErrPathBitmap): the protocol 5 schedule plus the split terms
-  const g = computeGate(cfgB, envelope.length, kernelRequestBytes(cfgB.length, env.history.length), env);
-  return { ...res, gas: g.native + res.splitGas };
-}
-
 /** abi.encode(uint8 op, bytes cfg, bytes envelope) read back. */
 function readComposeInput(b: Uint8Array): { op: number; cfg: Uint8Array; envelope: Uint8Array } {
   const w = (o: number): number => Number(BigInt('0x' + toHex(b.subarray(o, o + 32))));
@@ -214,7 +198,7 @@ test('native family: every BRIDGE_COMPOSE_V2 output is the plug-ins\' relation r
     const env = decodeEnvelope(envelope);
     let res: LineageOutcome | undefined;
     const got = await verdict(async () => {
-      res = await composeOffline(dep, cfg, envelope);
+      res = await composeOfflineV2(dep, cfg, envelope);
     });
     if (v.status !== '0') {
       if (!B1_ONLY.has(v.statusName)) assert.deepEqual(got, { status: 'error', family: got.family, reason: v.statusName }, c.id);
@@ -243,8 +227,10 @@ test('native family: every BRIDGE_COMPOSE_V2 output is the plug-ins\' relation r
  * Mutations whose status differs only in the anchor phase of protocol 5: the native composition scans the anchors and lets B1
  * authenticate them before it opens their input records; the plug-ins' offline steps open them first. No lineage status differs.
  */
-const ANCHOR_ORDER: Record<string, string> = {
-  'mutation-029': 'ErrPathBitmap', 'mutation-198': 'ErrAnchorAuth', 'mutation-240': 'ErrIRShape', 'mutation-269': 'ErrAnchorAuth', 'mutation-297': 'ErrAnchorAuth',
+/** case: [the oracle's status, the plug-ins' refusal]. */
+const ANCHOR_ORDER: Record<string, [string, string]> = {
+  'mutation-029': ['ErrPathBitmap', 'ErrIROpening'], 'mutation-198': ['ErrAnchorAuth', 'ErrShape'], 'mutation-240': ['ErrIRShape', 'ErrIROpening'],
+  'mutation-269': ['ErrAnchorAuth', 'ErrIROpening'], 'mutation-297': ['ErrAnchorAuth', 'ErrIROpening'],
 };
 
 test('mutation family: 400 seeded patches of a depth-2 input give the oracle\'s status (and gas) wherever the plug-ins decide', async () => {
@@ -265,12 +251,12 @@ test('mutation family: 400 seeded patches of a depth-2 input give the oracle\'s 
     const { cfg, envelope } = readComposeInput(input);
     let res: (LineageOutcome & { gas: number }) | undefined;
     const got = await verdict(async () => {
-      res = await composeOffline(dep, cfg, envelope);
+      res = await composeOfflineV2(dep, cfg, envelope);
     });
     const gotName = got.status === 'ok' ? 'ok' : got.reason;
     if (c.id in ANCHOR_ORDER) {
-      assert.equal(name, ANCHOR_ORDER[c.id], `${c.id}: the allow-list entry still applies`);
-      assert.notEqual(gotName, name, `${c.id}: the allow-list entry still applies`);
+      assert.equal(name, ANCHOR_ORDER[c.id][0], `${c.id}: the allow-list entry still applies`);
+      assert.equal(gotName, ANCHOR_ORDER[c.id][1], `${c.id}: the plug-ins refuse it, for the listed reason`);
       tally.anchorOrder++;
     } else if (B1_ONLY.has(name) && gotName === 'ok') {
       tally.b1++;

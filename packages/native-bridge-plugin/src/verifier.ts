@@ -19,6 +19,7 @@ import type { IMintJustificationVerifier } from '@unicitylabs/state-transition-s
 import type { ITokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/ITokenVerifier.js';
 import type { IVerificationContext } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/IVerificationContext.js';
 import { MintJustificationVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/MintJustificationVerifierService.js';
+import { SplitMintJustificationVerifier } from '@unicitylabs/state-transition-sdk/lib/payment/SplitMintJustificationVerifier.js';
 import { TokenIssuanceVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/TokenIssuanceVerifierService.js';
 import { VerificationContext } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/VerificationContext.js';
 import type { WalletIssuancePolicy } from '@unicitylabs/bridge-core';
@@ -32,16 +33,21 @@ import { NativeError, fail, type NativeReason } from './errors.js';
 import { decodeHistory, checkJustification, checkMintData, projectToken, verifyHistory, type Leaf, type Outcome } from './history.js';
 import { COMPOSED_HISTORY, TAG_MINT_LOCK } from './limits.js';
 import { parseJustification, verifyLockProof, type Justification, type VerifiedLock } from './lockproof.js';
+import { verifyLineage, type LineageOutcome } from './lineage.js';
 import { H, deriveSalt, deriveTokenId, lockDigest, lockRecord, shardCovers, shardDepth } from './profile.js';
+import { WalletValue, isSplitReason, lineageProofs, rootJustification, splitChain } from './splitpart.js';
 import { certificateFailure, type TrustInput } from './trust.js';
 
 export type Expect = 'receipt' | 'return';
 
 export interface VerifiedToken {
+  /** For a split part, the lineage's root identity and every leaf of the lineage, root first (`lineage` below). */
   outcome: Outcome;
   lock: VerifiedLock;
   /** Index of the allow-listed deployment the token was verified under. */
   deployment: number;
+  /** A split part's lineage (protocol 6): the part, the depth and the walk's charge; absent for a lock-backed token. */
+  lineage?: LineageOutcome;
 }
 
 const reasonOf = (e: unknown): NativeReason | null => (e instanceof NativeError ? e.reason : null);
@@ -86,7 +92,11 @@ export class NativeBridge {
 
   /** The SDK verification context with this bridge's justification verifier and issuance policies. */
   public async context(base?: Partial<Pick<IVerificationContext, 'predicateVerifier' | 'unicityCertificateVerifier'>>): Promise<VerificationContext> {
-    const mjvs = new MintJustificationVerifierService().register(new NativeLockJustificationVerifier(this));
+    // A split part's reason carries its burned parent: the SDK verifies the allocation and the parent recursively under this same
+    // context, down to the root's lock reason; the issuance policies below admit a split output only of a deployment's own type.
+    const mjvs = new MintJustificationVerifierService()
+      .register(new NativeLockJustificationVerifier(this))
+      .register(new SplitMintJustificationVerifier(WalletValue.decode));
     const tiv = new TokenIssuanceVerifierService(true);
     for (const ty of this.registry.tokenTypes) tiv.register(new BridgedTokenIssuancePolicy(this, ty));
     return new VerificationContext(
@@ -136,6 +146,7 @@ export class NativeBridge {
     const g = token.genesis;
     // The generic data hook skips null data, so missing genesis data/justification is explicit here.
     if (g.justification === null) fail('ErrMintJustif');
+    if (isSplitReason(g.justification)) return this.verifySplitPart(token, expect, parts);
     if (g.data === null) fail('ErrMintData');
     // J's errors are already the oracle's (bft-core ParseJustification), so they pass through unchanged.
     const parsed: Justification = parseJustification(g.justification as Uint8Array);
@@ -154,6 +165,30 @@ export class NativeBridge {
     const r = await new TokenVerifier().verify(token, await this.context(parts));
     if (r.status !== VerificationStatus.OK) fail(mapSdkFailure(r));
     return { outcome, lock, deployment: index };
+  }
+
+  /**
+   * A split part (protocol 6): the lineage relation over the part's projection (its ancestry read from the exact reason bytes), the
+   * root's lock proof against the root's lock digest, every leaf of the lineage (root first) admitted under the deployment's policy,
+   * then the SDK's own verification (the split verifier walks the same ancestry).
+   */
+  private async verifySplitPart(token: Token, expect: Expect, parts?: Partial<Pick<IVerificationContext, 'predicateVerifier' | 'unicityCertificateVerifier'>>): Promise<VerifiedToken> {
+    const g = token.genesis;
+    if (g.data === null) fail('ErrMintData');
+    const parsed: Justification = parseJustification(rootJustification(g.justification));
+    const index = this.registry.index(g.networkId.id, parsed.chainId, parsed.vault);
+    const dep = this.registry.deployments[index];
+
+    const lineage = await verifyLineage(dep, decodeHistory(projectToken(token), COMPOSED_HISTORY), expect === 'return');
+    const lock = await verifyLockProof(dep, this.trust, parsed, lineage.lockDigest);
+
+    const proofs = lineageProofs(await splitChain(token));
+    if (proofs.length !== lineage.leaves.length) fail('ErrCDMismatch');
+    for (let i = 0; i < proofs.length; i++) await this.checkLeaf(dep, proofs[i], lineage.leaves[i]);
+
+    const r = await new TokenVerifier().verify(token, await this.context(parts));
+    if (r.status !== VerificationStatus.OK) fail(mapSdkFailure(r));
+    return { outcome: lineage, lock, deployment: index, lineage };
   }
 
   private async checkLeaf(dep: Deployment, proof: CertifiedMintTransaction['inclusionProof'], leaf: Leaf): Promise<void> {
@@ -219,7 +254,9 @@ export class NativeLockJustificationVerifier implements IMintJustificationVerifi
 
 /**
  * Claims exactly the native asset for one token type: the exact lock reason and the exact value
- * envelope, no split exception, no null or unknown reason.
+ * envelope, no null or unknown reason. A split output (protocol 6) is admitted only when the root its
+ * reason walks down to is a lock of an allow-listed deployment of this type and its value is that
+ * deployment's exact envelope; the split verifier proves the allocation and the burned parent.
  */
 export class BridgedTokenIssuancePolicy implements WalletIssuancePolicy {
   public readonly tokenType: TokenType;
@@ -240,18 +277,21 @@ export class BridgedTokenIssuancePolicy implements WalletIssuancePolicy {
   public check(genesis: CertifiedMintTransaction): void {
     const j = genesis.justification;
     if (j === null) fail('ErrIssuanceReason');
+    const split = isSplitReason(j);
     let dep: Deployment;
     try {
-      const p = parseJustification(j as Uint8Array);
+      const p = parseJustification(split ? rootJustification(j) : (j as Uint8Array));
       dep = this.bridge.registry.find(genesis.networkId.id, p.chainId, p.vault);
     } catch {
       return fail('ErrIssuanceReason');
     }
     if (!eq(genesis.tokenType.bytes, this.tokenType.bytes) || !eq(dep.cfg.ty, this.tokenType.bytes)) fail('ErrMintType');
-    try {
-      checkJustification(dep, j);
-    } catch {
-      return fail('ErrIssuanceReason');
+    if (!split) {
+      try {
+        checkJustification(dep, j);
+      } catch {
+        return fail('ErrIssuanceReason');
+      }
     }
     try {
       checkMintData(dep, genesis.data);
