@@ -7,7 +7,10 @@ export type Item =
   | { kind: 'bytes'; data: Uint8Array; start: number; end: number }
   | { kind: 'array'; kids: Item[]; start: number; end: number }
   | { kind: 'tag'; tag: bigint; content: Item; start: number; end: number }
-  | { kind: 'null'; start: number; end: number };
+  | { kind: 'null'; start: number; end: number }
+  // only in a native scan ({@link scanNative}): the opaque certificate inside an SDK inclusion proof
+  | { kind: 'text'; data: Uint8Array; start: number; end: number }
+  | { kind: 'map'; kids: Item[]; start: number; end: number };
 
 function readHead(b: Uint8Array, p: { pos: number }): { major: number; arg: bigint } {
   if (p.pos >= b.length) fail('ErrTruncated');
@@ -32,6 +35,20 @@ function readHead(b: Uint8Array, p: { pos: number }): { major: number; arg: bigi
  * simple value other than null are forbidden.
  */
 export function scanOne(b: Uint8Array, maxItems: number = MAX_CBOR_ITEMS): Item {
+  return scanCounted(b, maxItems, false).root;
+}
+
+/**
+ * {@link scanOne} for items that embed a native certificate (bft-core `scanOneNative`): definite text strings and maps are
+ * admitted, which the profile's own objects never use but the certificate inside an SDK inclusion proof does. Canonical key order
+ * inside that certificate is the certificate scan's concern, not this scanner's.
+ */
+export function scanNative(b: Uint8Array, maxItems: number = MAX_CBOR_ITEMS): Item {
+  return scanCounted(b, maxItems, true).root;
+}
+
+/** The scan and its item count (bft-core `scanner.tokens`), which the composition charges per item. */
+export function scanCounted(b: Uint8Array, maxItems: number, native: boolean): { root: Item; tokens: number } {
   const p = { pos: 0 };
   let tokens = 0;
   const item = (depth: number): Item => {
@@ -39,19 +56,27 @@ export function scanOne(b: Uint8Array, maxItems: number = MAX_CBOR_ITEMS): Item 
     if (++tokens > maxItems) fail('ErrTooManyItems');
     if (p.pos < b.length) {
       const mj = b[p.pos] >> 5;
-      if (mj === 3 || mj === 5 || (mj === 7 && b[p.pos] !== 0xf6)) fail('ErrForbiddenCBOR');
+      if ((!native && (mj === 3 || mj === 5)) || (mj === 7 && b[p.pos] !== 0xf6)) fail('ErrForbiddenCBOR');
     }
     const { major, arg } = readHead(b, p);
     const rest = BigInt(b.length - p.pos);
     switch (major) {
       case 0:
         return { kind: 'uint', value: arg, start, end: p.pos };
-      case 2: {
+      case 2:
+      case 3: {
         if (arg > rest) fail('ErrTruncated');
         const n = Number(arg);
         const data = b.subarray(p.pos, p.pos + n);
         p.pos += n;
-        return { kind: 'bytes', data, start, end: p.pos };
+        return { kind: major === 2 ? 'bytes' : 'text', data, start, end: p.pos };
+      }
+      case 5: {
+        if (depth + 1 > MAX_CBOR_DEPTH) fail('ErrTooDeep');
+        if (arg > rest || 2n * arg > rest) fail('ErrTruncated');
+        const kids: Item[] = [];
+        for (let i = 0n; i < 2n * arg; i++) kids.push(item(depth + 1));
+        return { kind: 'map', kids, start, end: p.pos };
       }
       case 4: {
         if (depth + 1 > MAX_CBOR_DEPTH) fail('ErrTooDeep');
@@ -71,7 +96,7 @@ export function scanOne(b: Uint8Array, maxItems: number = MAX_CBOR_ITEMS): Item 
   };
   const root = item(0);
   if (p.pos !== b.length) fail('ErrTrailing');
-  return root;
+  return { root, tokens };
 }
 
 export const raw = (b: Uint8Array, it: Item): Uint8Array => b.subarray(it.start, it.end);

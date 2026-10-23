@@ -62,6 +62,21 @@ export const MAX_IR_SUMMARY_BYTES = 256;
 export const MAX_TOKEN_BYTES = 2 << 20;
 
 export const TAG_PREDICATE = 39032n;
+export const TAG_TOKEN = 39040n;
+export const TAG_INCLUSION = 39033n;
+export const TOKEN_VERSION = 2n;
+export const INCLUSION_VERSION = 1n;
+/** The SDK token decode (bft-core `DecodeToken`): a whole token and one proof's certificate. A nested ancestor also lies inside the
+ * envelope, so the envelope bound binds first. */
+export const MAX_DECODED_TOKEN_BYTES = 4 << 20;
+export const MAX_PROOF_UC_BYTES = 24 << 10;
+
+// ---- protocol 6: split lineage (bft-core docs/design/bridge-split-lineage-spec.md) ------------------
+export const SPLIT_PROTO_VERSION = 6 as const;
+export const TAG_SPLIT_JUSTIFICATION = 39044n;
+export const TAG_SPLIT_MANIFEST = 39046n;
+/** One allocation-proof step per key bit. */
+export const MAX_SUM_PROOF_STEPS = 256;
 export const TAG_MINT = 39041n;
 export const TAG_TRANSFER = 39045n;
 export const TAG_CERTIFICATION = 39031n;

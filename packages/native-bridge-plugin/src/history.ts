@@ -45,6 +45,9 @@ function decodePredicate(it: Item): Pred {
   return { type: code[0], params };
 }
 
+/** The exact predicate bytes of an encoded predicate, strictly decoded and re-encoded. */
+export const decodePredicateBytes = (b: Uint8Array): Uint8Array => predBytes(decodePredicate(scanOne(b)));
+
 /** A request deadline: null or an integer in [1, 2^64-1]; anything else in the slot is ErrDeadline (bft-core `item.deadline`). */
 function deadline(it: Item): bigint | null {
   if (it.kind === 'null') return null;
@@ -74,13 +77,13 @@ export interface Cd {
   unlock: Uint8Array;
 }
 
-function decodeCd(it: Item): Cd {
+export function decodeCd(it: Item): Cd {
   const k = arrayOf(tagContent(it, TAG_CERTIFICATION), 6) ?? fail('ErrShape');
   version(k[0], 2n);
   return { source: decodePredicate(k[1]), sourceHash: bytesN(k[2], 32), txHash: bytesN(k[3], 32), expiresAt: deadline(k[4]), unlock: bytesAny(k[5]) };
 }
 
-function decodeMint(it: Item): Mint {
+export function decodeMint(it: Item): Mint {
   const k = arrayOf(tagContent(it, TAG_MINT), 8) ?? fail('ErrShape');
   version(k[0], 2n);
   return {
@@ -94,7 +97,7 @@ function decodeMint(it: Item): Mint {
   };
 }
 
-function decodeTransfer(it: Item): Transfer {
+export function decodeTransfer(it: Item): Transfer {
   const k = arrayOf(tagContent(it, TAG_TRANSFER), 5) ?? fail('ErrShape');
   version(k[0], 2n);
   return { recipient: decodePredicate(k[1]), mask: bytesN(k[2], 32), data: nullableBytes(k[3]), expiresAt: deadline(k[4]) };
@@ -160,9 +163,9 @@ const ZERO32 = new Uint8Array(32);
 const ZERO20 = new Uint8Array(20);
 export const stateId = (source: Pred, sourceHash: Uint8Array): Uint8Array => H(arr(predBytes(source), bs(sourceHash)));
 export const resultState = (sourceHash: Uint8Array, mask: Uint8Array): Uint8Array => H(arr(bs(concat(new Uint8Array(2), sourceHash)), bs(mask)));
-const mintSourceHash = (id: Uint8Array): Uint8Array => H(arr(bs(id), bs(H(new TextEncoder().encode('TOKENID')))));
+export const mintSourceHash = (id: Uint8Array): Uint8Array => H(arr(bs(id), bs(H(new TextEncoder().encode('TOKENID')))));
 
-function minterKey(id: Uint8Array): Uint8Array {
+export function minterKey(id: Uint8Array): Uint8Array {
   const sk = H(arr(bs(new TextEncoder().encode('I_AM_UNIVERSAL_MINTER_FOR_')), bs(id)));
   try {
     return secp256k1.getPublicKey(sk, true);
@@ -214,7 +217,7 @@ export function checkMintData(dep: Deployment, d: Uint8Array | null): Uint8Array
   }
 }
 
-async function checkStep(
+export async function checkStep(
   source: Pred, sourceHash: Uint8Array, txRaw: Uint8Array, txDeadline: bigint | null, cd: Cd, t: bigint,
   key: Uint8Array, seen: Set<string>,
 ): Promise<Leaf> {
@@ -277,7 +280,7 @@ export async function verifyHistory(dep: Deployment, hist: History, wantBurn: bo
   return out;
 }
 
-function checkReturn(dep: Deployment, out: Outcome, t: Transfer): void {
+export function checkReturn(dep: Deployment, out: Outcome, t: Transfer): void {
   const cfg = dep.cfg;
   if (t.recipient.type !== PRED_BURN) fail('ErrNotBurn');
   if (t.data === null) fail('ErrReturnData');
