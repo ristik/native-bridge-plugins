@@ -23,6 +23,8 @@ import { buildReturnProof, checkBurnProjection, preflightBurn } from '../src/pro
 import { cfgBytes, policyBytes, valueEnvelope } from '../src/profile.js';
 import { preflightToken } from '../src/resources.js';
 import { WalletValue, lineageProofs, splitChain } from '../src/splitpart.js';
+import { DEFAULT_REDEEM, anchorRounds, redeemReturn, returnIdentity, type ChainReader, type RedeemTransport } from '../src/readiness.js';
+import { createNativeBridgePlugin } from '../src/wallet.js';
 import { BridgedTokenIssuancePolicy } from '../src/verifier.js';
 import { AGG_PARTITION, NETWORK, assembleToken, buildToken, burnStep, makeWorld, signer, spec, txStep, type MintSpec, type TokenOut, type World } from './world.js';
 
@@ -255,4 +257,40 @@ test('fresh witnesses go into the envelope only, one per lineage leaf for the sa
   await rejects(buildReturnProof(w.bridge, child.token, proofs.slice(1)), 'ErrRefreshMismatch');
   const swapped = [proofs[1], proofs[0], ...proofs.slice(2)];
   await rejects(buildReturnProof(w.bridge, child.token, swapped), 'ErrRefreshMismatch');
+});
+
+test('readiness keys a split part by (root nonce, part ID): identity, the part\'s own spent word, a sibling\'s spent word does not block it', async () => {
+  const w = await makeWorld();
+  const { child, sibling } = await lineage(w, () => [txStep(7, 9, T0 + 25n), burnStep(T0 + 26n)]);
+  const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
+  const id = await returnIdentity(plugin, child.bytes);
+  assert.ok(eq(id.partId, child.token.id.bytes), 'the part key is the redeemed token\'s ID, never the root\'s');
+  assert.equal(id.partAmount, 400n, 'the part\'s amount, not the lock\'s 1000');
+  const built = await buildReturnProof(w.bridge, child.token);
+  assert.equal(id.nonce, built.verified.outcome.nonce, 'the root lock nonce');
+  assert.ok(eq(id.nullifier, built.verified.lineage!.nullifier));
+  // anchors: the whole lineage's distinct certificates, root first
+  const lineageUcs = new Set(lineageProofs(await splitChain(child.token)).map((p) => toHex(p.unicityCertificate.toCBOR())));
+  assert.equal((await anchorRounds(child.token)).length, lineageUcs.size);
+  const spent = new Map<string, Uint8Array>();
+  const key = (n: bigint, p: Uint8Array) => `${n}:${toHex(p)}`;
+  let sends = 0;
+  const transport: RedeemTransport = {
+    send: () => { sends++; return Promise.resolve('0x01'); },
+    receipt: () => Promise.resolve(undefined),
+    spentPart: (n, p) => Promise.resolve(spent.get(key(n, p)) ?? new Uint8Array(32)),
+  };
+  const chain: ChainReader = { origin: () => Promise.resolve(1n << 60n) };
+  const down = (): Promise<never> => Promise.reject(new NativeError('ErrProofUnavailable', 'proof service down (test)'));
+  const policy = { ...DEFAULT_REDEEM, maxAttempts: 1, maxSends: 1, receiptTimeoutMs: 0, pollMs: 0 };
+  // the sibling's part of the same lock redeemed by its own burn: this part still goes on to fetch its proofs (and fails there, not on the spent word)
+  spent.set(key(id.nonce, sibling.token.id.bytes), new Uint8Array(32).fill(7));
+  await rejects(redeemReturn(plugin, child.bytes, down, chain, transport, policy), 'ErrProofUnavailable');
+  // its own part credited by its own burn: already redeemed, before any proof is fetched
+  spent.set(key(id.nonce, id.partId), id.nullifier);
+  assert.equal((await redeemReturn(plugin, child.bytes, down, chain, transport, policy)).status, 'already-redeemed');
+  // its own part credited by a different burn: ErrUnexpectedBurn
+  spent.set(key(id.nonce, id.partId), new Uint8Array(32).fill(9));
+  await rejects(redeemReturn(plugin, child.bytes, down, chain, transport, policy), 'ErrUnexpectedBurn');
+  assert.equal(sends, 0);
 });

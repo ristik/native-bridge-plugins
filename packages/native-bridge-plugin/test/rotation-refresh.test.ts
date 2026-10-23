@@ -106,7 +106,7 @@ class Vault implements RedeemTransport {
     return Promise.resolve(`0x${this.sent.length}`);
   }
   public receipt(): Promise<'success'> { return Promise.resolve('success'); }
-  public spentNullifier(): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent ? this.nullifier : undefined); }
+  public spentPart(): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent ? this.nullifier : undefined); }
 }
 const noWait = { sleep: () => Promise.resolve() };
 const policy = (): RedeemPolicy => ({ maxAttempts: 3, maxOriginWaitMs: 1_000, pollMs: 1, ...noWait, maxSends: 2, receiptTimeoutMs: 10, now: (() => { let n = 0; return () => (n += 4); })() });

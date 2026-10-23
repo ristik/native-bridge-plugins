@@ -383,9 +383,12 @@ pub fn leaf_value(tx_hash: &[u8; 32], reference_time: u64) -> [u8; 32] {
 
 // ---- vault storage layout ----------------------------------------------------------------------
 
+// protocol 6 (interop.md "Resource and custody profile"): slot 6 is redeemedAmount (was the spent nullifier), 8 lockedAmount, 9 spentPart
 pub const SLOT_LOCK_DIGEST: u64 = 5;
-pub const SLOT_SPENT_NULLIFIER: u64 = 6;
+pub const SLOT_REDEEMED_AMOUNT: u64 = 6;
 pub const SLOT_CLAIMABLE: u64 = 7;
+pub const SLOT_LOCKED_AMOUNT: u64 = 8;
+pub const SLOT_SPENT_PART: u64 = 9;
 
 pub fn word(n: u64) -> [u8; 32] {
     let mut w = [0u8; 32];
@@ -403,8 +406,15 @@ pub fn mapping_slot(key: &[u8], base: u64) -> [u8; 32] {
 pub fn lock_digest_slot(n: u64) -> [u8; 32] {
     mapping_slot(&word(n), SLOT_LOCK_DIGEST)
 }
-pub fn spent_slot(n: u64) -> [u8; 32] {
-    mapping_slot(&word(n), SLOT_SPENT_NULLIFIER)
+pub fn redeemed_amount_slot(n: u64) -> [u8; 32] {
+    mapping_slot(&word(n), SLOT_REDEEMED_AMOUNT)
+}
+pub fn locked_amount_slot(n: u64) -> [u8; 32] {
+    mapping_slot(&word(n), SLOT_LOCKED_AMOUNT)
+}
+/// `spentPart[nonce][partId]`: the inner mapping's slot is `keccak256(partId . keccak256(nonce . 9))`.
+pub fn spent_part_slot(n: u64, part_id: &[u8; 32]) -> [u8; 32] {
+    keccak(&[part_id, &mapping_slot(&word(n), SLOT_SPENT_PART)])
 }
 pub fn claimable_slot(a: &[u8; 20]) -> [u8; 32] {
     mapping_slot(a, SLOT_CLAIMABLE)
