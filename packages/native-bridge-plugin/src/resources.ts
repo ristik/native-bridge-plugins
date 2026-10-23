@@ -3,7 +3,8 @@
  * Unicity path 32 steps; seal 64 signatures; signer ID 128 UTF-8 bytes.
  */
 import { NativeError, fail } from './errors.js';
-import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_UC_BYTES } from './limits.js';
+import { justificationTag } from './split.js';
+import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_UC_BYTES, TAG_SPLIT_JUSTIFICATION } from './limits.js';
 
 type Node = { major: number; arg: bigint; start: number; end: number; depth: number; data: Uint8Array; kids: Node[] };
 /**
@@ -97,19 +98,28 @@ function visit(n: Node, budget: Budget): void {
     const body = n.kids[0];
     if (body.major === 4) {
       const k = body.kids;
-      const nested = (x: Node | undefined, max: number, certificate = false): void => {
+      // `token`: a split reason `tag(39044,[token,[proof]])` carries its whole burned parent, which is checked as a token in its own
+      // right: the scan starts two levels up, so the parent token sits at a top-level token's depth (every lineage level gets the bounds
+      // of an ordinary token, and the lineage depth is not capped by nesting), its items bounded by its bytes; any other payload
+      // continues its container's depth under its own item budget
+      const nested = (x: Node | undefined, max: number, certificate = false, token = false): void => {
         if (!x || x.major !== 2) return;
         if (x.data.length > max) fail('ErrProofTooLarge');
         let root: Node;
-        const own = new Budget();
-        try { root = scan(x.data, own, x.depth + 1); } catch (e) {
+        const own = token ? new Budget(Number.MAX_SAFE_INTEGER) : new Budget();
+        try { root = scan(x.data, own, token ? -2 : x.depth + 1); } catch (e) {
           if (e instanceof NativeError && e.family !== 'budget') { if (certificate) unsupported(); return; }
           throw e;
         }
         if (certificate) uc(root, own); else visit(root, own);
       };
       if (n.arg === 39032n) nested(k[1], MAX_TOKEN_BYTES); // The predicate code is CBOR in a bstr.
-      if (n.arg === 39041n) { nested(k[5], MAX_JUSTIFICATION_BYTES); nested(k[6], MAX_TOKEN_BYTES); }
+      if (n.arg === 39041n) {
+        // a split reason (protocol 6) embeds its whole burned parent token: it is bounded as a token, a lock reason as a justification
+        const split = k[5]?.major === 2 && justificationTag(k[5].data) === TAG_SPLIT_JUSTIFICATION;
+        nested(k[5], split ? MAX_TOKEN_BYTES : MAX_JUSTIFICATION_BYTES, false, split);
+        nested(k[6], MAX_TOKEN_BYTES);
+      }
       if (n.arg === 39045n) nested(k[3], MAX_TOKEN_BYTES);
       if (n.arg === 39049n && k[5]?.major === 4) {
         const lp = k[5].kids;

@@ -21,6 +21,7 @@ import { parseJustification } from './lockproof.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import type { Deployment } from './deployment.js';
 import { H, arr, cfgBytes, policyBytes, u } from './profile.js';
+import { isSplitReason, lineageProofs, rootJustification, splitChain } from './splitpart.js';
 import type { NativeBridge, VerifiedToken } from './verifier.js';
 
 const proofOf = (certified: { inclusionProof: InclusionProof }): InclusionProof => certified.inclusionProof;
@@ -55,11 +56,16 @@ export async function refreshToken(token: Token, fresh: InclusionProof[]): Promi
  * split. The returned `gate` is the gas estimate the redemption should be sent with; it is never a
  * refusal (owner section 36).
  */
-export async function buildReturnProof(bridge: NativeBridge, token: Token): Promise<{ envelope: Envelope; encoded: Uint8Array; verified: VerifiedToken; gate: Gate }> {
+export async function buildReturnProof(
+  bridge: NativeBridge, token: Token, witnesses?: InclusionProof[],
+): Promise<{ envelope: Envelope; encoded: Uint8Array; verified: VerifiedToken; gate: Gate }> {
   const verified = await bridge.verifyNativeToken(token, 'return');
   const dep = bridge.registry.deployments[verified.deployment];
   const history = projectToken(token);
-  const proofs = [proofOf(token.genesis), ...token.transactions.map(proofOf)];
+  // A split part's leaves are the whole lineage's, root first: an ancestor's witnesses are the proofs inside its embedded token, never
+  // rewritten there (that would change the descendant's mint hash); fresher ones go into the envelope only.
+  const embedded = verified.lineage ? lineageProofs(await splitChain(token)) : [proofOf(token.genesis), ...token.transactions.map(proofOf)];
+  const proofs = witnesses === undefined ? embedded : sameLeaves(embedded, witnesses);
   const anchors: Anchor[] = [];
   const anchorOf = new Map<string, number>();
   const leafProofs: LeafProof[] = proofs.map((p, i) => {
@@ -96,7 +102,24 @@ export async function buildReturnProof(bridge: NativeBridge, token: Token): Prom
   const plan = planAnchors(pol, envelope, sids);
   const gate = computeGate(cfgBytes(dep.cfg), encoded.length, kernelRequestBytes(cfgBytes(dep.cfg).length, history.length), envelope);
   checkAnchors(envelope, plan, verified.outcome.leaves.map((l) => l.referenceTime));
+  // BRIDGE_COMPOSE_V2 also charges the lineage walk (spec section 6) on top of the schedule over every leaf
+  if (verified.lineage) {
+    gate.native += verified.lineage.splitGas;
+    gate.total += verified.lineage.splitGas;
+  }
   return { envelope, encoded, verified, gate };
+}
+
+/**
+ * Fresh witnesses for the envelope: one per leaf, in the leaves' order, each for the same certified leaf (the same certification data
+ * and reference time). Their certificates are the chain's to authenticate (B1); the anchor plan and openings below check the rest.
+ */
+function sameLeaves(embedded: InclusionProof[], fresh: InclusionProof[]): InclusionProof[] {
+  if (fresh.length !== embedded.length) fail('ErrRefreshMismatch');
+  embedded.forEach((p, i) => {
+    if (!eq(p.certificationData.toCBOR(), fresh[i].certificationData.toCBOR()) || p.referenceTime !== fresh[i].referenceTime) fail('ErrRefreshMismatch');
+  });
+  return fresh;
 }
 
 /**
@@ -115,6 +138,7 @@ export async function preflightBurn(bridge: NativeBridge, tokenBytes: Uint8Array
   preflightToken(tokenBytes);
   const token = await Token.fromCBOR(tokenBytes);
   const dep = deploymentOf(bridge, token);
+  if (isSplitReason(token.genesis.justification)) return preflightSplitBurn(bridge, token, dep, shards);
   const leaves = token.transactions.length + 2; // the mint, every transfer and the burn
   // the best case is the fewest anchors under one seal: one per aggregator shard the leaves touch (`shards`, from the host's routing
   // of `leafStateIds`; 1 when unknown, since a single certificate may serve every leaf). It is a lower bound, not a promise: over 8
@@ -137,9 +161,24 @@ export function checkBurnProjection(cfgLen: number, policyLen: number, leaves: n
   return gate;
 }
 
+/**
+ * A split part's burn-time estimate: the whole lineage's leaves plus the burn, the part's history (its ancestry is inside its mint) and
+ * the walk's charge (spec section 6: the outer mint's and every embedded reason's bytes and items, every allocation edge), which the
+ * burn does not change. The held part is verified first (the receipt relation): a part that could not be redeemed is never burned.
+ */
+async function preflightSplitBurn(bridge: NativeBridge, token: Token, dep: Deployment, shards: number): Promise<Gate> {
+  const held = await bridge.verifyNativeToken(token, 'receipt');
+  const leaves = held.outcome.leaves.length + 1;
+  const gate = checkBurnProjection(cfgBytes(dep.cfg).length, policyBytes(dep.policy).length, leaves, projectToken(token).length, Math.min(shards, leaves));
+  const split = held.lineage?.splitGas ?? 0;
+  gate.native += split;
+  gate.total += split;
+  return gate;
+}
+
 function deploymentOf(bridge: NativeBridge, token: Token): Deployment {
   const j = token.genesis.justification ?? fail('ErrMintJustif');
-  const parsed = parseJustification(j);
+  const parsed = parseJustification(rootJustification(j));
   return bridge.registry.find(token.genesis.networkId.id, parsed.chainId, parsed.vault);
 }
 

@@ -12,6 +12,7 @@ export * from './history.js';
 export * from './split.js';
 export * from './lineage.js';
 export * from './sdktoken.js';
+export * from './splitpart.js';
 export * from './lockproof.js';
 export * from './manifest.js';
 export * from './proof.js';

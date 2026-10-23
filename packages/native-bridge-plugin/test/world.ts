@@ -393,6 +393,8 @@ export interface Tweaks {
   proofTime?: [number, bigint][];
   /** The root round of the certificate of leaf `i`; leaves of one shard in different rounds get different UCs. */
   ucRound?: (i: number) => bigint;
+  /** The aggregation partition every leaf is certified in (default the deployment's). */
+  ucPartition?: number;
 }
 
 export interface TokenOut {
@@ -492,7 +494,7 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
     for (const i of g.members) await smt.addLeaf(items[i].sid, values[i]);
     const root = await smt.calculateRoot();
     const uc = await makeUc(w.agg, {
-      partition: AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
+      partition: tw.ucPartition ?? AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
       blockHash: null, signers: 4,
       shard: { bytes: shardOf(w, g.row), siblings: w.depth === 0 ? [] : [sha(text(`sibling of shard ${g.row}`))] },
     });
