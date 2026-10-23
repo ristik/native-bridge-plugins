@@ -17,8 +17,8 @@ import { EncodedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicat
 import { SplitMintJustification } from '@unicitylabs/state-transition-sdk/lib/payment/SplitMintJustification.js';
 import { SplitTokenRequest } from '@unicitylabs/state-transition-sdk/lib/payment/SplitTokenRequest.js';
 import { TokenSplit, type ISplit } from '@unicitylabs/state-transition-sdk/lib/payment/TokenSplit.js';
-import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
-import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
+import { CertifiedMintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/CertifiedMintTransaction.js';
+import { CertifiedTransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/CertifiedTransferTransaction.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
 import { StateMask } from '@unicitylabs/state-transition-sdk/lib/transaction/StateMask.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
@@ -143,15 +143,14 @@ async function rebuild(record: SplitRecord, source: Token, aid: Uint8Array): Pro
   return TokenSplit.split(source, WalletValue.decode, requests, { burnStateMask: StateMask.fromBytes(record.burnStateMask) });
 }
 
-/** A token file with one more certified transaction after its last one. */
-function appendTransaction(tokenBytes: Uint8Array, tx: Uint8Array, proof: Uint8Array): Uint8Array {
-  const tagged = D.decodeTag(tokenBytes);
-  const [version, genesis, txs] = D.decodeArray(tagged.data, 3);
-  return C.encodeTag(tagged.tag, C.encodeArray(version, genesis, C.encodeArray(...D.decodeArray(txs), C.encodeArray(tx, proof))));
+/** The SDK's own checks of one certified step (its proof, certificate and predicate), as a profile failure. */
+async function sdkStep<T>(what: string, f: () => Promise<T>): Promise<T> {
+  try {
+    return await f();
+  } catch (e) {
+    return fail('ErrSdkVerification', `${what}: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+  }
 }
-
-/** A freshly minted token file: its mint and the mint's proof, no transfers. */
-const mintedToken = (mint: Uint8Array, proof: Uint8Array): Uint8Array => C.encodeTag(39040n, C.encodeArray(C.encodeUnsignedInteger(2n), C.encodeArray(mint, proof), C.encodeArray()));
 
 const amountBytes = (v: bigint): Uint8Array => {
   const out: number[] = [];
@@ -169,6 +168,7 @@ export async function runSplit(plugin: NativeBridgePlugin, record: SplitRecord, 
   const held = await plugin.bridge.verifyNativeToken(source, 'receipt');
   const aid = plugin.bridge.registry.deployments[held.deployment].cfg.aid;
   const split = await rebuild(record, source, aid);
+  const ctx = await plugin.bridge.context();
   let r = { ...record, children: [...record.children] };
   if (r.burned === undefined) {
     let request: CertificationData;
@@ -182,9 +182,13 @@ export async function runSplit(plugin: NativeBridgePlugin, record: SplitRecord, 
       if (!eq((await split.burn.transaction.calculateTransactionHash()).data, request.transactionHash.data)) fail('ErrBurnReason', 'the journaled burn is not this plan\'s');
     }
     const proof = await host.certify(request, 'the split burn');
-    const burned = appendTransaction(r.source, split.burn.transaction.toCBOR(), proof.toCBOR());
+    // the host's answer is verified before it is journaled: the proof is for this request, and the SDK accepts the burned source (its
+    // proof under the installed trust, the holder's unlock), so a bad proof never reaches the journal or a child's mint
+    if (!eq(proof.certificationData.toCBOR(), request.toCBOR())) fail('ErrCDMismatch', 'the burn proof is not for the journaled request');
+    const certified = await sdkStep('the split burn', () =>
+      CertifiedTransferTransaction.fromTransaction(ctx.trustBase, ctx.predicateVerifier, ctx.unicityCertificateVerifier, split.burn.transaction, proof));
+    const burned = (await sdkStep('the burned source', () => source.transfer(certified, ctx))).toCBOR();
     preflightToken(burned);
-    await Token.fromCBOR(burned);
     r = { ...r, burned };
     await host.journal.put(r);
   }
@@ -196,8 +200,12 @@ export async function runSplit(plugin: NativeBridgePlugin, record: SplitRecord, 
     const mint = await MintTransaction.create(NetworkId.fromId(o.networkId.id), o.recipient, {
       data: await o.paymentData.encode(), expiresAt: null, justification: SplitMintJustification.create(burnedToken, o.proofs).toCBOR(), salt: o.salt, tokenType: o.tokenType,
     });
-    const proof = await host.certify(await CertificationData.fromMintTransaction(mint), `split output ${j + 1}/${split.tokens.length}`);
-    const child = mintedToken(mint.toCBOR(), proof.toCBOR());
+    const request = await CertificationData.fromMintTransaction(mint);
+    const proof = await host.certify(request, `split output ${j + 1}/${split.tokens.length}`);
+    if (!eq(proof.certificationData.toCBOR(), request.toCBOR())) fail('ErrCDMismatch', `the proof of split output ${j + 1} is not for its mint`);
+    const genesis = await sdkStep(`split output ${j + 1}`, () =>
+      CertifiedMintTransaction.fromTransaction(ctx.trustBase, ctx.predicateVerifier, ctx.unicityCertificateVerifier, mint, proof));
+    const child = (await sdkStep(`split output ${j + 1}`, () => Token.mint(genesis, ctx))).toCBOR();
     preflightToken(child);
     await plugin.bridge.verifyNativeToken(await Token.fromCBOR(child), 'receipt');
     r.children[j] = child;

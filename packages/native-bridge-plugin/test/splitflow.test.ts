@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
+import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { SignaturePredicateUnlockScript } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicateUnlockScript.js';
 import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
@@ -115,4 +117,54 @@ test('plan refusals: outputs that do not sum to the held amount, a single output
   await refuses([out(2, 1000n, 0x10)], 'ErrSplitProofCount');
   await refuses([out(2, 0n, 0x10), out(3, 1000n, 0x20)], 'ErrSplitSum');
   await refuses([out(2, 400n, 0x10), out(3, 600n, 0x10)], 'ErrSplitProofShape');
+});
+
+test('a crash after the burn is certified but before the burned source is journaled resumes with the same request, and the burn is not repeated', async () => {
+  const { w, plugin, held } = await setup();
+  const { record } = await planSplit(plugin, 's4', held.bytes, [out(2, 400n, 0x12), out(3, 600n, 0x22)]);
+  const x = host(w, 7);
+  await x.journal.put(record);
+  // the journal refuses the write that would record the burned source, once
+  const put = x.journal.put.bind(x.journal);
+  let refused = false;
+  x.h.journal = { get: (id) => x.journal.get(id), put: (r) => (r.burned && !refused ? ((refused = true), Promise.reject(new Error('disk full (test)'))) : put(r)) };
+  await assert.rejects(runSplit(plugin, record, x.h), /disk full/);
+  const mid = (await x.journal.get('s4'))!;
+  assert.ok(mid.burnRequest && mid.burned === undefined, 'certified, but the burned source is not in the journal');
+  const children = await runSplit(plugin, mid, x.h);
+  const burns = x.calls.filter((c) => c.what === 'the split burn');
+  assert.equal(burns.length, 2, 'the same request answered again');
+  assert.ok(eq(burns[0].request, burns[1].request), 'never a second burn');
+  assert.equal(children.length, 2);
+});
+
+test('the host\'s burn proof is verified before it is journaled: a proof of another request, or a corrupted path, is refused and nothing is recorded as burned', async () => {
+  const { w, plugin, held } = await setup();
+  const { record } = await planSplit(plugin, 's5', held.bytes, [out(2, 400n, 0x13), out(3, 600n, 0x23)]);
+  const other = (await planSplit(plugin, 's6', held.bytes, [out(2, 500n, 0x13), out(3, 500n, 0x23)])).record;
+  // the other plan's burn request, certified: a valid proof of another transaction
+  const y = host(w, 7);
+  await y.journal.put(other);
+  const wrong = await (async () => {
+    let p: InclusionProof | undefined;
+    const spy: SplitHost = { ...y.h, certify: async (rq, what) => (p = await y.h.certify(rq, what)) };
+    await runSplit(plugin, other, spy).catch(() => undefined);
+    return p!;
+  })();
+  const x = host(w, 7);
+  await x.journal.put(record);
+  await assert.rejects(runSplit(plugin, record, { ...x.h, certify: () => Promise.resolve(wrong) }), (e: unknown) => e instanceof NativeError && e.reason === 'ErrCDMismatch');
+  assert.equal((await x.journal.get('s5'))!.burned, undefined);
+  // the right request and path under a validly signed certificate of another tree (the other burn's): the path does not reach its root
+  const otherUc = D.decodeArray(D.decodeTag(wrong.toCBOR()).data, 5)[4];
+  const corrupt: SplitHost = {
+    ...x.h,
+    certify: async (rq, what) => {
+      const good = await x.h.certify(rq, what);
+      const [version, cd, t, path] = D.decodeArray(D.decodeTag(good.toCBOR()).data, 5);
+      return InclusionProof.fromCBOR(C.encodeTag(39033, C.encodeArray(version, cd, t, path, otherUc)));
+    },
+  };
+  await assert.rejects(runSplit(plugin, (await x.journal.get('s5'))!, corrupt), (e: unknown) => e instanceof NativeError && e.reason === 'ErrSdkVerification');
+  assert.equal((await x.journal.get('s5'))!.burned, undefined, 'a bad proof never reaches the journal');
 });

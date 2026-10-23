@@ -757,12 +757,13 @@ async function splitNegatives(cfgPath: string, wallet: string, partId: string, p
   const ok = [a, b].filter((r) => r.status === '0x1');
   assert.equal(ok.length, 1, `exactly one of the two submissions redeems: ${a.status} ${b.status}`);
   const after = await view(await latest());
-  assert.equal(BigInt(after.claimable) - BigInt(before.claimable), partAmount, 'the recipient is credited the part\'s amount once');
+  const credited = BigInt(after.claimable) - BigInt(before.claimable);
+  assert.equal(credited, partAmount, 'the recipient is credited the part\'s amount once');
   assert.equal(BigInt(before.remaining) - BigInt(after.remaining), partAmount, 'the lock\'s remaining falls by the part\'s amount once');
   assert.equal(after.spentPart.toLowerCase(), `0x${hex(lin.nullifier)}`, 'the vault records the part\'s nullifier');
   const refused = await callVault(c.eth, vault, data, await latest());
   assert.equal(refused.revert, `${PART_ALREADY_REDEEMED}${hex(word(nonce))}${hex(lin.partTokenId)}`, 'a third submission is refused as PartAlreadyRedeemed');
-  out.duplicate = { statuses: [a.status, b.status], blocks: [a.blockNumber, b.blockNumber], credited: BigInt(after.claimable) - BigInt(before.claimable), before, after, thirdRefusal: refused.revert };
+  out.duplicate = { statuses: [a.status, b.status], blocks: [a.blockNumber, b.blockNumber], credited, before, after, thirdRefusal: refused.revert };
   writeFileSync(`${wallet}/tokens/${partId}/split-negatives.json`, toJson(out));
   console.log('SPLIT NEGATIVES', toJson(out));
 }
