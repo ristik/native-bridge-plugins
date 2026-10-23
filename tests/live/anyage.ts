@@ -690,11 +690,11 @@ async function splitNegatives(cfgPath: string, wallet: string, partId: string, p
   const read = (id: string) => Uint8Array.from(readFileSync(`${wallet}/tokens/${id}/token.cbor`));
   const part = await Token.fromCBOR(read(partId));
   const parent = await Token.fromCBOR(read(parentId));
-  const status = (revert: string | undefined): string => {
+  const status = (revert: string | undefined): { revert: string; code: number; name: string } => {
     assert.ok(revert?.startsWith(BRIDGE_REJECTED), `refused by the composition (BridgeRejected): ${revert}`);
     const code = Number(BigInt(`0x${revert!.slice(10, 74)}`));
     assert.ok(code !== 0, 'a nonzero status');
-    return STATUS_V2.find((s) => s.code === code)?.name ?? `status ${code}`;
+    return { revert: revert!, code, name: STATUS_V2.find((s) => s.code === code)?.name ?? `status ${code}` };
   };
   const latest = async () => (await rpc(c.eth, 'eth_blockNumber', [])) as string;
   const out: Json = { part: partId, parent: parentId };
@@ -749,7 +749,7 @@ async function splitNegatives(cfgPath: string, wallet: string, partId: string, p
   const afterOog = await view(oog.blockNumber);
   assert.equal(oog.status, '0x0', 'the underfunded redemption reverts');
   assert.deepEqual(afterOog, before, 'the underfunded redemption changed nothing in the vault');
-  out.outOfGas = { gasLimit: low, estimate, gasUsed: BigInt(oog.gasUsed), block: oog.blockNumber };
+  out.outOfGas = { status: oog.status, gasLimit: low, estimate, gasUsed: BigInt(oog.gasUsed), block: oog.blockNumber, vaultUnchanged: true };
 
   // 5. the same envelope from two submitters at once: both signed and published before either is mined
   const gas = (estimate * 3n) / 2n + 100_000n;
@@ -762,7 +762,7 @@ async function splitNegatives(cfgPath: string, wallet: string, partId: string, p
   assert.equal(after.spentPart.toLowerCase(), `0x${hex(lin.nullifier)}`, 'the vault records the part\'s nullifier');
   const refused = await callVault(c.eth, vault, data, await latest());
   assert.equal(refused.revert, `${PART_ALREADY_REDEEMED}${hex(word(nonce))}${hex(lin.partTokenId)}`, 'a third submission is refused as PartAlreadyRedeemed');
-  out.duplicate = { statuses: [a.status, b.status], blocks: [a.blockNumber, b.blockNumber], before, after, thirdRefusal: refused.revert };
+  out.duplicate = { statuses: [a.status, b.status], blocks: [a.blockNumber, b.blockNumber], credited: BigInt(after.claimable) - BigInt(before.claimable), before, after, thirdRefusal: refused.revert };
   writeFileSync(`${wallet}/tokens/${partId}/split-negatives.json`, toJson(out));
   console.log('SPLIT NEGATIVES', toJson(out));
 }
