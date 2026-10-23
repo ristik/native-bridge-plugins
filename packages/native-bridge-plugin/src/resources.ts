@@ -62,8 +62,8 @@ const tagged = (n: Node, tag: bigint, count: number): Node[] => n.major === 6 &&
 const uint = (n: Node, max = 0xffffffffffffffffn): void => { if (n.major !== 0 || n.arg > max) unsupported(); };
 const version = (n: Node): void => { uint(n); if (n.arg !== 1n) unsupported(); };
 const hash = (n: Node, nullable = false): void => { if (!(nullable && n.major === 7 && n.arg === 22n) && (n.major !== 2 || n.data.length !== 32)) unsupported(); };
-function uc(n: Node, budget: Budget): void {
-  if (n.end - n.start > MAX_UC_BYTES) fail('ErrProofTooLarge');
+function uc(n: Node, budget: Budget, maxBytes = MAX_UC_BYTES): void {
+  if (n.end - n.start > maxBytes) fail('ErrProofTooLarge');
   const k = tagged(n, 39001n, 7); version(k[0]);
   const ir = tagged(k[1], 39002n, 10); version(ir[0]); uint(ir[1]); uint(ir[2]);
   hash(ir[3], true); hash(ir[4]);
@@ -139,6 +139,15 @@ export function preflightToken(bytes: Uint8Array): void {
   if (bytes.length > MAX_TOKEN_BYTES) fail('ErrInputTooLarge');
   const budget = new Budget(Number.MAX_SAFE_INTEGER); visit(scan(bytes, budget), budget);
 }
+/**
+ * The native certificate sublimit scan alone (the step bft-core `scanCertificate` takes from `b1ref.ScanUC`), with the B1 byte cap
+ * `maxBytes`; any failure is the caller's to classify.
+ */
+export function nativeUcScan(bytes: Uint8Array, maxBytes: number): void {
+  const budget = new Budget();
+  uc(scan(bytes, budget), budget, maxBytes);
+}
+
 export function preflightUc(bytes: Uint8Array): void {
   if (bytes.length > MAX_UC_BYTES) fail('ErrProofTooLarge');
   const budget = new Budget();

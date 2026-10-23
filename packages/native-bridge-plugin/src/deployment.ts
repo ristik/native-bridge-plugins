@@ -15,6 +15,13 @@ export interface Deployment {
   policy: Policy;
 }
 
+/** The configuration's own consistency (bft-core `Cfg.Validate`): identifiers recomputed from the family, a zero native address and a vault. */
+export function validateCfg(cfg: Cfg): void {
+  if (!eq(cfg.ty, deriveType(cfg.network, cfg.rootGenesis, cfg.executionGenesis, cfg.chainId)) ||
+      !eq(cfg.aid, deriveAsset(cfg.network, cfg.rootGenesis, cfg.executionGenesis, cfg.chainId))) fail('ErrCfgMismatch');
+  if (cfg.zeroAddress.some((x) => x !== 0) || cfg.vault.every((x) => x === 0)) fail('ErrCfgMismatch');
+}
+
 /** Validate a deployment: identifiers recomputed from the family, policy bound into Cfg. */
 export function makeDeployment(cfg: Cfg, vaultCodeHash: Uint8Array, evmConfigHash: Uint8Array, header: HeaderProfile, policy: Policy): Deployment {
   if (!eq(cfg.ty, deriveType(cfg.network, cfg.rootGenesis, cfg.executionGenesis, cfg.chainId)) ||
