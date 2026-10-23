@@ -1,0 +1,416 @@
+/**
+ * The bridge tester: one person's round trip through the native bridge of a public test network, with their own keys, against the operator's
+ * public endpoints only (tester/README.md). FAKE VALUE: a bridged token is test ether on a network that is reset without notice; nothing carries over.
+ *
+ *   bridge-tester.ts init --config <tester-config.json> [--eth-key-file <file>]   a new wallet: an EVM key (fund it from the faucet) and the configuration
+ *   bridge-tester.ts status [--token <nonce>]                                    the wallet's tokens and what the vault says about each
+ *   bridge-tester.ts lock --amount <ether|Nwei>                                  lock test ether in the vault for a new token
+ *   bridge-tester.ts mint [--token <nonce>]                                      fetch the lock's proof and mint the token on the aggregator
+ *   bridge-tester.ts transfer [--token <nonce>] [--count <n>]                    certified transfers to fresh keys of this wallet
+ *   bridge-tester.ts burn [--token <nonce>] [--recipient <0x address>]           burn the token for its return to an EVM address (default: this wallet's)
+ *   bridge-tester.ts redeem [--token <nonce>]                                    the return proof (consolidated by the aggregator), redeemed in the vault
+ *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
+ *
+ * The wallet is a directory (--wallet, or BRIDGE_TESTER_WALLET, default ./bridge-wallet): keys.json (owner-only: the EVM key and the Unicity keys),
+ * config.json, and tokens/<nonce>/ with the token file and its record. Keep it: a token exists only in its file.
+ */
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { parseArgs } from 'node:util';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
+import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
+import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
+import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
+import { ShardRouting } from '@unicitylabs/state-transition-sdk/lib/consolidation/ShardRouting.js';
+import { TokenProofClient } from '@unicitylabs/state-transition-sdk/lib/consolidation/TokenProofClient.js';
+import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
+import { BurnPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/BurnPredicate.js';
+import { SignaturePredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicate.js';
+import { SignaturePredicateUnlockScript } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicateUnlockScript.js';
+import { EncodedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/EncodedPredicate.js';
+import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
+import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
+import { StateMask } from '@unicitylabs/state-transition-sdk/lib/transaction/StateMask.js';
+import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
+import { TokenSalt } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenSalt.js';
+import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js';
+import { TransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+
+import { DeploymentRegistry, makeDeployment } from '../packages/native-bridge-plugin/src/deployment.js';
+import { configHashOfPdr, encodeJustification } from '../packages/native-bridge-plugin/src/lockproof.js';
+import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin/src/proof.js';
+import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
+import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
+import { NativeBridge } from '../packages/native-bridge-plugin/src/verifier.js';
+import { consolidatedProofs } from '../packages/native-bridge-plugin/src/wallet.js';
+import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
+import {
+  amountBytes, appendTransaction, calldata, decBytes, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  requirePhase, TesterConfig, TokenRecord,
+} from './core.js';
+
+/** The public gateway's request-body limit (bft-core deploy/testnet/gateway.py MAX_BODY). */
+const GATEWAY_MAX_BODY = 16384;
+
+// ---- JSON-RPC and HTTP --------------------------------------------------------------------------------------------------------------------------
+async function jsonRpc(url: string, method: string, params: unknown[]): Promise<any> {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${method} at ${url}: HTTP ${res.status}${body.length > GATEWAY_MAX_BODY ? ` (the request is ${body.length} bytes)` : ''}: ${text.slice(0, 200)}`);
+  const r = JSON.parse(text) as { result?: unknown; error?: { message: string; data?: string } };
+  if (r.error) throw new Error(`${method}: ${r.error.message}${r.error.data ? ` (${r.error.data})` : ''}`);
+  return r.result;
+}
+
+async function waitFor<T>(what: string, timeoutMs: number, f: () => Promise<T | undefined>, everyMs = 2000): Promise<T> {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    const v = await f();
+    if (v !== undefined) return v;
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(everyMs);
+  }
+}
+
+// ---- the wallet -------------------------------------------------------------------------------------------------------------------------------
+interface Keys {
+  eth: string;
+  unicity: string[];
+}
+
+class Wallet {
+  constructor(readonly dir: string) {}
+
+  get config(): TesterConfig {
+    return loadTesterConfig(`${this.dir}/config.json`);
+  }
+
+  keys(): Keys {
+    return JSON.parse(readFileSync(`${this.dir}/keys.json`, 'utf8')) as Keys;
+  }
+
+  saveKeys(k: Keys): void {
+    writeFileSync(`${this.dir}/keys.json`, `${JSON.stringify(k, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(`${this.dir}/keys.json`, 0o600);
+  }
+
+  /** a new Unicity key, saved before it is used */
+  newOwner(): { index: number; signer: SigningService } {
+    const k = this.keys();
+    const key = SigningService.generatePrivateKey();
+    k.unicity.push(hex(key));
+    this.saveKeys(k);
+    return { index: k.unicity.length - 1, signer: new SigningService(key) };
+  }
+
+  owner(index: number): SigningService {
+    return new SigningService(unhex(this.keys().unicity[index]));
+  }
+
+  tokenDir(nonce: string): string {
+    return `${this.dir}/tokens/${nonce}`;
+  }
+
+  record(nonce?: string): TokenRecord {
+    const all = this.records();
+    if (all.length === 0) throw new Error('this wallet has no tokens yet: run lock');
+    const r = nonce === undefined ? all[all.length - 1] : all.find((t) => t.nonce === nonce);
+    if (!r) throw new Error(`this wallet has no token ${nonce} (it has ${all.map((t) => t.nonce).join(', ')})`);
+    return r;
+  }
+
+  records(): TokenRecord[] {
+    const dir = `${this.dir}/tokens`;
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((n) => /^\d+$/.test(n)).sort((a, b) => Number(a) - Number(b))
+      .map((n) => JSON.parse(readFileSync(`${dir}/${n}/token.json`, 'utf8')) as TokenRecord);
+  }
+
+  saveRecord(t: TokenRecord): void {
+    mkdirSync(this.tokenDir(t.nonce), { recursive: true });
+    writeFileSync(`${this.tokenDir(t.nonce)}/token.json`, `${JSON.stringify(t, null, 2)}\n`);
+  }
+
+  async token(t: TokenRecord): Promise<{ bytes: Uint8Array; token: Token }> {
+    const bytes = Uint8Array.from(readFileSync(`${this.tokenDir(t.nonce)}/token.cbor`));
+    return { bytes, token: await Token.fromCBOR(bytes) };
+  }
+
+  saveToken(t: TokenRecord, bytes: Uint8Array): void {
+    writeFileSync(`${this.tokenDir(t.nonce)}/token.cbor`, bytes);
+  }
+}
+
+// ---- the chain --------------------------------------------------------------------------------------------------------------------------------
+class Chain {
+  constructor(readonly cfg: TesterConfig) {}
+
+  call(data: string, from?: string, url = this.cfg.ethUrl): Promise<string> {
+    return jsonRpc(url, 'eth_call', [{ to: this.cfg.vault, data, ...(from ? { from } : {}) }, 'latest']);
+  }
+
+  async uint(signature: string, ...words: string[]): Promise<bigint> {
+    return BigInt(await this.call(calldata(signature, ...words)));
+  }
+
+  /** Signs once and sends to one endpoint; waits for the receipt there. */
+  async send(key: string, data: string, value = 0n, url = this.cfg.ethUrl): Promise<{ status: string; transactionHash: string; blockHash: string; blockNumber: string; gasUsed: string; logs: { address: string; topics: string[] }[] }> {
+    const from = ethAddress(key);
+    const tx = { from, to: this.cfg.vault, data, value: `0x${value.toString(16)}` };
+    const gas = (BigInt(await jsonRpc(url, 'eth_estimateGas', [tx, 'latest'])) * 6n) / 5n + 20_000n;
+    const gasPrice = BigInt(await jsonRpc(url, 'eth_gasPrice', [])) * 2n;
+    const balance = BigInt(await jsonRpc(url, 'eth_getBalance', [from, 'latest']));
+    if (balance < gas * gasPrice + value) throw new Error(`${from} holds ${balance} wei, and this needs ${gas * gasPrice + value}: get test ether from the faucet`);
+    const nonce = BigInt(await jsonRpc(url, 'eth_getTransactionCount', [from, 'pending']));
+    const { raw, hash } = signLegacyTx({ nonce, gasPrice, gas, to: this.cfg.vault, value, data: unhex(data), chainId: BigInt(this.cfg.chainId) }, key);
+    await jsonRpc(url, 'eth_sendRawTransaction', [raw]);
+    console.log(`  sent ${hash} (gas limit ${gas})`);
+    const rc = await waitFor(`the receipt of ${hash}`, 180_000, async () => (await jsonRpc(url, 'eth_getTransactionReceipt', [hash])) ?? undefined);
+    if (rc.status !== '0x1') throw new Error(`${hash} reverted (gas used ${BigInt(rc.gasUsed)})`);
+    return rc;
+  }
+}
+
+/** The installed bridge as the plug-in verifies it: the vault's Cfg read from the vault, trust, EVM PDR and policy from the operator's published files. */
+async function installedBridge(cfg: TesterConfig, chain: Chain) {
+  const vaultCfg = decodeCfg(decBytes(await chain.call(calldata('cfgBytes()'))));
+  const trust = await TrustInput.fromBundle(Uint8Array.from(readFileSync(cfg.files.trustBundle)), unhex(readFileSync(cfg.files.trustEntryId, 'utf8').trim()));
+  const pdr = Uint8Array.from(readFileSync(cfg.files.evmPdr));
+  const policy = decodePolicy(unhex(JSON.parse(readFileSync(cfg.files.deployment, 'utf8')).policyBody));
+  const code = unhex(await jsonRpc(cfg.ethUrl, 'eth_getCode', [cfg.vault, 'latest']));
+  const dep = makeDeployment(vaultCfg, keccak256(code), configHashOfPdr(pdr), { fields: 20 }, policy);
+  return { vaultCfg, dep, bridge: new NativeBridge(new DeploymentRegistry([dep]), trust) };
+}
+
+/** Submit one certification request and wait for its inclusion proof. */
+async function certify(agg: AggregatorClient, cd: CertificationData, what: string) {
+  const sid = await StateId.fromCertificationData(cd);
+  await agg.submitCertificationRequest(cd);
+  return waitFor(`${what} to be certified`, 180_000, async () => (await agg.getInclusionProof(sid)).inclusionProof ?? undefined);
+}
+
+// ---- the commands -----------------------------------------------------------------------------------------------------------------------------
+async function init(w: Wallet, configPath: string, ethKeyFile?: string): Promise<void> {
+  if (existsSync(`${w.dir}/keys.json`)) throw new Error(`${w.dir} already holds a wallet`);
+  const cfg = loadTesterConfig(configPath);
+  mkdirSync(`${w.dir}/tokens`, { recursive: true, mode: 0o700 });
+  const raw = JSON.parse(readFileSync(configPath, 'utf8')) as TesterConfig;
+  raw.files = cfg.files; // absolute, so the copy reads the same files
+  writeFileSync(`${w.dir}/config.json`, `${JSON.stringify(raw, null, 2)}\n`);
+  const eth = ethKeyFile ? readFileSync(ethKeyFile, 'utf8').trim() : `0x${hex(secp256k1.utils.randomSecretKey())}`;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(eth)) throw new Error(`${ethKeyFile}: not a 32-byte hex key`);
+  w.saveKeys({ eth, unicity: [] });
+  console.log(`wallet ${w.dir}\nEVM address ${ethAddress(eth)}: fund it from the faucet (test ether only), then run lock`);
+}
+
+async function status(w: Wallet, nonce?: string): Promise<void> {
+  const cfg = w.config;
+  const chain = new Chain(cfg);
+  const me = ethAddress(w.keys().eth);
+  console.log(`EVM address ${me}: balance ${BigInt(await jsonRpc(cfg.ethUrl, 'eth_getBalance', [me, 'latest']))} wei, vault credit ${await chain.uint('claimable(address)', encAddress(me))} wei`);
+  for (const t of nonce === undefined ? w.records() : [w.record(nonce)]) {
+    const digest = await chain.uint('lockDigest(uint256)', encUint(BigInt(t.nonce)));
+    const spent = await chain.uint('spentNullifier(uint256)', encUint(BigInt(t.nonce)));
+    console.log(`token ${t.nonce}: ${t.phase}, ${t.amountWei} wei, ${t.transfers} transfers${t.recipient ? `, returns to ${t.recipient}` : ''}; ` +
+      `vault: ${digest === 0n ? 'NO LOCK' : 'locked'}, ${spent === 0n ? 'not redeemed' : 'redeemed'}`);
+  }
+}
+
+async function lock(w: Wallet, amountText: string): Promise<void> {
+  const cfg = w.config;
+  const chain = new Chain(cfg);
+  const amountWei = parseAmount(amountText);
+  const owner = w.newOwner();
+  const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.signer.publicKey)).toCBOR();
+  const rc = await chain.send(w.keys().eth, calldata('lock(bytes)', encBytes(p0)), amountWei);
+  const log = rc.logs.find((l) => l.address.toLowerCase() === cfg.vault.toLowerCase() && l.topics[0] === LOCKED_TOPIC);
+  if (!log) throw new Error(`${rc.transactionHash} has no Locked event of the vault`);
+  const t: TokenRecord = { nonce: BigInt(log.topics[1]).toString(), amountWei: amountWei.toString(), phase: 'locked', lockTx: rc.transactionHash, lockBlockHash: rc.blockHash, holder: owner.index, transfers: 0 };
+  w.saveRecord(t);
+  console.log(`locked ${amountWei} wei as token ${t.nonce} in block ${BigInt(rc.blockNumber)}; next: mint`);
+}
+
+async function mint(w: Wallet, nonce?: string): Promise<void> {
+  const t = w.record(nonce);
+  requirePhase(t, 'locked', 'mint');
+  const cfg = w.config;
+  const chain = new Chain(cfg);
+  const { vaultCfg, dep } = await installedBridge(cfg, chain);
+  // the lock's proof: the endpoint answers 404 until the lock block is certified and archived, and again once it is out of the proof window
+  const url = `${cfg.lockProofUrl.replace(/\/$/, '')}/v1/lockproof?block=${t.lockBlockHash}&nonce=${t.nonce}`;
+  const lockProof = await waitFor('the lock proof (the lock block certified and archived)', 300_000, async () => {
+    const res = await fetch(url);
+    if (res.status === 200) return new Uint8Array(await res.arrayBuffer());
+    if (res.status === 404 || res.status === 429 || res.status === 502) return undefined;
+    throw new Error(`the lock-proof endpoint answered ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }, 5000);
+  writeFileSync(`${w.tokenDir(t.nonce)}/lockproof.cbor`, lockProof);
+  const owner = w.owner(t.holder);
+  const nonceN = BigInt(t.nonce);
+  const amount = amountBytes(BigInt(t.amountWei));
+  const salt = deriveSalt(dep.cfgHash, nonceN);
+  const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.publicKey)).toCBOR();
+  // the vault's record of this lock must be the one the plug-in derives for this wallet's key and amount
+  const onChain = (await chain.call(calldata('lockDigest(uint256)', encUint(nonceN)))).replace(/^0x/, '');
+  if (onChain !== hex(lockDigest(dep.cfgHash, nonceN, lockRecord(vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, amount, deriveTokenId(salt, vaultCfg.network), sha256(p0))))) {
+    throw new Error(`the vault's lock ${t.nonce} is not this wallet's (another key or amount)`);
+  }
+  const tx = await MintTransaction.create(NetworkId.fromId(vaultCfg.network), SignaturePredicate.create(owner.publicKey), {
+    data: valueEnvelope(vaultCfg.aid, amount), expiresAt: null, justification: encodeJustification(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, nonceN, lockProof),
+    salt: TokenSalt.fromBytes(salt), tokenType: new TokenType(vaultCfg.ty),
+  });
+  const proof = await certify(new AggregatorClient(cfg.aggUrl), await CertificationData.fromMintTransaction(tx), 'the mint');
+  const bytes = C.encodeTag(39040n, arr(u(2), arr(tx.toCBOR(), proof.toCBOR()), arr()));
+  await Token.fromCBOR(bytes);
+  w.saveToken(t, bytes);
+  w.saveRecord({ ...t, phase: 'minted' });
+  console.log(`minted token ${t.nonce}; next: transfer or burn`);
+}
+
+async function transfer(w: Wallet, nonce: string | undefined, count: number): Promise<void> {
+  let t = w.record(nonce);
+  requirePhase(t, 'minted', 'transfer');
+  const agg = new AggregatorClient(w.config.aggUrl);
+  let { bytes, token } = await w.token(t);
+  for (let i = 0; i < count; i++) {
+    const next = w.newOwner();
+    const tx = await TransferTransaction.create(token, SignaturePredicate.create(next.signer.publicKey), StateMask.generate());
+    const proof = await certify(agg, await CertificationData.fromTransaction(tx, await SignaturePredicateUnlockScript.create(tx, w.owner(t.holder))), `transfer ${i + 1}/${count}`);
+    bytes = appendTransaction(bytes, tx.toCBOR(), proof.toCBOR());
+    token = await Token.fromCBOR(bytes);
+    w.saveToken(t, bytes);
+    t = { ...t, holder: next.index, transfers: t.transfers + 1 };
+    w.saveRecord(t);
+  }
+  console.log(`token ${t.nonce}: ${t.transfers} transfers; next: transfer or burn`);
+}
+
+async function burn(w: Wallet, nonce: string | undefined, recipient?: string): Promise<void> {
+  const t = w.record(nonce);
+  requirePhase(t, 'minted', 'burn');
+  const to = recipient ?? ethAddress(w.keys().eth);
+  if (!isAddress(to)) throw new Error(`--recipient: not an address: ${to}`);
+  const cfg = w.config;
+  const { vaultCfg } = await installedBridge(cfg, new Chain(cfg));
+  const { bytes, token } = await w.token(t);
+  const reason = returnReason(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, unhex(to), amountBytes(BigInt(t.amountWei)));
+  const tx = await TransferTransaction.create(token, BurnPredicate.create(sha256(reason)), StateMask.generate(), { data: reason });
+  const proof = await certify(new AggregatorClient(cfg.aggUrl), await CertificationData.fromTransaction(tx, await SignaturePredicateUnlockScript.create(tx, w.owner(t.holder))), 'the burn');
+  const burned = appendTransaction(bytes, tx.toCBOR(), proof.toCBOR());
+  await Token.fromCBOR(burned);
+  w.saveToken(t, burned);
+  w.saveRecord({ ...t, phase: 'burned', recipient: to });
+  console.log(`burned token ${t.nonce} for its return to ${to}; next: redeem`);
+}
+
+async function redeem(w: Wallet, nonce?: string): Promise<void> {
+  const t = w.record(nonce);
+  requirePhase(t, 'burned', 'redeem');
+  const cfg = w.config;
+  const chain = new Chain(cfg);
+  const { bridge } = await installedBridge(cfg, chain);
+  const { token } = await w.token(t);
+  // one consolidated proof set from the aggregator (every leaf under one seal), so the envelope has one anchor whatever the history's length
+  const client = new AggregatorClient(cfg.aggUrl);
+  const proofClient = new TokenProofClient({ routing: ShardRouting.single(client), verificationContext: await bridge.context() });
+  let cons: Awaited<ReturnType<typeof consolidatedProofs>> | undefined;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    cons = await consolidatedProofs(token, { partitionShards: 1, consolidate: (tk) => proofClient.consolidate(tk, { timeoutMs: 60_000 }) });
+    if (cons.proofs || !(cons.path.kind === 'per-sid' && cons.path.retryable)) break;
+    await sleep(5000);
+  }
+  let ret: Awaited<ReturnType<typeof buildReturnProof>>;
+  if (cons?.proofs) ret = await buildReturnProof(bridge, await refreshToken(token, cons.proofs));
+  else {
+    // no consolidation: the proofs as certified, one anchor per certificate (a short history only)
+    const why = `${JSON.stringify(cons?.path)}${cons?.path.kind === 'per-sid' && cons.path.unavailable === 'limit_exceeded' ? ' (one batch carries at most 256 states: 254 transfers)' : ''}`;
+    console.log(`  the aggregator did not consolidate the token (${why}); using the proofs as certified`);
+    try {
+      ret = await buildReturnProof(bridge, token);
+    } catch (e) {
+      throw new Error(`no return proof: the consolidation was unavailable (${why}) and the proofs as certified do not make one: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  writeFileSync(`${w.tokenDir(t.nonce)}/envelope.bin`, ret.encoded);
+  const data = calldata('redeem(bytes)', encBytes(ret.encoded));
+  const url = cfg.redeemEthUrl ?? cfg.ethUrl;
+  if (url === cfg.ethUrl && data.length + 1024 > GATEWAY_MAX_BODY) {
+    console.log(`  note: the redemption is ${data.length} characters of calldata; a gateway with a ${GATEWAY_MAX_BODY}-byte body limit refuses it (configure redeemEthUrl)`);
+  }
+  // the vault accepts the envelope once the root chain's seal of it is within the registry's usable origin (a few rounds)
+  await waitFor('the vault to accept the return proof', 240_000, async () => {
+    try {
+      return BigInt(await chain.call(data, ethAddress(w.keys().eth), url)) === BigInt(t.nonce) ? true : undefined;
+    } catch {
+      return undefined;
+    }
+  }, 3000);
+  const rc = await chain.send(w.keys().eth, data, 0n, url);
+  w.saveRecord({ ...t, phase: 'redeemed', redeemTx: rc.transactionHash });
+  console.log(`redeemed token ${t.nonce}: ${t.recipient} is credited ${t.amountWei} wei (gas used ${BigInt(rc.gasUsed)}); next: claim (by ${t.recipient})`);
+}
+
+async function claim(w: Wallet, to?: string): Promise<void> {
+  const cfg = w.config;
+  const chain = new Chain(cfg);
+  const key = w.keys().eth;
+  const me = ethAddress(key);
+  const dest = to ?? me;
+  if (!isAddress(dest)) throw new Error(`--to: not an address: ${dest}`);
+  const credit = await chain.uint('claimable(address)', encAddress(me));
+  if (credit === 0n) throw new Error(`${me} has no credit in the vault: redeem a burned token first`);
+  await chain.send(key, calldata('claim(uint256,address)', encUint(credit), encAddress(dest)));
+  console.log(`claimed ${credit} wei to ${dest}`);
+}
+
+// ---- the command line -------------------------------------------------------------------------------------------------------------------------
+const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | burn [--recipient 0x..] | redeem | claim [--to 0x..]; ' +
+  'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce> (default the newest)';
+
+export async function main(argv: string[]): Promise<void> {
+  const { positionals, values } = parseArgs({
+    args: argv, allowPositionals: true, strict: true,
+    options: {
+      wallet: { type: 'string' }, config: { type: 'string' }, 'eth-key-file': { type: 'string' }, token: { type: 'string' }, amount: { type: 'string' },
+      count: { type: 'string' }, recipient: { type: 'string' }, to: { type: 'string' },
+    },
+  });
+  const w = new Wallet(values.wallet ?? process.env.BRIDGE_TESTER_WALLET ?? './bridge-wallet');
+  const [cmd, ...extra] = positionals;
+  if (extra.length) throw new Error(`unexpected arguments: ${extra.join(' ')}\n${USAGE}`);
+  if (cmd !== 'init' && !existsSync(`${w.dir}/keys.json`)) throw new Error(`no wallet at ${w.dir}: run init first`);
+  switch (cmd) {
+    case 'init':
+      if (!values.config) throw new Error(`init needs --config\n${USAGE}`);
+      return init(w, values.config, values['eth-key-file']);
+    case 'status':
+      return status(w, values.token);
+    case 'lock':
+      if (!values.amount) throw new Error(`lock needs --amount\n${USAGE}`);
+      return lock(w, values.amount);
+    case 'mint':
+      return mint(w, values.token);
+    case 'transfer': {
+      const n = Number(values.count ?? '1');
+      if (!Number.isInteger(n) || n < 1 || n > 254) throw new Error('--count must be 1 to 254');
+      return transfer(w, values.token, n);
+    }
+    case 'burn':
+      return burn(w, values.token, values.recipient);
+    case 'redeem':
+      return redeem(w, values.token);
+    case 'claim':
+      return claim(w, values.to);
+    default:
+      throw new Error(USAGE);
+  }
+}
+
+if (process.argv[1]?.endsWith('bridge-tester.ts')) {
+  main(process.argv.slice(2)).catch((e: unknown) => {
+    console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}
