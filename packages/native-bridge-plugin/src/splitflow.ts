@@ -96,8 +96,10 @@ export interface SplitPlan {
  * Check and price a split before anything is burned. The held token must verify as a receipt (a whole token or a part); the outputs must
  * be at least two, each positive, summing to exactly the held amount, with distinct 32-byte salts. Each output's redemption is priced
  * from the lineage it will have (the held lineage, the manifest burn, the output's mint and its own return burn) and the walk's charge of
- * the new edge, as a lower bound like `preflightBurn`'s: an output that could never be redeemed under the resource policy
- * (`ErrInputTooLarge`) refuses the whole split. The estimate is never a gas ceiling (owner section 36).
+ * the new edge: the full estimate interop.md asks for before the manifest burn ("Split lineage": the whole lineage and the walk, not the
+ * output's own leaves only), computed before the burn exists and therefore a lower bound, as `preflightBurn`'s is for a whole token. An
+ * output that could never be redeemed under the resource policy (`ErrInputTooLarge`) refuses the whole split. The estimate is never a gas
+ * ceiling (owner section 36).
  */
 export async function planSplit(
   plugin: NativeBridgePlugin, splitId: string, tokenBytes: Uint8Array, outputs: SplitOutput[], burnStateMask: Uint8Array = StateMask.generate().bytes,

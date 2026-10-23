@@ -320,10 +320,8 @@ admits a split part only through the full lineage relation under the pinned
 configuration (a root through J, a part through SplitJ to exactly one J, the
 39050 value of exactly aid); split outputs are built from the SDK's frozen
 payment data (`paymentData.encode()` bytes are the committed mint data);
-before the parent's manifest burn the wallet prices a lower-bound redemption
-estimate of every output (the lineage it will have, as the burn-time preflight
-of a whole token; an output the envelope bound can never carry refuses the
-split); the split, the manifest burn and
+before the parent's manifest burn the wallet prices the full redemption
+estimate of every part it intends to redeem; the split, the manifest burn and
 each child mint are journaled durably, each step resumable after a crash, and
 no step is acknowledged before its certified blob is stored.
 
