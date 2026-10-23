@@ -52,7 +52,9 @@ import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/Tok
 import { batchRequest, measure } from '../../packages/native-bridge-plugin/src/certgroups.js';
 import { DeploymentRegistry, makeDeployment } from '../../packages/native-bridge-plugin/src/deployment.js';
 import { configHashOfPdr, encodeJustification } from '../../packages/native-bridge-plugin/src/lockproof.js';
-import { buildReturnProof, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
+import { assembleEnvelope, buildReturnProof, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
+import { projectToken } from '../../packages/native-bridge-plugin/src/history.js';
+import { isSplitReason, lineageProofs, splitChain } from '../../packages/native-bridge-plugin/src/splitpart.js';
 import { consolidatedProofs } from '../../packages/native-bridge-plugin/src/wallet.js';
 import {
   arr, bs, decodeCfg, decodePolicy, deriveSalt, deriveTokenId, H, keccak256, lockDigest, lockRecord, returnReason, shardCovers, shardDepth, u, valueEnvelope,
@@ -657,6 +659,114 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   console.log('NEGATIVES', toJson({ conflictingSubmission: submitted, freshSeal: conAnchors[0], refusedAtBlock: accepted }));
 }
 
+
+// ---- split negatives (split plan PR5: a part of a split token, live) -----------------------------------------------------------------------
+/** BridgeVault's BridgeRejected(uint256): the composition (BRIDGE_COMPOSE_V2) refused the redemption with a nonzero status. */
+const BRIDGE_REJECTED = '0x2896c49d';
+const STATUS_V2 = JSON.parse(readFileSync(new URL('../../protocol/vectors/split/config/compose-status-v2.json', import.meta.url), 'utf8')) as { code: number; name: string }[];
+
+/** One byte string replaced by another of the same length, exactly once in `b`. */
+function replaceOnce(b: Uint8Array, from: Uint8Array, to: Uint8Array, what: string): Uint8Array {
+  assert.equal(from.length, to.length);
+  const h = hex(b);
+  const at = h.indexOf(hex(from));
+  assert.ok(at >= 0 && at % 2 === 0 && h.indexOf(hex(from), at + 2) < 0, `${what}: the bytes occur exactly once in the envelope`);
+  return unhex(h.slice(0, at) + hex(to) + h.slice(at + from.length * 2));
+}
+
+/**
+ * The live negatives of a split part (bft-core rehearse_bridge.py `split`), on a tester wallet: PART is a burned, not yet redeemed part, PARENT a split
+ * (manifest-burned) ancestor. Every refusal is the chain's own: an eth_call of the vault (BridgeRejected with the V2 status, or the vault's error).
+ *  - the parent returned: its envelope (assembled, since the plug-in refuses to build it) is refused by the composition;
+ *  - the part's envelope with its return recipient, or its amount in its mint, changed: refused (the certified transaction hashes no longer match);
+ *  - an underfunded redemption runs out of gas: status 0, the vault unchanged;
+ *  - the same envelope submitted twice at once by two submitters: one credit, the other reverts; the vault records the part's nullifier once.
+ * The part ends redeemed by this command. Writes split-negatives.json next to the part.
+ */
+async function splitNegatives(cfgPath: string, wallet: string, partId: string, parentId: string): Promise<void> {
+  const c = ctx(cfgPath);
+  const { cfg, dep, bridge } = await installedBridge(c);
+  const vault = c.lane.vault;
+  const read = (id: string) => Uint8Array.from(readFileSync(`${wallet}/tokens/${id}/token.cbor`));
+  const part = await Token.fromCBOR(read(partId));
+  const parent = await Token.fromCBOR(read(parentId));
+  const status = (revert: string | undefined): string => {
+    assert.ok(revert?.startsWith(BRIDGE_REJECTED), `refused by the composition (BridgeRejected): ${revert}`);
+    const code = Number(BigInt(`0x${revert!.slice(10, 74)}`));
+    assert.ok(code !== 0, 'a nonzero status');
+    return STATUS_V2.find((s) => s.code === code)?.name ?? `status ${code}`;
+  };
+  const latest = async () => (await rpc(c.eth, 'eth_blockNumber', [])) as string;
+  const out: Json = { part: partId, parent: parentId };
+
+  // the part's own envelope, as certified (any age), once the registry's origin covers its anchors
+  const built = await buildReturnProof(bridge, part);
+  const lin = built.verified.lineage!;
+  const nonce = built.verified.outcome.nonce;
+  const data = redeemCalldata(built.encoded);
+  await until('the vault accepts the part\'s envelope (eth_call)', 240_000, async () => ((await callVault(c.eth, vault, data, await latest())).result ? true : undefined));
+  const partAmount = BigInt(`0x${hex(lin.partAmount)}`);
+  const recipient = `0x${hex(built.verified.outcome.releaseTo)}`;
+  out.partAmount = partAmount;
+  out.depth = lin.depth;
+
+  // 1. the parent returned: the plug-in refuses to build it; the chain refuses the envelope assembled anyway
+  let pluginRefusal = '';
+  try {
+    await buildReturnProof(bridge, parent);
+  } catch (e) {
+    pluginRefusal = String(e).slice(0, 200);
+  }
+  assert.ok(pluginRefusal, 'the plug-in refuses to build a return of a split parent');
+  const chain = isSplitReason(parent.genesis.justification) ? lineageProofs(await splitChain(parent)) : [parent.genesis, ...parent.transactions].map((x) => x.inclusionProof);
+  const parentEnv = assembleEnvelope(dep, projectToken(parent), chain).encoded;
+  out.parentReturn = { pluginRefusal, chain: status((await callVault(c.eth, vault, redeemCalldata(parentEnv), await latest())).revert) };
+
+  // 2. the return recipient changed in the part's burn (R), and 3. the part's amount changed in its own mint's value
+  const other = unhex('000000000000000000000000000000000000dead');
+  out.changedRecipient = status((await callVault(c.eth, vault, redeemCalldata(replaceOnce(built.encoded, built.verified.outcome.releaseTo, other, 'the recipient')), await latest())).revert);
+  const value = valueEnvelope(cfg.aid, lin.partAmount);
+  const more = valueEnvelope(cfg.aid, amountBytes(partAmount + 1n));
+  out.changedAmount = status((await callVault(c.eth, vault, redeemCalldata(replaceOnce(built.encoded, value, more, 'the part\'s value')), await latest())).revert);
+
+  // the vault's view of this lock and part, at one block
+  const view = async (block: string) => {
+    const at = (sig: string, ...args: string[]): string => c.cast('call', vault, sig, ...args, '--block', block).split(' ')[0];
+    return {
+      spentPart: at('spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(lin.partTokenId)}`), redeemedAmount: at('redeemedAmount(uint256)(uint256)', nonce.toString()),
+      remaining: at('remaining(uint256)(uint256)', nonce.toString()), claimable: at('claimable(address)(uint256)', recipient),
+      balance: BigInt(await rpc(c.eth, 'eth_getBalance', [vault, block])).toString(),
+    };
+  };
+
+  // 4. out of gas: well under the estimate (above the calldata floor), status 0 and nothing changed
+  for (const a of [THIRD_PARTY_ADDR]) if (BigInt(await rpc(c.eth, 'eth_getBalance', [a, 'latest'])) < 10n ** 17n) await sendAll(c, a, '', [], DEPLOYER_KEY, '100000', '1000000000000000000');
+  const estimate = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: vault, data }, 'latest']));
+  const low = (estimate * 2n) / 3n;
+  assert.ok(low >= calldataFloor(data), 'the underfunded limit is above the calldata floor (the transaction is admitted)');
+  const before = await view(await latest());
+  const oog = await sendData(c, vault, data, THIRD_PARTY_KEY, low.toString());
+  const afterOog = await view(oog.blockNumber);
+  assert.equal(oog.status, '0x0', 'the underfunded redemption reverts');
+  assert.deepEqual(afterOog, before, 'the underfunded redemption changed nothing in the vault');
+  out.outOfGas = { gasLimit: low, estimate, gasUsed: BigInt(oog.gasUsed), block: oog.blockNumber };
+
+  // 5. the same envelope from two submitters at once: both signed and published before either is mined
+  const gas = (estimate * 3n) / 2n + 100_000n;
+  const [a, b] = await Promise.all([sendData(c, vault, data, DEPLOYER_KEY, gas.toString()), sendData(c, vault, data, THIRD_PARTY_KEY, gas.toString())]);
+  const ok = [a, b].filter((r) => r.status === '0x1');
+  assert.equal(ok.length, 1, `exactly one of the two submissions redeems: ${a.status} ${b.status}`);
+  const after = await view(await latest());
+  assert.equal(BigInt(after.claimable) - BigInt(before.claimable), partAmount, 'the recipient is credited the part\'s amount once');
+  assert.equal(BigInt(before.remaining) - BigInt(after.remaining), partAmount, 'the lock\'s remaining falls by the part\'s amount once');
+  assert.equal(after.spentPart.toLowerCase(), `0x${hex(lin.nullifier)}`, 'the vault records the part\'s nullifier');
+  const refused = await callVault(c.eth, vault, data, await latest());
+  assert.equal(refused.revert, `${PART_ALREADY_REDEEMED}${hex(word(nonce))}${hex(lin.partTokenId)}`, 'a third submission is refused as PartAlreadyRedeemed');
+  out.duplicate = { statuses: [a.status, b.status], blocks: [a.blockNumber, b.blockNumber], before, after, thirdRefusal: refused.revert };
+  writeFileSync(`${wallet}/tokens/${partId}/split-negatives.json`, toJson(out));
+  console.log('SPLIT NEGATIVES', toJson(out));
+}
+
 const [cmd, cfgPath, arg3, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case 'save':
@@ -681,6 +791,9 @@ switch (cmd) {
   case 'negatives':
     await negatives(cfgPath, arg3);
     break;
+  case 'split-negatives':
+    await splitNegatives(cfgPath, arg3, rest[0], rest[1]);
+    break;
   default:
-    throw new Error('usage: anyage.ts save <lane-config> [<out-dir>] | verify <lane-config> <saved.json> --epoch current|historical | release <lane-config> <saved.json> | consolidated <lane-config> [<out-dir>] | long-history <lane-config> [<out-dir>] | negatives <lane-config> <saved.json>');
+    throw new Error('usage: anyage.ts save <lane-config> [<out-dir>] | verify <lane-config> <saved.json> --epoch current|historical | release <lane-config> <saved.json> | consolidated <lane-config> [<out-dir>] | long-history <lane-config> [<out-dir>] | negatives <lane-config> <saved.json> | split-negatives <lane-config> <tester-wallet> <part-id> <parent-id>');
 }
