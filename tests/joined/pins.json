@@ -3,7 +3,7 @@
   "sources": {
     "plugins": "19c6b274157fd5ff9fed9f43552debcc79d01e55",
     "ureth": "d41d5310329fb56ae288134a0261b234c16effc1",
-    "contracts": "49948607e81508934c51ec27498ea18b2b1953a2",
+    "contracts": "31b2ec1a9736c8597dc53803da5481117502abbd",
     "oracle": "cb4152c9b7fa5538e5597b91483ba30352f9d714",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
