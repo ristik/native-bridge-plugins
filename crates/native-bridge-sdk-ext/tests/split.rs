@@ -404,11 +404,12 @@ fn every_compose_v2_output_is_the_relation_result_and_every_success_its_gas() {
 /// Mutations whose status differs only in the anchor phase of protocol 5: the native composition scans the anchors and lets B1
 /// authenticate them before it opens their input records; the plug-ins' offline steps open them first. No lineage status differs.
 /// (mutation-198, a malformed anchor certificate, is the oracle's `ErrAnchorAuth` here; the TypeScript scan names it `ErrShape`.)
-const ANCHOR_ORDER: [(&str, &str); 4] = [
-    ("mutation-029", "ErrPathBitmap"),
-    ("mutation-240", "ErrIRShape"),
-    ("mutation-269", "ErrAnchorAuth"),
-    ("mutation-297", "ErrAnchorAuth"),
+/// `(case, the oracle's status, the plug-ins' refusal)`.
+const ANCHOR_ORDER: [(&str, &str, &str); 4] = [
+    ("mutation-029", "ErrPathBitmap", "ErrIROpening"),
+    ("mutation-240", "ErrIRShape", "ErrIROpening"),
+    ("mutation-269", "ErrAnchorAuth", "ErrIROpening"),
+    ("mutation-297", "ErrAnchorAuth", "ErrIROpening"),
 ];
 
 #[test]
@@ -423,7 +424,10 @@ fn every_mutation_gets_the_oracles_status_and_gas_wherever_the_plug_ins_decide()
         .map(|e| e["name"].as_str().unwrap().to_string())
         .collect();
     let base = hx(&m["base"]);
-    let order: BTreeMap<&str, &str> = ANCHOR_ORDER.into_iter().collect();
+    let order: BTreeMap<&str, (&str, &str)> = ANCHOR_ORDER
+        .into_iter()
+        .map(|(id, oracle, ours)| (id, (oracle, ours)))
+        .collect();
     let mut tally = BTreeMap::<&str, usize>::new();
     for c in m["cases"].as_array().unwrap() {
         let id = c["id"].as_str().unwrap();
@@ -447,9 +451,12 @@ fn every_mutation_gets_the_oracles_status_and_gas_wherever_the_plug_ins_decide()
             Ok(_) => "ok".to_string(),
             Err(e) => e.name().to_string(),
         };
-        if let Some(w) = order.get(id) {
-            assert_eq!(name, w, "{id}: the allow-list entry still applies");
-            assert_ne!(&got_name, name, "{id}: the allow-list entry still applies");
+        if let Some((oracle, ours)) = order.get(id) {
+            assert_eq!(name, oracle, "{id}: the allow-list entry still applies");
+            assert_eq!(
+                &got_name, ours,
+                "{id}: the plug-ins refuse it, for the listed reason"
+            );
             *tally.entry("anchorOrder").or_default() += 1;
         } else if B1_ONLY.contains(&name.as_str()) && got_name == "ok" {
             *tally.entry("b1").or_default() += 1;
