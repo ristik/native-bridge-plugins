@@ -817,6 +817,8 @@ pub struct Tweaks {
     /// The root round of the certificate of leaf `i`; leaves of one shard in different rounds get
     /// different UCs.
     pub uc_round: Option<Box<dyn Fn(usize) -> u64>>,
+    /// The aggregation partition every leaf is certified in (default the deployment's).
+    pub uc_partition: Option<u32>,
 }
 
 pub struct TokenOut {
@@ -1053,7 +1055,7 @@ pub fn assemble_token(
         let uc = make_uc_in_shard(
             &w.agg,
             &UcSpec {
-                partition: AGG_PARTITION,
+                partition: tw.uc_partition.unwrap_or(AGG_PARTITION),
                 conf: w.agg_confs[*row].to_vec(),
                 epoch_ir: 1,
                 root_epoch: 2,

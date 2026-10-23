@@ -32,6 +32,7 @@ pub mod rlp;
 pub mod scan;
 pub mod sdktoken;
 pub mod split;
+pub mod splitpart;
 pub mod token;
 pub mod trust;
 pub mod unlock;

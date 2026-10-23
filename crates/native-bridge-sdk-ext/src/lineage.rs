@@ -83,11 +83,17 @@ pub fn verify_lineage_return_within(
     if h.transfers.is_empty() {
         return Err(E::NoTransfers);
     }
-    verify_lineage(dep, h)
+    verify_lineage(dep, h, true)
 }
 
-/// The walk (part first), then the verification (root first).
-pub fn verify_lineage(dep: &Deployment, part: History) -> Result<LineageOutcome> {
+/// The walk (part first), then the verification (root first). `want_return` selects the return relation (the part ends in its
+/// return burn: the composition's) or the receipt relation a wallet checks a held part with (every transfer of the part a signature
+/// transfer with no data, none required; no release_to or nullifier).
+pub fn verify_lineage(
+    dep: &Deployment,
+    part: History,
+    want_return: bool,
+) -> Result<LineageOutcome> {
     let mut split_gas = SPLIT_PER_BYTE * part.mint_raw.len() as u64;
     let mut chain: Vec<History> = Vec::new();
     let mut just: Vec<SplitJustification> = Vec::new(); // just[i] is chain[i]'s reason; chain[i+1] is its burned token
@@ -136,7 +142,7 @@ pub fn verify_lineage(dep: &Deployment, part: History) -> Result<LineageOutcome>
     let mut parent: Option<LevelState> = None;
     for i in (0..=d).rev() {
         let hist = &chain[i];
-        let mut lv = verify_level(dep, hist, i == d, &mut seen)?;
+        let mut lv = verify_level(dep, hist, i == d, &mut seen, i == 0 && !want_return)?;
         if i < d {
             split_gas +=
                 check_split_edge(parent.as_ref().ok_or(E::MintJustif)?, &lv, hist, &just[i])?;
@@ -147,9 +153,12 @@ pub fn verify_lineage(dep: &Deployment, part: History) -> Result<LineageOutcome>
             amount: lv.amount.clone(),
             leaves: lv.leaves.len(),
         });
-        let last = lv.leaves.last().ok_or(E::NoTransfers)?.clone();
-        let last_t = hist.transfers.last().ok_or(E::NoTransfers)?;
-        if i == 0 {
+        if i == 0 && !want_return {
+            out.part_token_id = lv.id;
+            out.part_amount = lv.amount.clone();
+        } else if i == 0 {
+            let last = lv.leaves.last().ok_or(E::NoTransfers)?.clone();
+            let last_t = hist.transfers.last().ok_or(E::NoTransfers)?;
             let mut rr = out.outcome.clone();
             rr.amount = lv.amount.clone();
             check_return(&dep.cfg, &mut rr, last_t)?;
@@ -161,7 +170,7 @@ pub fn verify_lineage(dep: &Deployment, part: History) -> Result<LineageOutcome>
             out.part_token_id = lv.id;
             out.part_amount = lv.amount.clone();
         } else {
-            check_split_burn(last_t, &mut lv)?;
+            check_split_burn(hist.transfers.last().ok_or(E::NoTransfers)?, &mut lv)?;
         }
         if i == d {
             let m = &hist.mint;
@@ -201,6 +210,7 @@ fn verify_level(
     h: &History,
     root: bool,
     seen: &mut BTreeSet<[u8; 32]>,
+    held_part: bool,
 ) -> Result<LevelState> {
     let cfg = &dep.cfg;
     let m = &h.mint;
@@ -219,7 +229,8 @@ fn verify_level(
     }
     let id = derive_token_id(&m.salt, cfg.network);
     let amount = check_mint_data(dep, m.data.as_deref())?;
-    if h.transfers.is_empty() {
+    // a held part (the receipt relation) needs no transfer; every other token ends in its burn
+    if h.transfers.is_empty() && !held_part {
         return Err(E::NoTransfers);
     }
     let mk = minter_key(&id)?;
@@ -252,9 +263,14 @@ fn verify_level(
             &key,
             seen,
         )?);
-        if i < h.transfers.len() - 1 {
+        let last = i == h.transfers.len() - 1;
+        if held_part || !last {
             if t.recipient.typ != PRED_SIGNATURE {
-                return Err(E::BurnNotFinal);
+                return Err(if held_part && last {
+                    E::UnexpectedBurn
+                } else {
+                    E::BurnNotFinal
+                });
             }
             if t.data.is_some() {
                 return Err(E::TransferData);
@@ -321,4 +337,46 @@ fn check_split_edge(
         return Err(E::SplitSum);
     }
     Ok(SPLIT_EDGE_BASE + SPLIT_PER_STEP * sj.proof.len() as u64)
+}
+
+/// BRIDGE_COMPOSE_V2's steps a wallet can run offline, in the composition's order, on the exact call it would send: the input's own
+/// Cfg (decoded and validated), the envelope, the policy body, the lineage relation, the anchor plan, the anchor openings and the gas
+/// estimate (the protocol 5 schedule over every leaf plus the walk's charge: the native charge of a successful call). B1 (certificate
+/// signatures and quorum, RSMT membership) is the chain's. `fixture` supplies the deployment's other pins. Returns the lineage and
+/// the gas.
+pub fn compose_offline_v2(
+    fixture: &Deployment,
+    cfg_b: &[u8],
+    envelope: &[u8],
+) -> Result<(LineageOutcome, u64)> {
+    use crate::envelope::{check_anchors, check_policy_body, plan_anchors, Envelope};
+    use crate::gas::{compute_gate, kernel_request_bytes};
+    let cfg = crate::profile::Cfg::from_bytes(cfg_b)?;
+    Deployment::validate_cfg(&cfg)?;
+    let env = Envelope::decode(envelope)?;
+    let pol = check_policy_body(&cfg, &env)?;
+    let dep = Deployment {
+        cfg_hash: cfg.hash(),
+        cfg,
+        policy: pol.clone(),
+        ..fixture.clone()
+    };
+    let res = verify_lineage_return(&dep, &env.history)?;
+    let sids: Vec<[u8; 32]> = res.outcome.leaves.iter().map(|l| l.sid).collect();
+    let times: Vec<u64> = res
+        .outcome
+        .leaves
+        .iter()
+        .map(|l| l.reference_time)
+        .collect();
+    check_anchors(&env, &plan_anchors(&pol, &env, &sids)?, &times)?;
+    // the estimate walks every leaf path (a malformed bitmap is PathBitmap)
+    let g = compute_gate(
+        cfg_b,
+        envelope.len(),
+        kernel_request_bytes(cfg_b.len() as u64, env.history.len() as u64),
+        &env,
+    )?;
+    let gas = g.native + res.split_gas;
+    Ok((res, gas))
 }

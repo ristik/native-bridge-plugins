@@ -3,6 +3,7 @@
 //! Unicity path 32 steps; seal 64 signatures; signer ID 128 UTF-8 bytes.
 use crate::error::{NativeError as E, Result};
 use crate::limits::*;
+use crate::split::justification_tag;
 use alloc::vec::Vec;
 
 struct Node<'a> {
@@ -10,7 +11,7 @@ struct Node<'a> {
     arg: u64,
     start: usize,
     end: usize,
-    depth: usize,
+    depth: isize,
     data: &'a [u8],
     kids: Vec<Node<'a>>,
 }
@@ -28,9 +29,9 @@ impl Budget {
         }
     }
 }
-fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: usize) -> Result<Node<'a>> {
-    fn read<'a>(b: &'a [u8], pos: &mut usize, budget: &mut Budget, d: usize) -> Result<Node<'a>> {
-        if d > MAX_CBOR_DEPTH {
+fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: isize) -> Result<Node<'a>> {
+    fn read<'a>(b: &'a [u8], pos: &mut usize, budget: &mut Budget, d: isize) -> Result<Node<'a>> {
+        if d > MAX_CBOR_DEPTH as isize {
             return Err(E::TooDeep);
         }
         budget.items += 1;
@@ -59,7 +60,7 @@ fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: usize) -> Result<Node<'a>> 
                 return Err(E::NonCanonical);
             }
         }
-        if matches!(major, 4..=6) && d + 1 > MAX_CBOR_DEPTH {
+        if matches!(major, 4..=6) && d + 1 > MAX_CBOR_DEPTH as isize {
             return Err(E::TooDeep);
         }
         let mut data = &b[*pos..*pos];
@@ -242,13 +243,24 @@ fn uc_within(n: &Node<'_>, max_bytes: usize) -> Result<()> {
     }
     Ok(())
 }
-fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool) -> Result<()> {
+/// `token`: a split reason `tag(39044,[token,[proof]])` carries its whole burned parent, which is checked as a token in its own right:
+/// the scan starts two levels up, so the parent token sits at a top-level token's depth (every lineage level gets the bounds of an
+/// ordinary token, and the lineage depth is not capped by nesting), its items bounded by its bytes; any other payload continues its
+/// container's depth under its own item budget.
+fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool, token: bool) -> Result<()> {
     if let Some(x) = n.filter(|x| x.major == 2) {
         if x.data.len() > max {
             return Err(E::ProofTooLarge);
         }
-        let mut own = Budget::object();
-        match scan(x.data, &mut own, x.depth + 1) {
+        let mut own = if token {
+            Budget {
+                items: 0,
+                limit: usize::MAX,
+            }
+        } else {
+            Budget::object()
+        };
+        match scan(x.data, &mut own, if token { -2 } else { x.depth + 1 }) {
             Ok(root) => {
                 if certificate {
                     uc(&root)?;
@@ -275,12 +287,23 @@ fn visit(n: &Node<'_>) -> Result<()> {
         if body.major == 4 {
             let k = &body.kids;
             match n.arg {
-                39032 => nested(k.get(1), MAX_TOKEN_BYTES, false)?, // CBOR predicate code.
+                39032 => nested(k.get(1), MAX_TOKEN_BYTES, false, false)?, // CBOR predicate code.
                 39041 => {
-                    nested(k.get(5), MAX_JUSTIFICATION_BYTES, false)?;
-                    nested(k.get(6), MAX_TOKEN_BYTES, false)?;
+                    // a split reason (protocol 6) embeds its whole burned parent token: it is bounded as a token, a lock reason as a
+                    // justification
+                    let split = k.get(5).is_some_and(|x| {
+                        x.major == 2
+                            && justification_tag(Some(x.data)) == Some(TAG_SPLIT_JUSTIFICATION)
+                    });
+                    let max = if split {
+                        MAX_TOKEN_BYTES
+                    } else {
+                        MAX_JUSTIFICATION_BYTES
+                    };
+                    nested(k.get(5), max, false, split)?;
+                    nested(k.get(6), MAX_TOKEN_BYTES, false, false)?;
                 }
-                39045 => nested(k.get(3), MAX_TOKEN_BYTES, false)?,
+                39045 => nested(k.get(3), MAX_TOKEN_BYTES, false, false)?,
                 39049 => {
                     if let Some(lp) = k.get(5).filter(|x| x.major == 4) {
                         if lp
@@ -308,8 +331,8 @@ fn visit(n: &Node<'_>) -> Result<()> {
                                 total += node.data.len();
                             }
                         }
-                        nested(lp.kids.get(3), MAX_PDR_BYTES, false)?;
-                        nested(lp.kids.get(4), MAX_UC_BYTES, true)?;
+                        nested(lp.kids.get(3), MAX_PDR_BYTES, false, false)?;
+                        nested(lp.kids.get(4), MAX_UC_BYTES, true, false)?;
                     }
                 }
                 39033 => {
