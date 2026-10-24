@@ -74,7 +74,8 @@ fn family(f: Family) -> &'static str {
 type Got = Result<BTreeMap<String, String>, E>;
 
 /// Where the plug-ins name a refusal differently from the oracle, per op: the oracle's reason and the plug-in reasons it may appear as
-/// (see `corpus-ops.test.ts`). The verdict never differs; only these names do, and only as listed.
+/// (see `corpus-ops.test.ts`), each as the plug-in's `reason/family`: the family is compared too. The verdict never differs;
+/// only these names do, and only as listed.
 fn aliases(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
     pairs
         .iter()
@@ -136,9 +137,10 @@ fn replay_all(
             ("error", Err(e)) => {
                 let reason = want["reason"].as_str().unwrap();
                 (e.name() == reason && family(e.family()) == want["family"].as_str().unwrap())
-                    || names
-                        .get(reason)
-                        .is_some_and(|p| p.iter().any(|x| x == e.name()))
+                    || names.get(reason).is_some_and(|p| {
+                        p.iter()
+                            .any(|x| *x == format!("{}/{}", e.name(), family(e.family())))
+                    })
             }
             _ => false,
         };
@@ -278,15 +280,27 @@ fn lock_lock_backing() {
     let names = aliases(&[
         (
             "ErrCertScan",
-            &["ErrUnsupportedCertificateEncoding", "ErrProofTooLarge"],
+            &[
+                "ErrUnsupportedCertificateEncoding/invalid",
+                "ErrProofTooLarge/budget",
+            ],
         ),
-        ("ErrLockAccount", &["ErrAccountProof"]),
-        ("ErrLockCodeHash", &["ErrAccountCode"]),
-        ("ErrLockHeader", &["ErrHeaderHash", "ErrHeaderRoot"]),
-        ("ErrLockPDR", &["ErrEvmConfigHash", "ErrEvmConfigPin"]),
-        ("ErrLockStorage", &["ErrStorageProof"]),
-        ("ErrLockUC", &["ErrQuorumNotMet", "ErrSealRoot"]),
-        ("ErrTrustBaseDigest", &["ErrLockProofTrust"]),
+        ("ErrLockAccount", &["ErrAccountProof/invalid"]),
+        ("ErrLockCodeHash", &["ErrAccountCode/invalid"]),
+        (
+            "ErrLockHeader",
+            &["ErrHeaderHash/invalid", "ErrHeaderRoot/invalid"],
+        ),
+        (
+            "ErrLockPDR",
+            &["ErrEvmConfigHash/invalid", "ErrEvmConfigPin/invalid"],
+        ),
+        ("ErrLockStorage", &["ErrStorageProof/invalid"]),
+        (
+            "ErrLockUC",
+            &["ErrQuorumNotMet/invalid", "ErrSealRoot/invalid"],
+        ),
+        ("ErrTrustBaseDigest", &["ErrLockProofTrust/invalid"]),
     ]);
     let skip = [(
         "backing-no-pin",
@@ -339,10 +353,10 @@ fn lock_lock_backing() {
 #[test]
 fn lock_mpt() {
     let names = aliases(&[
-        ("ErrMPTAbsent", &["ErrMptMalformed"]),
-        ("ErrMPTExtraneous", &["ErrMptMalformed"]),
-        ("ErrMPTNode", &["ErrMptMalformed"]),
-        ("ErrMPTPath", &["ErrMptMalformed"]),
+        ("ErrMPTAbsent", &["ErrMptMalformed/malformed"]),
+        ("ErrMPTExtraneous", &["ErrMptMalformed/malformed"]),
+        ("ErrMPTNode", &["ErrMptMalformed/malformed"]),
+        ("ErrMPTPath", &["ErrMptMalformed/malformed"]),
     ]);
     replay_all("lock", "mpt", 7, &names, &[], |c| {
         let nodes: Vec<Vec<u8>> = c["aux"]["nodes"]
@@ -388,14 +402,23 @@ fn wire_token_project() {
     let names = aliases(&[
         (
             "ErrCertScan",
-            &["ErrUnsupportedCertificateEncoding", "ErrNonCanonical"],
+            &[
+                "ErrUnsupportedCertificateEncoding/invalid",
+                "ErrNonCanonical/malformed",
+            ],
         ),
-        ("ErrCertSigLength", &["ErrUnsupportedCertificateEncoding"]),
-        ("ErrInputTooLarge", &["ErrUnsupportedCertificateEncoding"]),
-        ("ErrLength", &["ErrUnsupportedCertificateEncoding"]),
-        ("ErrShape", &["ErrUnsupportedCertificateEncoding"]),
-        ("ErrTag", &["ErrUnsupportedCertificateEncoding"]),
-        ("ErrVersion", &["ErrUnsupportedCertificateEncoding"]),
+        (
+            "ErrCertSigLength",
+            &["ErrUnsupportedCertificateEncoding/invalid"],
+        ),
+        (
+            "ErrInputTooLarge",
+            &["ErrUnsupportedCertificateEncoding/invalid"],
+        ),
+        ("ErrLength", &["ErrUnsupportedCertificateEncoding/invalid"]),
+        ("ErrShape", &["ErrUnsupportedCertificateEncoding/invalid"]),
+        ("ErrTag", &["ErrUnsupportedCertificateEncoding/invalid"]),
+        ("ErrVersion", &["ErrUnsupportedCertificateEncoding/invalid"]),
     ]);
     replay_all("wire", "token-project", 36, &names, &[], |c| {
         let input = bytes(c["input"].as_str().unwrap());

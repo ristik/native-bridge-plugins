@@ -57,23 +57,24 @@ const amountOf = (dec: string): Uint8Array => {
 /**
  * Where the plug-ins name a refusal differently from the oracle, per op: the oracle's reason and the plug-in reasons it may appear as. The verdict
  * never differs (a refusal stays a refusal); only these names do, and only as listed. lock-backing: the plug-in's lock-proof names (one-to-one, finer
- * for the PDR and the header); mpt and token-project: the plug-in's coarser names (one MPT failure, one unsupported-certificate refusal).
+ * for the PDR and the header); mpt and token-project: the plug-in's coarser names (one MPT failure, one unsupported-certificate refusal). Each
+ * alias is the plug-in's `reason/family`: the family is compared too.
  */
 type Aliases = Record<string, string[]>;
 const LOCK_BACKING_NAMES: Aliases = {
-  ErrCertScan: ['ErrUnsupportedCertificateEncoding', 'ErrProofTooLarge'],
-  ErrLockAccount: ['ErrAccountProof'],
-  ErrLockCodeHash: ['ErrAccountCode'],
-  ErrLockHeader: ['ErrHeaderHash', 'ErrHeaderRoot'],
-  ErrLockPDR: ['ErrEvmConfigHash', 'ErrEvmConfigPin'],
-  ErrLockStorage: ['ErrStorageProof'],
-  ErrLockUC: ['ErrQuorumNotMet', 'ErrSealRoot'],
-  ErrTrustBaseDigest: ['ErrLockProofTrust'],
+  ErrCertScan: ['ErrUnsupportedCertificateEncoding/invalid', 'ErrProofTooLarge/budget'],
+  ErrLockAccount: ['ErrAccountProof/invalid'],
+  ErrLockCodeHash: ['ErrAccountCode/invalid'],
+  ErrLockHeader: ['ErrHeaderHash/invalid', 'ErrHeaderRoot/invalid'],
+  ErrLockPDR: ['ErrEvmConfigHash/invalid', 'ErrEvmConfigPin/invalid'],
+  ErrLockStorage: ['ErrStorageProof/invalid'],
+  ErrLockUC: ['ErrQuorumNotMet/invalid', 'ErrSealRoot/invalid'],
+  ErrTrustBaseDigest: ['ErrLockProofTrust/invalid'],
 };
-const MPT_NAMES: Aliases = Object.fromEntries(['ErrMPTAbsent', 'ErrMPTExtraneous', 'ErrMPTNode', 'ErrMPTPath'].map((r) => [r, ['ErrMptMalformed']]));
+const MPT_NAMES: Aliases = Object.fromEntries(['ErrMPTAbsent', 'ErrMPTExtraneous', 'ErrMPTNode', 'ErrMPTPath'].map((r) => [r, ['ErrMptMalformed/malformed']]));
 const TOKEN_NAMES: Aliases = {
-  ...Object.fromEntries(['ErrCertSigLength', 'ErrInputTooLarge', 'ErrLength', 'ErrShape', 'ErrTag', 'ErrVersion'].map((r) => [r, ['ErrUnsupportedCertificateEncoding']])),
-  ErrCertScan: ['ErrUnsupportedCertificateEncoding', 'ErrNonCanonical'],
+  ...Object.fromEntries(['ErrCertSigLength', 'ErrInputTooLarge', 'ErrLength', 'ErrShape', 'ErrTag', 'ErrVersion'].map((r) => [r, ['ErrUnsupportedCertificateEncoding/invalid']])),
+  ErrCertScan: ['ErrUnsupportedCertificateEncoding/invalid', 'ErrNonCanonical/malformed'],
 };
 
 /**
@@ -96,7 +97,8 @@ async function replayAll(family: string, op: string, count: number, run: (c: Cas
       ? { status: 'ok', ...(c.expected.values ? { values: c.expected.values } : {}), ...(c.expected.result ? { result: c.expected.result } : {}) }
       : { status: 'error', family: c.expected.family, reason: c.expected.reason };
     const have = got.status === 'ok' ? { status: 'ok', ...(c.expected.values ? { values: got.values } : {}), ...(c.expected.result ? { result: got.result } : {}) } : got;
-    const aliased = want.status === 'error' && have.status === 'error' && (aliases[want.reason as string] ?? []).includes((have as { reason: string }).reason);
+    const aliased = want.status === 'error' && have.status === 'error' &&
+      (aliases[want.reason as string] ?? []).includes(`${(have as { reason: string }).reason}/${(have as { family: string }).family}`);
     try {
       if (!aliased) assert.deepEqual(have, want);
     } catch {
