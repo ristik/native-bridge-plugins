@@ -183,7 +183,8 @@ export class HttpError extends Error {
 
 /**
  * Refused before any upstream call, so retrying never sends a transaction twice: the gateway's per-address rate limit (429), and its busy answer when
- * every large-body slot is taken (503 "busy"). Its other 503 (a broadcast that may be partial) is never retried.
+ * every large-body slot is taken (bft-core deploy/testnet/gateway.py: 503 `{"error": "busy: too many large requests, retry"}`). Its other 503
+ * (`RPC unavailable; broadcast may be partial, inspect before retry`) is never retried.
  */
 const retryable = (status: number, text: string): boolean => status === 429 || (status === 503 && text.includes('busy'));
 

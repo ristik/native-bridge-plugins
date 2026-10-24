@@ -431,7 +431,8 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
     } catch (e) {
       // not yet accepted (the vault reverts until the seal is within the usable origin) or a transient upstream failure: wait; but a client error
       // (4xx) is the endpoint refusing the request itself, which waiting never changes
-      if (e instanceof HttpError && e.status >= 400 && e.status < 500) throw e;
+      // (a 429 that outlived jsonRpc's retries is the rate limit, transient: wait like a 5xx)
+      if (e instanceof HttpError && e.status >= 400 && e.status < 500 && e.status !== 429) throw e;
       return undefined;
     }
   }, 3000);
