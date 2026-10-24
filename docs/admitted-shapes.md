@@ -61,8 +61,8 @@ profile: they fail as one of the shape errors above (interop "Whole-token histor
 
 Admission caps only the token's bytes (2 MiB). A return is bounded by the 2 MiB direct envelope and by its gas, which must fit the
 deployment's ordinary block capacity (60M, D3; recorded in bft-core's `bridge-release.json`). Measured with `test/measure-shapes.ts`
-(the plug-in's own envelope and gas estimate; the fixture tree holds the token's leaves only, so live paths are longer and these are lower
-bounds):
+(the plug-in's own envelope and gas estimate; the fixture tree holds the token's leaves only, so live paths are longer: the bytes and gas
+below are lower bounds, and the transfer counts derived from them are upper bounds):
 
 | Bundle | Transfers | Token bytes | Envelope bytes | Gas estimate |
 |---|---|---|---|---|
@@ -75,10 +75,10 @@ bounds):
 
 So:
 
-- **Original proofs**: a history redeemed with the proofs it was certified with, every leaf in its own round, runs out of block gas at about
-  830 transfers.
+- **Original proofs**: a history redeemed with the proofs it was certified with, every leaf in its own round, runs out of block gas at
+  about 830 transfers at most (an upper bound: live paths add gas per leaf).
 - **A fresh bundle**: the wallet's redemption re-fetches every leaf's proof (`readiness.ts`, each attempt) or consolidates, so the leaves come
-  under the few seals of the fetch, not one each. With one seal, the return fits up to the admission cap (1,700 transfers: 58.1M). The margin
+  under the few seals of the fetch, not one each. With one seal, the return fits up to at most the admission cap (1,700 transfers: 58.1M in the fixture; an upper bound for live paths). The margin
   there is small, and longer live paths add bytes and gas per leaf, so a token near the 2 MiB cap may still exceed the block. That is
   "direct exit unavailable" (owner section 36), not an invalid token; nothing is refused at admission for it.
 - **Consolidation on a single aggregator** stops at 254 transfers (the SDK's 256 state IDs per endpoint batch; bft-core testnet-bridge
