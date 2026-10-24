@@ -55,7 +55,7 @@ test('an already-old token: every leaf is refetched and the bundle is ready', as
   const w = await makeWorld();
   const out = await ret(w);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
-  assert.deepEqual(anchorRounds(out.token), [900n]);
+  assert.deepEqual(await anchorRounds(out.token), [900n]);
   let fetches = 0;
   const source = async (): Promise<InclusionProof[]> => (++fetches, proofsAt(w, out, 950n));
   const r = await buildReadyReturnProof(plugin, out.bytes, source, chainAt([952n]), fast);
@@ -116,7 +116,7 @@ class Vault implements RedeemTransport {
   }
   /** The nullifier the vault stored for the nonce (the token's own unless a test says another burn took it). */
   public stored: Uint8Array | undefined;
-  public spentNullifier(): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent ? (this.stored ?? currentNullifier) : undefined); }
+  public spentPart(): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent ? (this.stored ?? currentNullifier) : undefined); }
 }
 const rp = (over: Partial<RedeemPolicy> = {}): RedeemPolicy => ({ ...fast, maxSends: 3, receiptTimeoutMs: 10, now: (() => { let n = 0; return () => (n += 4); })(), ...over });
 
@@ -187,7 +187,7 @@ test('several certificates in different rounds: the NEWEST anchor decides readin
   const w = await makeWorld();
   // the genesis leaf is certified in the NEWER round: judging on the burn leaf's older anchor alone would accept
   const two = await buildToken(w, spec(1), [txStep(2, 7, T0 + 10n), burnStep(T0 + 20n)], T0, UC_TS, { ucRound: (i) => (i === 0 ? 905n : 900n) });
-  assert.deepEqual(anchorRounds(two.token), [905n, 900n]);
+  assert.deepEqual(await anchorRounds(two.token), [905n, 900n]);
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const held = (): Promise<InclusionProof[]> => Promise.resolve([two.token.genesis, ...two.token.transactions].map((c) => c.inclusionProof));
   const err = await buildReadyReturnProof(plugin, two.bytes, held, chainAt([904n]), { ...fast, maxOriginWaitMs: 0 }).then(() => undefined, (e: unknown) => e);

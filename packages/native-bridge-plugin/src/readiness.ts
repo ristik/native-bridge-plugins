@@ -16,10 +16,11 @@
 import { NativeError, fail } from './errors.js';
 import { buildReturnProof, refreshToken } from './proof.js';
 import { preflightToken } from './resources.js';
-import { PAIR_RACE, consolidatedProofs, type ConsolidationPath, type NativeBridgePlugin, type ProofSource, type ReturnProofPath } from './wallet.js';
+import { PAIR_RACE, consolidatedProofs, uintOf, type ConsolidationPath, type NativeBridgePlugin, type ProofSource, type ReturnProofPath } from './wallet.js';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
 import { eq, toHex } from './bytes.js';
 import { MAX_ANCHORS } from './limits.js';
+import { isSplitReason, lineageProofs, splitChain } from './splitpart.js';
 
 /** What the chain says about the registry, read by the host from the registry. */
 export interface ChainReader {
@@ -65,11 +66,15 @@ function checkPolicy(policy: ReadinessPolicy, sends?: number): void {
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-/** The distinct seal rounds of a token's anchors (byte-identical certificates counted once). */
-export function anchorRounds(token: Token): bigint[] {
+/**
+ * The distinct seal rounds of a token's anchors (byte-identical certificates counted once). A split part's anchors are the whole
+ * lineage's: an ancestor's burn may have been certified just before the part was redeemed, so its round is awaited like the part's.
+ */
+export async function anchorRounds(token: Token): Promise<bigint[]> {
+  const proofs = isSplitReason(token.genesis.justification) ? lineageProofs(await splitChain(token)) : [token.genesis, ...token.transactions].map((c) => c.inclusionProof);
   const seen = new Map<string, bigint>();
-  for (const c of [token.genesis, ...token.transactions]) {
-    const uc = c.inclusionProof.unicityCertificate;
+  for (const p of proofs) {
+    const uc = p.unicityCertificate;
     seen.set(toHex(uc.toCBOR()), BigInt(uc.unicitySeal.rootChainRoundNumber));
   }
   return [...seen.values()];
@@ -129,7 +134,7 @@ export async function buildReadyReturnProof(
         // A bundle over the anchor, gas or size bound is a budget refusal, never retried (a refetch must not be used to make certificates converge or
         // to obtain fewer anchors): report the measured count so the host can see how far over it was.
         if (e instanceof NativeError && e.family === 'budget') {
-          const n = anchorRounds(token).length;
+          const n = (await anchorRounds(token)).length;
           throw new NativeError(e.reason, e.reason === 'ErrTooManyPaths' ? `${n} distinct anchors fetched, ceiling ${MAX_ANCHORS}; not retried` : `over the gas or size bound with ${n} distinct anchors fetched; not retried`);
         }
         throw e;
@@ -142,7 +147,7 @@ export async function buildReadyReturnProof(
       }
       throw e;
     }
-    const rounds = anchorRounds(token);
+    const rounds = await anchorRounds(token);
     const deadline = now() + policy.maxOriginWaitMs;
     // only the host's own read is guarded: the classification is pure code, and a bug or a bad policy there must not read as an unavailable origin
     const readOrigin = async (): Promise<bigint | undefined> => {
@@ -180,11 +185,13 @@ export interface RedeemTransport {
   /** The receipt of a sent transaction: undefined while it is not mined. */
   receipt(txHash: string): Promise<'success' | 'reverted' | undefined>;
   /**
-   * The vault's spent state for a lock nonce: `spentNullifier(nonce)`, the burn nullifier the vault stored when it credited that nonce. The
-   * vault keys spent state by NONCE and keeps the nullifier as the stored value (and as an indexed topic of `RedemptionCredited`); it has no
-   * nullifier-keyed lookup. `undefined` or an all-zero word: not redeemed. A host that only has the logs may answer from `RedemptionCredited`.
+   * The vault's spent state for one part of a lock (protocol 6): `spentPart(nonce, partId)`, the burn nullifier the vault stored when it
+   * credited that part. The vault keys spent state by (root lock NONCE, part token ID) and keeps the nullifier as the stored value (and in
+   * `RedemptionCredited`, whose indexed topics are nonce, partId and recipient); it has no nullifier-keyed lookup. A whole (unsplit) token
+   * is the part whose ID is the root token ID. `undefined` or an all-zero word: not redeemed. A host that only has the logs may answer from
+   * `RedemptionCredited`.
    */
-  spentNullifier(nonce: bigint): Promise<Uint8Array | undefined>;
+  spentPart(nonce: bigint, partId: Uint8Array): Promise<Uint8Array | undefined>;
 }
 
 /** What `redeemReturn` tells the host's journal, in order: before every send, and with its hash (undefined when the send failed without one). */
@@ -216,18 +223,32 @@ export class RedemptionUnconfirmed extends NativeError {
   }
 }
 
-/** The identity the vault knows a return token by: its lock nonce (the spent-state key) and its burn nullifier (the stored value). Needs no aggregator proof. */
-export async function returnIdentity(plugin: NativeBridgePlugin, tokenBytes: Uint8Array): Promise<{ nonce: bigint; nullifier: Uint8Array }> {
-  preflightToken(tokenBytes);
-  const v = await plugin.bridge.verifyNativeToken(await Token.fromCBOR(tokenBytes), 'return');
-  return { nonce: v.outcome.nonce, nullifier: v.outcome.nullifier };
+/** What the vault knows a return token by. */
+export interface ReturnIdentity {
+  /** The ROOT lock's nonce. */
+  nonce: bigint;
+  /** The redeemed part's token ID (the root token ID for a whole token): with the nonce, the spent-state key. */
+  partId: Uint8Array;
+  /** The part's whole amount, which the redemption credits. */
+  partAmount: bigint;
+  /** The part's burn nullifier (the stored value). */
+  nullifier: Uint8Array;
 }
 
-/** Whether the vault has already credited this token's lock nonce. A nonce credited to ANOTHER burn can never be redeemed by this token: `ErrUnexpectedBurn`. */
-async function isRedeemed(transport: RedeemTransport, id: { nonce: bigint; nullifier: Uint8Array }): Promise<boolean> {
-  const stored = await transport.spentNullifier(id.nonce);
+/** The identity the vault knows a return token by: (root lock nonce, part token ID) and its burn nullifier. Needs no aggregator proof. */
+export async function returnIdentity(plugin: NativeBridgePlugin, tokenBytes: Uint8Array): Promise<ReturnIdentity> {
+  preflightToken(tokenBytes);
+  const v = await plugin.bridge.verifyNativeToken(await Token.fromCBOR(tokenBytes), 'return');
+  const partId = v.lineage?.partTokenId ?? v.outcome.tokenId;
+  const partAmount = v.lineage?.partAmount ?? v.outcome.amount;
+  return { nonce: v.outcome.nonce, partId, partAmount: uintOf(partAmount), nullifier: v.outcome.nullifier };
+}
+
+/** Whether the vault has already credited this part. A part credited to ANOTHER burn can never be redeemed by this token: `ErrUnexpectedBurn`. */
+async function isRedeemed(transport: RedeemTransport, id: ReturnIdentity): Promise<boolean> {
+  const stored = await transport.spentPart(id.nonce, id.partId);
   if (stored === undefined || stored.every((b) => b === 0)) return false;
-  if (!eq(stored, id.nullifier)) fail('ErrUnexpectedBurn', `lock nonce ${id.nonce} is already redeemed by a different burn`);
+  if (!eq(stored, id.nullifier)) fail('ErrUnexpectedBurn', `part ${toHex(id.partId)} of lock nonce ${id.nonce} is already redeemed by a different burn`);
   return true;
 }
 

@@ -9,7 +9,7 @@ import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
   amountBytes, appendTransaction, calldata, decBytes, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI, parseAmount,
-  requirePhase, selector, TokenRecord,
+  RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
 } from './core.js';
 
 test('the vault ABI: selectors and the Locked topic match cast at the contracts pin', () => {
@@ -46,6 +46,11 @@ test('amounts: ether or wei, more than zero, at most one lock (8 bytes)', () => 
   assert.throws(() => parseAmount(`${MAX_LOCK_WEI + 1n}wei`), /at most/);
   assert.throws(() => parseAmount('19'), /at most/);
   assert.equal(hex(amountBytes(10n ** 18n)), '0de0b6b3a7640000');
+  // minimal: no leading zero byte below 2^56 wei (the plug-in refuses a padded amount as ErrIntRange)
+  assert.equal(hex(amountBytes(100n)), '64');
+  assert.equal(hex(amountBytes(256n)), '0100');
+  assert.equal(hex(amountBytes((1n << 56n) - 1n)), 'ff'.repeat(7));
+  assert.equal(hex(amountBytes(MAX_LOCK_WEI)), 'ff'.repeat(8));
 });
 
 test('the configuration: URLs, chain, vault and files checked; files resolved against its directory', () => {
@@ -87,7 +92,18 @@ test('a certified transaction is appended after the last one; anything but a tok
 test('steps out of order are refused with the next step named', () => {
   const t: TokenRecord = { nonce: '7', amountWei: '1', phase: 'minted', lockTx: '0x', lockBlockHash: '0x', holder: 0, transfers: 0 };
   assert.doesNotThrow(() => requirePhase(t, 'minted', 'burn'));
-  assert.throws(() => requirePhase(t, 'locked', 'mint'), /token 7 is minted: mint needs it locked \(that step is done\); next: transfer or burn/);
-  assert.throws(() => requirePhase(t, 'burned', 'redeem'), /redeem needs it burned; next: transfer or burn/);
+  assert.throws(() => requirePhase(t, 'locked', 'mint'), /token 7 is minted: mint needs it locked \(that step is done\); next: transfer, split or burn/);
+  assert.throws(() => requirePhase(t, 'burned', 'redeem'), /redeem needs it burned; next: transfer, split or burn/);
   assert.throws(() => requirePhase({ ...t, phase: 'redeemed' }, 'minted', 'transfer'), /next: claim/);
+  // a split token is done: every step names its parts instead
+  assert.throws(() => requirePhase({ ...t, phase: 'split', parts: ['7.1', '7.2'] }, 'minted', 'burn'), /token 7 was split: burn one of its parts \(--token 7\.1 \| --token 7\.2\)/);
+  assert.equal(recordId({ ...t, id: '7.2' }), '7.2');
+  assert.ok(RECORD_ID.test('7') && RECORD_ID.test('7.1.2') && !RECORD_ID.test('7.') && !RECORD_ID.test('../7'));
 });
+
+test('--amounts: at least two, each an amount, adding up to exactly the token', () => {
+  assert.deepEqual(splitAmounts('40wei,60wei', 100n), [40n, 60n]);
+  assert.deepEqual(splitAmounts('0.25, 0.75', 10n ** 18n), [25n * 10n ** 16n, 75n * 10n ** 16n]);
+  assert.throws(() => splitAmounts('100wei', 100n), /at least two/);
+  assert.throws(() => splitAmounts('40wei,59wei', 100n), /add up to 99 wei, the token holds 100 wei/);
+  assert.throws(() => splitAmounts('0wei,100wei', 100n), /more than zero/);});

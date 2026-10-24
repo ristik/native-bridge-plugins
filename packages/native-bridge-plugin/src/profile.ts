@@ -173,9 +173,12 @@ export const leafValue = (txHash: Uint8Array, t: bigint): Uint8Array => H(arr(bs
 
 // ---- vault storage layout ------------------------------------------------------------------------
 
+// protocol 6 (interop.md "Resource and custody profile"): slot 6 is redeemedAmount (was the spent nullifier), 8 lockedAmount, 9 spentPart
 export const SLOT_LOCK_DIGEST = 5n;
-export const SLOT_SPENT_NULLIFIER = 6n;
+export const SLOT_REDEEMED_AMOUNT = 6n;
 export const SLOT_CLAIMABLE = 7n;
+export const SLOT_LOCKED_AMOUNT = 8n;
+export const SLOT_SPENT_PART = 9n;
 
 export function word(n: bigint): Uint8Array {
   const w = new Uint8Array(32);
@@ -190,7 +193,10 @@ export function mappingSlot(key: Uint8Array, base: bigint): Uint8Array {
 }
 
 export const lockDigestSlot = (n: bigint): Uint8Array => mappingSlot(word(n), SLOT_LOCK_DIGEST);
-export const spentSlot = (n: bigint): Uint8Array => mappingSlot(word(n), SLOT_SPENT_NULLIFIER);
+export const redeemedAmountSlot = (n: bigint): Uint8Array => mappingSlot(word(n), SLOT_REDEEMED_AMOUNT);
+export const lockedAmountSlot = (n: bigint): Uint8Array => mappingSlot(word(n), SLOT_LOCKED_AMOUNT);
+/** `spentPart[nonce][partId]`: the inner mapping's slot is `keccak256(partId . keccak256(nonce . 9))`. */
+export const spentPartSlot = (n: bigint, partId: Uint8Array): Uint8Array => keccak256(partId, mappingSlot(word(n), SLOT_SPENT_PART));
 export const claimableSlot = (a: Uint8Array): Uint8Array => mappingSlot(a, SLOT_CLAIMABLE);
 export const storageTrieKey = (slot: Uint8Array): Uint8Array => keccak256(slot);
 export const accountTrieKey = (a: Uint8Array): Uint8Array => keccak256(a);

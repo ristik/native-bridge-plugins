@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { SplitMintJustification } from '@unicitylabs/state-transition-sdk/lib/payment/SplitMintJustification.js';
 import { SplitTokenRequest } from '@unicitylabs/state-transition-sdk/lib/payment/SplitTokenRequest.js';
@@ -23,6 +24,8 @@ import { buildReturnProof, checkBurnProjection, preflightBurn } from '../src/pro
 import { cfgBytes, policyBytes, valueEnvelope } from '../src/profile.js';
 import { preflightToken } from '../src/resources.js';
 import { WalletValue, lineageProofs, splitChain } from '../src/splitpart.js';
+import { DEFAULT_REDEEM, anchorRounds, redeemReturn, returnIdentity, type ChainReader, type RedeemTransport } from '../src/readiness.js';
+import { createNativeBridgePlugin } from '../src/wallet.js';
 import { BridgedTokenIssuancePolicy } from '../src/verifier.js';
 import { AGG_PARTITION, NETWORK, assembleToken, buildToken, burnStep, makeWorld, signer, spec, txStep, type MintSpec, type TokenOut, type World } from './world.js';
 
@@ -62,7 +65,7 @@ async function mintChild(w: World, split: ISplit, j: number, out: Out, burned: T
 }
 
 /** Root variations: its spec, the certificate time of its leaves, and transfers before its split burn (the split burn's time follows them). */
-interface RootOpts { root?: MintSpec; rootUcTs?: bigint; rootSteps?: Parameters<typeof assembleToken>[4]; rootPartition?: number }
+interface RootOpts { root?: MintSpec; rootUcTs?: bigint; rootSteps?: Parameters<typeof assembleToken>[4]; rootPartition?: number; rootPartitionAt?: [number, number] }
 
 /** Lock 1000 -> split 400 + 600 (the 400 to owner 2), and optionally split the 400 again into 150 + 250. */
 async function lineage(w: World, childSteps: (s: MintSpec) => Parameters<typeof assembleToken>[4], depth: 1 | 2 = 1, o: RootOpts = {}) {
@@ -72,7 +75,7 @@ async function lineage(w: World, childSteps: (s: MintSpec) => Parameters<typeof 
   const s1 = await sdkSplit(w, held.token, first);
   const pre = o.rootSteps ?? [];
   const burnT = T0 + 10n + BigInt(pre.length);
-  const burned = await buildToken(w, root, [...pre, { kind: 'burnWith', reason: s1.burn.transaction.data!, t: burnT }], T0, o.rootUcTs ?? UC_TS, { ucPartition: o.rootPartition });
+  const burned = await buildToken(w, root, [...pre, { kind: 'burnWith', reason: s1.burn.transaction.data!, t: burnT }], T0, o.rootUcTs ?? UC_TS, { ucPartition: o.rootPartition, ucPartitionAt: o.rootPartitionAt });
   if (depth === 1) {
     const child = await mintChild(w, s1, 0, first[0], burned.token, childSteps({ ...spec(2), amount: amt(400) }), T0 + 20n);
     const sibling = await mintChild(w, s1, 1, first[1], burned.token, [], T0 + 21n);
@@ -204,6 +207,13 @@ test('every ancestor leaf is admitted like the part\'s: an ancestor certified in
   // the root's leaves certified by a validly signed certificate of a partition the policy does not name: only the bridge admission refuses
   const { child } = await lineage(w, () => [], 1, { rootPartition: AGG_PARTITION + 1 });
   await rejects(w.bridge.verifyNativeToken(child.token, 'receipt'), 'ErrNotAdmitted');
+  // exactly one out-of-policy leaf: only the root's transfer (leaf 1), or only its split burn (leaf 2), or only its mint (leaf 0), in another partition
+  for (const leaf of [1, 2, 0]) {
+    const one = await lineage(w, () => [], 1, { rootSteps: [txStep(7, 9, T0 + 5n)], rootPartitionAt: [leaf, AGG_PARTITION + 1] });
+    await rejects(w.bridge.verifyNativeToken(one.child.token, 'receipt'), 'ErrNotAdmitted');
+  }
+  // control: the same lineage with every leaf in the policy's partition is admitted
+  await w.bridge.verifyNativeToken((await lineage(w, () => [], 1, { rootSteps: [txStep(7, 9, T0 + 5n)] })).child.token, 'receipt');
   // the root's certificates are stamped before its split burn
   const late = await lineage(w, () => [], 1, { rootUcTs: T0 + 5n });
   await rejects(w.bridge.verifyNativeToken(late.child.token, 'receipt'), 'ErrReferenceTimeFuture');
@@ -255,4 +265,76 @@ test('fresh witnesses go into the envelope only, one per lineage leaf for the sa
   await rejects(buildReturnProof(w.bridge, child.token, proofs.slice(1)), 'ErrRefreshMismatch');
   const swapped = [proofs[1], proofs[0], ...proofs.slice(2)];
   await rejects(buildReturnProof(w.bridge, child.token, swapped), 'ErrRefreshMismatch');
+  // the same certification data under another reference time is another leaf (v = H(txHash, t)): refused, whichever lineage leaf it replaces
+  for (const i of [0, proofs.length - 1]) {
+    const [version, cd, , path, uc] = CborDeserializer.decodeArray(CborDeserializer.decodeTag(proofs[i].toCBOR()).data, 5);
+    const later = InclusionProof.fromCBOR(C.encodeTag(39033, C.encodeArray(version, cd, C.encodeUnsignedInteger(proofs[i].referenceTime + 1n), path, uc)));
+    assert.deepEqual(later.certificationData.toCBOR(), proofs[i].certificationData.toCBOR());
+    await rejects(buildReturnProof(w.bridge, child.token, proofs.map((p, k) => (k === i ? later : p))), 'ErrRefreshMismatch');
+  }
+});
+
+test('readiness keys a split part by (root nonce, part ID): identity, the part\'s own spent word, a sibling\'s spent word does not block it', async () => {
+  const w = await makeWorld();
+  const { child, sibling } = await lineage(w, () => [txStep(7, 9, T0 + 25n), burnStep(T0 + 26n)]);
+  const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
+  const id = await returnIdentity(plugin, child.bytes);
+  assert.ok(eq(id.partId, child.token.id.bytes), 'the part key is the redeemed token\'s ID, never the root\'s');
+  assert.equal(id.partAmount, 400n, 'the part\'s amount, not the lock\'s 1000');
+  const built = await buildReturnProof(w.bridge, child.token);
+  assert.equal(id.nonce, built.verified.outcome.nonce, 'the root lock nonce');
+  assert.ok(eq(id.nullifier, built.verified.lineage!.nullifier));
+  // anchors: the whole lineage's distinct certificates, root first
+  const lineageUcs = new Set(lineageProofs(await splitChain(child.token)).map((p) => toHex(p.unicityCertificate.toCBOR())));
+  assert.equal((await anchorRounds(child.token)).length, lineageUcs.size);
+  const spent = new Map<string, Uint8Array>();
+  const key = (n: bigint, p: Uint8Array) => `${n}:${toHex(p)}`;
+  let sends = 0;
+  const transport: RedeemTransport = {
+    send: () => { sends++; return Promise.resolve('0x01'); },
+    receipt: () => Promise.resolve(undefined),
+    spentPart: (n, p) => Promise.resolve(spent.get(key(n, p)) ?? new Uint8Array(32)),
+  };
+  const chain: ChainReader = { origin: () => Promise.resolve(1n << 60n) };
+  const down = (): Promise<never> => Promise.reject(new NativeError('ErrProofUnavailable', 'proof service down (test)'));
+  const policy = { ...DEFAULT_REDEEM, maxAttempts: 1, maxSends: 1, receiptTimeoutMs: 0, pollMs: 0 };
+  // the sibling's part of the same lock redeemed by its own burn: this part still goes on to fetch its proofs (and fails there, not on the spent word)
+  spent.set(key(id.nonce, sibling.token.id.bytes), new Uint8Array(32).fill(7));
+  await rejects(redeemReturn(plugin, child.bytes, down, chain, transport, policy), 'ErrProofUnavailable');
+  // its own part credited by its own burn: already redeemed, before any proof is fetched
+  spent.set(key(id.nonce, id.partId), id.nullifier);
+  assert.equal((await redeemReturn(plugin, child.bytes, down, chain, transport, policy)).status, 'already-redeemed');
+  // its own part credited by a different burn: ErrUnexpectedBurn
+  spent.set(key(id.nonce, id.partId), new Uint8Array(32).fill(9));
+  await rejects(redeemReturn(plugin, child.bytes, down, chain, transport, policy), 'ErrUnexpectedBurn');
+  assert.equal(sends, 0);
+});
+
+test('a depth-32 part (split 32 times) preflights, verifies and returns on the JS stack: no unclassified RangeError, the gate is the composition\'s', async () => {
+  const w = await makeWorld();
+  const root: MintSpec = { ...spec(1), amount: amt(1000) };
+  const level = (a: number, d: number): Out[] => [{ owner: 2 + (d % 3), amount: a - 1, salt: d }, { owner: 9, amount: 1, salt: (d + 0x80) & 0xff }];
+  let amount = 1000;
+  let held = (await buildToken(w, root, [], T0, UC_TS)).token;
+  let outs = level(amount, 1);
+  let split = await sdkSplit(w, held, outs);
+  let t = T0 + 10n;
+  let burned = (await buildToken(w, root, [{ kind: 'burnWith', reason: split.burn.transaction.data!, t }], T0, UC_TS)).token;
+  for (let d = 2; d <= 32; d++) {
+    amount -= 1;
+    t += 10n;
+    held = (await mintChild(w, split, 0, outs[0], burned, [], t)).token;
+    const next = level(amount, d);
+    const nextSplit = await sdkSplit(w, held, next);
+    burned = (await mintChild(w, split, 0, outs[0], burned, [{ kind: 'burnWith', reason: nextSplit.burn.transaction.data!, t: t + 5n }], t)).token;
+    split = nextSplit;
+    outs = next;
+  }
+  const last = await mintChild(w, split, 0, outs[0], burned, [burnStep(t + 20n)], t + 10n);
+  preflightToken(last.bytes);
+  const built = await buildReturnProof(w.bridge, last.token);
+  const lin = built.verified.lineage!;
+  assert.equal(lin.depth, 32);
+  assert.deepEqual(lin.partAmount, amt(1000 - 32));
+  assert.equal(built.gate.native, (await composeOfflineV2(w.dep, cfgBytes(w.dep.cfg), built.encoded)).gas);
 });

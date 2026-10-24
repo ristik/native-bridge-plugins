@@ -86,7 +86,12 @@ export function parseAmount(s: string): bigint {
   if (wei > MAX_LOCK_WEI) throw new Error(`one lock carries at most ${MAX_LOCK_WEI} wei (the amount is 8 bytes in the token)`);
   return wei;
 }
-export const amountBytes = (wei: bigint): Uint8Array => unhex(wei.toString(16).padStart(16, '0'));
+/** The token's amount bytes: minimal big-endian, no leading zero (interop.md "Canonical primitives"; 1 to 8 bytes for a lock). */
+export const amountBytes = (wei: bigint): Uint8Array => {
+  if (wei <= 0n) throw new Error('the amount must be more than zero');
+  const h = wei.toString(16);
+  return unhex(h.length % 2 ? `0${h}` : h);
+};
 
 // ---- the token file -----------------------------------------------------------------------------------------------------------------------------
 const TOKEN_TAG = 39040n;
@@ -99,9 +104,13 @@ export function appendTransaction(tokenBytes: Uint8Array, tx: Uint8Array, proof:
 }
 
 // ---- the wallet's token records -----------------------------------------------------------------------------------------------------------------
-export type Phase = 'locked' | 'minted' | 'burned' | 'redeemed';
+export type Phase = 'locked' | 'minted' | 'split' | 'burned' | 'redeemed';
 export interface TokenRecord {
+  /** the record's name: the lock nonce for the token minted from the lock, `<parent>.<n>` for the n-th part of a split (absent: the nonce) */
+  id?: string;
+  /** the ROOT lock's nonce (a part redeems against it) */
   nonce: string;
+  /** this token's whole amount (a part's own) */
   amountWei: string;
   phase: Phase;
   lockTx: string;
@@ -112,12 +121,29 @@ export interface TokenRecord {
   /** the EVM address the burn names (credited by the redemption) */
   recipient?: string;
   redeemTx?: string;
+  /** a part's parent record; a split token's parts */
+  parent?: string;
+  parts?: string[];
 }
+/** The name a record is selected by (`--token`) and stored under. */
+export const recordId = (t: TokenRecord): string => t.id ?? t.nonce;
+/** A record name: a nonce, then one `.n` per split level. */
+export const RECORD_ID = /^\d+(\.\d+)*$/;
 const ORDER: Phase[] = ['locked', 'minted', 'burned', 'redeemed'];
 /** Refuses a step out of order, with what to run instead. */
 export function requirePhase(t: TokenRecord, want: Phase, step: string): void {
   if (t.phase === want) return;
-  const next: Record<Phase, string> = { locked: 'mint', minted: 'transfer or burn', burned: 'redeem', redeemed: 'claim' };
+  if (t.phase === 'split') throw new Error(`token ${recordId(t)} was split: ${step} one of its parts (--token ${(t.parts ?? []).join(' | --token ')})`);
+  const next: Record<Phase, string> = { locked: 'mint', minted: 'transfer, split or burn', split: 'its parts', burned: 'redeem', redeemed: 'claim' };
   const ahead = ORDER.indexOf(t.phase) > ORDER.indexOf(want);
-  throw new Error(`token ${t.nonce} is ${t.phase}: ${step} needs it ${want}${ahead ? ' (that step is done)' : ''}; next: ${next[t.phase]}`);
+  throw new Error(`token ${recordId(t)} is ${t.phase}: ${step} needs it ${want}${ahead ? ' (that step is done)' : ''}; next: ${next[t.phase]}`);
+}
+
+/** `--amounts a,b,...`: at least two positive amounts (each as `parseAmount`) that add up to exactly the token's amount. */
+export function splitAmounts(text: string, totalWei: bigint): bigint[] {
+  const parts = text.split(',').map((x) => parseAmount(x.trim()));
+  if (parts.length < 2) throw new Error('--amounts needs at least two amounts, comma separated');
+  const sum = parts.reduce((a, b) => a + b, 0n);
+  if (sum !== totalWei) throw new Error(`--amounts add up to ${sum} wei, the token holds ${totalWei} wei`);
+  return parts;
 }

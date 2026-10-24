@@ -108,7 +108,7 @@ export interface RedemptionEntry {
   tokenId: string;
   burnedToken: Uint8Array;
   nullifier: Uint8Array;
-  /** The lock nonce of the token: the vault keys its spent state by it (`spentNullifier(nonce)` holds the nullifier). */
+  /** The ROOT lock nonce of the token: with the part's token ID it keys the vault's spent state (`spentPart(nonce, partId)` holds the nullifier). */
   nonce: bigint;
   /** The redeemable native amount, in wei. */
   amount: bigint;
@@ -125,9 +125,9 @@ export interface RedemptionEntry {
 /** The big-endian unsigned integer of a fixed-width byte string. */
 export const uintOf = (b: Uint8Array): bigint => (b.length === 0 ? 0n : BigInt(`0x${toHex(b)}`));
 
-/** A fresh `burned` entry for a verified return token. */
-const burnedEntry = (burnId: string, tokenId: string, blob: Uint8Array, o: { nullifier: Uint8Array; nonce: bigint; amount: Uint8Array; releaseTo: Uint8Array }): RedemptionEntry =>
-  ({ burnId, tokenId, burnedToken: blob, nullifier: o.nullifier, nonce: o.nonce, amount: uintOf(o.amount), releaseTo: o.releaseTo, status: 'burned', redeemTxs: [] });
+/** A fresh `burned` entry for a verified return token. The amount is the part's (a split part credits its own amount, never the root lock's). */
+const burnedEntry = (burnId: string, tokenId: string, blob: Uint8Array, v: VerifiedToken): RedemptionEntry =>
+  ({ burnId, tokenId, burnedToken: blob, nullifier: v.outcome.nullifier, nonce: v.outcome.nonce, amount: uintOf(v.lineage?.partAmount ?? v.outcome.amount), releaseTo: v.outcome.releaseTo, status: 'burned', redeemTxs: [] });
 
 export interface RedemptionJournal {
   put(entry: RedemptionEntry): Promise<void>;
@@ -238,7 +238,7 @@ export async function burnForReturn(
     reasonBytes: args.reasonBytes,
     persist: async (blob, burnId) => {
       const v = await plugin.verifyNativeToken(blob, 'return');
-      await payments.journal.put(burnedEntry(burnId, args.tokenId, blob, v.outcome));
+      await payments.journal.put(burnedEntry(burnId, args.tokenId, blob, v));
       await args.persist(blob, burnId);
     },
   });
@@ -255,7 +255,7 @@ export function recoverPendingBurns(plugin: NativeBridgePlugin, payments: Native
     if (!data || !eq(data, pending.reasonBytes)) fail('ErrBurnReason');
     // an interrupted burn that was already journalled keeps its later state (a redemption may be under way)
     const known = await payments.journal.get(burnId);
-    if (!known) await payments.journal.put(burnedEntry(burnId, pending.tokenId, blob, v.outcome));
+    if (!known) await payments.journal.put(burnedEntry(burnId, pending.tokenId, blob, v));
     await persist(blob, burnId);
   });
 }

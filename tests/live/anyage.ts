@@ -18,7 +18,7 @@
  *   anyage.ts negatives <lane-config.json> <saved.json>                       (bft-core #438) after the saved token's release: a conflicting burn of its pre-burn state
  *                                                                              (another recipient) is not certified, the aggregator serves the first burn's proof for that
  *                                                                              state; and a fresh proof of the redeemed burn (consolidated now, under a newer seal) is refused
- *                                                                              by the vault as AlreadyRedeemed, with the saved nullifier. Writes negatives.json; sends nothing
+ *                                                                              by the vault as PartAlreadyRedeemed, with the saved nullifier. Writes negatives.json; sends nothing
  *                                                                              to the vault
  *
  * Nothing is refreshed: the saved envelope is the one the plug-in assembled from the proofs the aggregator returned when each transition
@@ -52,7 +52,9 @@ import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/Tok
 import { batchRequest, measure } from '../../packages/native-bridge-plugin/src/certgroups.js';
 import { DeploymentRegistry, makeDeployment } from '../../packages/native-bridge-plugin/src/deployment.js';
 import { configHashOfPdr, encodeJustification } from '../../packages/native-bridge-plugin/src/lockproof.js';
-import { buildReturnProof, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
+import { assembleEnvelope, buildReturnProof, refreshToken } from '../../packages/native-bridge-plugin/src/proof.js';
+import { projectToken } from '../../packages/native-bridge-plugin/src/history.js';
+import { isSplitReason, lineageProofs, splitChain } from '../../packages/native-bridge-plugin/src/splitpart.js';
 import { consolidatedProofs } from '../../packages/native-bridge-plugin/src/wallet.js';
 import {
   arr, bs, decodeCfg, decodePolicy, deriveSalt, deriveTokenId, H, keccak256, lockDigest, lockRecord, returnReason, shardCovers, shardDepth, u, valueEnvelope,
@@ -72,8 +74,8 @@ const THIRD_PARTY_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a
 const PAYEE = '0x000000000000000000000000000000000000bEEF';
 const REGISTRY = '0xff00000000000000000000000000000000000002';
 const CERT_BATCH = '0x0000000000000000000000000000000000000100';
-/** BridgeVault's AlreadyRedeemed(uint256) (`cast sig`, contracts pin) */
-const ALREADY_REDEEMED = '0xd36d946d';
+/** BridgeVault's PartAlreadyRedeemed(uint256,bytes32) (protocol 6: spent state per (lock nonce, part token ID); `cast sig`, contracts pin) */
+const PART_ALREADY_REDEEMED = '0xe8f8709e';
 /** The owner keys a token passes through (the mint's first, then each transfer to the next, cyclically): `negatives` re-derives the holder. */
 const ownerKey = (i: number): SigningService => new SigningService(sha256(text(i === 0 ? 'anyage-owner' : `anyage-owner-${i}`)));
 const OWNERS = 4;
@@ -83,6 +85,8 @@ const text = (s: string): Uint8Array => new TextEncoder().encode(s);
 const sha = (b: Uint8Array): string => hex(sha256(b));
 const toJson = (v: unknown): string => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x), 2);
 const word = (n: bigint): Uint8Array => unhex(n.toString(16).padStart(64, '0'));
+/** A token amount: minimal big-endian, no leading zero byte (interop.md "Canonical primitives"). */
+const amountBytes = (n: bigint): Uint8Array => unhex(n.toString(16).length % 2 ? `0${n.toString(16)}` : n.toString(16));
 /** ABI calldata of `redeem(bytes)` (selector 0x9945e3d3), encoded here: `cast calldata` is offline (no --rpc-url, so not c.cast) and a
  * large envelope would exceed the per-argument limit of a subprocess. */
 const redeemCalldata = (envelope: Uint8Array): string => {
@@ -90,6 +94,9 @@ const redeemCalldata = (envelope: Uint8Array): string => {
   padded.set(envelope);
   return `0x9945e3d3${hex(word(32n))}${hex(word(BigInt(envelope.length)))}${hex(padded)}`;
 };
+/** BridgeVault.redeem's return data, abi.encode(uint256 nonce, bytes32 partId) (protocol 6); undefined for any other length. */
+const redeemReturn = (out: string): { nonce: bigint; partId: string } | undefined =>
+  out.length === 2 + 128 ? { nonce: BigInt(`0x${out.slice(2, 66)}`), partId: out.slice(66, 130) } : undefined;
 /** An eth_call of the vault as the third-party submitter at BLOCK: its result, or its revert data (lib's rpc keeps only the message). */
 async function callVault(eth: string, vault: string, data: string, block: string): Promise<{ result?: string; revert?: string; message?: string }> {
   const res = await fetch(eth, { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -196,7 +203,7 @@ async function burnedToken(c: Ctx, out: string, transfers = 0) {
   const owner = ownerKey(0);
   const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.publicKey)).toCBOR();
   const amountWei = 10n ** 18n;
-  const amount = unhex(amountWei.toString(16).padStart(16, '0'));
+  const amount = amountBytes(amountWei);
   // With several aggregator shards the history must span them: the burn's StateId is fixed by the mint (its source state) and the mint's by the lock's nonce,
   // so a lock whose mint and burn fall to the same shard is abandoned (its funds stay in the vault, unredeemed) and the next lock is tried.
   const spans = (c.lane.aggShards?.length ?? 0) >= 2;
@@ -328,7 +335,16 @@ function loadSaved(savedPath: string) {
 async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'historical'): Promise<void> {
   const c = ctx(cfgPath);
   const { saved, dir, envelope, request } = loadSaved(savedPath);
-  const head = await rpc(c.eth, 'eth_blockNumber', []);
+  // the native batch verdict on the saved request: abi.encode(uint256 2, bool). A fresh anchor is admitted only once the registry's usable
+  // origin covers its round (round <= O), so wait for the verdict (bounded) and read everything else at that block.
+  let out = '';
+  const head = await until('the native CERT_BATCH_V2 verdict on the saved request is (2, true) (the usable origin covers every anchor)', 240_000, async () => {
+    const block = await rpc(c.eth, 'eth_blockNumber', []);
+    out = await rpc(c.eth, 'eth_call', [{ to: CERT_BATCH, data: `0x${hex(request)}` }, block]);
+    return BigInt(`0x${out.slice(2, 66)}`) === 2n && BigInt(`0x${out.slice(66, 130)}`) === 1n ? block : undefined;
+  }).catch((e: unknown) => {
+    throw new Error(`${String(e)}; the last verdict: ${out}`);
+  });
   const anchorEpochs = (saved.anchors as { epoch: string }[]).map((a) => BigInt(a.epoch));
   const reg = await registryAt(c, head, anchorEpochs);
   const usable = reg.usableEpoch as bigint;
@@ -346,8 +362,6 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   }
   const ages = (saved.anchors as { round: string }[]).map((a) => (reg.clockRound as bigint) - BigInt(a.round));
 
-  // the native batch verdict on the saved request: abi.encode(uint256 2, bool)
-  const out = await rpc(c.eth, 'eth_call', [{ to: CERT_BATCH, data: `0x${hex(request)}` }, head]);
   const version = BigInt(`0x${out.slice(2, 66)}`);
   const valid = BigInt(`0x${out.slice(66, 130)}`) === 1n;
   const batchGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ to: CERT_BATCH, data: `0x${hex(request)}` }, head]));
@@ -357,8 +371,9 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
   const redeemData = redeemCalldata(envelope);
   const redeemOut = await rpc(c.eth, 'eth_call', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]);
   const redeemGas = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: c.lane.vault, data: redeemData }, head]));
-  // BridgeVault.redeem returns the redeemed lock's nonce (the credited amount is checked by release on the real transaction)
-  assert.equal(BigInt(redeemOut), BigInt(saved.nonce), `the redeem eth_call must return the saved nonce: ${redeemOut}`);
+  // BridgeVault.redeem returns the redeemed lock's nonce and the part's token ID (the credited amount is checked by release on the real transaction)
+  const partId = hex((await Token.fromCBOR(Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`)))).id.bytes);
+  assert.deepEqual(redeemReturn(redeemOut), { nonce: BigInt(saved.nonce), partId }, `the redeem eth_call must return the saved (nonce, partId): ${redeemOut}`);
   const result = { epoch, block: head, registry: reg, anchorAges: ages, batch: { returndata: out, valid, estimatedGas: batchGas }, redeem: { returndata: redeemOut, estimatedGas: redeemGas } };
   writeFileSync(`${dir}/verify-${epoch}.json`, toJson(result));
   console.log(`VERIFIED ${epoch}`, toJson({ block: head, usableEpoch: usable, anchorEpochs, anchorAges: ages, batchGas, redeemGas }));
@@ -366,14 +381,14 @@ async function verify(cfgPath: string, savedPath: string, epoch: 'current' | 'hi
 
 // ---- release (the one redemption, then the claim) -----------------------------------------------------------------------------------------
 /** The one vault redemption of an envelope by the third-party submitter, then the claim; every effect asserted. */
-async function redeemAndClaim(c: Ctx, p: { envelope: Uint8Array; gateTotal: number; nonce: bigint | string; nullifier: string; amountWei: bigint; recipient: string; epochs: bigint[]; gasLimit?: bigint }) {
+async function redeemAndClaim(c: Ctx, p: { envelope: Uint8Array; gateTotal: number; nonce: bigint | string; partId: string; nullifier: string; amountWei: bigint; recipient: string; epochs: bigint[]; gasLimit?: bigint }) {
   const gas = p.gasLimit?.toString() ?? String(Math.min(7_000_000, p.gateTotal + 200_000));
   const claimable = (): bigint => BigInt(c.cast('call', c.lane.vault, 'claimable(address)(uint256)', p.recipient).split(' ')[0]);
   const creditBefore = claimable();
   const rc = await sendData(c, c.lane.vault, redeemCalldata(p.envelope), THIRD_PARTY_KEY, gas);
   assert.equal(rc.status, '0x1', `redeem reverted: ${JSON.stringify(rc).slice(0, 400)}`);
   const credited = claimable() - creditBefore;
-  const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', String(p.nonce))));
+  const recorded = hex(unhex(c.cast('call', c.lane.vault, 'spentPart(uint256,bytes32)(bytes32)', String(p.nonce), `0x${p.partId}`)));
   assert.equal(credited, p.amountWei, 'the recipient is credited with exactly the locked amount by this redemption');
   assert.equal(recorded, p.nullifier, 'the vault recorded the saved nullifier');
   const claim = await sendAll(c, c.lane.vault, 'claim(uint256,address)', [p.amountWei.toString(), PAYEE], RECIPIENT_KEY, '500000');
@@ -393,7 +408,8 @@ async function release(cfgPath: string, savedPath: string): Promise<void> {
   const c = ctx(cfgPath);
   const { saved, dir, envelope } = loadSaved(savedPath);
   const result = await redeemAndClaim(c, {
-    envelope, gateTotal: Number(saved.gate.total), nonce: saved.nonce, nullifier: saved.nullifier, amountWei: BigInt(saved.amountWei), recipient: saved.recipient,
+    envelope, gateTotal: Number(saved.gate.total), nonce: saved.nonce, partId: hex((await Token.fromCBOR(Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`)))).id.bytes),
+    nullifier: saved.nullifier, amountWei: BigInt(saved.amountWei), recipient: saved.recipient,
     epochs: (saved.anchors as { epoch: string }[]).map((a) => BigInt(a.epoch)),
   });
   writeFileSync(`${dir}/release.json`, toJson(result));
@@ -454,7 +470,7 @@ async function consolidateAndAccept(c: Ctx, bridge: NativeBridge, token: Token, 
   const accepted = await until(refusal ? `the vault to refuse the consolidated envelope with ${refusal.slice(0, 10)}` : 'the vault accepts the consolidated envelope (master round within the usable origin)', 240_000, async () => {
     const head = await rpc(c.eth, 'eth_blockNumber', []);
     last = await callVault(c.eth, c.lane.vault, redeemCalldata(ret.encoded), head);
-    const done = refusal ? last.revert === refusal : last.result !== undefined && BigInt(last.result) === nonce;
+    const done = refusal ? last.revert === refusal : last.result !== undefined && redeemReturn(last.result)?.nonce === nonce && redeemReturn(last.result)?.partId === hex(token.id.bytes);
     return done ? head : undefined;
   }).catch((e: unknown) => {
     throw new Error(`${String(e)}; the last eth_call: ${toJson(last)}`);
@@ -500,7 +516,7 @@ async function consolidated(cfgPath: string, outDir?: string): Promise<void> {
   const perEst = await estimate(per.encoded);
 
   const result = await redeemAndClaim(c, {
-    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
+    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, partId: hex(token.id.bytes), nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
     epochs: conAnchors.map((a) => BigInt(a.epoch)),
   });
   const record = {
@@ -548,7 +564,8 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   const head = await rpc(c.eth, 'eth_blockNumber', []);
   const succeeds = async (gas: bigint): Promise<boolean> => {
     try {
-      return BigInt(await rpc(c.eth, 'eth_call', [{ from, to: c.lane.vault, data, gas: `0x${gas.toString(16)}` }, head])) === nonce;
+      const r = redeemReturn(await rpc(c.eth, 'eth_call', [{ from, to: c.lane.vault, data, gas: `0x${gas.toString(16)}` }, head]));
+      return r?.nonce === nonce && r.partId === hex(token.id.bytes);
     } catch {
       return false;
     }
@@ -562,7 +579,8 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
   const vault = async (block: string) => {
     const at = (sig: string, ...args: string[]): string => c.cast('call', c.lane.vault, sig, ...args, '--block', block).split(' ')[0];
     return {
-      lockDigest: at('lockDigest(uint256)(bytes32)', nonce.toString()), spentNullifier: at('spentNullifier(uint256)(bytes32)', nonce.toString()),
+      lockDigest: at('lockDigest(uint256)(bytes32)', nonce.toString()), spentPart: at('spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(token.id.bytes)}`),
+      redeemedAmount: at('redeemedAmount(uint256)(uint256)', nonce.toString()),
       claimable: at('claimable(address)(uint256)', RECIPIENT), balance: BigInt(await rpc(c.eth, 'eth_getBalance', [c.lane.vault, block])).toString(),
     };
   };
@@ -575,7 +593,7 @@ async function longHistory(cfgPath: string, outDir?: string): Promise<void> {
 
   // funded: the wallet's estimate, then the claim
   const release = await redeemAndClaim(c, {
-    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
+    envelope: ret.encoded, gateTotal: Number(ret.gate.total), nonce, partId: hex(token.id.bytes), nullifier: hex(ret.verified.outcome.nullifier), amountWei, recipient: RECIPIENT,
     epochs: conAnchors.map((a) => BigInt(a.epoch)), gasLimit: estimatedGas,
   });
   const record = {
@@ -601,12 +619,12 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   const tokenBytes = Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`));
   assert.equal(sha(tokenBytes), saved.token.sha256, 'token.cbor changed since it was saved');
   const nonce = BigInt(saved.nonce);
-  assert.equal(c.cast('call', c.lane.vault, 'spentNullifier(uint256)(bytes32)', nonce.toString()).toLowerCase(), `0x${saved.nullifier}`.toLowerCase(),
-    'run after the release: the vault has spent this lock');
   const { cfg, bridge } = await installedBridge(c);
   const token = await Token.fromCBOR(tokenBytes);
+  assert.equal(c.cast('call', c.lane.vault, 'spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(token.id.bytes)}`).toLowerCase(), `0x${saved.nullifier}`.toLowerCase(),
+    'run after the release: the vault has spent this token');
   const burn = token.transactions[token.transactions.length - 1];
-  const amount = unhex(BigInt(saved.amountWei).toString(16).padStart(16, '0'));
+  const amount = amountBytes(BigInt(saved.amountWei));
 
   // 1. a conflicting burn of the same pre-burn state, returning the token to another address: the state is spent, so the aggregator certifies
   // only the first burn. Whatever it answers to the submission, the proof it serves for that state ID is the first burn's.
@@ -635,8 +653,8 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   console.log(`CONFLICTING BURN submission ${submitted}; the first burn's proof is served; the plug-in refuses: ${conflictingRefused}`);
 
   // 2. a fresh proof of the redeemed burn: consolidated now, under a seal newer than every saved anchor. The vault refuses it on the nullifier
-  // (AlreadyRedeemed of this nonce), not for its certificate, so a replay does not depend on the age of the proof.
-  const refusal = ALREADY_REDEEMED + hex(word(nonce));
+  // (PartAlreadyRedeemed of this nonce and token), not for its certificate, so a replay does not depend on the age of the proof.
+  const refusal = PART_ALREADY_REDEEMED + hex(word(nonce)) + hex(token.id.bytes);
   const { ret, conAnchors, accepted } = await consolidateAndAccept(c, bridge, token, nonce, labelByCertificate, refusal);
   assert.equal(hex(ret.verified.outcome.nullifier), saved.nullifier, 'the fresh proof carries the redeemed burn\'s nullifier');
   const newest = (saved.anchors as { round: string }[]).reduce((m, a) => (BigInt(a.round) > m ? BigInt(a.round) : m), 0n);
@@ -651,6 +669,115 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   };
   writeFileSync(`${dir}/negatives.json`, toJson(record));
   console.log('NEGATIVES', toJson({ conflictingSubmission: submitted, freshSeal: conAnchors[0], refusedAtBlock: accepted }));
+}
+
+
+// ---- split negatives (split plan PR5: a part of a split token, live) -----------------------------------------------------------------------
+/** BridgeVault's BridgeRejected(uint256): the composition (BRIDGE_COMPOSE_V2) refused the redemption with a nonzero status. */
+const BRIDGE_REJECTED = '0x2896c49d';
+const STATUS_V2 = JSON.parse(readFileSync(new URL('../../protocol/vectors/split/config/compose-status-v2.json', import.meta.url), 'utf8')) as { code: number; name: string }[];
+
+/** One byte string replaced by another of the same length, exactly once in `b`. */
+function replaceOnce(b: Uint8Array, from: Uint8Array, to: Uint8Array, what: string): Uint8Array {
+  assert.equal(from.length, to.length);
+  const h = hex(b);
+  const at = h.indexOf(hex(from));
+  assert.ok(at >= 0 && at % 2 === 0 && h.indexOf(hex(from), at + 2) < 0, `${what}: the bytes occur exactly once in the envelope`);
+  return unhex(h.slice(0, at) + hex(to) + h.slice(at + from.length * 2));
+}
+
+/**
+ * The live negatives of a split part (bft-core rehearse_bridge.py `split`), on a tester wallet: PART is a burned, not yet redeemed part, PARENT a split
+ * (manifest-burned) ancestor. Every refusal is the chain's own: an eth_call of the vault (BridgeRejected with the V2 status, or the vault's error).
+ *  - the parent returned: its envelope (assembled, since the plug-in refuses to build it) is refused by the composition;
+ *  - the part's envelope with its return recipient, or its amount in its mint, changed: refused (the certified transaction hashes no longer match);
+ *  - an underfunded redemption runs out of gas: status 0, the vault unchanged;
+ *  - the same envelope submitted twice at once by two submitters: one credit, the other reverts; the vault records the part's nullifier once.
+ * The part ends redeemed by this command. Writes split-negatives.json next to the part.
+ */
+async function splitNegatives(cfgPath: string, wallet: string, partId: string, parentId: string): Promise<void> {
+  const c = ctx(cfgPath);
+  const { cfg, dep, bridge } = await installedBridge(c);
+  const vault = c.lane.vault;
+  const read = (id: string) => Uint8Array.from(readFileSync(`${wallet}/tokens/${id}/token.cbor`));
+  const part = await Token.fromCBOR(read(partId));
+  const parent = await Token.fromCBOR(read(parentId));
+  const status = (revert: string | undefined): { revert: string; code: number; name: string } => {
+    assert.ok(revert?.startsWith(BRIDGE_REJECTED), `refused by the composition (BridgeRejected): ${revert}`);
+    const code = Number(BigInt(`0x${revert!.slice(10, 74)}`));
+    assert.ok(code !== 0, 'a nonzero status');
+    return { revert: revert!, code, name: STATUS_V2.find((s) => s.code === code)?.name ?? `status ${code}` };
+  };
+  const latest = async () => (await rpc(c.eth, 'eth_blockNumber', [])) as string;
+  const out: Json = { part: partId, parent: parentId };
+
+  // the part's own envelope, as certified (any age), once the registry's origin covers its anchors
+  const built = await buildReturnProof(bridge, part);
+  const lin = built.verified.lineage!;
+  const nonce = built.verified.outcome.nonce;
+  const data = redeemCalldata(built.encoded);
+  await until('the vault accepts the part\'s envelope (eth_call)', 240_000, async () => ((await callVault(c.eth, vault, data, await latest())).result ? true : undefined));
+  const partAmount = BigInt(`0x${hex(lin.partAmount)}`);
+  const recipient = `0x${hex(built.verified.outcome.releaseTo)}`;
+  out.partAmount = partAmount;
+  out.depth = lin.depth;
+
+  // 1. the parent returned: the plug-in refuses to build it; the chain refuses the envelope assembled anyway
+  let pluginRefusal = '';
+  try {
+    await buildReturnProof(bridge, parent);
+  } catch (e) {
+    pluginRefusal = String(e).slice(0, 200);
+  }
+  assert.ok(pluginRefusal, 'the plug-in refuses to build a return of a split parent');
+  const chain = isSplitReason(parent.genesis.justification) ? lineageProofs(await splitChain(parent)) : [parent.genesis, ...parent.transactions].map((x) => x.inclusionProof);
+  const parentEnv = assembleEnvelope(dep, projectToken(parent), chain).encoded;
+  out.parentReturn = { pluginRefusal, chain: status((await callVault(c.eth, vault, redeemCalldata(parentEnv), await latest())).revert) };
+
+  // 2. the return recipient changed in the part's burn (R), and 3. the part's amount changed in its own mint's value
+  const other = unhex('000000000000000000000000000000000000dead');
+  out.changedRecipient = status((await callVault(c.eth, vault, redeemCalldata(replaceOnce(built.encoded, built.verified.outcome.releaseTo, other, 'the recipient')), await latest())).revert);
+  const value = valueEnvelope(cfg.aid, lin.partAmount);
+  const more = valueEnvelope(cfg.aid, amountBytes(partAmount + 1n));
+  out.changedAmount = status((await callVault(c.eth, vault, redeemCalldata(replaceOnce(built.encoded, value, more, 'the part\'s value')), await latest())).revert);
+
+  // the vault's view of this lock and part, at one block
+  const view = async (block: string) => {
+    const at = (sig: string, ...args: string[]): string => c.cast('call', vault, sig, ...args, '--block', block).split(' ')[0];
+    return {
+      spentPart: at('spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(lin.partTokenId)}`), redeemedAmount: at('redeemedAmount(uint256)(uint256)', nonce.toString()),
+      remaining: at('remaining(uint256)(uint256)', nonce.toString()), claimable: at('claimable(address)(uint256)', recipient),
+      balance: BigInt(await rpc(c.eth, 'eth_getBalance', [vault, block])).toString(),
+    };
+  };
+
+  // 4. out of gas: well under the estimate (above the calldata floor), status 0 and nothing changed
+  for (const a of [THIRD_PARTY_ADDR]) if (BigInt(await rpc(c.eth, 'eth_getBalance', [a, 'latest'])) < 10n ** 17n) await sendAll(c, a, '', [], DEPLOYER_KEY, '100000', '1000000000000000000');
+  const estimate = BigInt(await rpc(c.eth, 'eth_estimateGas', [{ from: THIRD_PARTY_ADDR, to: vault, data }, 'latest']));
+  const low = (estimate * 2n) / 3n;
+  assert.ok(low >= calldataFloor(data), 'the underfunded limit is above the calldata floor (the transaction is admitted)');
+  const before = await view(await latest());
+  const oog = await sendData(c, vault, data, THIRD_PARTY_KEY, low.toString());
+  const afterOog = await view(oog.blockNumber);
+  assert.equal(oog.status, '0x0', 'the underfunded redemption reverts');
+  assert.deepEqual(afterOog, before, 'the underfunded redemption changed nothing in the vault');
+  out.outOfGas = { status: oog.status, gasLimit: low, estimate, gasUsed: BigInt(oog.gasUsed), block: oog.blockNumber, vaultUnchanged: true };
+
+  // 5. the same envelope from two submitters at once: both signed and published before either is mined
+  const gas = (estimate * 3n) / 2n + 100_000n;
+  const [a, b] = await Promise.all([sendData(c, vault, data, DEPLOYER_KEY, gas.toString()), sendData(c, vault, data, THIRD_PARTY_KEY, gas.toString())]);
+  const ok = [a, b].filter((r) => r.status === '0x1');
+  assert.equal(ok.length, 1, `exactly one of the two submissions redeems: ${a.status} ${b.status}`);
+  const after = await view(await latest());
+  const credited = BigInt(after.claimable) - BigInt(before.claimable);
+  assert.equal(credited, partAmount, 'the recipient is credited the part\'s amount once');
+  assert.equal(BigInt(before.remaining) - BigInt(after.remaining), partAmount, 'the lock\'s remaining falls by the part\'s amount once');
+  assert.equal(after.spentPart.toLowerCase(), `0x${hex(lin.nullifier)}`, 'the vault records the part\'s nullifier');
+  const refused = await callVault(c.eth, vault, data, await latest());
+  assert.equal(refused.revert, `${PART_ALREADY_REDEEMED}${hex(word(nonce))}${hex(lin.partTokenId)}`, 'a third submission is refused as PartAlreadyRedeemed');
+  out.duplicate = { statuses: [a.status, b.status], blocks: [a.blockNumber, b.blockNumber], credited, before, after, thirdRefusal: refused.revert };
+  writeFileSync(`${wallet}/tokens/${partId}/split-negatives.json`, toJson(out));
+  console.log('SPLIT NEGATIVES', toJson(out));
 }
 
 const [cmd, cfgPath, arg3, ...rest] = process.argv.slice(2);
@@ -677,6 +804,9 @@ switch (cmd) {
   case 'negatives':
     await negatives(cfgPath, arg3);
     break;
+  case 'split-negatives':
+    await splitNegatives(cfgPath, arg3, rest[0], rest[1]);
+    break;
   default:
-    throw new Error('usage: anyage.ts save <lane-config> [<out-dir>] | verify <lane-config> <saved.json> --epoch current|historical | release <lane-config> <saved.json> | consolidated <lane-config> [<out-dir>] | long-history <lane-config> [<out-dir>] | negatives <lane-config> <saved.json>');
+    throw new Error('usage: anyage.ts save <lane-config> [<out-dir>] | verify <lane-config> <saved.json> --epoch current|historical | release <lane-config> <saved.json> | consolidated <lane-config> [<out-dir>] | long-history <lane-config> [<out-dir>] | negatives <lane-config> <saved.json> | split-negatives <lane-config> <tester-wallet> <part-id> <parent-id>');
 }

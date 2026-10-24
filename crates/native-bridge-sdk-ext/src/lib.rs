@@ -40,8 +40,8 @@ pub mod verifier;
 
 pub use error::{Family, NativeError, Result};
 
-/// Native bridge protocol version (`NATIVE_BRIDGE_PROTO_VERSION=5`).
-pub const NATIVE_BRIDGE_PROTO_VERSION: u8 = 5;
+/// Native bridge protocol version (`NATIVE_BRIDGE_PROTO_VERSION=6`).
+pub const NATIVE_BRIDGE_PROTO_VERSION: u8 = 6;
 /// Bridge identity family.
 pub const NATIVE_BRIDGE_FAMILY: &str = "unicity-native";
 /// SDK the byte profile is built for.

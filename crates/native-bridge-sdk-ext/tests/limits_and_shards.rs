@@ -1,5 +1,5 @@
 #![allow(clippy::type_complexity, unused_imports, unused_variables, dead_code)]
-//! The named profile-v5 bounds against `protocol/profile-v5.json`, the shared gas gate at the worst
+//! The named profile-v6 bounds against `protocol/profile-v6.json`, the shared gas gate at the worst
 //! admitted bundle, the DN-B depth-1 topology and the burn-time preflight.
 
 mod common;
@@ -21,7 +21,7 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     let p: serde_json::Value = serde_json::from_slice(
         &std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../protocol/profile-v5.json"
+            "/../../protocol/profile-v6.json"
         ))
         .unwrap(),
     )
@@ -40,7 +40,7 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     assert_eq!(MAX_INPUT_RECORD_BYTES as u64, n("irBytes"));
     assert_eq!(GAS_RESERVE, n("gasReserve"));
     assert_eq!(MAX_JUSTIFICATION_BYTES as u64, n("justificationBytes"));
-    assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 5);
+    assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 6);
     assert_eq!(BRIDGE_ITEM_GAS, n("bridgeItemGas"));
     assert_eq!(MAX_SHARD_DEPTH as u64, n("shardDepthMax"));
     assert_eq!(MAX_CBOR_ITEMS as u64, n("cborItems"));

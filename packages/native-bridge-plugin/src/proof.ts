@@ -66,9 +66,32 @@ export async function buildReturnProof(
   // rewritten there (that would change the descendant's mint hash); fresher ones go into the envelope only.
   const embedded = verified.lineage ? lineageProofs(await splitChain(token)) : [proofOf(token.genesis), ...token.transactions.map(proofOf)];
   const proofs = witnesses === undefined ? embedded : sameLeaves(embedded, witnesses);
+  const { envelope, encoded } = assembleEnvelope(dep, history, proofs);
+  if (encoded.length > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
+  // The composing verifier's own checks must pass on what we assembled, in its order: policy opening,
+  // anchor table, the gas estimate, then every anchor's opening and every leaf's own anchor time.
+  const sids = verified.outcome.leaves.map((l) => l.sid);
+  const pol = checkPolicyBody(dep.cfg, envelope);
+  const plan = planAnchors(pol, envelope, sids);
+  const gate = computeGate(cfgBytes(dep.cfg), encoded.length, kernelRequestBytes(cfgBytes(dep.cfg).length, history.length), envelope);
+  checkAnchors(envelope, plan, verified.outcome.leaves.map((l) => l.referenceTime));
+  // BRIDGE_COMPOSE_V2 also charges the lineage walk (spec section 6) on top of the schedule over every leaf
+  if (verified.lineage) {
+    gate.native += verified.lineage.splitGas;
+    gate.total += verified.lineage.splitGas;
+  }
+  return { envelope, encoded, verified, gate };
+}
+
+/**
+ * The envelope of a history and one witness per leaf, in leaf order: the anchor table (one anchor per distinct complete UC, in first-use
+ * order, each claim read from its own UC) and the leaf paths. Assembly only: nothing is verified here ({@link buildReturnProof} verifies
+ * the token first and checks the result), so a caller can also assemble what the chain must refuse (the live lane's negatives).
+ */
+export function assembleEnvelope(dep: Deployment, history: Uint8Array, proofs: readonly InclusionProof[]): { envelope: Envelope; encoded: Uint8Array } {
   const anchors: Anchor[] = [];
   const anchorOf = new Map<string, number>();
-  const leafProofs: LeafProof[] = proofs.map((p, i) => {
+  const leafProofs: LeafProof[] = proofs.map((p) => {
     const ucBytes = p.unicityCertificate.toCBOR();
     const key = toHex(ucBytes);
     let idx = anchorOf.get(key);
@@ -94,20 +117,7 @@ export async function buildReturnProof(
   });
   const envelope: Envelope = { policyBody: policyBytes(dep.policy), history, anchors, leafProofs };
   const encoded = encodeEnvelope(envelope);
-  if (encoded.length > MAX_ENVELOPE_BYTES) fail('ErrInputTooLarge');
-  // The composing verifier's own checks must pass on what we assembled, in its order: policy opening,
-  // anchor table, the gas estimate, then every anchor's opening and every leaf's own anchor time.
-  const sids = verified.outcome.leaves.map((l) => l.sid);
-  const pol = checkPolicyBody(dep.cfg, envelope);
-  const plan = planAnchors(pol, envelope, sids);
-  const gate = computeGate(cfgBytes(dep.cfg), encoded.length, kernelRequestBytes(cfgBytes(dep.cfg).length, history.length), envelope);
-  checkAnchors(envelope, plan, verified.outcome.leaves.map((l) => l.referenceTime));
-  // BRIDGE_COMPOSE_V2 also charges the lineage walk (spec section 6) on top of the schedule over every leaf
-  if (verified.lineage) {
-    gate.native += verified.lineage.splitGas;
-    gate.total += verified.lineage.splitGas;
-  }
-  return { envelope, encoded, verified, gate };
+  return { envelope, encoded };
 }
 
 /**

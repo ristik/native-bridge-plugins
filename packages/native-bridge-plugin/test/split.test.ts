@@ -21,7 +21,7 @@ import {
 } from '../src/split.js';
 
 /**
- * The protocol 6 split corpus (bft-core `bridgeprofile/testdata/split-corpus`, development copy in `protocol/split-vectors-dev`),
+ * The protocol 6 split corpus (bft-core `bridgeprofile/testdata/split-corpus`, sealed under `protocol/vectors/split`),
  * replayed by an implementation independent of the Go oracle that generated it.
  */
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol');
@@ -34,7 +34,7 @@ interface Case {
   aux?: Record<string, string>;
   expected: { status: 'ok' | 'error' | 'halt'; family?: string; reason?: string; output?: string; values?: Record<string, string>; split?: any };
 }
-const cases = (family: string): Case[] => load(`split-vectors-dev/${family}/cases.json`).cases as Case[];
+const cases = (family: string): Case[] => load(`vectors/split/${family}/cases.json`).cases as Case[];
 
 /** The verdict of `run`: ok, or the profile failure it raised. */
 async function verdict(run: () => unknown): Promise<{ status: 'ok' | 'error'; family?: string; reason?: string }> {
@@ -55,13 +55,14 @@ const devDeployment = () => {
   return makeDeployment(decodeCfg(fromHex(fx.cfg)!), fromHex(f.pins.dev.vaultCodeHash)!, new Uint8Array(32), { fields: 20 }, decodePolicy(fromHex(fx.policyBody)!));
 };
 
-test('split corpus: the development copy is the one this suite names, unedited (README digests)', () => {
-  const readme = readFileSync(path.join(ROOT, 'split-vectors-dev/README.md'), 'utf8');
-  const listed = [...readme.matchAll(/^([0-9a-f]{64})  (\S+)$/gm)].map((m) => [m[2], m[1]]);
+test('split corpus: every file this suite reads is in the sealed manifest (SHA256SUMS under MANIFEST.sha256), unedited', () => {
+  const sums = readFileSync(path.join(ROOT, 'vectors/SHA256SUMS'), 'utf8');
+  const listed = [...sums.matchAll(/^([0-9a-f]{64})  (split\/\S+)$/gm)].map((m) => [m[2], m[1]]);
   assert.equal(listed.length, 6);
-  for (const [file, digest] of listed) assert.equal(toHex(H(readFileSync(path.join(ROOT, 'split-vectors-dev', file)))), digest, file);
-  assert.equal(load('split-vectors-dev/config/fixtures.json').nativeBridgeProtoVersion, 6);
-  for (const fam of ['sum-tree', 'lineage', 'native']) assert.equal(load(`split-vectors-dev/${fam}/cases.json`).format, 'native-bridge-split-vectors/1', fam);
+  for (const [file, digest] of listed) assert.equal(toHex(H(readFileSync(path.join(ROOT, 'vectors', file)))), digest, file);
+  assert.equal(toHex(H(new TextEncoder().encode(sums))), readFileSync(path.join(ROOT, 'vectors/MANIFEST.sha256'), 'utf8').trim());
+  assert.equal(load('vectors/split/config/fixtures.json').nativeBridgeProtoVersion, 6);
+  for (const fam of ['sum-tree', 'lineage', 'native']) assert.equal(load(`vectors/split/${fam}/cases.json`).format, 'native-bridge-split-vectors/1', fam);
   // the split corpus uses the protocol 5 corpus's dev fixture
   assert.equal(toHex(H(fromHex(load('vectors/config/fixtures.json').fixtures.dev.cfg)!)), '67c007348bc786d6a4d31f1c55fa35ef5d42e37eec63a7b91e32594d190a907a');
 });
@@ -164,7 +165,7 @@ test('lineage family: the relation, the anchor plan and the openings give every 
 });
 
 test('compose status table V2: config/compose-status-v2.json is the plug-ins\' append-only table, code 0 ok', () => {
-  const table = load('split-vectors-dev/config/compose-status-v2.json') as { code: number; name: string }[];
+  const table = load('vectors/split/config/compose-status-v2.json') as { code: number; name: string }[];
   assert.deepEqual(table, [{ code: 0, name: 'ok' }, ...COMPOSE_STATUS_V2.map((name, i) => ({ code: i + 1, name }))]);
 });
 
@@ -235,9 +236,9 @@ const ANCHOR_ORDER: Record<string, [string, string]> = {
 
 test('mutation family: 400 seeded patches of a depth-2 input give the oracle\'s status (and gas) wherever the plug-ins decide', async () => {
   const dep = devDeployment();
-  const m = load('split-vectors-dev/mutation/cases.json');
+  const m = load('vectors/split/mutation/cases.json');
   assert.equal(m.format, 'native-bridge-split-mutations/1');
-  const names = (load('split-vectors-dev/config/compose-status-v2.json') as { code: number; name: string }[]).map((x) => x.name);
+  const names = (load('vectors/split/config/compose-status-v2.json') as { code: number; name: string }[]).map((x) => x.name);
   const base = fromHex(m.base)!;
   const tally = { halt: 0, same: 0, priced: 0, b1: 0, anchorOrder: 0 };
   for (const c of m.cases as { id: string; patch: { o: number; x: number }[]; expected: { status: string; values: Record<string, string> } }[]) {

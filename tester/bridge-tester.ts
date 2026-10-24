@@ -7,14 +7,15 @@
  *   bridge-tester.ts lock --amount <ether|Nwei>                                  lock test ether in the vault for a new token
  *   bridge-tester.ts mint [--token <nonce>]                                      fetch the lock's proof and mint the token on the aggregator
  *   bridge-tester.ts transfer [--token <nonce>] [--count <n>]                    certified transfers to fresh keys of this wallet
- *   bridge-tester.ts burn [--token <nonce>] [--recipient <0x address>]           burn the token for its return to an EVM address (default: this wallet's)
+ *   bridge-tester.ts split [--token <id>] --amounts <a,b,...>                     split the token into parts (each a token: --token <id>.1, <id>.2, ...)
+ *   bridge-tester.ts burn [--token <id>] [--recipient <0x address>]              burn the token (or a part) for its return to an EVM address (default: this wallet's)
  *   bridge-tester.ts redeem [--token <nonce>]                                    the return proof (consolidated by the aggregator), redeemed in the vault
  *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
  *
  * The wallet is a directory (--wallet, or BRIDGE_TESTER_WALLET, default ./bridge-wallet): keys.json (owner-only: the EVM key and the Unicity keys),
  * config.json, and tokens/<nonce>/ with the token file and its record. Keep it: a token exists only in its file.
  */
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
@@ -43,11 +44,12 @@ import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin
 import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { NativeBridge } from '../packages/native-bridge-plugin/src/verifier.js';
-import { consolidatedProofs } from '../packages/native-bridge-plugin/src/wallet.js';
+import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../packages/native-bridge-plugin/src/splitflow.js';
+import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
   amountBytes, appendTransaction, calldata, decBytes, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
-  requirePhase, TesterConfig, TokenRecord,
+  RECORD_ID, recordId, requirePhase, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
 
 /** The public gateway's request-body limit (bft-core deploy/testnet/gateway.py MAX_BODY). */
@@ -109,37 +111,45 @@ class Wallet {
     return new SigningService(unhex(this.keys().unicity[index]));
   }
 
-  tokenDir(nonce: string): string {
-    return `${this.dir}/tokens/${nonce}`;
+  tokenDir(id: string): string {
+    return `${this.dir}/tokens/${id}`;
   }
 
-  record(nonce?: string): TokenRecord {
+  /** `--token`: a nonce, or a part (`<nonce>.<n>...`); the newest by default. */
+  record(id?: string): TokenRecord {
     const all = this.records();
     if (all.length === 0) throw new Error('this wallet has no tokens yet: run lock');
-    const r = nonce === undefined ? all[all.length - 1] : all.find((t) => t.nonce === nonce);
-    if (!r) throw new Error(`this wallet has no token ${nonce} (it has ${all.map((t) => t.nonce).join(', ')})`);
+    const r = id === undefined ? all[all.length - 1] : all.find((t) => recordId(t) === id);
+    if (!r) throw new Error(`this wallet has no token ${id} (it has ${all.map(recordId).join(', ')})`);
     return r;
   }
 
   records(): TokenRecord[] {
     const dir = `${this.dir}/tokens`;
     if (!existsSync(dir)) return [];
-    return readdirSync(dir).filter((n) => /^\d+$/.test(n)).sort((a, b) => Number(a) - Number(b))
+    const key = (n: string) => n.split('.').map(Number);
+    const cmp = (a: string, b: string) => {
+      const [x, y] = [key(a), key(b)];
+      for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+      return x.length - y.length;
+    };
+    return readdirSync(dir).filter((n) => RECORD_ID.test(n)).sort(cmp)
       .map((n) => JSON.parse(readFileSync(`${dir}/${n}/token.json`, 'utf8')) as TokenRecord);
   }
 
   saveRecord(t: TokenRecord): void {
-    mkdirSync(this.tokenDir(t.nonce), { recursive: true });
-    writeFileSync(`${this.tokenDir(t.nonce)}/token.json`, `${JSON.stringify(t, null, 2)}\n`);
+    mkdirSync(this.tokenDir(recordId(t)), { recursive: true });
+    writeFileSync(`${this.tokenDir(recordId(t))}/token.json`, `${JSON.stringify(t, null, 2)}\n`);
   }
 
   async token(t: TokenRecord): Promise<{ bytes: Uint8Array; token: Token }> {
-    const bytes = Uint8Array.from(readFileSync(`${this.tokenDir(t.nonce)}/token.cbor`));
+    const bytes = Uint8Array.from(readFileSync(`${this.tokenDir(recordId(t))}/token.cbor`));
     return { bytes, token: await Token.fromCBOR(bytes) };
   }
 
   saveToken(t: TokenRecord, bytes: Uint8Array): void {
-    writeFileSync(`${this.tokenDir(t.nonce)}/token.cbor`, bytes);
+    mkdirSync(this.tokenDir(recordId(t)), { recursive: true });
+    writeFileSync(`${this.tokenDir(recordId(t))}/token.cbor`, bytes);
   }
 }
 
@@ -211,10 +221,18 @@ async function status(w: Wallet, nonce?: string): Promise<void> {
   const me = ethAddress(w.keys().eth);
   console.log(`EVM address ${me}: balance ${BigInt(await jsonRpc(cfg.ethUrl, 'eth_getBalance', [me, 'latest']))} wei, vault credit ${await chain.uint('claimable(address)', encAddress(me))} wei`);
   for (const t of nonce === undefined ? w.records() : [w.record(nonce)]) {
-    const digest = await chain.uint('lockDigest(uint256)', encUint(BigInt(t.nonce)));
-    const spent = await chain.uint('spentNullifier(uint256)', encUint(BigInt(t.nonce)));
-    console.log(`token ${t.nonce}: ${t.phase}, ${t.amountWei} wei, ${t.transfers} transfers${t.recipient ? `, returns to ${t.recipient}` : ''}; ` +
-      `vault: ${digest === 0n ? 'NO LOCK' : 'locked'}, ${spent === 0n ? 'not redeemed' : 'redeemed'}`);
+    const n = encUint(BigInt(t.nonce));
+    const digest = await chain.uint('lockDigest(uint256)', n);
+    // protocol 6: the vault keys spent state by (root lock nonce, part token ID); a whole token is the part whose ID is its own
+    let spent = 'not minted';
+    if (t.phase === 'split') spent = 'split (its parts redeem)';
+    else if (t.phase !== 'locked') {
+      const { token } = await w.token(t);
+      spent = (await chain.uint('spentPart(uint256,bytes32)', n, hex(token.id.bytes))) === 0n ? 'not redeemed' : 'redeemed';
+    }
+    const remaining = await chain.uint('remaining(uint256)', n);
+    console.log(`token ${recordId(t)}: ${t.phase}, ${t.amountWei} wei, ${t.transfers} transfers${t.recipient ? `, returns to ${t.recipient}` : ''}` +
+      `${t.parts ? `, split into ${t.parts.join(', ')}` : ''}; vault: ${digest === 0n ? 'NO LOCK' : `lock ${t.nonce} has ${remaining} wei left`}, this token ${spent}`);
   }
 }
 
@@ -246,7 +264,7 @@ async function mint(w: Wallet, nonce?: string): Promise<void> {
     if (res.status === 404 || res.status === 429 || res.status === 502) return undefined;
     throw new Error(`the lock-proof endpoint answered ${res.status}: ${(await res.text()).slice(0, 200)}`);
   }, 5000);
-  writeFileSync(`${w.tokenDir(t.nonce)}/lockproof.cbor`, lockProof);
+  writeFileSync(`${w.tokenDir(recordId(t))}/lockproof.cbor`, lockProof);
   const owner = w.owner(t.holder);
   const nonceN = BigInt(t.nonce);
   const amount = amountBytes(BigInt(t.amountWei));
@@ -266,7 +284,7 @@ async function mint(w: Wallet, nonce?: string): Promise<void> {
   await Token.fromCBOR(bytes);
   w.saveToken(t, bytes);
   w.saveRecord({ ...t, phase: 'minted' });
-  console.log(`minted token ${t.nonce}; next: transfer or burn`);
+  console.log(`minted token ${t.nonce}; next: transfer, split or burn`);
 }
 
 async function transfer(w: Wallet, nonce: string | undefined, count: number): Promise<void> {
@@ -284,7 +302,76 @@ async function transfer(w: Wallet, nonce: string | undefined, count: number): Pr
     t = { ...t, holder: next.index, transfers: t.transfers + 1 };
     w.saveRecord(t);
   }
-  console.log(`token ${t.nonce}: ${t.transfers} transfers; next: transfer or burn`);
+  console.log(`token ${recordId(t)}: ${t.transfers} transfers; next: transfer, split or burn`);
+}
+
+/** The split's journal: one file next to the token, replaced atomically (write, then rename), so a crash leaves the last complete record. */
+class FileSplitJournal implements SplitJournal {
+  constructor(readonly path: string) {}
+  put(r: SplitRecord): Promise<void> {
+    const json = JSON.stringify({ ...r, source: hex(r.source), burnStateMask: hex(r.burnStateMask), burnRequest: r.burnRequest && hex(r.burnRequest), burned: r.burned && hex(r.burned),
+      children: r.children.map((c) => c && hex(c)), outputs: r.outputs.map((o) => ({ recipient: hex(o.recipient), amount: o.amount.toString(), salt: hex(o.salt) })) }, null, 2);
+    writeFileSync(`${this.path}.tmp`, `${json}\n`);
+    renameSync(`${this.path}.tmp`, this.path);
+    return Promise.resolve();
+  }
+  get(): Promise<SplitRecord | null> {
+    if (!existsSync(this.path)) return Promise.resolve(null);
+    const j = JSON.parse(readFileSync(this.path, 'utf8'));
+    return Promise.resolve({ ...j, source: unhex(j.source), burnStateMask: unhex(j.burnStateMask), burnRequest: j.burnRequest && unhex(j.burnRequest), burned: j.burned && unhex(j.burned),
+      children: j.children.map((c: string | null) => c && unhex(c)), outputs: j.outputs.map((o: { recipient: string; amount: string; salt: string }) => ({ recipient: unhex(o.recipient), amount: BigInt(o.amount), salt: unhex(o.salt) })) });
+  }
+}
+
+/**
+ * Split a held token into parts (protocol 6): the manifest burn of the token, then one mint per part, each to a fresh key of this wallet. The plan
+ * (amounts, keys, salts, the burn's mask) is journaled in split.json before anything is submitted, and every certified step after it, so running
+ * `split` again on the same token after a crash continues the same split (its --amounts must then be the same). Each part is a token of its own
+ * (`--token <id>.<n>`) that can be transferred, split again or burned and redeemed against the original lock.
+ */
+async function split(w: Wallet, id: string | undefined, amountsText: string): Promise<void> {
+  const t = w.record(id);
+  requirePhase(t, 'minted', 'split');
+  const amounts = splitAmounts(amountsText, BigInt(t.amountWei));
+  const cfg = w.config;
+  const { bridge } = await installedBridge(cfg, new Chain(cfg));
+  const plugin = createNativeBridgePlugin(bridge, { manifestRevision: 'tester', profileRevision: 'tester' });
+  const journal = new FileSplitJournal(`${w.tokenDir(recordId(t))}/split.json`);
+  let record = await journal.get();
+  const owners: number[] = [];
+  if (record === null) {
+    const { bytes } = await w.token(t);
+    const outputs = amounts.map((amount) => {
+      const o = w.newOwner();
+      owners.push(o.index);
+      return { recipient: EncodedPredicate.fromPredicate(SignaturePredicate.create(o.signer.publicKey)).toCBOR(), amount, salt: secp256k1.utils.randomSecretKey() };
+    });
+    const plan = await planSplit(plugin, recordId(t), bytes, outputs);
+    plan.estimates.forEach((g, i) => console.log(`  part ${i + 1}: ${amounts[i]} wei; its redemption needs at least ${g.total} gas`));
+    record = plan.record;
+    await journal.put(record);
+  } else {
+    if (record.outputs.length !== amounts.length || record.outputs.some((o, i) => o.amount !== amounts[i])) {
+      throw new Error(`token ${recordId(t)} has a split under way with --amounts ${record.outputs.map((o) => `${o.amount}wei`).join(',')}: run it again with those`);
+    }
+    console.log('  continuing the split journaled in split.json');
+    const keys = w.keys().unicity.map((k) => hex(EncodedPredicate.fromPredicate(SignaturePredicate.create(new SigningService(unhex(k)).publicKey)).toCBOR()));
+    for (const o of record.outputs) owners.push(keys.indexOf(hex(o.recipient)));
+  }
+  const agg = new AggregatorClient(cfg.aggUrl);
+  const children = await runSplit(plugin, record, {
+    journal,
+    unlock: (tx) => SignaturePredicateUnlockScript.create(tx, w.owner(t.holder)),
+    certify: (cd, what) => certify(agg, cd, what),
+  });
+  const parts = children.map((bytes, i) => {
+    const part: TokenRecord = { ...t, id: `${recordId(t)}.${i + 1}`, amountWei: amounts[i].toString(), phase: 'minted', holder: owners[i], transfers: 0, parent: recordId(t), parts: undefined, recipient: undefined, redeemTx: undefined };
+    w.saveToken(part, bytes);
+    w.saveRecord(part);
+    return recordId(part);
+  });
+  w.saveRecord({ ...t, phase: 'split', parts });
+  console.log(`split token ${recordId(t)} into ${parts.map((p, i) => `${p} (${amounts[i]} wei)`).join(', ')}; next: transfer, split or burn a part (--token ${parts[0]})`);
 }
 
 async function burn(w: Wallet, nonce: string | undefined, recipient?: string): Promise<void> {
@@ -302,7 +389,7 @@ async function burn(w: Wallet, nonce: string | undefined, recipient?: string): P
   await Token.fromCBOR(burned);
   w.saveToken(t, burned);
   w.saveRecord({ ...t, phase: 'burned', recipient: to });
-  console.log(`burned token ${t.nonce} for its return to ${to}; next: redeem`);
+  console.log(`burned token ${recordId(t)} for its return to ${to}; next: redeem`);
 }
 
 async function redeem(w: Wallet, nonce?: string): Promise<void> {
@@ -333,7 +420,7 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
       throw new Error(`no return proof: the consolidation was unavailable (${why}) and the proofs as certified do not make one: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  writeFileSync(`${w.tokenDir(t.nonce)}/envelope.bin`, ret.encoded);
+  writeFileSync(`${w.tokenDir(recordId(t))}/envelope.bin`, ret.encoded);
   const data = calldata('redeem(bytes)', encBytes(ret.encoded));
   const url = cfg.redeemEthUrl ?? cfg.ethUrl;
   if (url === cfg.ethUrl && data.length + 1024 > GATEWAY_MAX_BODY) {
@@ -342,14 +429,16 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
   // the vault accepts the envelope once the root chain's seal of it is within the registry's usable origin (a few rounds)
   await waitFor('the vault to accept the return proof', 240_000, async () => {
     try {
-      return BigInt(await chain.call(data, ethAddress(w.keys().eth), url)) === BigInt(t.nonce) ? true : undefined;
+      // redeem returns (uint256 nonce, bytes32 partId): the root lock's nonce and this token's ID
+      const ret = (await chain.call(data, ethAddress(w.keys().eth), url)).replace(/^0x/, '');
+      return BigInt(`0x${ret.slice(0, 64)}`) === BigInt(t.nonce) && ret.slice(64, 128) === hex(token.id.bytes) ? true : undefined;
     } catch {
       return undefined;
     }
   }, 3000);
   const rc = await chain.send(w.keys().eth, data, 0n, url);
   w.saveRecord({ ...t, phase: 'redeemed', redeemTx: rc.transactionHash });
-  console.log(`redeemed token ${t.nonce}: ${t.recipient} is credited ${t.amountWei} wei (gas used ${BigInt(rc.gasUsed)}); next: claim (by ${t.recipient})`);
+  console.log(`redeemed token ${recordId(t)}: ${t.recipient} is credited ${t.amountWei} wei of lock ${t.nonce} (gas used ${BigInt(rc.gasUsed)}); next: claim (by ${t.recipient})`);
 }
 
 async function claim(w: Wallet, to?: string): Promise<void> {
@@ -366,15 +455,15 @@ async function claim(w: Wallet, to?: string): Promise<void> {
 }
 
 // ---- the command line -------------------------------------------------------------------------------------------------------------------------
-const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | burn [--recipient 0x..] | redeem | claim [--to 0x..]; ' +
-  'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce> (default the newest)';
+const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem | claim [--to 0x..]; ' +
+  'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce or part, e.g. 5.1> (default the newest)';
 
 export async function main(argv: string[]): Promise<void> {
   const { positionals, values } = parseArgs({
     args: argv, allowPositionals: true, strict: true,
     options: {
       wallet: { type: 'string' }, config: { type: 'string' }, 'eth-key-file': { type: 'string' }, token: { type: 'string' }, amount: { type: 'string' },
-      count: { type: 'string' }, recipient: { type: 'string' }, to: { type: 'string' },
+      count: { type: 'string' }, recipient: { type: 'string' }, to: { type: 'string' }, amounts: { type: 'string' },
     },
   });
   const w = new Wallet(values.wallet ?? process.env.BRIDGE_TESTER_WALLET ?? './bridge-wallet');
@@ -397,6 +486,9 @@ export async function main(argv: string[]): Promise<void> {
       if (!Number.isInteger(n) || n < 1 || n > 254) throw new Error('--count must be 1 to 254');
       return transfer(w, values.token, n);
     }
+    case 'split':
+      if (!values.amounts) throw new Error(`split needs --amounts\n${USAGE}`);
+      return split(w, values.token, values.amounts);
     case 'burn':
       return burn(w, values.token, values.recipient);
     case 'redeem':

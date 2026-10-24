@@ -1,6 +1,6 @@
 //! Native-call acceptance of the merged bridge vault: the real vault and verifier runtimes, the
 //! real registry genesis of the production B1 path and the Unicity node's EVM factory, with the B2
-//! kernel at 0x0104 (prepareLock) and the native composition BRIDGE_COMPOSE_V1 at 0x0105 (mint and
+//! kernel at 0x0104 (prepareLock) and the native composition BRIDGE_COMPOSE_V2 at 0x0105 (mint and
 //! return, B7 direct PR 2) executing natively; B1 at 0x0100/0x0102 is recorded too, and the verifier
 //! must no longer call it directly. Every call to those addresses is recorded by an inspector.
 //! Restart/reorg and a running aggregator are NOT covered here.
@@ -49,7 +49,7 @@ const NATIVE: [(Address, &str); 4] = [
     ),
     (
         address!("0000000000000000000000000000000000000105"),
-        "BRIDGE_COMPOSE_V1 0x0105",
+        "BRIDGE_COMPOSE_V2 0x0105",
     ),
 ];
 const DEPOSITOR: Address = address!("00000000000000000000000000000000000d0001");
@@ -73,14 +73,16 @@ sol! {
     }
     function lock(bytes p0) external payable returns (uint256);
     function verifyMint(bytes proof) external view returns (uint256);
-    function redeem(bytes proof) external returns (uint256);
+    function redeem(bytes proof) external returns (uint256 nonce, bytes32 partId);
     function claim(uint256 amount, address to) external;
     function lastNonce() external view returns (uint256);
     function locked() external view returns (uint256);
     function credited() external view returns (uint256);
     function paid() external view returns (uint256);
     function lockDigest(uint256 n) external view returns (bytes32);
-    function spentNullifier(uint256 n) external view returns (bytes32);
+    function spentPart(uint256 n, bytes32 partId) external view returns (bytes32);
+    function redeemedAmount(uint256 n) external view returns (uint256);
+    function remaining(uint256 n) external view returns (uint256);
     function claimable(address a) external view returns (uint256);
     function unexpectedValue() external view returns (uint256);
     function CFG() external view returns (bytes32);
@@ -417,7 +419,7 @@ fn snapshot(w: &World, at: Address) -> (U256, BTreeMap<U256, U256>) {
 const KERNEL: &str = "B2 kernel 0x0104";
 const UC: &str = "B1 CERT_BATCH_V2 0x0100";
 const MEMBER: &str = "B1 RSMT_MEMBER_V1 0x0102";
-const COMPOSE: &str = "BRIDGE_COMPOSE_V1 0x0105";
+const COMPOSE: &str = "BRIDGE_COMPOSE_V2 0x0105";
 /// The status codes of config/compose-status.json the refusals below expect (bft-core `ComposeStatus`).
 const STATUS_ANCHOR_AUTH: u64 = 61;
 const STATUS_LEAF_PROOF: u64 = 62;
@@ -447,43 +449,60 @@ fn require_exact(step: &str, o: &Out, want: &[(&str, usize)]) {
 /// The CBOR item heads of one canonical definite-length object (tags and containers, scalar and string heads, every child and
 /// map key and value; the contents of a byte or text string are opaque): bft-core `BridgeItems`, the J of the history.
 fn cbor_items(b: &[u8]) -> u64 {
-    fn item(b: &[u8], pos: &mut usize) -> u64 {
-        let ib = b[*pos];
-        *pos += 1;
-        let (major, ai) = (ib >> 5, ib & 31);
-        let arg = match ai {
-            0..=23 => u64::from(ai),
-            24..=27 => {
-                let n = 1usize << (ai - 24);
-                let v = b[*pos..*pos + n]
-                    .iter()
-                    .fold(0u64, |a, &x| (a << 8) | u64::from(x));
-                *pos += n;
-                v
-            }
-            _ => panic!("indefinite or reserved CBOR head in the history"),
-        };
-        match major {
-            2 | 3 => {
-                *pos += arg as usize;
-                1
-            }
-            4 => 1 + (0..arg).map(|_| item(b, pos)).sum::<u64>(),
-            5 => 1 + (0..2 * arg).map(|_| item(b, pos)).sum::<u64>(),
-            6 => 1 + item(b, pos),
-            _ => 1,
-        }
-    }
     let mut pos = 0;
-    let n = item(b, &mut pos);
+    let n = cbor_item(b, &mut pos);
     assert_eq!(pos, b.len(), "trailing bytes after the history");
     n
 }
 
-/// The one BRIDGE_COMPOSE_V1 call of a mint or return: its input is `abi.encode(op, cfg, envelope)` with the golden envelope, its
-/// 384-byte output carries the marker, status 0 and the golden result, and the gas it charged is the plug-ins' estimate
-/// `G_compose = 100000 + 2B + 20J + 16000L + 6000Q + 29900E + 2000A + 250P + 50K*ceil(log2 K)` computed from the golden scans (J
-/// of the Cfg, policy, UCs and IR openings from the gate components, plus the history's item heads). Returns the charged gas.
+/// One canonical definite-length CBOR item at `pos`: advances past it and returns its item heads (as `cbor_items` counts them).
+fn cbor_item(b: &[u8], pos: &mut usize) -> u64 {
+    let ib = b[*pos];
+    *pos += 1;
+    let (major, ai) = (ib >> 5, ib & 31);
+    let arg = match ai {
+        0..=23 => u64::from(ai),
+        24..=27 => {
+            let n = 1usize << (ai - 24);
+            let v = b[*pos..*pos + n]
+                .iter()
+                .fold(0u64, |a, &x| (a << 8) | u64::from(x));
+            *pos += n;
+            v
+        }
+        _ => panic!("indefinite or reserved CBOR head in the history"),
+    };
+    match major {
+        2 | 3 => {
+            *pos += arg as usize;
+            1
+        }
+        4 => 1 + (0..arg).map(|_| cbor_item(b, pos)).sum::<u64>(),
+        5 => 1 + (0..2 * arg).map(|_| cbor_item(b, pos)).sum::<u64>(),
+        6 => 1 + cbor_item(b, pos),
+        _ => 1,
+    }
+}
+
+/// The byte length of the outer mint M of a history `[[M, CD0, t0], [...]]`: the return's `16*len(outer mint)` term of `G_split`,
+/// which the composition charges at every depth (bft-core `verifyLineage`; the plug-ins' `SPLIT_PER_BYTE * mintRaw`).
+fn outer_mint_len(history: &[u8]) -> u64 {
+    assert_eq!(
+        &history[..2],
+        &[0x82, 0x83],
+        "history head [[M, CD0, t0], ...]"
+    );
+    let mut pos = 2;
+    cbor_item(history, &mut pos);
+    (pos - 2) as u64
+}
+
+/// The one BRIDGE_COMPOSE_V2 call of a mint or return: its input is `abi.encode(op, cfg, envelope)` with the golden envelope, its
+/// 480-byte output carries the marker, status 0 and the golden result (an unsplit token: the part is the root, depth 0), and
+/// the gas it charged is the plug-ins' estimate
+/// `G_compose = 100000 + 2B + 20J + 16000L + 6000Q + 29900E + 2000A + 250P + 50K*ceil(log2 K) + G_split` computed from the golden
+/// scans (J of the Cfg, policy, UCs and IR openings from the gate components, plus the history's item heads; `G_split` of a
+/// depth 0 return is `16*len(outer mint)`, of a mint zero). Returns the charged gas.
 fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
     let c = o
         .native
@@ -502,10 +521,10 @@ fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
         "{step}: the compose envelope is the oracle's"
     );
     let out = hx(&c["output"]);
-    assert_eq!(out.len(), 384, "{step}: compose output bytes");
+    assert_eq!(out.len(), 480, "{step}: compose output bytes");
     assert_eq!(
         &out[..25],
-        b"UNICITY_BRIDGE_COMPOSE_V1",
+        b"UNICITY_BRIDGE_COMPOSE_V2",
         "{step}: compose marker"
     );
     assert!(
@@ -528,6 +547,21 @@ fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
         h32(&golden["result"]["nullifier"]),
         "{step}: nullifier"
     );
+    // protocol 6 words 12..14: the redeemed part is the root (partTokenId = tokenId, partAmount = amount, splitDepth 0)
+    assert_eq!(
+        B256::from_slice(&out[384..416]),
+        h32(&golden["result"]["tokenId"]),
+        "{step}: partTokenId"
+    );
+    assert_eq!(
+        U256::from_be_slice(&out[416..448]),
+        U256::from_str_radix(golden["result"]["amount"].as_str().unwrap(), 10).unwrap(),
+        "{step}: partAmount"
+    );
+    assert!(
+        U256::from_be_slice(&out[448..480]).is_zero(),
+        "{step}: splitDepth 0"
+    );
     let g = &e["gate"];
     let n = |k: &str| g[k].as_u64().unwrap();
     let gr = |k: &str| g["grouping"][k].as_u64().unwrap();
@@ -548,7 +582,12 @@ fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
         + 29_900 * gr("e")
         + 2_000 * gr("a")
         + 250 * n("steps")
-        + group;
+        + group
+        + if op == 2 {
+            16 * outer_mint_len(&hx(&golden["history"]))
+        } else {
+            0
+        };
     let charged = c["gasUsed"].as_u64().unwrap();
     assert_eq!(
         charged, want,
@@ -915,7 +954,7 @@ fn main() {
     steps.push(tx_json(&w, "lock", &o, json!({"lockDigest": h(digest.as_slice()), "kernelRequestAndResultEqualOracle": true, "minGasLimit": bisect_min_gas(&w0, &t(DEPOSITOR, lockCall { p0: p0.clone().into() }.abi_encode(), WEI), false)})));
     let w1 = w.clone();
 
-    // ---- verifyMint (one native BRIDGE_COMPOSE_V1 call at 0x0105, no direct B1/B2 call) ----
+    // ---- verifyMint (one native BRIDGE_COMPOSE_V2 call at 0x0105, no direct B1/B2 call) ----
     let vm = t(
         THIRD_PARTY,
         verifyMintCall {
@@ -961,12 +1000,38 @@ fn main() {
     let min = bisect_min_gas(&w1, &rd, false);
     let credit = w.view_u(vault_addr, claimableCall { a: recipient }.abi_encode());
     assert_eq!(credit, amount);
+    // protocol 6: redeem returns (nonce, partId); the part's nullifier is spentPart[1][tokenId] and the lock is complete
+    let part_id = h32(&golden["return"]["result"]["tokenId"]);
+    assert_eq!(
+        o.output,
+        [
+            U256::from(1).to_be_bytes::<32>().as_slice(),
+            part_id.as_slice()
+        ]
+        .concat(),
+        "redeem returns (nonce 1, partId)"
+    );
     assert_eq!(
         w.view_b(
             vault_addr,
-            spentNullifierCall { n: U256::from(1) }.abi_encode()
+            spentPartCall {
+                n: U256::from(1),
+                partId: part_id
+            }
+            .abi_encode()
         ),
         h32(&golden["return"]["result"]["nullifier"])
+    );
+    assert_eq!(
+        (
+            w.view_u(
+                vault_addr,
+                redeemedAmountCall { n: U256::from(1) }.abi_encode()
+            ),
+            w.view_u(vault_addr, remainingCall { n: U256::from(1) }.abi_encode())
+        ),
+        (amount, U256::ZERO),
+        "redeemedAmount and remaining after the whole-token redemption"
     );
     steps.push(tx_json(&w, "redeem (third-party submitter)", &o, json!({"creditedRecipient": h(recipient.as_slice()), "credit": credit.to_string(), "minGasLimit": min, "composeGas": compose_gas})));
     let w2 = w.clone();

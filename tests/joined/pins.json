@@ -1,10 +1,10 @@
 {
-  "profile": "utb-history-protocol-5",
+  "profile": "utb-history-protocol-6",
   "sources": {
-    "plugins": "9286df6f5220ea38ee5cd027d10a052b86cbee9a",
-    "ureth": "ef52f3c178ee3c4e6bc8827d1b6fd0b1d3652bc4",
-    "contracts": "fe5a6930f2c31c6e0f2d6ba479207e61f367dabf",
-    "oracle": "17dfe06becad1e3890f1f8bc233bf806d234bf02",
+    "plugins": "19c6b274157fd5ff9fed9f43552debcc79d01e55",
+    "ureth": "d41d5310329fb56ae288134a0261b234c16effc1",
+    "contracts": "31b2ec1a9736c8597dc53803da5481117502abbd",
+    "oracle": "cb4152c9b7fa5538e5597b91483ba30352f9d714",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
@@ -20,5 +20,5 @@
     "old-J validity across rotation",
     "full B1/SDK seal-signature acceptance parity"
   ],
-  "pluginsTree": "d00d86c7b07f8f5e4415f1528374d11185efa5d81a41a047d1331dafacaad30e"
+  "pluginsTree": "8dbef5f7b4e0a773b6231f939d4db5e76891c83911e60f9ab66a50a4edefbf0c"
 }

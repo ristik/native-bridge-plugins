@@ -84,8 +84,8 @@ class FakeVault implements RedeemTransport, ClaimTransport {
     return hash;
   }
   public receipt(h: string): Promise<'success' | 'reverted' | undefined> { return Promise.resolve(this.receipts.get(h)); }
-  /** The real vault answers `spentNullifier(nonce)` with a ZERO WORD for a nonce that was not redeemed. */
-  public spentNullifier(nonce: bigint): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent.get(nonce) ?? new Uint8Array(32)); }
+  /** The real vault answers `spentPart(nonce, partId)` with a ZERO WORD for a part that was not redeemed (these tokens are whole: one part per nonce). */
+  public spentPart(nonce: bigint, _partId: Uint8Array): Promise<Uint8Array | undefined> { return Promise.resolve(this.spent.get(nonce) ?? new Uint8Array(32)); }
   public claimable(r: Uint8Array): Promise<bigint> { return Promise.resolve(this.credit.get(this.key(r)) ?? 0n); }
 }
 
@@ -214,12 +214,12 @@ test('a pending hash with no receipt does not hide a redemption the vault alread
 test('the vault\'s real answer for an unredeemed nonce, a zero word, is "not redeemed"; a missing answer is the same', async () => {
   const s = await setup();
   const vault = new FakeVault(s);
-  assert.deepEqual(await vault.spentNullifier(s.entry.nonce), new Uint8Array(32));
+  assert.deepEqual(await vault.spentPart(s.entry.nonce, new Uint8Array(32)), new Uint8Array(32));
   assert.equal((await redeemBurned(s.plugin, s.payments, 'b1', s.source, chain, vault, rp())).status, 'redeemed');
   assert.equal(vault.sentRedeems.length, 1, 'a zero word did not read as another burn\'s nullifier');
   const t = await setup();
   const v2 = new FakeVault(t);
-  v2.spentNullifier = () => Promise.resolve(undefined);
+  v2.spentPart = () => Promise.resolve(undefined);
   assert.equal((await redeemBurned(t.plugin, t.payments, 'b1', t.source, chain, v2, rp())).status, 'redeemed');
 });
 
