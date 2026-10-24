@@ -68,31 +68,25 @@ fn mpt_accepts_the_exact_path_and_nothing_else() {
     extra.push(refs[0]);
     assert_eq!(
         mpt::verify_proof(&root, &key, &extra).unwrap_err(),
-        E::MptMalformed
+        E::MPTExtraneous
     );
     assert_eq!(
         mpt::verify_proof(&root, &key, &refs[..refs.len() - 1]).unwrap_err(),
-        E::MptMalformed
+        E::MPTPath
     );
-    assert_eq!(
-        mpt::verify_proof(&root, &key, &[]).unwrap_err(),
-        E::MptMalformed
-    );
+    assert_eq!(mpt::verify_proof(&root, &key, &[]).unwrap_err(), E::MPTNode);
     if refs.len() > 1 {
         let mut rev = refs.clone();
         rev.swap(0, 1);
         assert_eq!(
             mpt::verify_proof(&root, &key, &rev).unwrap_err(),
-            E::MptMalformed
+            E::MPTNode
         );
     }
     let mut m = proof.clone();
     m[0][5] ^= 1;
     let mr: Vec<&[u8]> = m.iter().map(Vec::as_slice).collect();
-    assert_eq!(
-        mpt::verify_proof(&root, &key, &mr).unwrap_err(),
-        E::MptMalformed
-    );
+    assert_eq!(mpt::verify_proof(&root, &key, &mr).unwrap_err(), E::MPTNode);
     // another key never verifies against this path, and another root never does either.
     assert!(mpt::verify_proof(&root, &sha(b"absent"), &refs).is_err());
     assert!(mpt::verify_proof(&[1; 32], &key, &refs).is_err());
@@ -107,12 +101,12 @@ fn mpt_rejects_a_leaf_with_an_unused_key_suffix_or_a_short_key() {
     longer.push(0);
     assert_eq!(
         mpt::verify_proof(&root, &longer, &refs).unwrap_err(),
-        E::MptMalformed
+        E::MPTPath
     );
     // A key one byte shorter ends the leaf comparison early.
     assert_eq!(
         mpt::verify_proof(&root, &key[..31], &refs).unwrap_err(),
-        E::MptMalformed
+        E::MPTAbsent
     );
 }
 
@@ -142,14 +136,14 @@ fn hex_prefix_flags_are_validated() {
     let root = keccak(&[&bad]);
     assert_eq!(
         mpt::verify_proof(&root, &[0u8; 32], &[&bad]).unwrap_err(),
-        E::MptMalformed
+        E::MPTNode
     );
     // Even-length flag with a nonzero pad nibble.
     let bad = rlp::encode_list(&[&rlp::encode_bytes(&[0x21]), &rlp::encode_bytes(&[1; 40])]);
     let root = keccak(&[&bad]);
     assert_eq!(
         mpt::verify_proof(&root, &[0u8; 32], &[&bad]).unwrap_err(),
-        E::MptMalformed
+        E::MPTNode
     );
 }
 

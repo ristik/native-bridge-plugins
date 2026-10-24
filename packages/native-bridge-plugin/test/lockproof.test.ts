@@ -42,23 +42,23 @@ test('baseline lock proof verifies', async () => {
 
 test('cfg and trustBaseId must match the installed deployment and trust base', async () => {
   await rejects(mutated((_, p) => void (p.cfg = flip(p.cfg, 0))), 'ErrLockProofCfg');
-  await rejects(mutated((_, p) => void (p.trustBaseId = flip(p.trustBaseId, 0))), 'ErrLockProofTrust');
+  await rejects(mutated((_, p) => void (p.trustBaseId = flip(p.trustBaseId, 0))), 'ErrTrustBaseDigest');
 });
 
 test('quorum: one short is rejected, three of four is enough, a stranger fails the seal (B1)', async () => {
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2 }))), 'ErrQuorumNotMet');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2 }))), 'ErrLockUC');
   await mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 3 })));
   // B1: every signature must be a valid one of a committee member; an unknown signer fails the seal even beside a full quorum
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: [['intruder', signer(200)]] }))), 'ErrQuorumNotMet');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: [['intruder', signer(200)]] }))), 'ErrLockUC');
   // Two genuine plus two known members signing with the wrong keys: no quorum.
   await rejects(
     mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2, extra: [[w.evm.signers[2][0], signer(201)], [w.evm.signers[3][0], signer(202)]] }))),
-    'ErrQuorumNotMet',
+    'ErrLockUC',
   );
 });
 
 test('certificate checks: false root, wrong network, an epoch not held yet, an epoch before the genesis', async () => {
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { sealHash: new Uint8Array(32).fill(1) }))), 'ErrSealRoot');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { sealHash: new Uint8Array(32).fill(1) }))), 'ErrLockUC');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { network: 4 }))), 'ErrSealNetwork');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 9n }))), 'ErrNoEntryForEpoch');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 1n }))), 'ErrSealEpoch');
@@ -76,22 +76,22 @@ test('an epoch change: retryable until the history holds the new epoch, then ver
   await mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 1500n })), undefined, held);
   // ... under epoch 3's committee only, within its interval
   await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 500n })), undefined, held), 'ErrSealEpoch');
-  await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 3n, round: 1500n })), undefined, held), 'ErrQuorumNotMet');
+  await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 3n, round: 1500n })), undefined, held), 'ErrLockUC');
   // epoch 2 has ended at round 1000: an epoch-2 seal at round 1500 is outside its interval
   await rejects(mutated(async (ww, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 2n, round: 1500n })), undefined, held), 'ErrSealEpoch');
 });
 
 test('EVM partition, shard and configuration pins', async () => {
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { partition: EVM_PARTITION + 1 }))), 'ErrEvmPartition');
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { shard: { bytes: Uint8Array.of(0x40), siblings: [new Uint8Array(32)] } }))), 'ErrEvmShard');
-  await rejects(mutated((_, p) => void (p.pdr = flip(p.pdr, 3))), 'ErrEvmConfigHash');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { partition: EVM_PARTITION + 1 }))), 'ErrLockUC');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { shard: { bytes: Uint8Array.of(0x40), siblings: [new Uint8Array(32)] } }))), 'ErrLockUC');
+  await rejects(mutated((_, p) => void (p.pdr = flip(p.pdr, 3))), 'ErrLockPDR');
   // A self-consistent certificate over a PDR changing a non-membership setting.
   await rejects(
     mutated(async (w, p) => {
       p.pdr = pdrBytes(5n, 1n);
       p.uc = await resignUc(w, p, { conf: sha(p.pdr) });
     }),
-    'ErrEvmConfigPin',
+    'ErrLockPDR',
   );
   // A later shard epoch committing to its own PDR keeps the pin.
   await mutated(async (w, p) => {
@@ -99,23 +99,23 @@ test('EVM partition, shard and configuration pins', async () => {
     p.uc = await resignUc(w, p, { conf: sha(p.pdr), epochIr: 6n });
   });
   // Certified shard epoch must be the PDR's epoch.
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { epochIr: 9n }))), 'ErrEvmConfigPin');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { epochIr: 9n }))), 'ErrLockPDR');
   // Non-canonical PDR (long-form integer head), committed by the certificate.
   await rejects(
     mutated(async (w, p) => {
       p.pdr = Uint8Array.of(p.pdr[0], 0x18, 0x01, ...p.pdr.slice(2));
       p.uc = await resignUc(w, p, { conf: sha(p.pdr) });
     }),
-    'ErrEvmConfigPin',
+    'ErrLockPDR',
   );
 });
 
 test('header bindings', async () => {
-  await rejects(mutated((_, p) => void (p.header = flip(p.header, 40))), 'ErrHeaderHash');
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { stateHash: new Uint8Array(32).fill(0x5a) }))), 'ErrHeaderRoot');
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: new Uint8Array(32).fill(0x5b) }))), 'ErrHeaderHash');
+  await rejects(mutated((_, p) => void (p.header = flip(p.header, 40))), 'ErrLockHeader');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { stateHash: new Uint8Array(32).fill(0x5a) }))), 'ErrLockHeader');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: new Uint8Array(32).fill(0x5b) }))), 'ErrLockHeader');
   // a changed state with no block hash is not a native input record: refused by the certificate check, before any header binding
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: null }))), 'ErrCertStructure');
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { blockHash: null }))), 'ErrLockUC');
   // A well-formed 21-field header under a deployment pinned to 20 fields.
   await rejects(
     mutated(async (w, p) => {
@@ -124,21 +124,21 @@ test('header bindings', async () => {
       p.header = headerRlp(stateRoot, 1234n, 21);
       p.uc = await resignUc(w, p, { blockHash: keccak256(p.header) });
     }),
-    'ErrHeaderProfile',
+    'ErrLockHeader',
   );
 });
 
 test('account and storage proofs: mutated, extra, missing, empty nodes', async () => {
-  await rejects(mutated((_, p) => void (p.accountNodes[0] = flip(p.accountNodes[0], 10))), 'ErrAccountProof');
-  await rejects(mutated((_, p) => void p.accountNodes.push(p.accountNodes[0])), 'ErrAccountProof');
-  await rejects(mutated((_, p) => void p.accountNodes.pop()), 'ErrAccountProof');
+  await rejects(mutated((_, p) => void (p.accountNodes[0] = flip(p.accountNodes[0], 10))), 'ErrLockAccount');
+  await rejects(mutated((_, p) => void p.accountNodes.push(p.accountNodes[0])), 'ErrLockAccount');
+  await rejects(mutated((_, p) => void p.accountNodes.pop()), 'ErrLockAccount');
   await rejects(mutated((_, p) => void (p.accountNodes = [])), 'ErrLockProofShape');
-  await rejects(mutated(() => undefined, (s) => void (s.evm.vaultCodeHash = new Uint8Array(32).fill(0x77))), 'ErrAccountCode');
-  await rejects(mutated((_, p) => void (p.storageNodes[0] = flip(p.storageNodes[0], 12))), 'ErrStorageProof');
-  await rejects(mutated((_, p) => void p.storageNodes.push(p.storageNodes[0])), 'ErrStorageProof');
-  await rejects(mutated(() => undefined, (s) => void (s.evm.nonce = 99n)), 'ErrStorageProof');
+  await rejects(mutated(() => undefined, (s) => void (s.evm.vaultCodeHash = new Uint8Array(32).fill(0x77))), 'ErrLockCodeHash');
+  await rejects(mutated((_, p) => void (p.storageNodes[0] = flip(p.storageNodes[0], 12))), 'ErrLockStorage');
+  await rejects(mutated((_, p) => void p.storageNodes.push(p.storageNodes[0])), 'ErrLockStorage');
+  await rejects(mutated(() => undefined, (s) => void (s.evm.nonce = 99n)), 'ErrLockStorage');
   await rejects(mutated(() => undefined, (s) => void (s.evm.stored = new Uint8Array(32).fill(0x42))), 'ErrLockDigest');
-  await rejects(mutated(() => undefined, (s) => void (s.evm.stored = new Uint8Array(32))), 'ErrStorageValue');
+  await rejects(mutated(() => undefined, (s) => void (s.evm.stored = new Uint8Array(32))), 'ErrLockStorage');
 });
 
 test('a digest with leading zero bytes round trips through the stored word', async () => {
@@ -237,7 +237,7 @@ test('a weighted committee after a rotation: the heavy member alone certifies th
   await mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 1500n, signers: 1 })), undefined, held);
   await rejects(
     mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 1500n, signers: 0, extra: next.signers.slice(1) })), undefined, held),
-    'ErrQuorumNotMet',
+    'ErrLockUC',
   );
 });
 
@@ -274,6 +274,6 @@ test('several faults get the oracle verdict: the seal epoch first, then the conf
       p.uc = await resignUc(ww, p, { signers: 2 });
       p.pdr = flip(p.pdr, 3);
     }),
-    'ErrEvmConfigHash',
+    'ErrLockPDR',
   );
 });

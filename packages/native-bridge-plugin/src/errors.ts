@@ -13,7 +13,7 @@ const U = 'unavailable' as const;
 const FAMILY = {
   ErrTruncated: M, ErrTrailing: M, ErrNonCanonical: M, ErrForbiddenCBOR: M, ErrShape: M, ErrTag: M,
   ErrVersion: M, ErrLength: M, ErrIntRange: M, ErrABIFraming: M, ErrBadOperation: M, ErrRlpMalformed: M,
-  ErrMptMalformed: M, ErrSdkDecode: M, ErrDeadline: M,
+  ErrSdkDecode: M, ErrDeadline: M,
   ErrInputTooLarge: B, ErrTooManyTx: B, ErrTooManyItems: B, ErrTooDeep: B, ErrTooManyPaths: B, ErrProofTooLarge: B,
   ErrJustificationTooLarge: B, ErrLockProofTooLarge: B,
   ErrCfgMismatch: I, ErrPolicyHash: I, ErrPolicyTuple: I, ErrPolicyAnchors: I, ErrPolicyLeafIndex: I,
@@ -33,6 +33,9 @@ const FAMILY = {
   ErrMissingBacking: I, ErrLockProofShape: I, ErrLockProofCfg: I, ErrLockProofTrust: I, ErrEvmPartition: I, ErrEvmShard: I,
   ErrEvmConfigHash: I, ErrEvmConfigPin: I, ErrHeaderHash: I, ErrHeaderRoot: I, ErrHeaderProfile: I,
   ErrAccountProof: I, ErrAccountCode: I, ErrStorageProof: I, ErrStorageValue: I, ErrLockDigest: I,
+  // the oracle's lock-proof and MPT names (bft-core VerifyLockProof, mptVerify): the canonical reasons a lock proof is refused with
+  ErrLockUC: I, ErrLockPDR: I, ErrLockHeader: I, ErrLockAccount: I, ErrLockCodeHash: I, ErrLockStorage: I,
+  ErrMPTNode: I, ErrMPTPath: I, ErrMPTAbsent: I, ErrMPTExtraneous: I,
   ErrManifest: I,
   // protocol 4 (the oracle's names): certificate scan, anchor openings and the leaf proof
   ErrCertScan: M, ErrCertSigLength: M, ErrIROpening: I, ErrIRShape: I, ErrIRState: I, ErrIRTime: I, ErrLeafProof: I,
@@ -52,7 +55,10 @@ export const RETRYABLE: readonly NativeReason[] = ['ErrProofUnavailable'];
 export class NativeError extends Error {
   public readonly family: NativeFamily;
 
-  /** A diagnostic for a retryable refusal (for `ErrProofUnavailable`: why the proof could not be had in time); never a protocol input. */
+  /**
+   * A diagnostic, never a protocol input: for a retryable refusal why it happened (for `ErrProofUnavailable`: why the proof could not be had in
+   * time); for a refusal named by the oracle's canonical reason, the plug-in's finer one (a lock proof's `ErrLockUC` from `ErrQuorumNotMet`).
+   */
   public constructor(public readonly reason: NativeReason, public readonly detail?: string) {
     super(detail ? `${reason}: ${detail}` : reason);
     this.name = 'NativeError';

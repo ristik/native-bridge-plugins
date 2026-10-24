@@ -408,7 +408,7 @@ fn the_roots_lock_proof_backs_every_part() {
         w.bridge
             .verify_native_token(&child.token, Expect::Receipt)
             .unwrap_err(),
-        E::StorageValue
+        E::LockStorage
     );
 }
 

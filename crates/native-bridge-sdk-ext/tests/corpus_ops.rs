@@ -277,31 +277,7 @@ fn lock_lock_backing() {
     let f = fixtures();
     let cfg = Cfg::from_bytes(&bytes(f["fixtures"]["dev"]["cfg"].as_str().unwrap())).unwrap();
     let ch = cfg.hash();
-    let names = aliases(&[
-        (
-            "ErrCertScan",
-            &[
-                "ErrUnsupportedCertificateEncoding/invalid",
-                "ErrProofTooLarge/budget",
-            ],
-        ),
-        ("ErrLockAccount", &["ErrAccountProof/invalid"]),
-        ("ErrLockCodeHash", &["ErrAccountCode/invalid"]),
-        (
-            "ErrLockHeader",
-            &["ErrHeaderHash/invalid", "ErrHeaderRoot/invalid"],
-        ),
-        (
-            "ErrLockPDR",
-            &["ErrEvmConfigHash/invalid", "ErrEvmConfigPin/invalid"],
-        ),
-        ("ErrLockStorage", &["ErrStorageProof/invalid"]),
-        (
-            "ErrLockUC",
-            &["ErrQuorumNotMet/invalid", "ErrSealRoot/invalid"],
-        ),
-        ("ErrTrustBaseDigest", &["ErrLockProofTrust/invalid"]),
-    ]);
+    let names = BTreeMap::new();
     let skip = [(
         "backing-no-pin",
         "a plug-in deployment always carries its pin (Deployment::new requires the vault code hash and EVM configuration)",
@@ -352,12 +328,7 @@ fn lock_lock_backing() {
 
 #[test]
 fn lock_mpt() {
-    let names = aliases(&[
-        ("ErrMPTAbsent", &["ErrMptMalformed/malformed"]),
-        ("ErrMPTExtraneous", &["ErrMptMalformed/malformed"]),
-        ("ErrMPTNode", &["ErrMptMalformed/malformed"]),
-        ("ErrMPTPath", &["ErrMptMalformed/malformed"]),
-    ]);
+    let names = BTreeMap::new();
     replay_all("lock", "mpt", 7, &names, &[], |c| {
         let nodes: Vec<Vec<u8>> = c["aux"]["nodes"]
             .as_str()

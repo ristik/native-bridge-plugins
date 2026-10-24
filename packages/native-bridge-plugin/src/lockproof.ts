@@ -12,7 +12,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { preflightUc } from './resources.js';
 import { eq } from './bytes.js';
 import type { Deployment } from './deployment.js';
-import { NativeError, fail } from './errors.js';
+import { NativeError, fail, type NativeReason } from './errors.js';
 import { decodeHeader } from './header.js';
 import {
   LOCK_PROOF_VERSION, MAX_HEADER_BYTES, MAX_JUSTIFICATION_BYTES, MAX_MPT_NODE_BYTES, MAX_MPT_NODES,
@@ -161,13 +161,43 @@ export interface VerifiedLock {
   evmRootRound: bigint;
 }
 
-/** Verify a lock proof against the pinned deployment and trust input, in the specified order. */
+/**
+ * A lock proof's refusals by the oracle's canonical reason (bft-core `VerifyLockProof`, which the sealed corpus names): the plug-in's finer
+ * reason, from the step that failed, becomes the error's detail. The epoch, network, cfg and digest reasons are already the oracle's.
+ */
+const LOCK_CANONICAL: Partial<Record<NativeReason, NativeReason>> = {
+  ErrLockProofTrust: 'ErrTrustBaseDigest',
+  ErrEvmPartition: 'ErrLockUC', ErrEvmShard: 'ErrLockUC', ErrQuorumNotMet: 'ErrLockUC', ErrSealRoot: 'ErrLockUC', ErrCertStructure: 'ErrLockUC',
+  ErrUnsupportedCertificateEncoding: 'ErrLockUC',
+  ErrEvmConfigHash: 'ErrLockPDR', ErrEvmConfigPin: 'ErrLockPDR',
+  ErrHeaderHash: 'ErrLockHeader', ErrHeaderRoot: 'ErrLockHeader', ErrHeaderProfile: 'ErrLockHeader',
+  ErrAccountProof: 'ErrLockAccount', ErrAccountCode: 'ErrLockCodeHash',
+  ErrStorageProof: 'ErrLockStorage', ErrStorageValue: 'ErrLockStorage',
+};
+
+/** Verify a lock proof against the pinned deployment and trust input, in the specified order; a refusal carries the oracle's reason. */
 export async function verifyLockProof(dep: Deployment, trust: TrustInput, j: Justification, expectedDigest: Uint8Array): Promise<VerifiedLock> {
+  try {
+    return await verifyLockProofSteps(dep, trust, j, expectedDigest);
+  } catch (e) {
+    const canonical = e instanceof NativeError ? LOCK_CANONICAL[e.reason] : undefined;
+    if (canonical) throw new NativeError(canonical, (e as NativeError).detail ? `${(e as NativeError).reason}: ${(e as NativeError).detail}` : (e as NativeError).reason);
+    throw e;
+  }
+}
+
+async function verifyLockProofSteps(dep: Deployment, trust: TrustInput, j: Justification, expectedDigest: Uint8Array): Promise<VerifiedLock> {
   const lp = j.proof;
   if (j.chainId !== dep.cfg.chainId || !eq(j.vault, dep.cfg.vault) || !eq(j.zero, dep.cfg.zeroAddress)) fail('ErrMintJustif');
   if (!eq(lp.cfg, dep.cfgHash)) fail('ErrLockProofCfg');
   if (!eq(lp.trustBaseId, trust.id)) fail('ErrLockProofTrust');
-  preflightUc(lp.uc);
+  // the native certificate scan's refusal is the oracle's ErrCertScan, whatever the scan's own reason
+  try {
+    preflightUc(lp.uc);
+  } catch (e) {
+    if (e instanceof NativeError) fail('ErrCertScan', e.reason);
+    throw e;
+  }
   let uc: UnicityCertificate;
   try {
     uc = UnicityCertificate.fromCBOR(lp.uc);
@@ -224,15 +254,15 @@ export async function verifyLockProof(dep: Deployment, trust: TrustInput, j: Jus
       return fail('ErrAccountCode');
     }
   } catch (e) {
-    if (e instanceof Error && e.name === 'NativeError' && (e as { reason?: string }).reason === 'ErrAccountCode') throw e;
-    return fail('ErrAccountProof');
+    if (e instanceof NativeError && e.reason === 'ErrAccountCode') throw e;
+    return fail('ErrAccountProof', e instanceof NativeError ? e.reason : undefined);
   }
   // Storage MPT at keccak256(keccak256(abi.encode(nonce, 5))).
   let stored: Uint8Array;
   try {
     stored = verifyProof(storageRoot, storageTrieKey(lockDigestSlot(j.nonce)), lp.storageNodes);
-  } catch {
-    return fail('ErrStorageProof');
+  } catch (e) {
+    return fail('ErrStorageProof', e instanceof NativeError ? e.reason : undefined);
   }
   let v: Uint8Array;
   try {

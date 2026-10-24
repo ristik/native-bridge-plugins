@@ -36,7 +36,7 @@ errors! {
     Truncated => Malformed, Trailing => Malformed, NonCanonical => Malformed,
     ForbiddenCBOR => Malformed, Shape => Malformed, Tag => Malformed, Version => Malformed,
     Length => Malformed, IntRange => Malformed, ABIFraming => Malformed, BadOperation => Malformed,
-    RlpMalformed => Malformed, MptMalformed => Malformed, SdkDecode => Malformed, Deadline => Malformed,
+    RlpMalformed => Malformed, SdkDecode => Malformed, Deadline => Malformed,
     // budgets
     InputTooLarge => Budget, TooManyTx => Budget, TooManyItems => Budget, TooDeep => Budget,
     TooManyPaths => Budget, ProofTooLarge => Budget, JustificationTooLarge => Budget, LockProofTooLarge => Budget,
@@ -67,6 +67,9 @@ errors! {
     HeaderHash => Invalid, HeaderRoot => Invalid, HeaderProfile => Invalid,
     AccountProof => Invalid, AccountCode => Invalid, StorageProof => Invalid, StorageValue => Invalid,
     LockDigest => Invalid,
+    // the oracle's lock-proof and MPT names (bft-core VerifyLockProof, mptVerify): the canonical reasons a lock proof is refused with
+    LockUC => Invalid, LockPDR => Invalid, LockHeader => Invalid, LockAccount => Invalid, LockCodeHash => Invalid, LockStorage => Invalid,
+    MPTNode => Invalid, MPTPath => Invalid, MPTAbsent => Invalid, MPTExtraneous => Invalid,
     // manifests
     Manifest => Invalid,
     // protocol 4 (the oracle's names): certificate scan, anchor openings and the leaf proof

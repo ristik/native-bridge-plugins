@@ -55,23 +55,12 @@ const amountOf = (dec: string): Uint8Array => {
 };
 
 /**
- * Where the plug-ins name a refusal differently from the oracle, per op: the oracle's reason and the plug-in reasons it may appear as. The verdict
- * never differs (a refusal stays a refusal); only these names do, and only as listed. lock-backing: the plug-in's lock-proof names (one-to-one, finer
- * for the PDR and the header); mpt and token-project: the plug-in's coarser names (one MPT failure, one unsupported-certificate refusal). Each
- * alias is the plug-in's `reason/family`: the family is compared too.
+ * Where the plug-ins name a refusal differently from the oracle: only the certificate scan inside a token (token-project), whose reasons the
+ * plug-in reports as one unsupported-certificate refusal. Every other op names its refusals as the oracle does (the lock-proof and MPT reasons
+ * are the oracle's since the canonical names). The verdict never differs; only these names do, and only as listed. Each alias is the plug-in's
+ * `reason/family`: the family is compared too.
  */
 type Aliases = Record<string, string[]>;
-const LOCK_BACKING_NAMES: Aliases = {
-  ErrCertScan: ['ErrUnsupportedCertificateEncoding/invalid', 'ErrProofTooLarge/budget'],
-  ErrLockAccount: ['ErrAccountProof/invalid'],
-  ErrLockCodeHash: ['ErrAccountCode/invalid'],
-  ErrLockHeader: ['ErrHeaderHash/invalid', 'ErrHeaderRoot/invalid'],
-  ErrLockPDR: ['ErrEvmConfigHash/invalid', 'ErrEvmConfigPin/invalid'],
-  ErrLockStorage: ['ErrStorageProof/invalid'],
-  ErrLockUC: ['ErrQuorumNotMet/invalid', 'ErrSealRoot/invalid'],
-  ErrTrustBaseDigest: ['ErrLockProofTrust/invalid'],
-};
-const MPT_NAMES: Aliases = Object.fromEntries(['ErrMPTAbsent', 'ErrMPTExtraneous', 'ErrMPTNode', 'ErrMPTPath'].map((r) => [r, ['ErrMptMalformed/malformed']]));
 const TOKEN_NAMES: Aliases = {
   ...Object.fromEntries(['ErrCertSigLength', 'ErrInputTooLarge', 'ErrLength', 'ErrShape', 'ErrTag', 'ErrVersion'].map((r) => [r, ['ErrUnsupportedCertificateEncoding/invalid']])),
   ErrCertScan: ['ErrUnsupportedCertificateEncoding/invalid', 'ErrNonCanonical/malformed'],
@@ -183,14 +172,14 @@ test('lock/lock-backing: the mint\'s lock justification verified offline against
     const digest = lockDigest(ch, j.nonce, lockRecord(cfg.zeroAddress, cfg.ty, cfg.aid, amount, id, H(predBytes(h.mint.recipient))));
     await verifyLockProof(dep, trust, j, digest);
     return { status: 'ok' };
-  }, LOCK_BACKING_NAMES, { 'backing-no-pin': 'a plug-in deployment always carries its pin (makeDeployment requires the vault code hash and EVM configuration)' });
+  }, {}, { 'backing-no-pin': 'a plug-in deployment always carries its pin (makeDeployment requires the vault code hash and EVM configuration)' });
 });
 
 test('lock/mpt: the account and storage proof verifier', async () => {
   await replayAll('lock', 'mpt', 7, (c) => {
     const nodes = (c.aux!.nodes ?? '').split(',').filter((n) => n !== '').map(bytes);
     return { status: 'ok', values: { value: hex(verifyProof(bytes(c.aux!.root), bytes(c.aux!.key), nodes)) } };
-  }, MPT_NAMES);
+  });
 });
 
 test('unlock/unlock: the strict signature unlock of (source hash, transaction hash) under a key', async () => {
