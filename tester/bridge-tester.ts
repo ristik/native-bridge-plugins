@@ -48,7 +48,7 @@ import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../pac
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, decBytes, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
   RECORD_ID, recordId, requirePhase, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
 
@@ -154,6 +154,15 @@ class Wallet {
 }
 
 // ---- the chain --------------------------------------------------------------------------------------------------------------------------------
+/** The configured chain, after checking that every endpoint the tester sends to is this generation's network with its vault (core checkNetwork). */
+async function chainOf(cfg: TesterConfig): Promise<Chain> {
+  for (const url of [cfg.ethUrl, ...(cfg.redeemEthUrl ? [cfg.redeemEthUrl] : [])]) {
+    const block0 = (await jsonRpc(url, 'eth_getBlockByNumber', ['0x0', false])) as { hash: string } | null;
+    checkNetwork(cfg, url, block0?.hash ?? 'none', (await jsonRpc(url, 'eth_getCode', [cfg.vault, 'latest'])) as string);
+  }
+  return new Chain(cfg);
+}
+
 class Chain {
   constructor(readonly cfg: TesterConfig) {}
 
@@ -205,6 +214,7 @@ async function certify(agg: AggregatorClient, cd: CertificationData, what: strin
 async function init(w: Wallet, configPath: string, ethKeyFile?: string): Promise<void> {
   if (existsSync(`${w.dir}/keys.json`)) throw new Error(`${w.dir} already holds a wallet`);
   const cfg = loadTesterConfig(configPath);
+  await chainOf(cfg); // a configuration of another generation is refused before the wallet exists
   mkdirSync(`${w.dir}/tokens`, { recursive: true, mode: 0o700 });
   const raw = JSON.parse(readFileSync(configPath, 'utf8')) as TesterConfig;
   raw.files = cfg.files; // absolute, so the copy reads the same files
@@ -217,7 +227,7 @@ async function init(w: Wallet, configPath: string, ethKeyFile?: string): Promise
 
 async function status(w: Wallet, nonce?: string): Promise<void> {
   const cfg = w.config;
-  const chain = new Chain(cfg);
+  const chain = await chainOf(cfg);
   const me = ethAddress(w.keys().eth);
   console.log(`EVM address ${me}: balance ${BigInt(await jsonRpc(cfg.ethUrl, 'eth_getBalance', [me, 'latest']))} wei, vault credit ${await chain.uint('claimable(address)', encAddress(me))} wei`);
   for (const t of nonce === undefined ? w.records() : [w.record(nonce)]) {
@@ -238,7 +248,7 @@ async function status(w: Wallet, nonce?: string): Promise<void> {
 
 async function lock(w: Wallet, amountText: string): Promise<void> {
   const cfg = w.config;
-  const chain = new Chain(cfg);
+  const chain = await chainOf(cfg);
   const amountWei = parseAmount(amountText);
   const owner = w.newOwner();
   const p0 = EncodedPredicate.fromPredicate(SignaturePredicate.create(owner.signer.publicKey)).toCBOR();
@@ -254,7 +264,7 @@ async function mint(w: Wallet, nonce?: string): Promise<void> {
   const t = w.record(nonce);
   requirePhase(t, 'locked', 'mint');
   const cfg = w.config;
-  const chain = new Chain(cfg);
+  const chain = await chainOf(cfg);
   const { vaultCfg, dep } = await installedBridge(cfg, chain);
   // the lock's proof: the endpoint answers 404 until the lock block is certified and archived, and again once it is out of the proof window
   const url = `${cfg.lockProofUrl.replace(/\/$/, '')}/v1/lockproof?block=${t.lockBlockHash}&nonce=${t.nonce}`;
@@ -334,7 +344,7 @@ async function split(w: Wallet, id: string | undefined, amountsText: string): Pr
   requirePhase(t, 'minted', 'split');
   const amounts = splitAmounts(amountsText, BigInt(t.amountWei));
   const cfg = w.config;
-  const { bridge } = await installedBridge(cfg, new Chain(cfg));
+  const { bridge } = await installedBridge(cfg, await chainOf(cfg));
   const plugin = createNativeBridgePlugin(bridge, { manifestRevision: 'tester', profileRevision: 'tester' });
   const journal = new FileSplitJournal(`${w.tokenDir(recordId(t))}/split.json`);
   let record = await journal.get();
@@ -380,7 +390,7 @@ async function burn(w: Wallet, nonce: string | undefined, recipient?: string): P
   const to = recipient ?? ethAddress(w.keys().eth);
   if (!isAddress(to)) throw new Error(`--recipient: not an address: ${to}`);
   const cfg = w.config;
-  const { vaultCfg } = await installedBridge(cfg, new Chain(cfg));
+  const { vaultCfg } = await installedBridge(cfg, await chainOf(cfg));
   const { bytes, token } = await w.token(t);
   const reason = returnReason(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, unhex(to), amountBytes(BigInt(t.amountWei)));
   const tx = await TransferTransaction.create(token, BurnPredicate.create(sha256(reason)), StateMask.generate(), { data: reason });
@@ -396,7 +406,7 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
   const t = w.record(nonce);
   requirePhase(t, 'burned', 'redeem');
   const cfg = w.config;
-  const chain = new Chain(cfg);
+  const chain = await chainOf(cfg);
   const { bridge } = await installedBridge(cfg, chain);
   const { token } = await w.token(t);
   // one consolidated proof set from the aggregator (every leaf under one seal), so the envelope has one anchor whatever the history's length
@@ -443,7 +453,7 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
 
 async function claim(w: Wallet, to?: string): Promise<void> {
   const cfg = w.config;
-  const chain = new Chain(cfg);
+  const chain = await chainOf(cfg);
   const key = w.keys().eth;
   const me = ethAddress(key);
   const dest = to ?? me;

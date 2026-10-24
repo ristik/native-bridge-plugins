@@ -8,7 +8,8 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, decBytes, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI, parseAmount,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
+  parseAmount,
   RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
 } from './core.js';
 
@@ -56,7 +57,8 @@ test('amounts: ether or wei, more than zero, at most one lock (8 bytes)', () => 
 test('the configuration: URLs, chain, vault and files checked; files resolved against its directory', () => {
   const dir = mkdtempSync(join(tmpdir(), 'tester-'));
   const good = {
-    ethUrl: 'https://rpc.example', aggUrl: 'http://agg:3000', lockProofUrl: 'https://proof.example', chainId: 3, vault: `0x${'11'.repeat(20)}`,
+    ethUrl: 'https://rpc.example', aggUrl: 'http://agg:3000', lockProofUrl: 'https://proof.example', chainId: 3, genesisHash: `0x${'ab'.repeat(32)}`,
+    vault: `0x${'11'.repeat(20)}`,
     files: { trustBundle: 'trust-base.bundle.cbor', trustEntryId: 'trust-base.genesis.entryid', evmPdr: 'evm-pdr.cbor', deployment: 'bridge-deployment.json' },
   };
   const write = (c: unknown): string => {
@@ -70,7 +72,7 @@ test('the configuration: URLs, chain, vault and files checked; files resolved ag
   // one mutation at a time, each refused for its own field
   const cases: [string, unknown, RegExp][] = [
     ['ethUrl', 'rpc.example', /ethUrl/], ['aggUrl', undefined, /aggUrl/], ['lockProofUrl', 'ftp://x', /lockProofUrl/], ['redeemEthUrl', 'x', /redeemEthUrl/],
-    ['chainId', 0, /chainId/], ['chainId', '3', /chainId/], ['vault', '0x11', /vault/],
+    ['chainId', 0, /chainId/], ['chainId', '3', /chainId/], ['genesisHash', undefined, /genesisHash/], ['genesisHash', `0x${'ab'.repeat(31)}`, /genesisHash/], ['vault', '0x11', /vault/],
   ];
   for (const [k, v, re] of cases) assert.throws(() => loadTesterConfig(write({ ...good, [k]: v })), re, `${k}=${String(v)}`);
   assert.throws(() => loadTesterConfig(write({ ...good, files: { ...good.files, evmPdr: '' } })), /files.evmPdr/);
@@ -107,3 +109,12 @@ test('--amounts: at least two, each an amount, adding up to exactly the token', 
   assert.throws(() => splitAmounts('100wei', 100n), /at least two/);
   assert.throws(() => splitAmounts('40wei,59wei', 100n), /add up to 99 wei, the token holds 100 wei/);
   assert.throws(() => splitAmounts('0wei,100wei', 100n), /more than zero/);});
+
+test('the network guard: another generation\'s genesis, or no vault code, is refused before anything is sent', () => {
+  const cfg = { genesisHash: `0x${'ab'.repeat(32)}`, vault: `0x${'11'.repeat(20)}` };
+  checkNetwork(cfg, 'u', `0x${'AB'.repeat(32)}`, '0x6080'); // the same genesis (any case) and code: accepted
+  // a reset network keeps the chain ID, so only block 0 tells it apart
+  assert.throws(() => checkNetwork(cfg, 'u', `0x${'cd'.repeat(32)}`, '0x6080'), /another network/);
+  assert.throws(() => checkNetwork(cfg, 'u', 'none', '0x6080'), /another network/);
+  assert.throws(() => checkNetwork(cfg, 'u', cfg.genesisHash, '0x'), /no code at the vault/);
+});

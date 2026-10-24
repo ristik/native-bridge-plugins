@@ -14,7 +14,9 @@
  *                                                                              built and priced as the control (#526 step 4)
  *   anyage.ts long-history <lane-config.json> [<out-dir>]                     (B7 PR 3) a token transferred LONG_TRANSFERS times (default 320) through the
  *                                                                              live aggregators, burned and consolidated (K = m); redeemed first one gas below the least
- *                                                                              limit that succeeds (mined, reverts, the vault unchanged), then at the estimate, and claimed
+ *                                                                              limit that succeeds (mined, reverts, the vault unchanged), then at the estimate, and claimed.
+ *                                                                              320 needs two or more shards: one aggregator consolidates at most 254 transfers
+ *                                                                              (the SDK's 256 state IDs per endpoint), and the TN-B package runs 250
  *   anyage.ts negatives <lane-config.json> <saved.json>                       (bft-core #438) after the saved token's release: a conflicting burn of its pre-burn state
  *                                                                              (another recipient) is not certified, the aggregator serves the first burn's proof for that
  *                                                                              state; and a fresh proof of the redeemed burn (consolidated now, under a newer seal) is refused
@@ -309,7 +311,9 @@ async function save(cfgPath: string, outDir?: string): Promise<void> {
     assert.equal(labels.size, 1, `anchor ${i}: its certificate occurrences disagree on epoch/round`);
     return { epoch: matching[0].unicitySeal.epoch, round: matching[0].unicitySeal.rootChainRoundNumber, shard: hex(a.shard), ucSha256: sha(a.uc) };
   });
-  if (spans) assert.equal(new Set(anchors.map((a) => a.shard)).size, c.lane.aggShards!.length, `the saved history must carry an anchor of each aggregator shard: ${anchors.map((a) => a.shard)}`);
+  // only the steered history (no transfers: the burn is sent to the other shard than the mint) is sure to touch every shard; with SAVE_TRANSFERS
+  // the shards its leaves land on are recorded in the anchors, not asserted (nbp#44 review)
+  if (spans && transfers === 0) assert.equal(new Set(anchors.map((a) => a.shard)).size, c.lane.aggShards!.length, `the saved history must carry an anchor of each aggregator shard: ${anchors.map((a) => a.shard)}`);
   const head = await rpc(c.eth, 'eth_blockNumber', []);
   const saved = {
     lane: 'anyage', savedAtBlock: head, transfers, nonce, amountWei, recipient: RECIPIENT, nullifier: hex(ret.verified.outcome.nullifier),

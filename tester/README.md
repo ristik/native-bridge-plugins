@@ -47,6 +47,7 @@ The operator publishes `tester-config.json` together with the four files it name
   "aggUrl": "https://aggregator.example",
   "lockProofUrl": "https://lockproof.example",
   "chainId": 3,
+  "genesisHash": "0x...",
   "vault": "0x...",
   "files": { "trustBundle": "trust-base.bundle.cbor", "trustEntryId": "trust-base.genesis.entryid", "evmPdr": "evm-pdr.cbor", "deployment": "bridge-deployment.json" }
 }
@@ -55,6 +56,11 @@ The operator publishes `tester-config.json` together with the four files it name
 `redeemEthUrl` is optional. A redemption carries the whole return proof, about 8 to 13 KB of bytes and so 16 to 26 KB as hex. A gateway
 with a smaller request-body limit refuses it; the testnet package's public gateway takes 16 KiB. With `redeemEthUrl` set, redemptions go
 there and every other call goes to `ethUrl`.
+
+`genesisHash` is block 0's hash on this generation. Every command that reads or sends to the chain (and `init`) first checks it against
+`eth_getBlockByNumber(0)` on `ethUrl` and on `redeemEthUrl`, and checks that the vault has code there. A reset network keeps the chain ID,
+so an old wallet's transaction would be valid on the new chain and land at an address with no vault; the check refuses that before anything
+is sent. After a reset, start a new wallet from the new `tester-config.json`.
 
 ## What it checks
 
