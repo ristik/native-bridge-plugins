@@ -121,8 +121,13 @@ impl Cfg {
         if k[0].bytes().map_err(|_| E::Shape)? != CFG_DOMAIN {
             return Err(E::Shape);
         }
+        // network 0 is no network (bft-core DecodeCfg)
+        let network = k[1].uint_max(0xffff)?;
+        if network == 0 {
+            return Err(E::IntRange);
+        }
         Ok(Cfg {
-            network: k[1].uint_max(0xffff)? as u16,
+            network: network as u16,
             root_genesis: fixed(&k[2])?,
             chain_id: k[3].uint()?,
             execution_genesis: fixed(&k[4])?,

@@ -56,8 +56,11 @@ export function decodeCfg(b: Uint8Array): Cfg {
   if (b.length > MAX_SEMANTIC_BYTES) fail('ErrInputTooLarge');
   const k = arrayOf(scanOne(b), 16) ?? fail('ErrShape');
   if (!eq(bytesAny(k[0]), CFG_DOMAIN)) fail('ErrShape');
+  // network 0 is no network (bft-core DecodeCfg)
+  const network = Number(uintMax(k[1], 0xffffn));
+  if (network === 0) fail('ErrIntRange');
   return {
-    network: Number(uintMax(k[1], 0xffffn)),
+    network,
     rootGenesis: bytesN(k[2], 32),
     chainId: uint(k[3]),
     executionGenesis: bytesN(k[4], 32),
