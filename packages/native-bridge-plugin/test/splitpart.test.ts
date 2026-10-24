@@ -224,7 +224,7 @@ test('the root\'s lock proof is the backing of every part: a root whose vault sl
   const root = spec(1);
   root.evm.stored = new Uint8Array(32);
   const { child } = await lineage(w, () => [], 1, { root });
-  await rejects(w.bridge.verifyNativeToken(child.token, 'receipt'), 'ErrStorageValue');
+  await rejects(w.bridge.verifyNativeToken(child.token, 'receipt'), 'ErrLockStorage');
 });
 
 test('the SDK verification runs on a part: a part whose mint carries a valid certificate of another tree is refused', async () => {

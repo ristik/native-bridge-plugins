@@ -216,6 +216,9 @@ fn uc_within(n: &Node<'_>, max_bytes: usize) -> Result<()> {
         uint(&seal[i], u64::MAX)?;
     }
     uint(&seal[1], u16::MAX as u64)?;
+    if seal[1].arg == 0 {
+        return Err(E::UnsupportedCertificateEncoding); // network 0 is none (B1 scan)
+    }
     hash(&seal[5], true)?;
     hash(&seal[6], false)?;
     if seal[7].major != 5 {

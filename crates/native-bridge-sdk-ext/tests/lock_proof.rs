@@ -65,7 +65,7 @@ fn cfg_in_the_proof_must_equal_the_deployment() {
 fn trust_base_id_must_name_the_installed_trust_base() {
     assert_eq!(
         mutated(|_, p, _| p.trust_base_id[0] ^= 1).unwrap_err(),
-        E::LockProofTrust
+        E::TrustBaseDigest
     );
 }
 
@@ -73,7 +73,7 @@ fn trust_base_id_must_name_the_installed_trust_base() {
 fn a_quorum_short_by_one_signature_is_rejected() {
     // Four equal-weight validators need three signatures (> 2/3 of the weight).
     let e = mutated(|w, p, _| resign(&w.evm_root, &mut p.uc, 2)).unwrap_err();
-    assert_eq!(e, E::QuorumNotMet);
+    assert_eq!(e, E::LockUC);
     // Three is enough.
     mutated(|w, p, _| resign(&w.evm_root, &mut p.uc, 3)).unwrap();
 }
@@ -91,7 +91,7 @@ fn a_signer_unknown_to_the_trust_base_fails_the_seal_as_in_the_sdk() {
         ));
     })
     .unwrap_err();
-    assert_eq!(e, E::QuorumNotMet);
+    assert_eq!(e, E::LockUC);
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn a_weighted_committee_after_a_rotation_certifies_by_weight_not_by_count() {
     };
     // the heavy member alone is a quorum; the two light members (2 of 3 members, weight 2) are not
     run(&held, &s, &heavy).unwrap();
-    assert_eq!(run(&held, &s, &light).unwrap_err(), E::QuorumNotMet);
+    assert_eq!(run(&held, &s, &light).unwrap_err(), E::LockUC);
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn invalid_signatures_of_known_members_fail_the_seal() {
         p.uc.unicity_seal.signatures.push((id.clone(), bad));
     })
     .unwrap_err();
-    assert_eq!(e, E::QuorumNotMet);
+    assert_eq!(e, E::LockUC);
     // Two genuine plus two corrupt: no quorum.
     let e = mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 2);
@@ -176,13 +176,13 @@ fn invalid_signatures_of_known_members_fail_the_seal() {
         }
     })
     .unwrap_err();
-    assert_eq!(e, E::QuorumNotMet);
+    assert_eq!(e, E::LockUC);
 }
 
 #[test]
 fn seal_hash_not_matching_the_unicity_tree_is_rejected() {
     let e = mutated(|_, p, _| p.uc.unicity_seal.hash[0] ^= 1).unwrap_err();
-    assert_eq!(e, E::SealRoot);
+    assert_eq!(e, E::LockUC);
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn certificate_for_the_wrong_partition_is_not_the_evm_partition() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::EvmPartition);
+    assert_eq!(e, E::LockUC);
 }
 
 #[test]
@@ -214,13 +214,13 @@ fn certificate_for_a_longer_shard_is_not_the_pinned_shard() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::EvmShard);
+    assert_eq!(e, E::LockUC);
 }
 
 #[test]
 fn pdr_not_hashing_to_the_certificate_configuration_is_rejected() {
     let e = mutated(|_, p, _| flip(&mut p.pdr, 3)).unwrap_err();
-    assert_eq!(e, E::EvmConfigHash);
+    assert_eq!(e, E::LockPDR);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn pdr_changing_a_non_membership_setting_is_rejected_even_when_committed() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::EvmConfigPin);
+    assert_eq!(e, E::LockPDR);
 }
 
 #[test]
@@ -254,7 +254,7 @@ fn certified_shard_epoch_must_be_the_carried_pdrs_epoch() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::EvmConfigPin);
+    assert_eq!(e, E::LockPDR);
 }
 
 #[test]
@@ -269,13 +269,13 @@ fn non_canonical_pdr_is_rejected() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::EvmConfigPin);
+    assert_eq!(e, E::LockPDR);
 }
 
 #[test]
 fn header_not_hashing_to_the_block_hash_is_rejected() {
     let e = mutated(|_, p, _| flip(&mut p.header, 40)).unwrap_err();
-    assert_eq!(e, E::HeaderHash);
+    assert_eq!(e, E::LockHeader);
 }
 
 #[test]
@@ -286,7 +286,7 @@ fn signature_over_an_unrelated_state_root_is_insufficient() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::HeaderRoot);
+    assert_eq!(e, E::LockHeader);
 }
 
 #[test]
@@ -298,14 +298,14 @@ fn missing_block_hash_is_rejected() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::CertStructure);
+    assert_eq!(e, E::LockUC);
     // a block hash that is not the header's
     let e = mutated(|w, p, _| {
         p.uc.input_record.block_hash = Some(vec![0x5b; 32]);
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::HeaderHash);
+    assert_eq!(e, E::LockHeader);
 }
 
 #[test]
@@ -326,13 +326,13 @@ fn header_outside_the_pinned_profile_is_rejected() {
         resign(&w.evm_root, &mut p.uc, 4);
     })
     .unwrap_err();
-    assert_eq!(e, E::HeaderProfile);
+    assert_eq!(e, E::LockHeader);
 }
 
 #[test]
 fn a_node_of_the_account_proof_changed_is_rejected() {
     let e = mutated(|_, p, _| flip(&mut p.account_nodes[0], 10)).unwrap_err();
-    assert_eq!(e, E::AccountProof);
+    assert_eq!(e, E::LockAccount);
 }
 
 #[test]
@@ -342,7 +342,7 @@ fn an_extra_account_node_is_rejected() {
         p.account_nodes.push(dup);
     })
     .unwrap_err();
-    assert_eq!(e, E::AccountProof);
+    assert_eq!(e, E::LockAccount);
 }
 
 #[test]
@@ -351,7 +351,7 @@ fn a_missing_account_node_is_rejected() {
         p.account_nodes.pop();
     })
     .unwrap_err();
-    assert_eq!(e, E::AccountProof);
+    assert_eq!(e, E::LockAccount);
 }
 
 #[test]
@@ -365,13 +365,13 @@ fn an_empty_account_proof_is_rejected() {
 #[test]
 fn account_with_another_runtime_code_hash_is_rejected() {
     let e = mutated_spec(|s| s.evm.vault_code_hash = [0x77; 32]).unwrap_err();
-    assert_eq!(e, E::AccountCode);
+    assert_eq!(e, E::LockCodeHash);
 }
 
 #[test]
 fn a_storage_node_changed_is_rejected() {
     let e = mutated(|_, p, _| flip(&mut p.storage_nodes[0], 12)).unwrap_err();
-    assert_eq!(e, E::StorageProof);
+    assert_eq!(e, E::LockStorage);
 }
 
 #[test]
@@ -381,14 +381,14 @@ fn an_extra_storage_node_is_rejected() {
         p.storage_nodes.push(dup);
     })
     .unwrap_err();
-    assert_eq!(e, E::StorageProof);
+    assert_eq!(e, E::LockStorage);
 }
 
 #[test]
 fn proof_for_another_nonce_slot_is_rejected() {
     // The trie holds slot(99) too, but the mint is nonce 1 and the proof walks slot(5).
     let e = mutated_spec(|s| s.evm.nonce = 99).unwrap_err();
-    assert_eq!(e, E::StorageProof);
+    assert_eq!(e, E::LockStorage);
 }
 
 #[test]
@@ -419,7 +419,7 @@ fn stored_digest_with_leading_zero_bytes_round_trips() {
 #[test]
 fn zero_stored_value_is_rejected() {
     let e = mutated_spec(|s| s.evm.stored = Some([0; 32])).unwrap_err();
-    assert_eq!(e, E::StorageValue);
+    assert_eq!(e, E::LockStorage);
 }
 
 #[test]
@@ -475,7 +475,7 @@ fn j_mutated_after_certification_breaks_the_certified_transaction_hash() {
         .unwrap_err();
     // J itself is wrong first (the altered header), and the stale certification data would also
     // fail: either way the substituted justification never verifies.
-    assert!(matches!(e, E::HeaderHash | E::CDMismatch), "{e}");
+    assert!(matches!(e, E::LockHeader | E::CDMismatch), "{e}");
 }
 
 // ---- bounds ------------------------------------------------------------------------------------
@@ -668,7 +668,7 @@ fn an_epoch_change_is_retryable_until_held_then_verified_under_its_own_committee
         // before epoch 3's start
         (sealed(&next, 3, 500), Some(E::SealEpoch)),
         // epoch 3 signed by the old committee
-        (sealed(&old, 3, 1500), Some(E::QuorumNotMet)),
+        (sealed(&old, 3, 1500), Some(E::LockUC)),
         // epoch 2 has ended at round 1000
         (sealed(&old, 2, 1500), Some(E::SealEpoch)),
     ];
@@ -709,7 +709,7 @@ fn several_faults_get_the_oracle_verdict() {
         flip(&mut p.pdr, 3);
     })
     .unwrap_err();
-    assert_eq!(e, E::EvmConfigHash);
+    assert_eq!(e, E::LockPDR);
 }
 
 #[test]

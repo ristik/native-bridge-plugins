@@ -40,17 +40,17 @@ const small = () => {
 test('mpt accepts the exact path and nothing else', () => {
   const { root, proof, target, value } = small();
   assert.deepEqual(verifyProof(root, target, proof), value);
-  throwsReason(() => verifyProof(root, target, [...proof, proof[0]]), 'ErrMptMalformed', 'extra');
-  throwsReason(() => verifyProof(root, target, proof.slice(0, -1)), 'ErrMptMalformed', 'missing');
-  throwsReason(() => verifyProof(root, target, []), 'ErrMptMalformed', 'empty');
-  if (proof.length > 1) throwsReason(() => verifyProof(root, target, [proof[1], proof[0], ...proof.slice(2)]), 'ErrMptMalformed', 'reordered');
+  throwsReason(() => verifyProof(root, target, [...proof, proof[0]]), 'ErrMPTExtraneous', 'extra');
+  throwsReason(() => verifyProof(root, target, proof.slice(0, -1)), 'ErrMPTPath', 'missing');
+  throwsReason(() => verifyProof(root, target, []), 'ErrMPTNode', 'empty');
+  if (proof.length > 1) throwsReason(() => verifyProof(root, target, [proof[1], proof[0], ...proof.slice(2)]), 'ErrMPTNode', 'reordered');
   const m = proof.map((n) => n.slice());
   m[0][5] ^= 1;
-  throwsReason(() => verifyProof(root, target, m), 'ErrMptMalformed', 'mutated');
+  throwsReason(() => verifyProof(root, target, m), 'ErrMPTNode', 'mutated');
   assert.throws(() => verifyProof(root, sha(text('absent')), proof));
   assert.throws(() => verifyProof(new Uint8Array(32).fill(1), target, proof));
-  throwsReason(() => verifyProof(root, Uint8Array.of(...target, 0), proof), 'ErrMptMalformed', 'unused suffix');
-  throwsReason(() => verifyProof(root, target.slice(0, 31), proof), 'ErrMptMalformed', 'short key');
+  throwsReason(() => verifyProof(root, Uint8Array.of(...target, 0), proof), 'ErrMPTPath', 'unused suffix');
+  throwsReason(() => verifyProof(root, target.slice(0, 31), proof), 'ErrMPTAbsent', 'short key');
 });
 
 test('mpt embedded children and single-entry tries', () => {
@@ -69,7 +69,7 @@ test('mpt embedded children and single-entry tries', () => {
 test('hex-prefix flags are validated', () => {
   for (const flagByte of [0x40, 0x21]) {
     const bad = encodeList([encodeBytes(Uint8Array.of(flagByte)), encodeBytes(new Uint8Array(40).fill(1))]);
-    throwsReason(() => verifyProof(keccak256(bad), new Uint8Array(32), [bad]), 'ErrMptMalformed', `flag ${flagByte}`);
+    throwsReason(() => verifyProof(keccak256(bad), new Uint8Array(32), [bad]), 'ErrMPTNode', `flag ${flagByte}`);
   }
 });
 

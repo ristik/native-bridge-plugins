@@ -236,10 +236,41 @@ pub struct VerifiedLock {
     pub evm_root_round: u64,
 }
 
-/// Verify a lock proof against the pinned deployment and trust bundle, in the specified order.
+/// A lock proof's refusals by the oracle's canonical reason (bft-core `VerifyLockProof`, which the
+/// sealed corpus names). The TypeScript plug-in keeps its finer reason as the error's detail; this
+/// crate's error carries none. The epoch, network, cfg and digest reasons are already the oracle's.
+fn lock_canonical(e: E) -> E {
+    match e {
+        E::LockProofTrust => E::TrustBaseDigest,
+        E::EvmPartition
+        | E::EvmShard
+        | E::QuorumNotMet
+        | E::SealRoot
+        | E::CertStructure
+        | E::UnsupportedCertificateEncoding => E::LockUC,
+        E::EvmConfigHash | E::EvmConfigPin => E::LockPDR,
+        E::HeaderHash | E::HeaderRoot | E::HeaderProfile => E::LockHeader,
+        E::AccountProof => E::LockAccount,
+        E::AccountCode => E::LockCodeHash,
+        E::StorageProof | E::StorageValue => E::LockStorage,
+        other => other,
+    }
+}
+
+/// Verify a lock proof against the pinned deployment and trust bundle, in the specified order; a
+/// refusal is the oracle's reason.
 ///
 /// `expected_digest` is the lock digest reconstructed from the actual mint and configuration.
 pub fn verify(
+    dep: &Deployment,
+    trust: &TrustInput,
+    j: &Justification<'_>,
+    expected_digest: &[u8; 32],
+) -> Result<VerifiedLock> {
+    verify_steps(dep, trust, j, expected_digest).map_err(lock_canonical)
+}
+
+fn verify_steps(
     dep: &Deployment,
     trust: &TrustInput,
     j: &Justification<'_>,
@@ -259,7 +290,8 @@ pub fn verify(
     if entry_id != trust.id() {
         return Err(E::LockProofTrust);
     }
-    crate::resources::preflight_uc(lp.uc)?;
+    // the native certificate scan's refusal is the oracle's ErrCertScan, whatever the scan's own reason
+    crate::resources::preflight_uc(lp.uc).map_err(|_| E::CertScan)?;
     let uc = {
         let d = Decoder::with_limits(lp.uc, unicity_token::cbor::DecodeLimits::DEFAULT);
         let uc = UnicityCertificate::from_cbor(d).map_err(|_| E::UnsupportedCertificateEncoding)?;

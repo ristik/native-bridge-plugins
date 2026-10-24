@@ -81,7 +81,7 @@ function uc(n: Node, budget: Budget, maxBytes = MAX_UC_BYTES): void {
   const ut = tagged(k[5], 39004n, 3); version(ut[0]); uint(ut[1], 0xffffffffn);
   const steps = array(ut[2]); if (steps.length > 32) fail('ErrProofTooLarge');
   for (const step of steps) { const x = array(step, 2); uint(x[0], 0xffffffffn); hash(x[1]); }
-  const seal = tagged(k[6], 39005n, 8); version(seal[0]); uint(seal[1], 0xffffn); uint(seal[2]); uint(seal[3]); uint(seal[4]); hash(seal[5], true); hash(seal[6]);
+  const seal = tagged(k[6], 39005n, 8); version(seal[0]); uint(seal[1], 0xffffn); if (seal[1].arg === 0n) unsupported(); uint(seal[2]); // network 0 is none (B1 scan) uint(seal[3]); uint(seal[4]); hash(seal[5], true); hash(seal[6]);
   if (seal[7].major !== 5) unsupported();
   const sigs = seal[7].kids; if (sigs.length > 128) fail('ErrProofTooLarge');
   for (let i = 0; i < sigs.length; i += 2) {
