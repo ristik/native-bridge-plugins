@@ -18,6 +18,8 @@ export interface TesterConfig {
   /** the lock-proof endpoint (dnb-tool lockproof-serve): GET /v1/lockproof?block=..&nonce=.. */
   lockProofUrl: string;
   chainId: number;
+  /** block 0's hash on this generation: the chain ID stays the same across generations, so this is what tells a reset network apart */
+  genesisHash: string;
   vault: string;
   /** the trust-base release bundle, its genesis entry id, the EVM shard's PDR and the bridge deployment document (policyBody) */
   files: { trustBundle: string; trustEntryId: string; evmPdr: string; deployment: string };
@@ -35,6 +37,7 @@ export function loadTesterConfig(path: string): TesterConfig {
   for (const k of ['ethUrl', 'aggUrl', 'lockProofUrl'] as const) if (!isUrl(c[k])) bad(`${k} must be an http(s) URL`);
   if (c.redeemEthUrl !== undefined && !isUrl(c.redeemEthUrl)) bad('redeemEthUrl must be an http(s) URL');
   if (!Number.isSafeInteger(c.chainId) || c.chainId <= 0) bad('chainId must be a positive integer');
+  if (typeof c.genesisHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(c.genesisHash)) bad('genesisHash must be a 0x 32-byte hash');
   if (!isAddress(c.vault)) bad('vault must be a 0x address');
   const dir = dirname(resolve(path));
   const files = c.files ?? bad('files is missing');
@@ -146,4 +149,16 @@ export function splitAmounts(text: string, totalWei: bigint): bigint[] {
   const sum = parts.reduce((a, b) => a + b, 0n);
   if (sum !== totalWei) throw new Error(`--amounts add up to ${sum} wei, the token holds ${totalWei} wei`);
   return parts;
+}
+
+/**
+ * The network the configuration names, checked before anything is sent: an endpoint whose block 0 is not the configuration's genesis is another
+ * generation (a reset network keeps the chain ID, so an old wallet's transaction would be valid there and land at an address with no vault), and a
+ * vault address with no code is not this generation's vault.
+ */
+export function checkNetwork(cfg: Pick<TesterConfig, 'genesisHash' | 'vault'>, url: string, block0Hash: string, vaultCode: string): void {
+  if (block0Hash.toLowerCase() !== cfg.genesisHash.toLowerCase()) {
+    throw new Error(`${url} is another network: its genesis is ${block0Hash}, this wallet's is ${cfg.genesisHash} (a reset network: start a new wallet from its tester-config.json)`);
+  }
+  if (!/^0x[0-9a-fA-F]*$/.test(vaultCode) || vaultCode.length <= 2) throw new Error(`${url} has no code at the vault ${cfg.vault}: not this generation's bridge`);
 }
