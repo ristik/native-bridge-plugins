@@ -26,6 +26,11 @@ protocol-4 plug-in (partition-only policy, one `CERT_BATCH_V2` over the anchor t
   - A replay with a fresh proof: the redeemed burn is consolidated again under a seal newer than every saved anchor. The vault must refuse it
     as `PartAlreadyRedeemed(nonce, partId)` (protocol 6: spent per lock and part), so a replay is refused on the spent part whatever the age of its proof.
 
+  - An unknown-key forgery: the same fresh proofs with the seal re-signed by freshly generated keys under the same signer IDs. The plug-in must
+    refuse it (`ErrQuorumNotMet`) and the vault's composition must refuse its envelope (`BridgeRejected` with a nonzero V2 status) before any
+    spent-state check; the replay above is the control. This is NOT a retired-committee forgery: the package has no root handoff, so the
+    retired-key case is covered by the plug-in unit tests (`retired-key.test.ts`, `tests/retired_key.rs`) and listed as not covered live (#438).
+
   It writes `negatives.json`.
 
 Shard routing is host knowledge: `lane-config.json` may carry `aggShards: [{shard, url}]`. A leaf goes to the deepest configured shard

@@ -18,8 +18,10 @@
  *   anyage.ts negatives <lane-config.json> <saved.json>                       (bft-core #438) after the saved token's release: a conflicting burn of its pre-burn state
  *                                                                              (another recipient) is not certified, the aggregator serves the first burn's proof for that
  *                                                                              state; and a fresh proof of the redeemed burn (consolidated now, under a newer seal) is refused
- *                                                                              by the vault as PartAlreadyRedeemed, with the saved nullifier. Writes negatives.json; sends nothing
- *                                                                              to the vault
+ *                                                                              by the vault as PartAlreadyRedeemed, with the saved nullifier; the same fresh proofs with the seal
+ *                                                                              re-signed by unknown keys (an unknown-key forgery, not a retired committee) are refused by the
+ *                                                                              plug-in (ErrQuorumNotMet) and by the composition (BridgeRejected). Writes negatives.json; sends
+ *                                                                              nothing to the vault
  *
  * Nothing is refreshed: the saved envelope is the one the plug-in assembled from the proofs the aggregator returned when each transition
  * was certified, and every later command checks its sha256 before use. Protocol 4 (any-age registry, one CERT_BATCH_V2 call over the
@@ -30,6 +32,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 import { ShardId } from '@unicitylabs/state-transition-sdk/lib/api/bft/ShardId.js';
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicitySeal.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
 import { ShardRouting } from '@unicitylabs/state-transition-sdk/lib/consolidation/ShardRouting.js';
 import { TokenProofClient } from '@unicitylabs/state-transition-sdk/lib/consolidation/TokenProofClient.js';
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
@@ -619,7 +624,7 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   const tokenBytes = Uint8Array.from(readFileSync(`${dir}/${saved.token.file}`));
   assert.equal(sha(tokenBytes), saved.token.sha256, 'token.cbor changed since it was saved');
   const nonce = BigInt(saved.nonce);
-  const { cfg, bridge } = await installedBridge(c);
+  const { cfg, dep, bridge } = await installedBridge(c);
   const token = await Token.fromCBOR(tokenBytes);
   assert.equal(c.cast('call', c.lane.vault, 'spentPart(uint256,bytes32)(bytes32)', nonce.toString(), `0x${hex(token.id.bytes)}`).toLowerCase(), `0x${saved.nullifier}`.toLowerCase(),
     'run after the release: the vault has spent this token');
@@ -655,17 +660,40 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   // 2. a fresh proof of the redeemed burn: consolidated now, under a seal newer than every saved anchor. The vault refuses it on the nullifier
   // (PartAlreadyRedeemed of this nonce and token), not for its certificate, so a replay does not depend on the age of the proof.
   const refusal = PART_ALREADY_REDEEMED + hex(word(nonce)) + hex(token.id.bytes);
-  const { ret, conAnchors, accepted } = await consolidateAndAccept(c, bridge, token, nonce, labelByCertificate, refusal);
+  const { ret, conAnchors, accepted, consolidatedToken } = await consolidateAndAccept(c, bridge, token, nonce, labelByCertificate, refusal);
   assert.equal(hex(ret.verified.outcome.nullifier), saved.nullifier, 'the fresh proof carries the redeemed burn\'s nullifier');
   const newest = (saved.anchors as { round: string }[]).reduce((m, a) => (BigInt(a.round) > m ? BigInt(a.round) : m), 0n);
   assert.ok(BigInt(conAnchors[0].round) > newest, `the fresh proof's seal (round ${conAnchors[0].round}) is newer than every saved anchor (${newest})`);
   assert.notEqual(sha(ret.encoded), saved.envelope.sha256, 'the fresh envelope is not the saved one');
+
+  // 3. an UNKNOWN-KEY forgery, not a retired committee (this package has no root handoff; bft-core #438 lists the retired-key case as not covered
+  // live): the fresh proofs of step 2 with their seal re-signed by fresh keys under the same signer IDs. Step 2 is the control: with the genuine
+  // seal the composition accepts and the vault refuses only the spent part. The forged seal is refused by the plug-in, and by the composition
+  // (BridgeRejected) before any spent-state check.
+  const fresh = [consolidatedToken.genesis, ...consolidatedToken.transactions].map((x) => x.inclusionProof);
+  const forgedUcs = new Map<string, UnicityCertificate>();
+  for (const p of fresh) {
+    const k = hex(p.unicityCertificate.toCBOR());
+    if (!forgedUcs.has(k)) forgedUcs.set(k, await unknownKeyCertificate(p.unicityCertificate));
+  }
+  const forgedProofs = fresh.map((p) => new InclusionProof(p.certificationData, p.referenceTime, p.inclusionCertificate, forgedUcs.get(hex(p.unicityCertificate.toCBOR()))!));
+  let forgedPluginRefusal = '';
+  try {
+    await bridge.verifyNativeToken(await refreshToken(token, forgedProofs), 'return');
+  } catch (e) {
+    forgedPluginRefusal = String(e).slice(0, 200);
+  }
+  assert.match(forgedPluginRefusal, /ErrQuorumNotMet/, `the plug-in refuses the unknown-key seal as no quorum: ${forgedPluginRefusal}`);
+  const forgedEnv = assembleEnvelope(dep, projectToken(token), forgedProofs).encoded;
+  const forgedChain = composeRefusal((await callVault(c.eth, c.lane.vault, redeemCalldata(forgedEnv), await rpc(c.eth, 'eth_blockNumber', []))).revert);
+  console.log(`UNKNOWN-KEY FORGERY: plug-in ${forgedPluginRefusal}; composition ${forgedChain.name} (${forgedChain.code})`);
 
   const record = {
     nonce, nullifier: saved.nullifier,
     conflictingBurn: { stateId: hex(csid.data), recipient: THIRD_PARTY_ADDR, submission: submitted, servedTransactionHash: hex(served.certificationData.transactionHash.data),
       conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefused },
     freshReplay: { anchors: conAnchors, newestSavedRound: newest, envelopeSha256: sha(ret.encoded), envelopeBytes: ret.encoded.length, refusedAtBlock: accepted, revertData: refusal },
+    unknownKeyForgery: { label: 'unknown-key forgery (not a retired committee)', seals: forgedUcs.size, pluginRefusal: forgedPluginRefusal, composition: forgedChain },
   };
   writeFileSync(`${dir}/negatives.json`, toJson(record));
   console.log('NEGATIVES', toJson({ conflictingSubmission: submitted, freshSeal: conAnchors[0], refusedAtBlock: accepted }));
@@ -676,6 +704,23 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
 /** BridgeVault's BridgeRejected(uint256): the composition (BRIDGE_COMPOSE_V2) refused the redemption with a nonzero status. */
 const BRIDGE_REJECTED = '0x2896c49d';
 const STATUS_V2 = JSON.parse(readFileSync(new URL('../../protocol/vectors/split/config/compose-status-v2.json', import.meta.url), 'utf8')) as { code: number; name: string }[];
+
+/** A vault eth_call's revert that must be the composition's: BridgeRejected with a nonzero V2 status, named from the corpus table. */
+function composeRefusal(revert: string | undefined): { revert: string; code: number; name: string } {
+  assert.ok(revert?.startsWith(BRIDGE_REJECTED), `refused by the composition (BridgeRejected): ${revert}`);
+  const code = Number(BigInt(`0x${revert!.slice(10, 74)}`));
+  assert.ok(code !== 0, 'a nonzero status');
+  return { revert: revert!, code, name: STATUS_V2.find((s) => s.code === code)?.name ?? `status ${code}` };
+}
+
+/** `uc` with its seal re-signed by freshly generated keys under the same signer IDs: keys no trust-base entry ever held. */
+async function unknownKeyCertificate(uc: UnicityCertificate): Promise<UnicityCertificate> {
+  const s = uc.unicitySeal;
+  const signers = new Map([...(s.signatures ?? new Map()).keys()].map((id) => [id, SigningService.generate()] as const));
+  assert.ok(signers.size > 0, 'the genuine seal is signed');
+  const seal = await UnicitySeal.create(s.networkId, s.rootChainRoundNumber, s.epoch, s.timestamp, s.previousHash, s.hash, signers);
+  return new UnicityCertificate(uc.inputRecord, uc.technicalRecordHash, uc.shardConfigurationHash, uc.shardTreeCertificate, uc.unicityTreeCertificate, seal);
+}
 
 /** One byte string replaced by another of the same length, exactly once in `b`. */
 function replaceOnce(b: Uint8Array, from: Uint8Array, to: Uint8Array, what: string): Uint8Array {
@@ -702,12 +747,7 @@ async function splitNegatives(cfgPath: string, wallet: string, partId: string, p
   const read = (id: string) => Uint8Array.from(readFileSync(`${wallet}/tokens/${id}/token.cbor`));
   const part = await Token.fromCBOR(read(partId));
   const parent = await Token.fromCBOR(read(parentId));
-  const status = (revert: string | undefined): { revert: string; code: number; name: string } => {
-    assert.ok(revert?.startsWith(BRIDGE_REJECTED), `refused by the composition (BridgeRejected): ${revert}`);
-    const code = Number(BigInt(`0x${revert!.slice(10, 74)}`));
-    assert.ok(code !== 0, 'a nonzero status');
-    return { revert: revert!, code, name: STATUS_V2.find((s) => s.code === code)?.name ?? `status ${code}` };
-  };
+  const status = composeRefusal;
   const latest = async () => (await rpc(c.eth, 'eth_blockNumber', [])) as string;
   const out: Json = { part: partId, parent: parentId };
 
