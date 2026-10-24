@@ -16,7 +16,7 @@ use native_bridge_sdk_ext::lockproof::parse_justification;
 use native_bridge_sdk_ext::profile::*;
 use native_bridge_sdk_ext::token::{Expect, NativeBridge, VerifiedToken};
 use native_bridge_sdk_ext::NativeError as E;
-use unicity_token::crypto::signer::Signer;
+use unicity_token::crypto::signer::{Secp256k1Signer, Signer};
 
 const T0: u64 = 1_700_000_040;
 const UC_TS: u64 = 1_700_000_900;
@@ -95,8 +95,57 @@ fn a_signer_unknown_to_the_trust_base_fails_the_seal_as_in_the_sdk() {
 }
 
 #[test]
-#[ignore = "weighted or rotating committees: common SDK trust-base evolution, out of scope until it lands"]
-fn weighted_quorum_and_epoch_rotation_are_future_sdk_work() {}
+fn a_weighted_committee_after_a_rotation_certifies_by_weight_not_by_count() {
+    let w = make_world(20);
+    // epoch 3 from round 1000, weights 98, 1, 1 in member order: W = 100, threshold 67
+    let next = next_weighted_epoch(&w.evm_root, 1000, 3, 50, Some(&[98, 1, 1]));
+    let s = spec(1);
+    let sealed_by = |signers: &[(String, Secp256k1Signer)]| {
+        let mut parts = lock_parts(&w, &s);
+        parts.uc.unicity_seal.epoch = 3;
+        parts.uc.unicity_seal.root_chain_round_number = 1500;
+        resign_by(signers, &mut parts.uc);
+        parts
+    };
+    let heavy = sealed_by(&next.signers[..1]);
+    let light = sealed_by(&next.signers[1..]);
+    let held = World {
+        bridge: NativeBridge::new(w.bridge.registry.clone(), trust_input(&next)).unwrap(),
+        ..w
+    };
+    // the heavy member alone is a quorum; the two light members (2 of 3 members, weight 2) are not
+    run(&held, &s, &heavy).unwrap();
+    assert_eq!(run(&held, &s, &light).unwrap_err(), E::QuorumNotMet);
+}
+
+#[test]
+fn a_lock_sealed_by_a_historical_committee_verifies_inside_its_closed_interval() {
+    let w = make_world(20);
+    let next = next_epoch(&w.evm_root, 1000, 4, 30);
+    let s = spec(1);
+    // sealed by epoch 2's committee (the world's) at `round`
+    let sealed = |round: u64| {
+        let mut parts = lock_parts(&w, &s);
+        parts.uc.unicity_seal.epoch = 2;
+        parts.uc.unicity_seal.root_chain_round_number = round;
+        resign(&w.evm_root, &mut parts.uc, 4);
+        parts
+    };
+    let cases = [
+        (sealed(500), None),
+        // the last round of epoch 2 is 999; round 1000 is epoch 3's
+        (sealed(999), None),
+        (sealed(1000), Some(E::SealEpoch)),
+    ];
+    // the history holds epochs 2 and 3: epoch 2 is closed, and its committee still verifies its own rounds
+    let held = World {
+        bridge: NativeBridge::new(w.bridge.registry.clone(), trust_input(&next)).unwrap(),
+        ..w
+    };
+    for (parts, expected) in cases {
+        assert_eq!(run(&held, &s, &parts).err(), expected);
+    }
+}
 
 #[test]
 fn invalid_signatures_of_known_members_fail_the_seal() {

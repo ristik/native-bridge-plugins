@@ -85,6 +85,12 @@ pair restart/replay and reorg behavior, and measured gas/resource boundaries.
 A wallet burn acknowledgement alone cannot prove settlement. Synthetic roots,
 precompile doubles and direct library calls cannot fill these live evidence slots.
 
-Arbitrary weights, committee rotation, trust-base append/fetch, interval closure,
-old-J validity across rotation and full B1/SDK seal parity remain deferred,
-unsupported cases. They must not be counted as passing coverage.
+This tier does not exercise arbitrary weights, committee rotation, trust-base
+append/fetch, interval closure, old-J validity across rotation or full B1/SDK
+seal parity (the `deferred` list of `pins.json`), and must not be counted as
+coverage of them. The plug-ins support them since the SDK trust-base history
+(bft-core#421), and the unit tests cover them: weighted and historical
+committees and rotation for lock proofs (`lockproof.test.ts`, `lock_proof.rs`),
+weighted quorum and per-epoch verification (`trust.test.ts`, `trust.rs`), and
+the SDK fetch-and-append refresh loop across two rotations, then redeemed (TS
+only: `rotation-refresh.test.ts`).
