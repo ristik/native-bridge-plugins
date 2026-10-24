@@ -85,9 +85,9 @@ def compare_contracts(contracts, generated):
 
 
 NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER = 'B2 kernel 0x0104', 'B1 CERT_BATCH_V2 0x0100', 'B1 RSMT_MEMBER_V1 0x0102'
-NATIVE_COMPOSE = 'BRIDGE_COMPOSE_V1 0x0105'
+NATIVE_COMPOSE = 'BRIDGE_COMPOSE_V2 0x0105'
 NATIVE_TARGETS = {NATIVE_KERNEL, NATIVE_UC, NATIVE_MEMBER, NATIVE_COMPOSE}
-# Exact native calls per step (B7 direct PR 2): prepareLock is one B2 kernel call; a mint or return is one BRIDGE_COMPOSE_V1 call and
+# Exact native calls per step (B7 direct PR 2): prepareLock is one B2 kernel call; a mint or return is one BRIDGE_COMPOSE_V2 call and
 # no direct B1/B2 call. Coverage is per step, never a union over the report.
 _NONE = {NATIVE_KERNEL: 0, NATIVE_UC: 0, NATIVE_MEMBER: 0, NATIVE_COMPOSE: 0}
 NATIVE_STEP_CALLS = {
