@@ -48,23 +48,9 @@ import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../pac
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, GATEWAY_MAX_BODY, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
   RECORD_ID, recordId, requirePhase, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
-
-/** The public gateway's request-body limit (bft-core deploy/testnet/gateway.py MAX_BODY). */
-const GATEWAY_MAX_BODY = 16384;
-
-// ---- JSON-RPC and HTTP --------------------------------------------------------------------------------------------------------------------------
-async function jsonRpc(url: string, method: string, params: unknown[]): Promise<any> {
-  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
-  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`${method} at ${url}: HTTP ${res.status}${body.length > GATEWAY_MAX_BODY ? ` (the request is ${body.length} bytes)` : ''}: ${text.slice(0, 200)}`);
-  const r = JSON.parse(text) as { result?: unknown; error?: { message: string; data?: string } };
-  if (r.error) throw new Error(`${method}: ${r.error.message}${r.error.data ? ` (${r.error.data})` : ''}`);
-  return r.result;
-}
 
 async function waitFor<T>(what: string, timeoutMs: number, f: () => Promise<T | undefined>, everyMs = 2000): Promise<T> {
   const end = Date.now() + timeoutMs;
@@ -434,7 +420,7 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
   const data = calldata('redeem(bytes)', encBytes(ret.encoded));
   const url = cfg.redeemEthUrl ?? cfg.ethUrl;
   if (url === cfg.ethUrl && data.length + 1024 > GATEWAY_MAX_BODY) {
-    console.log(`  note: the redemption is ${data.length} characters of calldata; a gateway with a ${GATEWAY_MAX_BODY}-byte body limit refuses it (configure redeemEthUrl)`);
+    console.log(`  note: the redemption is ${data.length} characters of calldata: a gateway that limits eth_sendRawTransaction to ${GATEWAY_MAX_BODY} bytes refuses it (the testnet package's takes 4.5 MiB; otherwise configure redeemEthUrl)`);
   }
   // the vault accepts the envelope once the root chain's seal of it is within the registry's usable origin (a few rounds)
   await waitFor('the vault to accept the return proof', 240_000, async () => {

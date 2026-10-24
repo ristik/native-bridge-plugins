@@ -53,9 +53,14 @@ The operator publishes `tester-config.json` together with the four files it name
 }
 ```
 
-`redeemEthUrl` is optional. A redemption carries the whole return proof, about 8 to 13 KB of bytes and so 16 to 26 KB as hex. A gateway
-with a smaller request-body limit refuses it; the testnet package's public gateway takes 16 KiB. With `redeemEthUrl` set, redemptions go
-there and every other call goes to `ethUrl`.
+`redeemEthUrl` is optional. A redemption carries the whole return proof, about 8 to 13 KB of bytes and so 16 to 26 KB as hex (up to the
+2 MiB envelope bound, so about 4.2 MB as hex). The testnet package's public gateway takes `eth_sendRawTransaction` bodies up to 4.5 MiB (every
+other method 16 KiB), so behind it no `redeemEthUrl` is needed. Set it for a gateway with a smaller limit: redemptions then go there and every
+other call goes to `ethUrl`. `aggUrl` on the package is the same gateway's `/aggregator` path (its own rate limit and body bound; the SDK's
+trust-base refresh reads `/api/v1/trustbases` on the same host).
+
+The public gateway allows 10 requests a second per address. A refused (429) call is retried after a short wait, up to five times; the
+gateway refuses before it reads the request, so a retried transaction is never sent twice.
 
 `genesisHash` is block 0's hash on this generation. Every command that reads or sends to the chain (and `init`) first checks it against
 `eth_getBlockByNumber(0)` on `ethUrl` and on `redeemEthUrl`, and checks that the vault has code there. A reset network keeps the chain ID,

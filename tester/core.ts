@@ -5,7 +5,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { arr, keccak256 } from '../packages/native-bridge-plugin/src/profile.js';
-import { hex, unhex } from '../tests/live/lib.js';
+import { hex, sleep, unhex } from '../tests/live/lib.js';
 
 /** What an operator publishes for testers (the testnet package writes it as GENERATION/bridge/tester-config.json). Files are relative to the config. */
 export interface TesterConfig {
@@ -161,4 +161,28 @@ export function checkNetwork(cfg: Pick<TesterConfig, 'genesisHash' | 'vault'>, u
     throw new Error(`${url} is another network: its genesis is ${block0Hash}, this wallet's is ${cfg.genesisHash} (a reset network: start a new wallet from its tester-config.json)`);
   }
   if (!/^0x[0-9a-fA-F]*$/.test(vaultCode) || vaultCode.length <= 2) throw new Error(`${url} has no code at the vault ${cfg.vault}: not this generation's bridge`);
+}
+
+// ---- JSON-RPC ---------------------------------------------------------------------------------------------------------------------------------
+/** The public gateway's request-body limit for every method but eth_sendRawTransaction (bft-core deploy/testnet/gateway.py MAX_BODY). */
+export const GATEWAY_MAX_BODY = 16384;
+/** A rate-limited (429) call is retried this many times, after RATE_LIMIT_WAIT_MS and then longer: the public gateway allows 10 requests a second per address. */
+export const RATE_LIMIT_RETRIES = 5;
+const RATE_LIMIT_WAIT_MS = 1100;
+
+/** One JSON-RPC call; a rate-limited (429) answer is retried with a growing wait. `wait` is a test seam. */
+export async function jsonRpc(url: string, method: string, params: unknown[], wait: (ms: number) => Promise<void> = sleep): Promise<any> {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+  let res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+  // the gateway's per-address rate limit refuses before it reads the body, so a retry never sends a transaction twice
+  for (let attempt = 1; res.status === 429 && attempt <= RATE_LIMIT_RETRIES; attempt++) {
+    await res.text();
+    await wait(RATE_LIMIT_WAIT_MS * attempt);
+    res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+  }
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${method} at ${url}: HTTP ${res.status}${body.length > GATEWAY_MAX_BODY && method !== 'eth_sendRawTransaction' ? ` (the request is ${body.length} bytes)` : ''}: ${text.slice(0, 200)}`);
+  const r = JSON.parse(text) as { result?: unknown; error?: { message: string; data?: string } };
+  if (r.error) throw new Error(`${method}: ${r.error.message}${r.error.data ? ` (${r.error.data})` : ''}`);
+  return r.result;
 }

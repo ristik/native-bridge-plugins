@@ -8,7 +8,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
   parseAmount,
   RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
 } from './core.js';
@@ -117,4 +117,38 @@ test('the network guard: another generation\'s genesis, or no vault code, is ref
   assert.throws(() => checkNetwork(cfg, 'u', `0x${'cd'.repeat(32)}`, '0x6080'), /another network/);
   assert.throws(() => checkNetwork(cfg, 'u', 'none', '0x6080'), /another network/);
   assert.throws(() => checkNetwork(cfg, 'u', cfg.genesisHash, '0x'), /no code at the vault/);
+});
+
+test('a rate-limited JSON-RPC call is retried with a growing wait; a limit that does not clear fails with its status', async () => {
+  const { createServer } = await import('node:http');
+  let limited = 0;
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls++;
+    req.resume();
+    req.on('end', () => {
+      if (limited > 0) {
+        limited--;
+        res.writeHead(429, { 'content-type': 'application/json' }).end('{"error":"rate limit"}');
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' }).end('{"jsonrpc":"2.0","id":1,"result":"0x7"}');
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const waits: number[] = [];
+  const wait = (ms: number) => { waits.push(ms); return Promise.resolve(); };
+  try {
+    limited = 2;
+    assert.equal(await jsonRpc(url, 'eth_chainId', [], wait), '0x7');
+    assert.equal(calls, 3);
+    assert.deepEqual(waits, [1100, 2200]);
+    limited = RATE_LIMIT_RETRIES + 1;
+    calls = 0;
+    await assert.rejects(jsonRpc(url, 'eth_chainId', [], wait), /HTTP 429/);
+    assert.equal(calls, RATE_LIMIT_RETRIES + 1);
+  } finally {
+    server.close();
+  }
 });
