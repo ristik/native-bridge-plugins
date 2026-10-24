@@ -229,7 +229,28 @@ test('proof arity and version are exact', async () => {
   void accountTrieKey;
 });
 
-test('DEFERRED: rotation, weighted and historical-committee scenarios are unsupported', { skip: 'common SDK trust-base work (bft-core#421)' }, () => undefined);
+test('a weighted committee after a rotation: the heavy member alone certifies the lock, the two light members do not', async () => {
+  const w = await makeWorld();
+  // epoch 3 from round 1000, weights 98, 1, 1 in member order: W = 100, threshold 67
+  const next = await nextEpoch(w.evm, 1000n, 3, 50, [98, 1, 1]);
+  const held: World = { ...w, evm: next, bridge: new NativeBridge(w.bridge.registry, next.trust) };
+  await mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 1500n, signers: 1 })), undefined, held);
+  await rejects(
+    mutated(async (ww, p) => void (p.uc = await resignUc(ww, p, { rootEpoch: 3n, round: 1500n, signers: 0, extra: next.signers.slice(1) })), undefined, held),
+    'ErrQuorumNotMet',
+  );
+});
+
+test('a historical committee: a lock sealed in epoch 2 still verifies after the history holds epoch 3, inside epoch 2\'s closed interval', async () => {
+  const w = await makeWorld();
+  const next = await nextEpoch(w.evm, 1000n, 4, 30);
+  const held: World = { ...w, evm: next, bridge: new NativeBridge(w.bridge.registry, next.trust) };
+  // epoch 2's committee sealed round 500, before epoch 3 started: verified under epoch 2's own committee, at any later time
+  await mutated(async (_, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 2n, round: 500n })), undefined, held);
+  // the last round of epoch 2 is 999; round 1000 is epoch 3's
+  await mutated(async (_, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 2n, round: 999n })), undefined, held);
+  await rejects(mutated(async (_, p) => void (p.uc = await resignUc(w, p, { rootEpoch: 2n, round: 1000n })), undefined, held), 'ErrSealEpoch');
+});
 
 test('several faults get the oracle verdict: the seal epoch first, then the configuration, then the certificate', async () => {
   const w = await makeWorld();

@@ -328,8 +328,26 @@ pub fn make_weighted_root(epoch: u64, n: usize, seed: u8, weights: Option<&[u64]
 /// The next epoch of `root` from root round `start`: a committee of `n` members (seed `seed`),
 /// witnessed by every member of the current one. Same pin, one more entry.
 pub fn next_epoch(root: &Root, start: u64, n: usize, seed: u8) -> Root {
+    next_weighted_epoch(root, start, n, seed, None)
+}
+
+/// `next_epoch` with the new committee's weights in member (id) order; unit weights when `None`.
+pub fn next_weighted_epoch(
+    root: &Root,
+    start: u64,
+    n: usize,
+    seed: u8,
+    weights: Option<&[u64]>,
+) -> Root {
     let mut entries = root.entries.clone();
-    entries.push(successor_entry(root, start, n, seed, &root.signers));
+    entries.push(weighted_successor_entry(
+        root,
+        start,
+        n,
+        seed,
+        weights,
+        &root.signers,
+    ));
     root_of(committee(n, seed), entries)
 }
 
@@ -341,11 +359,22 @@ pub fn successor_entry(
     seed: u8,
     witnesses: &[(String, Secp256k1Signer)],
 ) -> TrustBaseEntry {
+    weighted_successor_entry(root, start, n, seed, None, witnesses)
+}
+
+fn weighted_successor_entry(
+    root: &Root,
+    start: u64,
+    n: usize,
+    seed: u8,
+    weights: Option<&[u64]>,
+    witnesses: &[(String, Secp256k1Signer)],
+) -> TrustBaseEntry {
     let tip = root.tb();
     let mut next = entry_of(
         tip.epoch + 1,
         start,
-        members(&committee(n, seed), None),
+        members(&committee(n, seed), weights),
         tip.entry_id(),
     );
     for (id, s) in witnesses {
@@ -771,12 +800,21 @@ pub fn built_from(w: &World, s: &MintSpec, parts: &LockParts) -> Built {
 
 /// Re-sign a mutated certificate: recompute the seal hash and all signatures.
 pub fn resign(root: &Root, uc: &mut UnicityCertificate, signers: usize) {
-    uc.unicity_seal.hash = uc.computed_seal_hash().unwrap().data().to_vec();
-    let digest = uc.unicity_seal.calculate_hash();
-    uc.unicity_seal.signatures = root
+    let first = root
         .signers
         .iter()
         .take(signers)
+        .cloned()
+        .collect::<Vec<_>>();
+    resign_by(&first, uc);
+}
+
+/// Re-sign a mutated certificate with exactly `signers`.
+pub fn resign_by(signers: &[(String, Secp256k1Signer)], uc: &mut UnicityCertificate) {
+    uc.unicity_seal.hash = uc.computed_seal_hash().unwrap().data().to_vec();
+    let digest = uc.unicity_seal.calculate_hash();
+    uc.unicity_seal.signatures = signers
+        .iter()
         .map(|(id, sg)| (id.clone(), sg.sign(&digest).encode().to_vec()))
         .collect();
 }
