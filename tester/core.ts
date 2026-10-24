@@ -170,18 +170,36 @@ export const GATEWAY_MAX_BODY = 16384;
 export const RATE_LIMIT_RETRIES = 5;
 const RATE_LIMIT_WAIT_MS = 1100;
 
-/** One JSON-RPC call; a rate-limited (429) answer is retried with a growing wait. `wait` is a test seam. */
+/** The methods the package gateway takes above GATEWAY_MAX_BODY (a redemption's send, and its call and estimate). */
+const LARGE_METHODS = new Set(['eth_sendRawTransaction', 'eth_call', 'eth_estimateGas']);
+
+/** An HTTP refusal of a JSON-RPC call, with its status (a JSON-RPC error inside a 200 is a plain Error). */
+export class HttpError extends Error {
+  public constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+/**
+ * Refused before any upstream call, so retrying never sends a transaction twice: the gateway's per-address rate limit (429), and its busy answer when
+ * every large-body slot is taken (503 "busy"). Its other 503 (a broadcast that may be partial) is never retried.
+ */
+const retryable = (status: number, text: string): boolean => status === 429 || (status === 503 && text.includes('busy'));
+
+/** One JSON-RPC call; a rate-limited or busy answer is retried with a growing wait. `wait` is a test seam. */
 export async function jsonRpc(url: string, method: string, params: unknown[], wait: (ms: number) => Promise<void> = sleep): Promise<any> {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
   let res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
-  // the gateway's per-address rate limit refuses before it reads the body, so a retry never sends a transaction twice
-  for (let attempt = 1; res.status === 429 && attempt <= RATE_LIMIT_RETRIES; attempt++) {
-    await res.text();
+  let text = await res.text();
+  for (let attempt = 1; retryable(res.status, text) && attempt <= RATE_LIMIT_RETRIES; attempt++) {
     await wait(RATE_LIMIT_WAIT_MS * attempt);
     res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+    text = await res.text();
   }
-  const text = await res.text();
-  if (!res.ok) throw new Error(`${method} at ${url}: HTTP ${res.status}${body.length > GATEWAY_MAX_BODY && method !== 'eth_sendRawTransaction' ? ` (the request is ${body.length} bytes)` : ''}: ${text.slice(0, 200)}`);
+  if (!res.ok) {
+    throw new HttpError(`${method} at ${url}: HTTP ${res.status}${body.length > GATEWAY_MAX_BODY && !LARGE_METHODS.has(method) ? ` (the request is ${body.length} bytes)` : ''}: ${text.slice(0, 200)}`, res.status);
+  }
   const r = JSON.parse(text) as { result?: unknown; error?: { message: string; data?: string } };
   if (r.error) throw new Error(`${method}: ${r.error.message}${r.error.data ? ` (${r.error.data})` : ''}`);
   return r.result;

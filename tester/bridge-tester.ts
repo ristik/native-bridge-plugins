@@ -48,7 +48,7 @@ import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../pac
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, GATEWAY_MAX_BODY, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
   RECORD_ID, recordId, requirePhase, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
 
@@ -420,7 +420,7 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
   const data = calldata('redeem(bytes)', encBytes(ret.encoded));
   const url = cfg.redeemEthUrl ?? cfg.ethUrl;
   if (url === cfg.ethUrl && data.length + 1024 > GATEWAY_MAX_BODY) {
-    console.log(`  note: the redemption is ${data.length} characters of calldata: a gateway that limits eth_sendRawTransaction to ${GATEWAY_MAX_BODY} bytes refuses it (the testnet package's takes 4.5 MiB; otherwise configure redeemEthUrl)`);
+    console.log(`  note: the redemption is ${data.length} characters of calldata: a gateway that limits eth_call or eth_sendRawTransaction to ${GATEWAY_MAX_BODY} bytes refuses it (the testnet package's takes 4.5 MiB; otherwise configure redeemEthUrl)`);
   }
   // the vault accepts the envelope once the root chain's seal of it is within the registry's usable origin (a few rounds)
   await waitFor('the vault to accept the return proof', 240_000, async () => {
@@ -428,7 +428,10 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
       // redeem returns (uint256 nonce, bytes32 partId): the root lock's nonce and this token's ID
       const ret = (await chain.call(data, ethAddress(w.keys().eth), url)).replace(/^0x/, '');
       return BigInt(`0x${ret.slice(0, 64)}`) === BigInt(t.nonce) && ret.slice(64, 128) === hex(token.id.bytes) ? true : undefined;
-    } catch {
+    } catch (e) {
+      // not yet accepted (the vault reverts until the seal is within the usable origin) or a transient upstream failure: wait; but a client error
+      // (4xx) is the endpoint refusing the request itself, which waiting never changes
+      if (e instanceof HttpError && e.status >= 400 && e.status < 500) throw e;
       return undefined;
     }
   }, 3000);

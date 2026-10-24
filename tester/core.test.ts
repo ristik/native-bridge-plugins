@@ -8,7 +8,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
   parseAmount,
   RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
 } from './core.js';
@@ -148,6 +148,38 @@ test('a rate-limited JSON-RPC call is retried with a growing wait; a limit that 
     calls = 0;
     await assert.rejects(jsonRpc(url, 'eth_chainId', [], wait), /HTTP 429/);
     assert.equal(calls, RATE_LIMIT_RETRIES + 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('the gateway\'s busy answer is retried like a rate limit; its partial-broadcast 503 and a client error are not, and carry their status', async () => {
+  const { createServer } = await import('node:http');
+  const answers: [number, string][] = [];
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls++;
+    req.resume();
+    req.on('end', () => {
+      const [status, body] = answers.shift() ?? [200, '{"jsonrpc":"2.0","id":1,"result":"0x7"}'];
+      res.writeHead(status, { 'content-type': 'application/json' }).end(body);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const wait = () => Promise.resolve();
+  try {
+    answers.push([503, '{"error":"busy: too many large requests, retry"}']);
+    assert.equal(await jsonRpc(url, 'eth_call', [], wait), '0x7');
+    assert.equal(calls, 2);
+    calls = 0;
+    answers.push([503, '{"error":"RPC unavailable; broadcast may be partial, inspect before retry"}']);
+    await assert.rejects(jsonRpc(url, 'eth_sendRawTransaction', ['0x00'], wait), (e: unknown) => e instanceof HttpError && e.status === 503);
+    assert.equal(calls, 1);
+    calls = 0;
+    answers.push([400, '{"error":"invalid or forbidden JSON-RPC request"}']);
+    await assert.rejects(jsonRpc(url, 'eth_call', [], wait), (e: unknown) => e instanceof HttpError && e.status === 400);
+    assert.equal(calls, 1);
   } finally {
     server.close();
   }
