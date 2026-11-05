@@ -249,7 +249,7 @@
           "const": 1
         },
         "protocolVersion": {
-          "const": 6
+          "const": 7
         },
         "family": {
           "const": "unicity-native"
