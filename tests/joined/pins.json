@@ -1,10 +1,10 @@
 {
   "profile": "utb-history-protocol-7",
   "sources": {
-    "plugins": "0e250ace75cc68653bda2618f45e4e3f3ae42d4a",
-    "ureth": "62c194bf23725444d8616c62474e6f92444e5334",
-    "contracts": "e0f46f854492d775b5b09b4418c993de4a8b7619",
-    "oracle": "a7f5692effb8ebecfb208658ccac357414d6e9ba",
+    "plugins": "b4f93871712ffd74900ab33962abf7c00d0df1a4",
+    "ureth": "870c1d012297cea6edbcc3ee8969a72a7a7020a8",
+    "contracts": "6a1185c500e8290086a1307fe3448cc01c4321cc",
+    "oracle": "df8339cc73ce9e86109535e9319ad738b9e87044",
     "aggregator": "ae081651ac7443496b5397baa8748e0b4280ba72"
   },
   "blocked": {
@@ -20,5 +20,5 @@
     "old-J validity across rotation",
     "B1 precompile and an SDK verifier compared on the same seal inputs in one joined run (parity under the upstream seal rule is evidenced per repo on the shared 202 b1-seal vectors, not by this tier)"
   ],
-  "pluginsTree": "f2d18f28c5b6fef6875af051c98e9ec380790322b9bbb45c23a94c41b27279b1"
+  "pluginsTree": "66dae4aaa3351fd8a186d5a6704f0a5b93344a39968b54c95379b7ea80428c2f"
 }
