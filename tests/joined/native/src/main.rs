@@ -578,7 +578,7 @@ fn matches_compose(step: &str, o: &Out, op: u8, golden: &Value) -> u64 {
         + 2 * input.len() as u64
         + 20 * j
         + 16_000 * leaves
-        + 6_000 * gr("q")
+        + 7_200 * gr("q")
         + 29_900 * gr("e")
         + 2_000 * gr("a")
         + 250 * n("steps")

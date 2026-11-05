@@ -43,9 +43,9 @@ test('the gas estimate prices its components exactly as the oracle and the contr
   // 26000 + 20*(160 + 131072 + 131072) + 14000*65
   assert.equal(b2Gas(kernelRequestBytes(L.MAX_SEMANTIC_BYTES, L.MAX_SEMANTIC_BYTES), L.MAX_LEAVES), 6_182_080);
   assert.equal(itemGas(4096), 4_096_000);
-  // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P
+  // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 7200*Q + 2000*A + 250*P
   const n = { k: 3, c: 1000, e: 2, s: 2, q: 8, a: 3, p: 7, items: 0 };
-  assert.equal(batchGas(n), 60_000 + 16_000 + 500 * 6 + 1_100 + 2 * 29_900 + 8 * 6_000 + 3 * 2_000 + 7 * 250);
+  assert.equal(batchGas(n), 60_000 + 16_000 + 500 * 6 + 1_100 + 2 * 29_900 + 8 * 7_200 + 3 * 2_000 + 7 * 250);
 });
 
 test('the best-case projection at the bounds is an estimate with ONE anchor', () => {
@@ -69,5 +69,5 @@ test('the BRIDGE_COMPOSE_V1 schedule is bft-core ComposeGas: 50*K*ceil(log2 K) g
   const { composeGas, composeGroupGas } = await import('../src/gas.js');
   assert.deepEqual([0, 1, 2, 3, 4, 16, 17].map(composeGroupGas), [0, 0, 100, 300, 400, 3_200, 4_250]);
   const d = { b: 1000, j: 10, l: 2, q: 3, e: 1, a: 2, k: 2, p: 5 };
-  assert.equal(composeGas(d), 100_000 + 2_000 + 200 + 32_000 + 18_000 + 29_900 + 4_000 + 1_250 + 100);
+  assert.equal(composeGas(d), 100_000 + 2_000 + 200 + 32_000 + 21_600 + 29_900 + 4_000 + 1_250 + 100);
 });

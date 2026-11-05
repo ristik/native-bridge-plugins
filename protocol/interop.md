@@ -492,7 +492,7 @@ nonzero status. `prepareLock` still calls B2 at 0x0104 directly (depth 0 only).
 ### Gas schedule and estimate
 
 The native call charges the trial schedule (bft-core `ComposeGas`)
-`G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K) + G_split`:
+`G_compose = 100000 + 2*B + 20*J + 16000*L + 7200*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K) + G_split`:
 B the input bytes; J the CBOR item heads of the Cfg, the policy body, the
 history, every anchor UC and every anchor IR opening, each encoded occurrence
 counted once (tags and containers, scalar and string heads, every child and map

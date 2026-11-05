@@ -30,7 +30,7 @@ const SCAN_PER_BYTE: u64 = 16;
 const SCAN_PER_PAIR: u64 = 500;
 const COMMON_READS: u64 = 1_100;
 const PER_EPOCH: u64 = 29_900;
-const PER_SIGNATURE: u64 = 6_000;
+const PER_SIGNATURE: u64 = 7_200; // profile 7: 6,000 repriced by the measured recovery/verification ratio (relative, not an absolute time bound)
 const PER_CLAIM: u64 = 2_000;
 const PER_STEP: u64 = 250;
 
