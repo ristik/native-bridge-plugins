@@ -102,7 +102,7 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
         sdk_error(uc),
         unicity_token::verify::VerificationError::SealRootMismatch
     );
-    // Two valid, two corrupt: the native rule fails the seal on an invalid signature.
+    // Two valid, two corrupt: the corrupt ones count zero and two of four are short of the quorum.
     let mut uc = proof.unicity_certificate.clone();
     uc.unicity_seal.signatures.truncate(2);
     let d = uc.unicity_seal.calculate_hash();
@@ -116,12 +116,22 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::QuorumNotMet);
     assert_eq!(
         sdk_error(uc),
-        unicity_token::verify::VerificationError::SealSignerInvalid
+        unicity_token::verify::VerificationError::QuorumNotMet
     );
+    // Three valid and one corrupt: the corrupt one counts zero and does not fail the quorum.
+    let mut uc = proof.unicity_certificate.clone();
+    uc.unicity_seal.signatures.truncate(3);
+    let d = uc.unicity_seal.calculate_hash();
+    let mut bad = r.signers[3].1.sign(&d).encode().to_vec();
+    bad[3] ^= 1;
+    uc.unicity_seal
+        .signatures
+        .push((r.signers[3].0.clone(), bad));
+    verify_embedded_uc(&ti, &uc).unwrap();
 }
 
 #[test]
-fn unknown_signers_fail_the_seal() {
+fn unknown_signers_count_zero_and_an_empty_signer_id_is_refused() {
     let r = make_root(2, 4, 10);
     let mut uc = uc_with(&r, 2);
     let d = uc.unicity_seal.calculate_hash();
@@ -135,6 +145,24 @@ fn unknown_signers_fail_the_seal() {
         verify_embedded_uc(&input(&r), &uc).unwrap_err(),
         E::QuorumNotMet
     );
+    // beside an honest quorum a stranger changes nothing ...
+    let mut uc = uc_with(&r, 3);
+    let d = uc.unicity_seal.calculate_hash();
+    uc.unicity_seal
+        .signatures
+        .push(("stranger".into(), signer(250).sign(&d).encode().to_vec()));
+    verify_embedded_uc(&input(&r), &uc).unwrap();
+    // ... but a real signature under an EMPTY signer ID is refused as the native seal validation refuses it
+    let mut uc = uc_with(&r, 3);
+    let real = uc.unicity_seal.signatures[0].1.clone();
+    uc.unicity_seal.signatures.push((String::new(), real));
+    assert!(verify_embedded_uc(&input(&r), &uc).is_err());
+    // ... and so is an empty signature value
+    let mut uc = uc_with(&r, 3);
+    uc.unicity_seal
+        .signatures
+        .push(("stranger".into(), Vec::new()));
+    assert!(verify_embedded_uc(&input(&r), &uc).is_err());
 }
 
 #[test]

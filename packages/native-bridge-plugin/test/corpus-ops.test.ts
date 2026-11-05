@@ -156,7 +156,7 @@ test('history/prepareLock: the lock request\'s outcome for (cfg, nonce, amount, 
 test('lock/lock-backing: the mint\'s lock justification verified offline against a trust base and a deployment pin', async () => {
   const cfg = decodeCfg(bytes(fixtures.fixtures.dev.cfg));
   const ch = cfgHash(cfg);
-  await replayAll('lock', 'lock-backing', 66, async (c) => {
+  await replayAll('lock', 'lock-backing', 71, async (c) => {
     assert.equal(c.cfg, 'dev', c.id);
     const h = decodeHistory(bytes(c.input));
     const tb = fixtures.trustBases[c.aux!.trustBase];
@@ -195,7 +195,7 @@ test('wire/token-project: the compact history of an SDK token', async () => {
   // A refused case goes through the plug-in's own token intake (NativeBridge.verifyNativeTokenBytes: the bounded native scan, then the SDK decode,
   // re-encoding equal). The accepted cases carry a synthetic certificate inside the mint's lock proof, which the intake scans (and refuses) and the
   // oracle's projection never reads, so their projection is compared through the SDK decode alone.
-  await replayAll('wire', 'token-project', 36, async (c) => {
+  await replayAll('wire', 'token-project', 38, async (c) => {
     const input = bytes(c.input);
     if (c.expected.status !== 'ok') preflightToken(input);
     let token: Token;

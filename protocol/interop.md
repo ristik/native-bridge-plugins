@@ -1,7 +1,16 @@
 # Native bridge interoperability contract
 
-Status: protocol v6, development profile; implementation and activation gates
+Status: protocol v7, development profile; implementation and activation gates
 remain open. This document is the sole normative native byte contract.
+Protocol 7 changes one rule, the seal signature rule: it is upstream's (each supplied
+signature is judged alone; only an exact 65-byte canonical recoverable signature
+of its member counts; an unknown signer or any other signature counts zero and
+never fails the seal; an empty signer ID or value is refused by the native seal
+validation; the witnesses of a trust-base ENTRY stay strict). It replaces the
+B1 rule of protocol 6 (64-byte or 0/1-suffixed compact signatures, any extra
+failing the seal); the wire formats and layouts are unchanged, the acceptance
+and the charge are not, so a v6 deployment is replaced, never upgraded
+(bft-core `briefs/upstream-seal-rule-b1.md`).
 Protocol 6 adds split lineage (section "Split lineage" below; bft-core
 `docs/design/bridge-split-lineage-spec.md`): one part of a split token is
 redeemed against the original lock, through `BRIDGE_COMPOSE_V2`, by a fresh
@@ -13,7 +22,7 @@ batch of bft-core `briefs/b1-any-age-contract.md` (one `CERT_BATCH_V2` call over
 the anchor table) and the aggregation-partition policy below; the v3 sharded
 policy, per-anchor certificate calls and earlier assumptions are abandoned, with
 no compatibility, migration or acceptance promise.
-`NATIVE_BRIDGE_PROTO_VERSION=6` is independent of SDK Token.VERSION and the
+`NATIVE_BRIDGE_PROTO_VERSION=7` is independent of SDK Token.VERSION and the
 external bridge's BRIDGE_PROTO_VERSION. Any byte/derivation change MUST bump
 this version and semantic profile. Consensus parsers accept only this profile;
 there is no pre-3.0 decoder, migration or dual-format interpretation.
@@ -88,8 +97,8 @@ avoiding a code-hash/configuration cycle. Runtime chain/vault MUST match Cfg.
 ## SDK wire
 
 Pins: the ristik SDK lines (`integration/enshrined-evm`), JS
-`6060f6cd86c19076ad83aea3ac9709f3657b24f0` (4.0.0-utb), Rust
-`a75f46ad56d09e402f67cd9e7353b490eaa022b1` (unicity-token 4.0.0). The token,
+`75c5be7fd4d02ef4306b9b1ff14c4365c7468009` (4.0.0-utb), Rust
+`0517256d9417e9ad52f77a3ac9ef593fa7541d95` (unicity-token 4.0.0). The token,
 predicate and certification wire below is unchanged from SDK 3.0.1; predicate
 version and tags are unchanged. No other SDK fork or patch is authorized.
 
@@ -180,15 +189,18 @@ embedded UC is verified by the SDK under the entry of its own seal epoch:
 network equal to the history's (`SealNetwork`), an epoch newer than the latest
 held one `NoEntryForEpoch` (retryable), an epoch before the genesis or a root
 round outside `[start_e, start_e+1)` `SealEpoch`, native structure
-(`CertStructure`), tree root (`SealRoot`) and the native B1 seal rule under the
-epoch's committee (`QuorumNotMet`). The embedded EVM UC uses the SDK certificate
+(`CertStructure`), tree root (`SealRoot`) and the upstream seal rule under the
+epoch's committee (`QuorumNotMet`): each supplied signature is judged alone, an unknown signer and any signature that is not an exact
+65-byte canonical recoverable one of its member count zero, and the valid weights reach the threshold. The embedded EVM UC uses the SDK certificate
 verifier for its own partition (TS `verifyCertificate`, Rust
 `verify_certificate_of_partition`). No plug-in weighted verifier, epoch
 resolver or trust-base store.
 
 Both ordinary and embedded UCs MUST be in the canonical native/SDK-decodable
-intersection: seal signatures of 64 bytes or 65 with suffix 0/1 (the suffix is
-ignored, as in both SDKs and native B1), byte-string IR summary, array-valued
+intersection: seal signature values that are byte strings of any width (a value
+that is not an exact 65-byte canonical recoverable signature of its member
+counts zero; an empty value is refused by the native seal validation),
+byte-string IR summary, array-valued
 shard siblings and Unicity steps (including empty arrays), valid signature maps,
 SDK integer/key widths, and existing native/bridge bounds. Construction/import/
 refresh fail `UnsupportedCertificateEncoding` outside this subset. Never rewrite
@@ -427,7 +439,7 @@ IR opening, Cfg, policy body and nested payload); anchor
 UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity steps and
 exactly d shard-tree siblings per UC (d its own shard's depth, the anchor's
 shard equal to the UC's); Cfg<=1024. These are the named parameters of
-`profile-v6.json` `limits` (the single source for contract, oracle and
+`profile-v7.json` `limits` (the single source for contract, oracle and
 plug-ins). There is no cumulative path-step budget and no shared CBOR item
 budget: path steps and items are charged. An envelope's declared RSMT siblings
 never exceed its bytes/32 in sum (refused before allocation). Bitmap popcount

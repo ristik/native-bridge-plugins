@@ -15,8 +15,6 @@ use crate::scan::{scan_counted, scan_native, Item, Kind};
 
 /// B1's certificate byte cap (bft-core `b1ref.MaxUCBytes`).
 const B1_MAX_UC_BYTES: usize = 24576;
-/// The only seal signature width the SDK certificate codec accepts; native B1 also admits 64 bytes.
-const SDK_SIGNATURE_LENGTH: usize = 65;
 const TAG_UC: u64 = 39001;
 
 /// What field `index` of the certificate must be: `tag(tag, [arity items])` whose item `required` has the given kind.
@@ -96,12 +94,9 @@ pub fn scan_certificate(raw: &[u8]) -> Result<()> {
     }
     if let Kind::Map(sigs) = &seal[7].kind {
         for sig in sigs.iter().skip(1).step_by(2) {
-            // 64 bytes (r||s) or 65 with an ignored recovery suffix, as both SDKs and native B1
-            match sig.kind {
-                Kind::Bytes(d)
-                    if d.len() == SDK_SIGNATURE_LENGTH - 1 || d.len() == SDK_SIGNATURE_LENGTH => {}
-                Kind::Bytes(_) => return Err(E::CertSigLength),
-                _ => return Err(E::CertScan),
+            // the width is not checked here: a value that is not an exact canonical 65-byte signature of its member counts zero at the quorum
+            if !matches!(sig.kind, Kind::Bytes(_)) {
+                return Err(E::CertScan);
             }
         }
     }

@@ -13,9 +13,9 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
 # the installed SDKs, the ones protocol/interop.md pins: the ristik lines (integration/enshrined-evm)
-SDK_JS_FORK_COMMIT = '6060f6cd86c19076ad83aea3ac9709f3657b24f0'
-SDK_JS_FORK_VERSION = '4.0.0-utb.6060f6c'
-SDK_RUST_FORK_COMMIT = 'a75f46ad56d09e402f67cd9e7353b490eaa022b1'
+SDK_JS_FORK_COMMIT = '75c5be7fd4d02ef4306b9b1ff14c4365c7468009'
+SDK_JS_FORK_VERSION = '4.0.0-utb.75c5be7'
+SDK_RUST_FORK_COMMIT = '0517256d9417e9ad52f77a3ac9ef593fa7541d95'
 
 
 def load(path):
@@ -85,14 +85,14 @@ def validate_manifest(registry):
 def main():
     validator()
     abi = load('protocol/abi.json')
-    assert abi['protocolVersion'] == 6
+    assert abi['protocolVersion'] == 7
     assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
     assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v6.json')
-    assert profile['nativeBridgeProtocolVersion'] == 6 and profile['sdkVersion'] == '4.0.0'
+    profile = load('protocol/profile-v7.json')
+    assert profile['nativeBridgeProtocolVersion'] == 7 and profile['sdkVersion'] == '4.0.0'
     assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'unicity-trust-base-history'
     assert profile['trustModel']['trustDocumentFormat'] == 'utb-release-bundle-v1 (tag 39015)'

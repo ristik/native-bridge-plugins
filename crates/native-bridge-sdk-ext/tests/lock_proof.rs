@@ -79,16 +79,32 @@ fn a_quorum_short_by_one_signature_is_rejected() {
 }
 
 #[test]
-fn a_signer_unknown_to_the_trust_base_fails_the_seal_as_in_the_sdk() {
-    // The native (B1) rule the SDK applies: every signature must be a valid one of a committee
-    // member; an extra stranger fails the seal even beside a full quorum.
-    let e = mutated(|_, p, _| {
+fn a_signer_unknown_to_the_trust_base_counts_zero_as_in_the_sdk() {
+    // The upstream seal rule the SDK applies: each signature is judged alone, an extra stranger
+    // counts zero beside a full quorum and makes up for no missing signer.
+    mutated(|_, p, _| {
         let intruder = signer(200);
         let digest = p.uc.unicity_seal.calculate_hash();
         p.uc.unicity_seal.signatures.push((
             "intruder".to_string(),
             intruder.sign(&digest).encode().to_vec(),
         ));
+    })
+    .unwrap();
+    let e = mutated(|w, p, _| {
+        resign(&w.evm_root, &mut p.uc, 2);
+        let digest = p.uc.unicity_seal.calculate_hash();
+        p.uc.unicity_seal.signatures.push((
+            "intruder".to_string(),
+            signer(200).sign(&digest).encode().to_vec(),
+        ));
+    })
+    .unwrap_err();
+    assert_eq!(e, E::LockUC);
+    // a real signature under an EMPTY signer ID is refused by the native seal validation
+    let e = mutated(|_, p, _| {
+        let real = p.uc.unicity_seal.signatures[0].1.clone();
+        p.uc.unicity_seal.signatures.push((String::new(), real));
     })
     .unwrap_err();
     assert_eq!(e, E::LockUC);
@@ -148,9 +164,9 @@ fn a_lock_sealed_by_a_historical_committee_verifies_inside_its_closed_interval()
 }
 
 #[test]
-fn invalid_signatures_of_known_members_fail_the_seal() {
-    // Three genuine signatures plus one corrupt known member: the corrupt one fails the seal (B1).
-    let e = mutated(|w, p, _| {
+fn invalid_signatures_of_known_members_count_zero() {
+    // Three genuine signatures plus one corrupt known member: the corrupt one counts zero and the quorum holds.
+    mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 3);
         let (id, sg) = &w.evm_root.signers[3];
         let mut bad = sg
@@ -160,8 +176,7 @@ fn invalid_signatures_of_known_members_fail_the_seal() {
         bad[10] ^= 1;
         p.uc.unicity_seal.signatures.push((id.clone(), bad));
     })
-    .unwrap_err();
-    assert_eq!(e, E::LockUC);
+    .unwrap();
     // Two genuine plus two corrupt: no quorum.
     let e = mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 2);
@@ -713,35 +728,36 @@ fn several_faults_get_the_oracle_verdict() {
 }
 
 #[test]
-fn seal_signature_widths_follow_the_b1_profile_rule() {
-    // 64 bytes (r||s): accepted by the pre-scan and by the SDK verification, as by B1
-    mutated(|w, p, _| {
-        resign(&w.evm_root, &mut p.uc, 4);
-        for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
-            sig.truncate(64);
-        }
-    })
-    .unwrap();
-    // 65 bytes with the recovery byte swapped between 0 and 1: ignored
-    mutated(|w, p, _| {
-        resign(&w.evm_root, &mut p.uc, 4);
-        for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
-            sig[64] ^= 1;
-        }
-    })
-    .unwrap();
-    // recovery byte 2, and 63 bytes: refused by the pre-scan
-    for f in [
-        (|s: &mut Vec<u8>| s[64] = 2) as fn(&mut Vec<u8>),
-        |s: &mut Vec<u8>| s.truncate(63),
-    ] {
-        let e = mutated(|w, p, _| {
+fn seal_signature_widths_follow_the_upstream_rule() {
+    // the pre-scan admits a byte string of any width; only an exact canonical 65-byte signature of its member has weight
+    let all = |f: fn(&mut Vec<u8>)| {
+        mutated(move |w, p, _| {
             resign(&w.evm_root, &mut p.uc, 4);
             for (_, sig) in p.uc.unicity_seal.signatures.iter_mut() {
                 f(sig);
             }
         })
-        .unwrap_err();
-        assert_eq!(e, E::UnsupportedCertificateEncoding);
+    };
+    // every signature in the 64-byte compact form, with the recovery byte swapped, id 2, or 63 bytes: no weight, no quorum
+    for f in [
+        (|s: &mut Vec<u8>| s.truncate(64)) as fn(&mut Vec<u8>),
+        |s: &mut Vec<u8>| s[64] ^= 1,
+        |s: &mut Vec<u8>| s[64] = 2,
+        |s: &mut Vec<u8>| s.truncate(63),
+    ] {
+        assert_eq!(all(f).unwrap_err(), E::LockUC);
+    }
+    // one such signature beside three genuine ones is a zero-weight extra
+    for f in [
+        (|s: &mut Vec<u8>| s.truncate(64)) as fn(&mut Vec<u8>),
+        |s: &mut Vec<u8>| s[64] ^= 1,
+        |s: &mut Vec<u8>| s[64] = 2,
+        |s: &mut Vec<u8>| s.truncate(63),
+    ] {
+        mutated(move |w, p, _| {
+            resign(&w.evm_root, &mut p.uc, 4);
+            f(&mut p.uc.unicity_seal.signatures[3].1);
+        })
+        .unwrap();
     }
 }

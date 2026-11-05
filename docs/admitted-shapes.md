@@ -1,7 +1,7 @@
 # Admitted and refused history shapes, and the exit of each admitted one
 
 bft-core #438 asks that every history a wallet admits has an exit (a redemption), and that the admitted and refused shapes are written down. This
-page lists them for protocol 6 (`profile-v6.json`), with the test or corpus case behind each line.
+page lists them for protocol 7 (`profile-v7.json`), with the test or corpus case behind each line.
 
 ## Why an admitted history can be redeemed
 

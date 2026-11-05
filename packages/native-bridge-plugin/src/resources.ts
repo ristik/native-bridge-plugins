@@ -87,9 +87,10 @@ function uc(n: Node, budget: Budget, maxBytes = MAX_UC_BYTES): void {
   for (let i = 0; i < sigs.length; i += 2) {
     if (sigs[i].major !== 3) unsupported();
     if (sigs[i].data.length > 128) fail('ErrProofTooLarge');
-    // 64 bytes (r||s) or 65 with a 0/1 recovery suffix, as both SDKs and native B1
+    // a signature value is any byte string (the upstream seal rule): whether it counts is decided by the SDK verifier, which gives a signature
+    // that is not an exact canonical 65-byte recoverable one of its member no weight; the width is not a scan failure
     const sig = sigs[i + 1];
-    if (sig.major !== 2 || (sig.data.length !== 64 && sig.data.length !== 65) || (sig.data.length === 65 && sig.data[64] > 1)) unsupported();
+    if (sig.major !== 2) unsupported();
   }
 }
 function visit(n: Node, budget: Budget): void {

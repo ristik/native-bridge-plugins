@@ -45,11 +45,12 @@ test('cfg and trustBaseId must match the installed deployment and trust base', a
   await rejects(mutated((_, p) => void (p.trustBaseId = flip(p.trustBaseId, 0))), 'ErrTrustBaseDigest');
 });
 
-test('quorum: one short is rejected, three of four is enough, a stranger fails the seal (B1)', async () => {
+test('quorum: one short is rejected, three of four is enough, a stranger counts zero (the upstream seal rule)', async () => {
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2 }))), 'ErrLockUC');
   await mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 3 })));
-  // B1: every signature must be a valid one of a committee member; an unknown signer fails the seal even beside a full quorum
-  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: [['intruder', signer(200)]] }))), 'ErrLockUC');
+  // the upstream rule: an unknown signer counts zero and does not fail a full quorum, and makes up for none that is missing
+  await mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: [['intruder', signer(200)]] })));
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2, extra: [['intruder', signer(200)]] }))), 'ErrLockUC');
   // Two genuine plus two known members signing with the wrong keys: no quorum.
   await rejects(
     mutated(async (w, p) => void (p.uc = await resignUc(w, p, { signers: 2, extra: [[w.evm.signers[2][0], signer(201)], [w.evm.signers[3][0], signer(202)]] }))),

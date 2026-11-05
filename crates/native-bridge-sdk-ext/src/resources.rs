@@ -235,12 +235,9 @@ fn uc_within(n: &Node<'_>, max_bytes: usize) -> Result<()> {
         if pair[0].data.len() > 128 {
             return Err(E::ProofTooLarge);
         }
-        // 64 bytes (r||s) or 65 with a 0/1 recovery suffix, as both SDKs and native B1
-        let sig = &pair[1];
-        if sig.major != 2
-            || !(sig.data.len() == 64 || sig.data.len() == 65)
-            || (sig.data.len() == 65 && sig.data[64] > 1)
-        {
+        // a signature value is any byte string (the upstream seal rule): whether it counts is decided by the SDK verifier, which gives a
+        // signature that is not an exact canonical 65-byte recoverable one of its member no weight; the width is not a scan failure
+        if pair[1].major != 2 {
             return Err(E::UnsupportedCertificateEncoding);
         }
     }

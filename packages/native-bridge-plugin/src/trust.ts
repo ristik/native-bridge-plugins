@@ -3,8 +3,9 @@
  * each witnessed by its predecessor's committee) and pinned by the EntryID of its genesis entry.
  *
  * `trustBaseId` is that genesis EntryID: a lock proof and every manifest entry name it, and a history is the same trust input exactly when it
- * has the same network and genesis. Each certificate is verified by the SDK against the committee of its own epoch (weighted quorum, the native
- * B1 seal rule, the epoch's round interval); a certificate of an epoch newer than the latest held entry is `ErrNoEntryForEpoch`, retryable once
+ * has the same network and genesis. Each certificate is verified by the SDK against the committee of its own epoch (weighted quorum, the upstream
+ * seal rule: each signature counts alone, an unknown signer or a signature that is not an exact recoverable one of its member counts zero;
+ * the epoch's round interval); a certificate of an epoch newer than the latest held entry is `ErrNoEntryForEpoch`, retryable once
  * the history holds the newer entries (fetched by the wallet, never by the plug-in).
  */
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
@@ -66,7 +67,7 @@ export class TrustInput {
   /**
    * Verify an embedded certificate with the SDK's certificate verifier for its own partition (the EVM partition pin is the caller's): the seal
    * epoch's committee first ({@link selectEpoch}), then native format and structure, the tree path to the seal hash, and the seal under that
-   * committee (B1 rule).
+   * committee (the upstream seal rule).
    */
   public async verifyEmbeddedUc(uc: UnicityCertificate): Promise<void> {
     preflightUc(uc.toCBOR());
@@ -93,7 +94,7 @@ export function certificateFailure(r: VerificationResult<unknown>): NativeReason
         case 'UnicitySealHashMatchesWithRootHashRule': return 'ErrSealRoot';
         // the seal's network, epoch or round interval against the held history (network is checked before, by the caller)
         case 'UnicitySealAuthorityRule': return 'ErrSealEpoch';
-        // a malformed signature map (format bounds) is a structure failure, as natively
+        // a malformed signature map (count and identifier bounds) is a structure failure, as natively; a signature that does not count is not one
         case 'UnicitySealQuorumSignaturesVerificationRule': return verdict === 'malformed' ? 'ErrCertStructure' : 'ErrQuorumNotMet';
         default:
       }
