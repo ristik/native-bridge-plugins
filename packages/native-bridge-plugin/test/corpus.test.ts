@@ -105,7 +105,7 @@ test('no gas ceiling (owner section 36): a bundle estimated above the former 7,0
   const cfgRaw = cfgBytes(cfgOf(c.cfg!));
   const env = decodeEnvelope(fromHex(c.input)!);
   const g = computeGate(cfgRaw, c.input.length / 2, kernelRequestBytes(cfgRaw.length, env.history.length), env);
-  assert.equal(g.legacyTotal, 7_206_166);
+  assert.equal(g.legacyTotal, 7_208_566);
   assert.ok(g.legacyTotal > 7_000_000);
 });
 

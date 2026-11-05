@@ -10,7 +10,7 @@ nonce guard contains competing return histories for a single lock.
 Offline receipt verifies against the network's Unicity Trust Base history,
 installed from a release bundle under its genesis EntryID (the trustBaseId every
 lock proof and manifest names). Each ordinary/embedded seal is verified by the
-SDK under the entry of its own epoch: weighted quorum, the B1 seal rule, the
+SDK under the entry of its own epoch: weighted quorum, the upstream seal rule, the
 epoch's root-round interval. A seal of an epoch the history does not hold yet is
 retryable (`NoEntryForEpoch`); the wallet appends newer entries, each witnessed
 by its predecessor, and the plug-ins fetch nothing. Integrity of the bundle does

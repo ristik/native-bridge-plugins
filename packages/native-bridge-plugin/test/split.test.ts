@@ -132,7 +132,7 @@ const B1_ONLY = new Set(['ErrAnchorAuth', 'ErrLeafProof']);
 test('lineage family: the relation, the anchor plan and the openings give every case the oracle\'s verdict and result', async () => {
   const dep = devDeployment();
   const all = cases('lineage');
-  assert.ok(all.length >= 39, String(all.length));
+  assert.ok(all.length >= 38, String(all.length));
   let ok = 0;
   for (const c of all) {
     let res: LineageOutcome | undefined;

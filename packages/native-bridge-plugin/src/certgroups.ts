@@ -39,7 +39,7 @@ const SCAN_PER_BYTE = 16;
 const SCAN_PER_PAIR = 500;
 const COMMON_READS = 1_100;
 const PER_EPOCH = 29_900;
-const PER_SIGNATURE = 6_000;
+const PER_SIGNATURE = 7_200; // profile 7: 6,000 repriced by the measured recovery/verification ratio (a relative repricing, not an absolute time bound)
 const PER_CLAIM = 2_000;
 const PER_STEP = 250;
 

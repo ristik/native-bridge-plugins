@@ -1,5 +1,5 @@
 #![allow(clippy::type_complexity, unused_imports, unused_variables, dead_code)]
-//! The named profile-v6 bounds against `protocol/profile-v6.json`, the shared gas gate at the worst
+//! The named profile-v7 bounds against `protocol/profile-v7.json`, the shared gas gate at the worst
 //! admitted bundle, the DN-B depth-1 topology and the burn-time preflight.
 
 mod common;
@@ -21,7 +21,7 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     let p: serde_json::Value = serde_json::from_slice(
         &std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../protocol/profile-v6.json"
+            "/../../protocol/profile-v7.json"
         ))
         .unwrap(),
     )
@@ -40,7 +40,7 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     assert_eq!(MAX_INPUT_RECORD_BYTES as u64, n("irBytes"));
     assert_eq!(GAS_RESERVE, n("gasReserve"));
     assert_eq!(MAX_JUSTIFICATION_BYTES as u64, n("justificationBytes"));
-    assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 6);
+    assert_eq!(native_bridge_sdk_ext::NATIVE_BRIDGE_PROTO_VERSION, 7);
     assert_eq!(BRIDGE_ITEM_GAS, n("bridgeItemGas"));
     assert_eq!(MAX_SHARD_DEPTH as u64, n("shardDepthMax"));
     assert_eq!(MAX_CBOR_ITEMS as u64, n("cborItems"));
@@ -80,7 +80,7 @@ fn the_gas_estimate_prices_its_components_as_the_oracle_and_the_contract_do() {
         6_182_080 // 26000 + 20*(160 + 131072 + 131072) + 14000*65
     );
     assert_eq!(item_gas(4096), 4_096_000);
-    // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 6000*Q + 2000*A + 250*P
+    // G_batch = 60000 + 16*C + 500*K*(K-1) + 1100 + 29900*E + 7200*Q + 2000*A + 250*P
     let n = Counts {
         k: 3,
         c: 1000,
@@ -93,7 +93,7 @@ fn the_gas_estimate_prices_its_components_as_the_oracle_and_the_contract_do() {
     };
     assert_eq!(
         batch_gas(&n),
-        60_000 + 16_000 + 500 * 6 + 1_100 + 2 * 29_900 + 8 * 6_000 + 3 * 2_000 + 7 * 250
+        60_000 + 16_000 + 500 * 6 + 1_100 + 2 * 29_900 + 8 * 7_200 + 3 * 2_000 + 7 * 250
     );
 }
 
@@ -326,9 +326,9 @@ fn preflight_burn_prices_a_held_token_exactly() {
             gate.intrinsic,
             gate.rsmt
         ],
-        [1_725_886, 107_896, 72_000, 125_600, 407_112, 13_278]
+        [1_727_086, 109_096, 72_000, 125_600, 407_112, 13_278]
     );
-    // BRIDGE_COMPOSE_V1: 100000 + 2*4480 + 20*72 + 16000*3 + 6000*1 + 29900*1 + 2000*1 (one claim, no grouping or path steps)
+    // BRIDGE_COMPOSE_V1: 100000 + 2*4480 + 20*72 + 16000*3 + 7200*1 + 29900*1 + 2000*1 (one claim, no grouping or path steps)
     assert_eq!(
         gate.compose,
         native_bridge_sdk_ext::gas::ComposeDims {
@@ -342,8 +342,8 @@ fn preflight_burn_prices_a_held_token_exactly() {
             p: 0
         }
     );
-    assert_eq!(gate.native, 196_300);
-    assert_eq!(gate.total, 1_288_532, "calldata + native + reserve");
+    assert_eq!(gate.native, 197_500);
+    assert_eq!(gate.total, 1_289_732, "calldata + native + reserve");
 }
 
 #[test]
@@ -365,7 +365,7 @@ fn the_compose_schedule_is_bft_cores_compose_gas() {
     };
     assert_eq!(
         compose_gas(&d),
-        100_000 + 2_000 + 200 + 32_000 + 18_000 + 29_900 + 4_000 + 1_250 + 100
+        100_000 + 2_000 + 200 + 32_000 + 21_600 + 29_900 + 4_000 + 1_250 + 100
     );
 }
 

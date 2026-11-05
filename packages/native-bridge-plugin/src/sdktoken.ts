@@ -13,8 +13,6 @@ import { arrayOf, raw, scanCounted, scanNative, tagContent, uintMax, version, ty
 
 /** B1's certificate byte cap (bft-core `b1ref.MaxUCBytes`). */
 const B1_MAX_UC_BYTES = 24576;
-/** The only seal signature width the SDK certificate codec accepts; native B1 also admits 64 bytes. */
-const SDK_SIGNATURE_LENGTH = 65;
 
 const TAG_UC = 39001n;
 const CERT_FIELDS: readonly { index: number; tag: bigint; arity: number; required: number; kind: Item['kind'] }[] = [
@@ -59,9 +57,7 @@ export function scanCertificate(rawUc: Uint8Array): void {
   for (let i = 1; i < sigs.length; i += 2) {
     const sig = sigs[i];
     if (sig.kind !== 'bytes') fail('ErrCertScan');
-    // 64 bytes (r||s) or 65 with an ignored recovery suffix, as both SDKs and native B1
-    const n = (sig as { data: Uint8Array }).data.length;
-    if (n !== SDK_SIGNATURE_LENGTH - 1 && n !== SDK_SIGNATURE_LENGTH) fail('ErrCertSigLength');
+    // the width is not checked here: a value that is not an exact canonical 65-byte signature of its member counts zero at the quorum
   }
   try {
     nativeUcScan(rawUc, B1_MAX_UC_BYTES);

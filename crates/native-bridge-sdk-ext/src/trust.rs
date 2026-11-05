@@ -5,7 +5,8 @@
 //! `trustBaseId` is that genesis EntryID: a lock proof and every manifest entry name it, and a
 //! history is the same trust input exactly when it has the same network and genesis. Each
 //! certificate is verified by the SDK against the committee of its own epoch (weighted quorum, the
-//! native B1 seal rule, the epoch's round interval); a certificate of an epoch newer than the
+//! upstream seal rule: each signature counts alone and one that is not an exact recoverable signature of a member counts zero; the
+//! epoch's round interval); a certificate of an epoch newer than the
 //! latest held entry is [`NativeError::NoEntryForEpoch`](crate::NativeError::NoEntryForEpoch),
 //! retryable once the history holds the newer entries (fetched by the wallet, never by the
 //! plug-in).
@@ -93,7 +94,7 @@ pub fn certificate_failure(e: &VerificationError) -> Option<E> {
         | VerificationError::SealAfterAuthorityEnd => E::SealEpoch,
         VerificationError::SealNetworkMismatch => E::SealNetwork,
         VerificationError::SealRootMismatch => E::SealRoot,
-        VerificationError::QuorumNotMet | VerificationError::SealSignerInvalid => E::QuorumNotMet,
+        VerificationError::QuorumNotMet => E::QuorumNotMet,
         VerificationError::SealMalformed
         | VerificationError::CertificateBodyInvalid
         | VerificationError::PartitionMismatch => E::CertStructure,

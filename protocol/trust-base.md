@@ -52,10 +52,13 @@ seal epoch e:
 5. native certificate structure (bft-go-base `IsValid`: input record rules,
    32-byte technical record hash, seal shape) and the recomputed unicity-tree
    root equal to the seal hash (else `CertStructure` and `SealRoot`);
-6. the seal under e's committee with the native B1 rule: every signature is a
-   valid one of a member of e (an unknown signer or an invalid signature fails
-   the seal), at most 16 signatures, and the signers' weights reach e's
-   threshold `floor(2W/3)+1` (else `QuorumNotMet`).
+6. the seal under e's committee with the upstream seal rule: each supplied
+   signature is judged alone and counts its member's weight only if it is
+   exactly 65 bytes `r||s||v` (`1 <= r < n`, `1 <= s <= n/2`, `v` in 0..3) whose
+   single recovery over SHA-256 of the seal bytes yields that member's key; an
+   unknown signer and any other signature count zero and never fail the seal;
+   at most 16 signatures; the counted weights reach e's threshold
+   `floor(2W/3)+1` (else `QuorumNotMet`).
 
 The steps run in this order, so an input with several faults gets one verdict
 in every implementation: steps 1-4 select e before any structure, root or
@@ -79,8 +82,12 @@ partition is passed; the EVM partition, shard and configuration pins stay the
 bridge's checks, on every call. No bridge-owned weighted verifier, epoch
 resolver or trust-base store exists.
 
-Seal signatures are 64 bytes (r||s) or 65 with a recovery suffix 0 or 1 that is
-ignored, as in both SDKs and native B1; any other length or suffix is malformed.
+A seal signature value may be any byte string: only an exact canonical 65-byte
+recoverable signature of its member has weight, and the recovery byte is
+binding (never discarded, normalized or replaced by the other parity). An empty
+value is refused by the native seal validation. The witnesses of a trust-base
+ENTRY are a different object and stay strict: a bad or unknown extra signature
+refuses a successor entry.
 
 ## Evolution
 

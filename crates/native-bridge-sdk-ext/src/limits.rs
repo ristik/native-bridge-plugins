@@ -1,14 +1,14 @@
 //! The resource policy of the direct path (owner section 36, bft-core briefs/b7-direct-uncapped-design.md section 1) and fixed
 //! protocol bytes of the native profile (protocol version 4).
 //!
-//! The numbers of the first block are the `limits` of `protocol/profile-v6.json`, the single source shared with the oracle, the
+//! The numbers of the first block are the `limits` of `protocol/profile-v7.json`, the single source shared with the oracle, the
 //! contract and the TypeScript plug-in (`tests/limits_and_shards.rs` pins them). There is no gas ceiling and no history cap: the
 //! composition (BRIDGE_COMPOSE_V1) streams the history and the anchor table, bounded by the envelope (the ingress bound the pool and
 //! RPC carry), the u16 anchor wire width and its gas (bft-core briefs/dev4-b7-native-compose-spec.md section 7). The transfer, leaf
 //! and semantic-byte bounds are the standalone B2 kernel's own (0x0104, which prepareLock calls); the rest are per-object shape
 //! bounds. Every count is checked before allocation or cryptography.
 
-// ---- profile parameters (profile-v6.json `limits`) ----------------------------------------------
+// ---- profile parameters (profile-v7.json `limits`) ----------------------------------------------
 /// Distinct UC anchors of one redemption: the wire width (the CERT_BATCH_V2 claim count and every anchorIndex are u16).
 pub const MAX_ANCHORS: usize = 65535;
 /// Standalone B2 transfers including the final burn (ureth b2 `MAX_TRANSFERS`).

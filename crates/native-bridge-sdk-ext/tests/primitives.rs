@@ -359,16 +359,13 @@ fn the_justification_hook_requires_the_bridge_history_genesis() {
 }
 
 #[test]
-fn the_native_seal_rule_failure_is_a_short_quorum() {
+fn the_seal_rule_failure_is_a_short_quorum() {
     use native_bridge_sdk_ext::token::map_sdk;
     use unicity_token::verify::VerificationError;
-    assert_eq!(
-        map_sdk(&VerificationError::SealSignerInvalid),
-        E::QuorumNotMet
-    );
+    assert_eq!(map_sdk(&VerificationError::QuorumNotMet), E::QuorumNotMet);
     assert_eq!(
         map_sdk(&VerificationError::Genesis(Box::new(
-            VerificationError::SealSignerInvalid
+            VerificationError::QuorumNotMet
         ))),
         E::QuorumNotMet
     );

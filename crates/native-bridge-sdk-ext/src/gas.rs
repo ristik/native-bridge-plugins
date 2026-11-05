@@ -1,7 +1,7 @@
 //! The gas estimate of a redemption. Since B7 direct PR 2 the composition is one native call, BRIDGE_COMPOSE_V1 at 0x0105, and
 //! its charge is the trial schedule of bft-core `bridgeprofile/native.go` (`ComposeGas`), computed here from the same scans:
 //!
-//! `G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)`
+//! `G_compose = 100000 + 2*B + 20*J + 16000*L + 7200*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)`
 //!
 //! with B the native input bytes (`abi.encode(uint8 op, bytes cfg, bytes envelope)`), J the CBOR item heads of the Cfg, the policy
 //! body, the history, every anchor UC and every anchor IR opening, L the leaves, Q/E/A/K the CERT_BATCH_V2 grouping of the anchor
@@ -105,7 +105,7 @@ pub const COMPOSE_BASE: u64 = 100_000;
 pub const COMPOSE_PER_BYTE: u64 = 2;
 pub const COMPOSE_PER_ITEM: u64 = 20;
 pub const COMPOSE_PER_LEAF: u64 = 16_000;
-pub const COMPOSE_PER_SIGNATURE: u64 = 6_000;
+pub const COMPOSE_PER_SIGNATURE: u64 = 7_200; // profile 7 (was 6,000): relative repricing by the measured ratio
 pub const COMPOSE_PER_EPOCH: u64 = 29_900;
 pub const COMPOSE_PER_CLAIM: u64 = 2_000;
 pub const COMPOSE_PER_STEP: u64 = 250;

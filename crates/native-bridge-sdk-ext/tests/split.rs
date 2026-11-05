@@ -223,7 +223,7 @@ fn every_allocation_proof_manifest_and_commitment_is_the_oracles() {
 fn every_lineage_case_gets_the_oracles_verdict_and_result() {
     let dep = dev();
     let all = cases("lineage");
-    assert!(all.len() >= 39);
+    assert!(all.len() >= 38);
     let mut ok = 0;
     for c in &all {
         let id = c["id"].as_str().unwrap();

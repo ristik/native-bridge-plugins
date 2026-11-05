@@ -31,10 +31,13 @@ test('embedded UC rejects false root and wrong network like the SDK', async () =
   await rejects(r.trust.verifyEmbeddedUc(await makeUc(r, { ...spec4, network: 4 })), 'ErrSealNetwork');
 });
 
-test('an unknown or wrong-key signer fails the seal (B1)', async () => {
+test('an unknown or wrong-key signer counts zero: it neither fails an honest quorum nor makes up for a missing signer', async () => {
   const r = await makeRoot(2, 4, 10);
   const { signer } = await import('./world.js');
-  await rejects(r.trust.verifyEmbeddedUc(await ucOf(r, 3, [['stranger', signer(250)]])), 'ErrQuorumNotMet');
+  await r.trust.verifyEmbeddedUc(await ucOf(r, 3, [['stranger', signer(250)]]));
+  await rejects(r.trust.verifyEmbeddedUc(await ucOf(r, 2, [['stranger', signer(250)]])), 'ErrQuorumNotMet');
+  // an EMPTY signer ID is refused by the native seal validation, even with a real signature behind it
+  await rejects(r.trust.verifyEmbeddedUc(await ucOf(r, 3, [['', signer(250)]])), 'ErrCertStructure');
   await rejects(r.trust.verifyEmbeddedUc(await ucOf(r, 2, [[r.signers[2][0], signer(251)]])), 'ErrQuorumNotMet');
 });
 

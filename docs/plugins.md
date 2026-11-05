@@ -114,7 +114,7 @@ plug-in routes a leaf to an aggregator by its state ID, and whatever certificate
 the depth of its own shard ID, and every leaf's state ID must carry the prefix bits of the anchor it names. Parent and child shards of a topology
 split may both appear in one history. The composition is one native call, BRIDGE_COMPOSE_V1 at 0x0105 (`compose.ts` / `compose.rs`:
 the input encoding, the 384-byte output and the status table). Its charge is the trial schedule
-`G_compose = 100000 + 2*B + 20*J + 16000*L + 6000*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)` (`gas.compose`, `native`), with
+`G_compose = 100000 + 2*B + 20*J + 16000*L + 7200*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K)` (`gas.compose`, `native`), with
 `B` the native input bytes, `J` the CBOR item heads of the Cfg, the policy, the history, every UC and every IR opening, `L` the leaves and
 `Q, E, A, K, P` the `CERT_BATCH_V2` grouping of the anchor table (`certgroups.ts` / `certgroups.rs`, exactly as the oracle) plus every
 leaf's RSMT siblings in `P`. The transaction estimate (`total`) is `21000 + 16*D_max + G_compose + 1,000,000`; the protocol-5 composite

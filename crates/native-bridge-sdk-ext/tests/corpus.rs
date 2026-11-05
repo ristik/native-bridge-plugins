@@ -183,7 +183,7 @@ fn a_bundle_above_the_former_ceiling_is_estimated_not_refused() {
         &env,
     )
     .unwrap();
-    assert_eq!(g.legacy_total, 7_206_166);
+    assert_eq!(g.legacy_total, 7_208_566);
     assert!(g.legacy_total > 7_000_000);
 }
 
