@@ -282,7 +282,7 @@ fn lock_lock_backing() {
         "backing-no-pin",
         "a plug-in deployment always carries its pin (Deployment::new requires the vault code hash and EVM configuration)",
     )];
-    replay_all("lock", "lock-backing", 71, &names, &skip, |c| {
+    replay_all("lock", "lock-backing", 72, &names, &skip, |c| {
         assert_eq!(c["cfg"], "dev");
         let hist = History::decode(&bytes(c["input"].as_str().unwrap()))?;
         let tb = &f["trustBases"][c["aux"]["trustBase"].as_str().unwrap()];

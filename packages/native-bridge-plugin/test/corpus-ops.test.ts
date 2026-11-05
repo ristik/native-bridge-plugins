@@ -156,7 +156,7 @@ test('history/prepareLock: the lock request\'s outcome for (cfg, nonce, amount, 
 test('lock/lock-backing: the mint\'s lock justification verified offline against a trust base and a deployment pin', async () => {
   const cfg = decodeCfg(bytes(fixtures.fixtures.dev.cfg));
   const ch = cfgHash(cfg);
-  await replayAll('lock', 'lock-backing', 71, async (c) => {
+  await replayAll('lock', 'lock-backing', 72, async (c) => {
     assert.equal(c.cfg, 'dev', c.id);
     const h = decodeHistory(bytes(c.input));
     const tb = fixtures.trustBases[c.aux!.trustBase];

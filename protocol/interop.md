@@ -509,8 +509,9 @@ RSMT path is hashed); a status is charged what was metered up to its failure,
 with no refund and no charge for work not done. On success the charge is the
 whole formula. It is a trial price to benchmark, not a measurement.
 
-`G_split` is zero at depth 0 and is charged in walk order (part to root), each
-term before the work it pays for: `16*len(outer mint transaction)`; for each
+`G_split` is charged in walk order (part to root) on every return, each term
+before the work it pays for: `16*len(outer mint transaction)` first, which at
+depth 0 is the whole of it (no justification is descended into); for each
 split justification descended into `16*len(justification)`, then `20*items` of
 it, then `16000*(1 + transfers)` of the parent (so L above counts every leaf of
 the lineage exactly once); for each edge `20000 + 1500*steps` of its proof. The
