@@ -102,7 +102,7 @@ def main():
     # every corpus trust input and the shared dev fixture install with the pinned SDK
     subprocess.run(['node', str(ROOT / 'tools/utb_trust_fixture.mjs')], check=True)
     interop = (ROOT / 'protocol/interop.md').read_text()
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=6' in interop
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=7' in interop
     assert SDK_JS_FORK_COMMIT in interop and SDK_RUST_FORK_COMMIT in interop
     package = load('packages/native-bridge-plugin/package.json')
     assert package['private'] and package['license'] == 'MIT OR Apache-2.0'
