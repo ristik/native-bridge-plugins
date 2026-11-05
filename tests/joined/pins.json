@@ -18,7 +18,7 @@
     "epoch rotation and historical authority",
     "trust-base append/fetch/interval closure",
     "old-J validity across rotation",
-    "full B1/SDK seal-signature acceptance parity"
+    "B1 precompile and an SDK verifier compared on the same seal inputs in one joined run (parity under the upstream seal rule is evidenced per repo on the shared 202 b1-seal vectors, not by this tier)"
   ],
   "pluginsTree": "f2d18f28c5b6fef6875af051c98e9ec380790322b9bbb45c23a94c41b27279b1"
 }
