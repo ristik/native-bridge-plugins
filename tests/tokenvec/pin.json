@@ -1,6 +1,6 @@
 {
   "repository": "ristik/bft-core",
-  "revision": "435eecccc12d76631cd152e33158414ef7bc871c",
+  "revision": "c05cbefa6aa21e4a8840c0a7910e33429fe2ece2",
   "path": "bridgeprofile/testdata/tokenvec-envelopes.json",
   "sha256": "4b235752925ed1129d6039b56c77991d83346aad38fae4c903249ec48fda76db",
   "status": "sealed-candidate-unmerged"
