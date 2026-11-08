@@ -11,7 +11,8 @@
  *   bridge-tester.ts burn [--token <id>] [--recipient <0x address>]              burn the token (or a part) for its return to an EVM address (default: this wallet's)
  *   bridge-tester.ts redeem [--token <nonce>]                                    the return proof (consolidated by the aggregator), redeemed in the vault
  *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
- *   bridge-tester.ts trust [--refresh]                                           the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries
+ *   bridge-tester.ts trust [--refresh] [--token <id>]                            the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries;
+ *                                                                                --token adds the root epoch and round that sealed each of the token's proofs
  *
  * The wallet is a directory (--wallet, or BRIDGE_TESTER_WALLET, default ./bridge-wallet): keys.json (owner-only: the EVM key and the Unicity keys),
  * config.json, trust-history.cbor (the held trust-base history, once it has grown past the shipped bundle), and tokens/<nonce>/ with the token
@@ -223,6 +224,10 @@ function withHeldTrust<T>(w: Wallet, trust: TrustInput, agg: AggregatorClient, v
     attempts: fetchOn ? 8 : 1, maxEntries,
     persist: (b) => persistTrust(w, b),
     onFetch: (e) => console.log(`  trust: fetched from epoch ${e.fromEpoch} (max ${maxEntries}): ${e.appended} appended, tip ${e.tipBefore} -> ${e.tipAfter}`),
+  }).catch((e: unknown) => {
+    // the same name whichever verification met it first (the plug-in, or the SDK's consolidation): the trust base lacks a newer epoch
+    if (needsNewerEntry(e)) throw new Error(`ErrNoEntryForEpoch: a certificate is of an epoch after the held trust base's tip ${trust.history.tipEpoch}${fetchOn ? ' (the aggregator did not have it either)' : ' (BRIDGE_TRUST_FETCH=0: not fetched)'}`, { cause: e });
+    throw e;
   });
 }
 
@@ -508,7 +513,7 @@ async function claim(w: Wallet, to?: string): Promise<void> {
 }
 
 /** The held trust-base history; --refresh first fetches the entries after the held tip (as many pages as the aggregator has). */
-async function trustCmd(w: Wallet, refresh: boolean): Promise<void> {
+async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<void> {
   const trust = await heldTrust(w);
   if (refresh) {
     const { fetchTrustBaseEntries } = await import('@unicitylabs/state-transition-sdk/lib/util/TrustBaseUtils.js');
@@ -525,11 +530,19 @@ async function trustCmd(w: Wallet, refresh: boolean): Promise<void> {
     const entry = h.entry(e)!;
     entries.push({ epoch: e.toString(), entryId: hex(await entry.entryId()), startRound: entry.epochStartRound.toString() });
   }
-  console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries }, null, 2));
+  let seals: { step: string; rootEpoch: string; rootRound: string }[] | undefined;
+  if (tokenId !== undefined) {
+    const { token } = await w.token(w.record(tokenId));
+    seals = [token.genesis, ...token.transactions].map((c, i) => {
+      const seal = c.inclusionProof.unicityCertificate.unicitySeal;
+      return { step: i === 0 ? 'mint' : `transaction ${i}`, rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
+    });
+  }
+  console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries, ...(seals ? { token: tokenId, seals } : {}) }, null, 2));
 }
 
 // ---- the command line -------------------------------------------------------------------------------------------------------------------------
-const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem | claim [--to 0x..] | trust [--refresh]; ' +
+const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem | claim [--to 0x..] | trust [--refresh] [--token id]; ' +
   'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce or part, e.g. 5.1> (default the newest)';
 
 export async function main(argv: string[]): Promise<void> {
@@ -570,7 +583,7 @@ export async function main(argv: string[]): Promise<void> {
     case 'claim':
       return claim(w, values.to);
     case 'trust':
-      return trustCmd(w, values.refresh ?? false);
+      return trustCmd(w, values.refresh ?? false, values.token);
     default:
       throw new Error(USAGE);
   }
