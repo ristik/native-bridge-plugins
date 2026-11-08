@@ -11,9 +11,16 @@
  *   bridge-tester.ts burn [--token <id>] [--recipient <0x address>]              burn the token (or a part) for its return to an EVM address (default: this wallet's)
  *   bridge-tester.ts redeem [--token <nonce>]                                    the return proof (consolidated by the aggregator), redeemed in the vault
  *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
+ *   bridge-tester.ts trust [--refresh]                                           the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries
  *
  * The wallet is a directory (--wallet, or BRIDGE_TESTER_WALLET, default ./bridge-wallet): keys.json (owner-only: the EVM key and the Unicity keys),
- * config.json, and tokens/<nonce>/ with the token file and its record. Keep it: a token exists only in its file.
+ * config.json, trust-history.cbor (the held trust-base history, once it has grown past the shipped bundle), and tokens/<nonce>/ with the token
+ * file and its record. Keep it: a token exists only in its file.
+ *
+ * Trust evolution: a verification that needs an epoch newer than the held history fetches the missing contiguous entries from the aggregator
+ * through the SDK (each authenticated from its predecessor; the pin and held entries never replaced), persists the history and retries.
+ * BRIDGE_TRUST_FETCH=0 disables the fetch (the verification then fails with ErrNoEntryForEpoch); BRIDGE_TRUST_MAX_ENTRIES (1..64, default 64)
+ * is the page size asked for.
  */
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -43,6 +50,7 @@ import { configHashOfPdr, encodeJustification } from '../packages/native-bridge-
 import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin/src/proof.js';
 import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
+import { needsNewerEntry, withTrustRefresh } from '../packages/native-bridge-plugin/src/trustrefresh.js';
 import { NativeBridge } from '../packages/native-bridge-plugin/src/verifier.js';
 import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../packages/native-bridge-plugin/src/splitflow.js';
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
@@ -178,10 +186,49 @@ class Chain {
   }
 }
 
-/** The installed bridge as the plug-in verifies it: the vault's Cfg read from the vault, trust, EVM PDR and policy from the operator's published files. */
-async function installedBridge(cfg: TesterConfig, chain: Chain) {
+/**
+ * The wallet's held trust: the operator's shipped bundle under its pin, or the wallet's own durable history (written only by {@link persistTrust},
+ * from appends) when it has one. The held history must extend the shipped one: every shipped epoch with identical bytes; shipped entries it lacks
+ * are appended (authenticated) rather than replacing anything.
+ */
+async function heldTrust(w: Wallet): Promise<TrustInput> {
+  const cfg = w.config;
+  const pin = unhex(readFileSync(cfg.files.trustEntryId, 'utf8').trim());
+  const shipped = await TrustInput.fromBundle(Uint8Array.from(readFileSync(cfg.files.trustBundle)), pin);
+  const file = `${w.dir}/trust-history.cbor`;
+  if (!existsSync(file)) return shipped;
+  const held = await TrustInput.fromBundle(Uint8Array.from(readFileSync(file)), pin);
+  for (let e = shipped.history.genesisEpoch; e <= shipped.history.tipEpoch; e++) {
+    const mine = held.history.bytes(e);
+    const theirs = shipped.history.bytes(e)!;
+    if (mine === null) await held.history.append(theirs);
+    else if (hex(mine) !== hex(theirs)) throw new Error(`${file} conflicts with the shipped trust bundle at epoch ${e}`);
+  }
+  return held;
+}
+
+/** Write the held history (tag 39015) atomically. */
+function persistTrust(w: Wallet, bundle: Uint8Array): void {
+  const file = `${w.dir}/trust-history.cbor`;
+  writeFileSync(`${file}.tmp`, bundle);
+  renameSync(`${file}.tmp`, file);
+}
+
+/** Run a verification against the held trust, fetching newer entries from the aggregator while it lacks an epoch (module comment). */
+function withHeldTrust<T>(w: Wallet, trust: TrustInput, agg: AggregatorClient, verify: () => Promise<T>): Promise<T> {
+  const fetchOn = process.env.BRIDGE_TRUST_FETCH !== '0';
+  const maxEntries = Number(process.env.BRIDGE_TRUST_MAX_ENTRIES ?? '64');
+  if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > 64) throw new Error('BRIDGE_TRUST_MAX_ENTRIES must be 1 to 64');
+  return withTrustRefresh(trust, agg, verify, {
+    attempts: fetchOn ? 8 : 1, maxEntries,
+    persist: (b) => persistTrust(w, b),
+    onFetch: (e) => console.log(`  trust: fetched from epoch ${e.fromEpoch} (max ${maxEntries}): ${e.appended} appended, tip ${e.tipBefore} -> ${e.tipAfter}`),
+  });
+}
+
+/** The installed bridge as the plug-in verifies it: the vault's Cfg read from the vault, the wallet's held trust, EVM PDR and policy from the operator's published files. */
+async function installedBridge(cfg: TesterConfig, chain: Chain, trust: TrustInput) {
   const vaultCfg = decodeCfg(decBytes(await chain.call(calldata('cfgBytes()'))));
-  const trust = await TrustInput.fromBundle(Uint8Array.from(readFileSync(cfg.files.trustBundle)), unhex(readFileSync(cfg.files.trustEntryId, 'utf8').trim()));
   const pdr = Uint8Array.from(readFileSync(cfg.files.evmPdr));
   const policy = decodePolicy(unhex(JSON.parse(readFileSync(cfg.files.deployment, 'utf8')).policyBody));
   const code = unhex(await jsonRpc(cfg.ethUrl, 'eth_getCode', [cfg.vault, 'latest']));
@@ -251,7 +298,7 @@ async function mint(w: Wallet, nonce?: string): Promise<void> {
   requirePhase(t, 'locked', 'mint');
   const cfg = w.config;
   const chain = await chainOf(cfg);
-  const { vaultCfg, dep } = await installedBridge(cfg, chain);
+  const { vaultCfg, dep } = await installedBridge(cfg, chain, await heldTrust(w));
   // the lock's proof: the endpoint answers 404 until the lock block is certified and archived, and again once it is out of the proof window
   const url = `${cfg.lockProofUrl.replace(/\/$/, '')}/v1/lockproof?block=${t.lockBlockHash}&nonce=${t.nonce}`;
   const lockProof = await waitFor('the lock proof (the lock block certified and archived)', 300_000, async () => {
@@ -330,8 +377,10 @@ async function split(w: Wallet, id: string | undefined, amountsText: string): Pr
   requirePhase(t, 'minted', 'split');
   const amounts = splitAmounts(amountsText, BigInt(t.amountWei));
   const cfg = w.config;
-  const { bridge } = await installedBridge(cfg, await chainOf(cfg));
+  const trust = await heldTrust(w);
+  const { bridge } = await installedBridge(cfg, await chainOf(cfg), trust);
   const plugin = createNativeBridgePlugin(bridge, { manifestRevision: 'tester', profileRevision: 'tester' });
+  const agg = new AggregatorClient(cfg.aggUrl);
   const journal = new FileSplitJournal(`${w.tokenDir(recordId(t))}/split.json`);
   let record = await journal.get();
   const owners: number[] = [];
@@ -342,7 +391,7 @@ async function split(w: Wallet, id: string | undefined, amountsText: string): Pr
       owners.push(o.index);
       return { recipient: EncodedPredicate.fromPredicate(SignaturePredicate.create(o.signer.publicKey)).toCBOR(), amount, salt: secp256k1.utils.randomSecretKey() };
     });
-    const plan = await planSplit(plugin, recordId(t), bytes, outputs);
+    const plan = await withHeldTrust(w, trust, agg, () => planSplit(plugin, recordId(t), bytes, outputs));
     plan.estimates.forEach((g, i) => console.log(`  part ${i + 1}: ${amounts[i]} wei; its redemption needs at least ${g.total} gas`));
     record = plan.record;
     await journal.put(record);
@@ -354,12 +403,12 @@ async function split(w: Wallet, id: string | undefined, amountsText: string): Pr
     const keys = w.keys().unicity.map((k) => hex(EncodedPredicate.fromPredicate(SignaturePredicate.create(new SigningService(unhex(k)).publicKey)).toCBOR()));
     for (const o of record.outputs) owners.push(keys.indexOf(hex(o.recipient)));
   }
-  const agg = new AggregatorClient(cfg.aggUrl);
-  const children = await runSplit(plugin, record, {
+  // a retry after a newer epoch was fetched resumes from the journal, as a rerun of the command would
+  const children = await withHeldTrust(w, trust, agg, async () => runSplit(plugin, (await journal.get()) ?? record, {
     journal,
     unlock: (tx) => SignaturePredicateUnlockScript.create(tx, w.owner(t.holder)),
     certify: (cd, what) => certify(agg, cd, what),
-  });
+  }));
   const parts = children.map((bytes, i) => {
     const part: TokenRecord = { ...t, id: `${recordId(t)}.${i + 1}`, amountWei: amounts[i].toString(), phase: 'minted', holder: owners[i], transfers: 0, parent: recordId(t), parts: undefined, recipient: undefined, redeemTx: undefined };
     w.saveToken(part, bytes);
@@ -376,7 +425,7 @@ async function burn(w: Wallet, nonce: string | undefined, recipient?: string): P
   const to = recipient ?? ethAddress(w.keys().eth);
   if (!isAddress(to)) throw new Error(`--recipient: not an address: ${to}`);
   const cfg = w.config;
-  const { vaultCfg } = await installedBridge(cfg, await chainOf(cfg));
+  const { vaultCfg } = await installedBridge(cfg, await chainOf(cfg), await heldTrust(w));
   const { bytes, token } = await w.token(t);
   const reason = returnReason(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, unhex(to), amountBytes(BigInt(t.amountWei)));
   const tx = await TransferTransaction.create(token, BurnPredicate.create(sha256(reason)), StateMask.generate(), { data: reason });
@@ -393,29 +442,33 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
   requirePhase(t, 'burned', 'redeem');
   const cfg = w.config;
   const chain = await chainOf(cfg);
-  const { bridge } = await installedBridge(cfg, chain);
+  const trust = await heldTrust(w);
+  const { bridge } = await installedBridge(cfg, chain, trust);
   const { token } = await w.token(t);
   // one consolidated proof set from the aggregator (every leaf under one seal), so the envelope has one anchor whatever the history's length
   const client = new AggregatorClient(cfg.aggUrl);
-  const proofClient = new TokenProofClient({ routing: ShardRouting.single(client), verificationContext: await bridge.context() });
-  let cons: Awaited<ReturnType<typeof consolidatedProofs>> | undefined;
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    cons = await consolidatedProofs(token, { partitionShards: 1, consolidate: (tk) => proofClient.consolidate(tk, { timeoutMs: 60_000 }) });
-    if (cons.proofs || !(cons.path.kind === 'per-sid' && cons.path.retryable)) break;
-    await sleep(5000);
-  }
-  let ret: Awaited<ReturnType<typeof buildReturnProof>>;
-  if (cons?.proofs) ret = await buildReturnProof(bridge, await refreshToken(token, cons.proofs));
-  else {
-    // no consolidation: the proofs as certified, one anchor per certificate (a short history only)
-    const why = `${JSON.stringify(cons?.path)}${cons?.path.kind === 'per-sid' && cons.path.unavailable === 'limit_exceeded' ? ' (one batch carries at most 256 states: 254 transfers)' : ''}`;
-    console.log(`  the aggregator did not consolidate the token (${why}); using the proofs as certified`);
-    try {
-      ret = await buildReturnProof(bridge, token);
-    } catch (e) {
-      throw new Error(`no return proof: the consolidation was unavailable (${why}) and the proofs as certified do not make one: ${e instanceof Error ? e.message : String(e)}`);
+  // the return proof is verified under the held trust: a certificate of a newer epoch fetches the entries and the whole assembly runs again
+  const ret = await withHeldTrust(w, trust, client, async () => {
+    const proofClient = new TokenProofClient({ routing: ShardRouting.single(client), verificationContext: await bridge.context() });
+    let cons: Awaited<ReturnType<typeof consolidatedProofs>> | undefined;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      cons = await consolidatedProofs(token, { partitionShards: 1, consolidate: (tk) => proofClient.consolidate(tk, { timeoutMs: 60_000 }) });
+      if (cons.proofs || !(cons.path.kind === 'per-sid' && cons.path.retryable)) break;
+      await sleep(5000);
     }
-  }
+    if (cons?.proofs) return buildReturnProof(bridge, await refreshToken(token, cons.proofs));
+    else {
+      // no consolidation: the proofs as certified, one anchor per certificate (a short history only)
+      const why = `${JSON.stringify(cons?.path)}${cons?.path.kind === 'per-sid' && cons.path.unavailable === 'limit_exceeded' ? ' (one batch carries at most 256 states: 254 transfers)' : ''}`;
+      console.log(`  the aggregator did not consolidate the token (${why}); using the proofs as certified`);
+      try {
+        return await buildReturnProof(bridge, token);
+      } catch (e) {
+        if (needsNewerEntry(e)) throw e;
+        throw new Error(`no return proof: the consolidation was unavailable (${why}) and the proofs as certified do not make one: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  });
   writeFileSync(`${w.tokenDir(recordId(t))}/envelope.bin`, ret.encoded);
   const data = calldata('redeem(bytes)', encBytes(ret.encoded));
   const url = cfg.redeemEthUrl ?? cfg.ethUrl;
@@ -454,8 +507,29 @@ async function claim(w: Wallet, to?: string): Promise<void> {
   console.log(`claimed ${credit} wei to ${dest}`);
 }
 
+/** The held trust-base history; --refresh first fetches the entries after the held tip (as many pages as the aggregator has). */
+async function trustCmd(w: Wallet, refresh: boolean): Promise<void> {
+  const trust = await heldTrust(w);
+  if (refresh) {
+    const { fetchTrustBaseEntries } = await import('@unicitylabs/state-transition-sdk/lib/util/TrustBaseUtils.js');
+    const agg = new AggregatorClient(w.config.aggUrl);
+    const maxEntries = Number(process.env.BRIDGE_TRUST_MAX_ENTRIES ?? '64');
+    for (let n = 1; n > 0;) {
+      n = await fetchTrustBaseEntries(trust.history, agg, { maxEntries });
+      if (n > 0) persistTrust(w, await trust.history.exportBundle());
+    }
+  }
+  const h = trust.history;
+  const entries: { epoch: string; entryId: string; startRound: string }[] = [];
+  for (let e = h.genesisEpoch; e <= h.tipEpoch; e++) {
+    const entry = h.entry(e)!;
+    entries.push({ epoch: e.toString(), entryId: hex(await entry.entryId()), startRound: entry.epochStartRound.toString() });
+  }
+  console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries }, null, 2));
+}
+
 // ---- the command line -------------------------------------------------------------------------------------------------------------------------
-const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem | claim [--to 0x..]; ' +
+const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem | claim [--to 0x..] | trust [--refresh]; ' +
   'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce or part, e.g. 5.1> (default the newest)';
 
 export async function main(argv: string[]): Promise<void> {
@@ -463,7 +537,7 @@ export async function main(argv: string[]): Promise<void> {
     args: argv, allowPositionals: true, strict: true,
     options: {
       wallet: { type: 'string' }, config: { type: 'string' }, 'eth-key-file': { type: 'string' }, token: { type: 'string' }, amount: { type: 'string' },
-      count: { type: 'string' }, recipient: { type: 'string' }, to: { type: 'string' }, amounts: { type: 'string' },
+      count: { type: 'string' }, refresh: { type: 'boolean' }, recipient: { type: 'string' }, to: { type: 'string' }, amounts: { type: 'string' },
     },
   });
   const w = new Wallet(values.wallet ?? process.env.BRIDGE_TESTER_WALLET ?? './bridge-wallet');
@@ -495,6 +569,8 @@ export async function main(argv: string[]): Promise<void> {
       return redeem(w, values.token);
     case 'claim':
       return claim(w, values.to);
+    case 'trust':
+      return trustCmd(w, values.refresh ?? false);
     default:
       throw new Error(USAGE);
   }
