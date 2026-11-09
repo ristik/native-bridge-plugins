@@ -71,15 +71,31 @@ pub fn verify_embedded_uc(input: &TrustInput, uc: &UnicityCertificate) -> Result
 /// Select the committee of the certificate's seal epoch (protocol/trust-base.md steps 1-4, before
 /// any structure, root or signature check, as the oracle orders them): another network
 /// `SealNetwork`, an epoch newer than the latest held `NoEntryForEpoch`, before the genesis or
-/// outside the epoch's round interval `SealEpoch`.
+/// outside the epoch's round interval `SealEpoch`. The same position rule as the SDK's own seal
+/// authentication of a history (an epoch above the tip is the retryable one; an epoch below the
+/// genesis, a round before the epoch's start or at the start of the next held epoch is final).
 pub fn select_epoch(input: &TrustInput, uc: &UnicityCertificate) -> Result<()> {
-    if uc.unicity_seal.network_id != input.network_id() {
+    let seal = &uc.unicity_seal;
+    if seal.network_id != input.network_id() {
         return Err(E::SealNetwork);
     }
-    SealSession::new(input.history())
-        .authority_for(&uc.unicity_seal)
-        .map(|_| ())
-        .map_err(|e| certificate_failure(&e).unwrap_or(E::SealEpoch))
+    let history = input.history();
+    let Some(entry) = history.get(seal.epoch) else {
+        return Err(if seal.epoch < history.genesis().epoch {
+            E::SealEpoch
+        } else {
+            E::NoEntryForEpoch
+        });
+    };
+    if seal.root_chain_round_number < entry.epoch_start {
+        return Err(E::SealEpoch);
+    }
+    if let Some(next) = seal.epoch.checked_add(1).and_then(|e| history.get(e)) {
+        if seal.root_chain_round_number >= next.epoch_start {
+            return Err(E::SealEpoch);
+        }
+    }
+    Ok(())
 }
 
 /// The sentinel of a certificate failure, as the TypeScript projection names it: an epoch newer
@@ -89,8 +105,8 @@ pub fn select_epoch(input: &TrustInput, uc: &UnicityCertificate) -> Result<()> {
 pub fn certificate_failure(e: &VerificationError) -> Option<E> {
     Some(match e {
         VerificationError::UnknownTrustEpoch { .. } => E::NoEntryForEpoch,
-        VerificationError::EpochBeforeGenesis
-        | VerificationError::SealBeforeEpochStart
+        VerificationError::SealBeforeEpochStart
+        | VerificationError::SealEpochMismatch
         | VerificationError::SealAfterAuthorityEnd => E::SealEpoch,
         VerificationError::SealNetworkMismatch => E::SealNetwork,
         VerificationError::SealRootMismatch => E::SealRoot,

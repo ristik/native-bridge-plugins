@@ -77,7 +77,8 @@ export function mapSdkFailure(r: VerificationResult<unknown>): NativeReason {
 
 /** Whether two authorities are the same history: the same network and the same genesis entry. */
 function sameBase(a: IVerificationContext['trustBase'], b: IVerificationContext['trustBase']): boolean {
-  return a.networkId.id === b.networkId.id && a.genesisEpoch === b.genesisEpoch && a.committee(a.genesisEpoch)?.id === b.committee(b.genesisEpoch)?.id;
+  const [x, y] = [a.networkId, b.networkId];
+  return x !== null && y !== null && x.id === y.id && a.genesisPin.length === b.genesisPin.length && a.genesisPin.every((v, i) => v === b.genesisPin[i]);
 }
 
 export class NativeBridge {
@@ -103,7 +104,9 @@ export class NativeBridge {
       await this.trust.authority(),
       base?.predicateVerifier ?? PredicateVerifierService.create(),
       base?.unicityCertificateVerifier ??
-        new UnicityCertificateVerifier(new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier())),
+        new UnicityCertificateVerifier(
+          new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: 16 }),
+        ),
       mjvs,
       tiv,
     );

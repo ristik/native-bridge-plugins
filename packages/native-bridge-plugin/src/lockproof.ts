@@ -200,7 +200,8 @@ async function verifyLockProofSteps(dep: Deployment, trust: TrustInput, j: Justi
   }
   let uc: UnicityCertificate;
   try {
-    uc = UnicityCertificate.fromCBOR(lp.uc);
+    // the B1 profile: an embedded certificate may carry null signature values (they count zero)
+    uc = UnicityCertificate.decodeWithOptions(lp.uc, { allowNullSignatures: true });
     if (!eq(uc.toCBOR(), lp.uc)) fail('ErrUnsupportedCertificateEncoding');
   } catch (e) {
     if (e instanceof Error && e.name === 'NativeError') throw e;

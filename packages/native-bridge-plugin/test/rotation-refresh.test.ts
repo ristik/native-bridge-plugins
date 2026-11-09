@@ -10,17 +10,17 @@ import { test } from 'node:test';
 import { InclusionCertificate } from '@unicitylabs/state-transition-sdk/lib/api/InclusionCertificate.js';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
 import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
-import { TrustBaseResponseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponse.js';
-import { TrustBaseUpdateError } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseUpdateError.js';
-import { CertificateVerificationResult } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/CertificateVerdict.js';
-import type { ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
+import { TrustBaseUpdateError } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseError.js';
+import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
+import { findNoTrustBaseEntry } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/TrustBaseEntryResult.js';
+import { verifyWithUpdate } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/verifyWithUpdate.js';
+import type { ITrustBaseRequest, ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
 import { DataHasherFactory } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHasherFactory.js';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/HashAlgorithm.js';
 import { NodeDataHasher } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/NodeDataHasher.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radix/SparseMerkleTree.js';
 import { TokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/default/TokenVerifier.js';
-import { verifyWithTrustBaseUpdate } from '@unicitylabs/state-transition-sdk/lib/util/TrustBaseUtils.js';
 import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
 
 import { decodeEnvelope } from '../src/envelope.js';
@@ -77,20 +77,22 @@ class PageSource implements ITrustBaseSource {
   public requests: bigint[] = [];
   public constructor(private readonly all: Uint8Array[], public available: number, public cap = 64) {}
 
-  public async getTrustBaseEntries(from: bigint, maxEntries: number): Promise<Uint8Array> {
+  public async getTrustBasePage(request: ITrustBaseRequest): Promise<Uint8Array> {
+    const from = request.fromEpoch;
+    const maxEntries = request.maxEntries;
     this.requests.push(from);
     const have = this.all.slice(0, this.available);
-    const tip = RootTrustBaseV2.fromCBOR(have[have.length - 1]);
-    const first = RootTrustBaseV2.fromCBOR(have[0]).epoch;
-    const page = (status: TrustBaseResponseStatus, entries: Uint8Array[], end: Uint8Array | null, next: bigint | null): Uint8Array =>
+    const tip = RootTrustBaseV2.decode(have[have.length - 1]);
+    const first = RootTrustBaseV2.decode(have[0]).epoch;
+    const page = (status: TrustBaseStatus, entries: Uint8Array[], end: Uint8Array | null, next: bigint | null): Uint8Array =>
       C.encodeTag(39015n, C.encodeArray(
         C.encodeUnsignedInteger(1n), C.encodeUnsignedInteger(NETWORK), C.encodeUnsignedInteger(status), C.encodeUnsignedInteger(from), C.encodeUnsignedInteger(tip.epoch),
         C.encodeNullable(end, C.encodeByteString), C.encodeArray(...entries), C.encodeNullable(next, C.encodeUnsignedInteger),
       ));
-    if (from > tip.epoch) return page(TrustBaseResponseStatus.NOT_YET_AVAILABLE, [], null, null);
+    if (from > tip.epoch) return page(TrustBaseStatus.NOT_YET_AVAILABLE, [], null, null);
     const slice = have.slice(Number(from - first), Number(from - first) + Math.min(maxEntries, this.cap));
-    const last = RootTrustBaseV2.fromCBOR(slice[slice.length - 1]).epoch;
-    return page(TrustBaseResponseStatus.OK, slice, await tip.entryId(), last < tip.epoch ? last + 1n : null);
+    const last = RootTrustBaseV2.decode(slice[slice.length - 1]).epoch;
+    return page(TrustBaseStatus.OK, slice, await tip.entryId(), last < tip.epoch ? last + 1n : null);
   }
 }
 
@@ -114,10 +116,8 @@ const chain: ChainReader = { origin: () => Promise.resolve(2600n) };
 
 /** The wallet's refresh loop around the SDK's: verify the refreshed token as the SDK does, fetching and appending trust-base entries on "no entry for epoch". */
 const verifyRefreshed = (x: Rotated, refreshed: Awaited<ReturnType<typeof refreshToken>>, source: ITrustBaseSource) =>
-  verifyWithTrustBaseUpdate(async (tb) => {
-    assert.equal(tb, x.w.bridge.trust.history, 'the loop works on the bridge\'s own history, not a copy');
-    return new TokenVerifier().verify(refreshed, await x.w.bridge.context());
-  }, x.w.bridge.trust.history, source, { attempts: 4, intervalMs: 1, timeoutMs: 20_000 });
+  // one update, one retry (the SDK's `verifyWithUpdate` has no loop): the update works on the bridge's own history, not a copy
+  verifyWithUpdate(x.w.bridge.trust.history, [source], async () => new TokenVerifier().verify(refreshed, await x.w.bridge.context()), { backoffMs: 1 });
 
 test('a return proof of epoch 2, refreshed to an epoch-4 anchor after two rotations, is redeemed once the SDK loop has fetched and appended epochs 3 and 4', async () => {
   const x = await rotated();
@@ -126,8 +126,8 @@ test('a return proof of epoch 2, refreshed to an epoch-4 anchor after two rotati
   const plugin = createNativeBridgePlugin(w.bridge, { manifestRevision: 'm', profileRevision: 'p' });
   const vault = new Vault(x.nullifier);
   const aggregator = () => proofsUnder4(x);
-  assert.equal(history.tipEpoch, 2n);
-  const epoch2 = history.bytes(2n)!;
+  assert.equal(history.tip?.epoch, 2n);
+  const epoch2 = history.entryForEpoch(2n)!.encode();
 
   // 1. the bridge cannot yet verify the epoch-4 anchor: retryable, and the redemption sends nothing
   await rejects(redeemReturn(plugin, x.out.bytes, aggregator, chain, vault, policy()), 'ErrNoEntryForEpoch');
@@ -137,19 +137,19 @@ test('a return proof of epoch 2, refreshed to an epoch-4 anchor after two rotati
   const refreshed = await refreshToken(x.out.token, await aggregator());
   const stale = await new TokenVerifier().verify(refreshed, await w.bridge.context());
   assert.notEqual(stale.status, VerificationStatus.OK);
-  const missing = CertificateVerificationResult.findMissingEpoch(stale)?.missing;
-  assert.deepEqual([missing?.epoch, missing?.latest], [4n, 2n]);
+  const missing = findNoTrustBaseEntry(stale);
+  assert.deepEqual([missing?.epoch, missing?.tipEpoch], [4n, 2n]);
 
   // 3. the loop: the source serves one entry per page, so epoch 3 and epoch 4 take two fetches, each from the epoch after the held tip
   const source = new PageSource(x.r4.entries, 3, 1);
   const result = await verifyRefreshed(x, refreshed, source);
   assert.equal(result.status, VerificationStatus.OK);
   assert.deepEqual(source.requests, [3n, 4n]);
-  assert.equal(history.tipEpoch, 4n);
+  assert.equal(history.tip?.epoch, 4n);
   assert.equal(w.bridge.trust.history, history, 'the same history object was appended to');
-  assert.deepEqual(history.bytes(2n), epoch2, 'held entries are never replaced');
-  assert.deepEqual(history.bytes(3n), x.r4.entries[1]);
-  assert.deepEqual(history.bytes(4n), x.r4.entries[2]);
+  assert.deepEqual(history.entryForEpoch(2n)!.encode(), epoch2, 'held entries are never replaced');
+  assert.deepEqual(history.entryForEpoch(3n)!.encode(), x.r4.entries[1]);
+  assert.deepEqual(history.entryForEpoch(4n)!.encode(), x.r4.entries[2]);
 
   // 4. the plug-in now verifies the refreshed token and the old, epoch-2 proof of the same token, and the redemption goes through with the epoch-4 proof
   await w.bridge.verifyNativeToken(refreshed, 'return');
@@ -175,8 +175,8 @@ test('a source that serves a forged epoch 3 (a successor not witnessed by the ep
   const forged = await successorEntry(w.agg, 1000n, 4, 30, undefined, x.r4.signers);
   assert.notDeepEqual(forged, x.r4.entries[1]);
   const liar = new PageSource([x.r4.entries[0], forged, x.r4.entries[2]], 2);
-  await assert.rejects(verifyRefreshed(x, refreshed, liar), (e: unknown) => TrustBaseUpdateError.is(e) && e.reason === 'rejected');
-  assert.equal(history.tipEpoch, 2n, 'a refused entry is not held');
+  await assert.rejects(verifyRefreshed(x, refreshed, liar), (e: unknown) => e instanceof TrustBaseUpdateError && e.appended === 0);
+  assert.equal(history.tip?.epoch, 2n, 'a refused entry is not held');
   await rejects(redeemReturn(plugin, x.out.bytes, aggregator, chain, vault, policy()), 'ErrNoEntryForEpoch');
   assert.equal(vault.sent.length, 0);
 
@@ -194,19 +194,19 @@ test('a source that has not caught up leaves the proof retryable; entries append
   const aggregator = () => proofsUnder4(x);
   const refreshed = await refreshToken(x.out.token, await aggregator());
 
-  // the source knows epoch 2 only: every fetch brings nothing, the loop gives up after its attempts and returns the missing-epoch result
+  // the source knows epoch 2 only: it answers "nothing newer" (not yet available), which is a result, not an error: the first, missing-epoch result stands
   const source = new PageSource(x.r4.entries, 1);
   const waiting = await verifyRefreshed(x, refreshed, source);
   assert.notEqual(waiting.status, VerificationStatus.OK);
-  assert.equal(CertificateVerificationResult.findMissingEpoch(waiting)?.missing?.epoch, 4n);
-  assert.equal(source.requests.length, 4);
-  assert.equal(history.tipEpoch, 2n);
+  assert.equal(findNoTrustBaseEntry(waiting)?.epoch, 4n);
+  assert.equal(source.requests.length, 1, 'one update pass: every source said nothing newer');
+  assert.equal(history.tip?.epoch, 2n);
 
   // it then has epoch 3: that is appended, epoch 4 is still missing
   source.available = 2;
   const partial = await verifyRefreshed(x, refreshed, source);
   assert.notEqual(partial.status, VerificationStatus.OK);
-  assert.deepEqual([CertificateVerificationResult.findMissingEpoch(partial)?.missing?.epoch, history.tipEpoch], [4n, 3n]);
+  assert.deepEqual([findNoTrustBaseEntry(partial)?.epoch, history.tip?.epoch], [4n, 3n]);
   await rejects(redeemReturn(plugin, x.out.bytes, aggregator, chain, vault, policy()), 'ErrNoEntryForEpoch');
   assert.equal(vault.sent.length, 0);
 

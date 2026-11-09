@@ -16,7 +16,7 @@ consolidation = ["alloc", "unicity-token/client"]
 host = ["alloc", "unicity-token/std", "k256/std", "sha2/std", "sha3/std", "dep:serde", "dep:serde_json"]
 
 [dependencies]
-unicity-token = { git = "https://github.com/ristik/state-transition-sdk-rust.git", rev = "0517256d9417e9ad52f77a3ac9ef593fa7541d95", default-features = false, features = ["alloc"] }
+unicity-token = { git = "https://github.com/ristik/state-transition-sdk-rust.git", rev = "de79e6c1e393a1846b75bca0640b9ec9a55aa143", default-features = false, features = ["alloc"] }
 k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "alloc"] }
 sha2 = { version = "=0.10.9", default-features = false }
 sha3 = { version = "=0.10.9", default-features = false }
@@ -25,4 +25,4 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
-unicity-token = { git = "https://github.com/ristik/state-transition-sdk-rust.git", rev = "0517256d9417e9ad52f77a3ac9ef593fa7541d95", features = ["std", "client"] }
+unicity-token = { git = "https://github.com/ristik/state-transition-sdk-rust.git", rev = "de79e6c1e393a1846b75bca0640b9ec9a55aa143", features = ["std", "client", "test-fixtures"] }

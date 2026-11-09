@@ -222,7 +222,7 @@ export interface EnvelopeView {
 export function describeEnvelope(bytes: Uint8Array): EnvelopeView {
   const env = decodeEnvelope(bytes);
   const anchors = env.anchors.map((a, i) => {
-    const seal = UnicityCertificate.fromCBOR(a.uc).unicitySeal;
+    const seal = UnicityCertificate.decodeWithOptions(a.uc, { allowNullSignatures: true }).unicitySeal;
     return { index: i, partition: a.partition, shard: hex(a.shard), rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
   });
   return { bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length };
