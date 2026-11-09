@@ -4,6 +4,9 @@ import { dirname, resolve } from 'node:path';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+import { decodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
 import { arr, keccak256 } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, sleep, unhex } from '../tests/live/lib.js';
 
@@ -204,4 +207,63 @@ export async function jsonRpc(url: string, method: string, params: unknown[], wa
   const r = JSON.parse(text) as { result?: unknown; error?: { message: string; data?: string } };
   if (r.error) throw new Error(`${method}: ${r.error.message}${r.error.data ? ` (${r.error.data})` : ''}`);
   return r.result;
+}
+
+/** A decoded return envelope, as `envelope` prints it: each anchor's partition, shard and the root epoch and round of its certificate's seal. */
+export interface EnvelopeView {
+  bytes: number;
+  sha256: string;
+  envelopeHex: string;
+  anchors: { index: number; partition: number; shard: string; rootEpoch: string; rootRound: string }[];
+  leafProofs: number;
+}
+
+/** Decode the envelope's bytes (the redeem(bytes) argument): the seals are read from the anchors' certificates, the ones the vault verifies. */
+export function describeEnvelope(bytes: Uint8Array): EnvelopeView {
+  const env = decodeEnvelope(bytes);
+  const anchors = env.anchors.map((a, i) => {
+    const seal = UnicityCertificate.fromCBOR(a.uc).unicitySeal;
+    return { index: i, partition: a.partition, shard: hex(a.shard), rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
+  });
+  return { bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length };
+}
+
+// ---- the replay negatives (bridge-tester.ts replays) ------------------------------------------------------------------------------------------
+/** BridgeVault's PartAlreadyRedeemed(uint256 nonce, bytes32 partId) and BridgeRejected(uint256 status) selectors. */
+export const PART_ALREADY_REDEEMED = '0xe8f8709e';
+export const BRIDGE_REJECTED = '0x2896c49d';
+/** The composition's V2 statuses the replay negatives expect (protocol/vectors/split/config/compose-status-v2.json, by name). */
+export const V2_STATUS = { ErrCDMismatch: 36, ErrAnchorAuth: 61 } as const;
+
+/** PartAlreadyRedeemed of this lock nonce and token ID, as the vault's revert data. */
+export const partAlreadyRedeemed = (nonce: bigint, tokenId: Uint8Array): string => `${PART_ALREADY_REDEEMED}${word(nonce)}${hex(tokenId)}`;
+
+/** The revert data of a failed eth_call as jsonRpc reports it (`eth_call: <message> (0x...)`), or undefined when it carries none. */
+export function revertOf(e: unknown): string | undefined {
+  const m = /\((0x[0-9a-fA-F]*)\)$/.exec(e instanceof Error ? e.message : String(e));
+  return m ? m[1].toLowerCase() : undefined;
+}
+
+/** The composition's refusal: BridgeRejected's nonzero V2 status, or undefined for any other revert. */
+export function bridgeRejectedStatus(revert: string | undefined): number | undefined {
+  if (!revert?.startsWith(BRIDGE_REJECTED) || revert.length < 74) return undefined;
+  const code = Number(BigInt(`0x${revert.slice(10, 74)}`));
+  return code === 0 ? undefined : code;
+}
+
+/** The envelope a redeem(bytes) transaction's input carries. */
+export function redeemArgument(input: string): Uint8Array {
+  if (!input.toLowerCase().startsWith(`0x${selector('redeem(bytes)')}`)) throw new Error('not a redeem(bytes) call');
+  return decBytes(`0x${input.slice(10)}`);
+}
+
+/** One byte string replaced by another of the same length; it must occur exactly once in `b` (at a byte boundary). */
+export function replaceOnce(b: Uint8Array, from: Uint8Array, to: Uint8Array, what: string): Uint8Array {
+  if (from.length !== to.length || from.length === 0) throw new Error(`${what}: the replacement must be as long as the original`);
+  const h = hex(b);
+  const f = hex(from);
+  const at: number[] = [];
+  for (let i = h.indexOf(f); i >= 0; i = h.indexOf(f, i + 1)) if (i % 2 === 0) at.push(i);
+  if (at.length !== 1) throw new Error(`${what}: the bytes occur ${at.length} times in the envelope, not once`);
+  return unhex(h.slice(0, at[0]) + hex(to) + h.slice(at[0] + f.length));
 }

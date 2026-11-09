@@ -11,9 +11,15 @@
  *   bridge-tester.ts burn [--token <id>] [--recipient <0x address>]              burn the token (or a part) for its return to an EVM address (default: this wallet's)
  *   bridge-tester.ts redeem [--token <nonce>] [--per-sid]                        the return proof (consolidated by the aggregator), redeemed in the vault; --per-sid: the
  *                                                                                proofs as certified, one anchor per certificate, no consolidation and no fallback
- *   bridge-tester.ts envelope [--token <nonce>]                                  the submitted return envelope (envelope.bin) decoded: each anchor's partition and the
- *                                                                                root epoch and round of its seal, the envelope's size and SHA-256
+ *   bridge-tester.ts envelope [--token <nonce>]                                  the return envelope built for the last redeem attempt (envelope.bin, written before
+ *                                                                                the send, so not proof it landed: compare with the transaction's input) decoded: each
+ *                                                                                anchor's partition and the root epoch and round of its seal, its size and SHA-256
  *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
+ *   bridge-tester.ts replays [--token <nonce>]                                   the replay negatives of a redeemed token, under the held trust (each refusal the chain's
+ *                                                                                own): its redeemed envelope again (eth_call, then mined: status 0), a fresh consolidated
+ *                                                                                proof of the redeemed burn (PartAlreadyRedeemed), that proof with its recipient changed
+ *                                                                                and re-signed by unknown keys (BridgeRejected), and a conflicting burn of the pre-burn
+ *                                                                                state (not certified once a later block is built; still the first burn's proof); writes replays.json next to the token. Sends one transaction
  *   bridge-tester.ts trust [--refresh] [--token <id>]                            the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries;
  *                                                                                --token adds the root epoch and round that sealed each of the token's proofs
  *
@@ -33,6 +39,10 @@ import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/Aggr
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicitySeal.js';
+import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { ShardRouting } from '@unicitylabs/state-transition-sdk/lib/consolidation/ShardRouting.js';
 import { TokenProofClient } from '@unicitylabs/state-transition-sdk/lib/consolidation/TokenProofClient.js';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
@@ -51,9 +61,8 @@ import { sha256 } from '@noble/hashes/sha2.js';
 
 import { DeploymentRegistry, makeDeployment } from '../packages/native-bridge-plugin/src/deployment.js';
 import { configHashOfPdr, encodeJustification } from '../packages/native-bridge-plugin/src/lockproof.js';
-import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin/src/proof.js';
-import { decodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
-import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+import { assembleEnvelope, buildReturnProof, refreshToken } from '../packages/native-bridge-plugin/src/proof.js';
+import { projectToken } from '../packages/native-bridge-plugin/src/history.js';
 import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { needsNewerEntry, withTrustRefresh } from '../packages/native-bridge-plugin/src/trustrefresh.js';
@@ -63,8 +72,8 @@ import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../pac
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
-  RECORD_ID, recordId, requirePhase, splitAmounts, TesterConfig, TokenRecord,
+  amountBytes, appendTransaction, bridgeRejectedStatus, V2_STATUS, calldata, checkNetwork, decBytes, describeEnvelope, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  partAlreadyRedeemed, RECORD_ID, recordId, redeemArgument, replaceOnce, requirePhase, revertOf, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
 
 async function waitFor<T>(what: string, timeoutMs: number, f: () => Promise<T | undefined>, everyMs = 2000): Promise<T> {
@@ -176,10 +185,17 @@ class Chain {
   }
 
   /** Signs once and sends to one endpoint; waits for the receipt there. */
-  async send(key: string, data: string, value = 0n, url = this.cfg.ethUrl): Promise<{ status: string; transactionHash: string; blockHash: string; blockNumber: string; gasUsed: string; logs: { address: string; topics: string[] }[] }> {
-    const from = ethAddress(key);
-    const tx = { from, to: this.cfg.vault, data, value: `0x${value.toString(16)}` };
+  async send(key: string, data: string, value = 0n, url = this.cfg.ethUrl): Promise<Receipt> {
+    const tx = { from: ethAddress(key), to: this.cfg.vault, data, value: `0x${value.toString(16)}` };
     const gas = (BigInt(await jsonRpc(url, 'eth_estimateGas', [tx, 'latest'])) * 6n) / 5n + 20_000n;
+    const rc = await this.sendWithGas(key, data, gas, value, url);
+    if (rc.status !== '0x1') throw new Error(`${rc.transactionHash} reverted (gas used ${BigInt(rc.gasUsed)})`);
+    return rc;
+  }
+
+  /** Signs once with this gas limit (no estimate: a transaction that reverts is still sent) and returns its receipt, whatever its status. */
+  async sendWithGas(key: string, data: string, gas: bigint, value = 0n, url = this.cfg.ethUrl): Promise<Receipt> {
+    const from = ethAddress(key);
     const gasPrice = BigInt(await jsonRpc(url, 'eth_gasPrice', [])) * 2n;
     const balance = BigInt(await jsonRpc(url, 'eth_getBalance', [from, 'latest']));
     if (balance < gas * gasPrice + value) throw new Error(`${from} holds ${balance} wei, and this needs ${gas * gasPrice + value}: get test ether from the faucet`);
@@ -187,10 +203,27 @@ class Chain {
     const { raw, hash } = signLegacyTx({ nonce, gasPrice, gas, to: this.cfg.vault, value, data: unhex(data), chainId: BigInt(this.cfg.chainId) }, key);
     await jsonRpc(url, 'eth_sendRawTransaction', [raw]);
     console.log(`  sent ${hash} (gas limit ${gas})`);
-    const rc = await waitFor(`the receipt of ${hash}`, 180_000, async () => (await jsonRpc(url, 'eth_getTransactionReceipt', [hash])) ?? undefined);
-    if (rc.status !== '0x1') throw new Error(`${hash} reverted (gas used ${BigInt(rc.gasUsed)})`);
-    return rc;
+    return waitFor(`the receipt of ${hash}`, 180_000, async () => ((await jsonRpc(url, 'eth_getTransactionReceipt', [hash])) as Receipt | null) ?? undefined);
   }
+
+  /** eth_call of the vault: its result, or the revert's data (never thrown). */
+  async attempt(data: string, from: string, url = this.cfg.ethUrl): Promise<{ result?: string; revert?: string; message?: string }> {
+    try {
+      return { result: await this.call(data, from, url) };
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      return { revert: revertOf(e), message: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
+    }
+  }
+}
+
+interface Receipt {
+  status: string;
+  transactionHash: string;
+  blockHash: string;
+  blockNumber: string;
+  gasUsed: string;
+  logs: { address: string; topics: string[] }[];
 }
 
 /** The wallet's held trust (tester/trust.ts loadHeldTrust): its durable history when it has one, else the shipped bundle, under the operator's pin. */
@@ -522,22 +555,196 @@ async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<
   console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries, ...(seals ? { token: tokenId, seals } : {}) }, null, 2));
 }
 
-/** The return envelope the last redeem built and submitted (envelope.bin, the bytes of its redeem(bytes) call), decoded: each anchor's seal. */
+/**
+ * The return envelope built for the token's last redeem attempt (envelope.bin, the argument of its redeem(bytes) call), decoded: each anchor's seal.
+ * It is written before the send, so it need not be what landed: the transaction's input on chain says that.
+ */
 async function envelopeCmd(w: Wallet, nonce?: string): Promise<void> {
   const t = w.record(nonce);
   const file = `${w.tokenDir(recordId(t))}/envelope.bin`;
   if (!existsSync(file)) throw new Error(`token ${recordId(t)} has no envelope: run redeem first`);
-  const bytes = Uint8Array.from(readFileSync(file));
-  const env = decodeEnvelope(bytes);
-  const anchors = env.anchors.map((a, i) => {
-    const seal = UnicityCertificate.fromCBOR(a.uc).unicitySeal;
-    return { index: i, partition: a.partition, shard: hex(a.shard), rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
+  console.log(JSON.stringify({ token: recordId(t), ...describeEnvelope(Uint8Array.from(readFileSync(file))) }, null, 2));
+}
+
+// ---- the replay negatives ---------------------------------------------------------------------------------------------------------------------
+/** Where a conflicting burn and a tampered envelope send the token: an address no lock or claim of the tester's names. */
+const OTHER_RECIPIENT = '0x000000000000000000000000000000000000dEaD';
+
+/** `uc` with its seal re-signed by freshly generated keys under the same signer IDs: keys no trust-base entry ever held. */
+async function unknownKeyCertificate(uc: UnicityCertificate): Promise<UnicityCertificate> {
+  const s = uc.unicitySeal;
+  const signers = new Map([...(s.signatures ?? new Map()).keys()].map((id) => [id, SigningService.generate()] as const));
+  if (signers.size === 0) throw new Error('the genuine seal is unsigned');
+  const seal = await UnicitySeal.create(s.networkId, s.rootChainRoundNumber, s.epoch, s.timestamp, s.previousHash, s.hash, signers);
+  return new UnicityCertificate(uc.inputRecord, uc.technicalRecordHash, uc.shardConfigurationHash, uc.shardTreeCertificate, uc.unicityTreeCertificate, seal);
+}
+
+/**
+ * The replay negatives of a redeemed token (module comment), under the wallet's held trust, which fetches newer entries as redeem does. Every check
+ * that fails throws: the stage reads replays.json only from a run that completed. The vault's whole state before and after is the stage's to check.
+ */
+async function replays(w: Wallet, nonce?: string): Promise<void> {
+  const t = w.record(nonce);
+  requirePhase(t, 'redeemed', 'replays');
+  if (!t.redeemTx) throw new Error(`token ${recordId(t)} has no redeem transaction recorded`);
+  const cfg = w.config;
+  const chain = await chainOf(cfg);
+  const url = cfg.redeemEthUrl ?? cfg.ethUrl;
+  const trust = await heldTrust(w);
+  const { vaultCfg, dep, bridge } = await installedBridge(cfg, chain, trust);
+  const { bytes, token } = await w.token(t);
+  const key = w.keys().eth;
+  const me = ethAddress(key);
+  const lockNonce = BigInt(t.nonce);
+  const spent = partAlreadyRedeemed(lockNonce, token.id.bytes);
+  const redeemData = (env: Uint8Array) => calldata('redeem(bytes)', encBytes(env));
+  const out: Record<string, unknown> = { token: recordId(t), lockNonce: t.nonce, redeemTx: t.redeemTx, expectedRefusal: spent };
+
+  // 1. the redeemed envelope again, exactly as the chain holds it: refused on the call, and mined it reverts (status 0)
+  const orig = (await jsonRpc(url, 'eth_getTransactionByHash', [t.redeemTx])) as { input: string };
+  const origRc = (await jsonRpc(url, 'eth_getTransactionReceipt', [t.redeemTx])) as Receipt;
+  const origView = describeEnvelope(redeemArgument(orig.input));
+  const again = await chain.attempt(orig.input, me, url);
+  if (again.revert !== spent) throw new Error(`the redeemed envelope was not refused as PartAlreadyRedeemed: ${JSON.stringify(again)}`);
+  const gasLimit = BigInt(origRc.gasUsed) * 2n + 100_000n;
+  const mined = await chain.sendWithGas(key, orig.input, gasLimit, 0n, url);
+  if (mined.status !== '0x0') throw new Error(`the redeemed envelope, mined again, did not revert: ${mined.transactionHash} ${mined.status}`);
+  out.duplicate = {
+    call: again.revert, originalAnchors: origView.anchors, originalSha256: origView.sha256,
+    mined: { tx: mined.transactionHash, status: mined.status, block: BigInt(mined.blockNumber), gasLimit, gasUsed: BigInt(mined.gasUsed) },
+  };
+  console.log(`  the redeemed envelope again: refused (PartAlreadyRedeemed), and mined it reverts (${mined.transactionHash}, status ${mined.status})`);
+
+  // 2. a fresh consolidated proof of the redeemed burn, under the seal current now: refused on the nullifier, not for its certificate
+  const client = new AggregatorClient(cfg.aggUrl);
+  const fresh = await withHeldTrust(w, trust, client, async () => {
+    const proofClient = new TokenProofClient({ routing: ShardRouting.single(client), verificationContext: await bridge.context() });
+    let cons: Awaited<ReturnType<typeof consolidatedProofs>> | undefined;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      cons = await consolidatedProofs(token, { partitionShards: 1, consolidate: (tk) => proofClient.consolidate(tk, { timeoutMs: 60_000 }) });
+      if (cons.proofs || !(cons.path.kind === 'per-sid' && cons.path.retryable)) break;
+      await sleep(5000);
+    }
+    if (!cons?.proofs) throw new Error(`the aggregator did not consolidate the redeemed token: ${JSON.stringify(cons?.path)}`);
+    const tok = await refreshToken(token, cons.proofs);
+    return { tok, proofs: cons.proofs, ret: await buildReturnProof(bridge, tok) };
   });
-  console.log(JSON.stringify({ token: recordId(t), bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length }, null, 2));
+  const freshView = describeEnvelope(fresh.ret.encoded);
+  const newest = (v: typeof freshView) => v.anchors.reduce((m, a) => (BigInt(a.rootRound) > m ? BigInt(a.rootRound) : m), 0n);
+  if (newest(freshView) <= newest(origView)) throw new Error(`the fresh proof's seal (round ${newest(freshView)}) is not newer than the redeemed one's (${newest(origView)})`);
+  if (freshView.sha256 === origView.sha256) throw new Error('the fresh envelope is the redeemed one');
+  // the vault reverts for the seal's round until the registry's usable origin covers it: wait until it gets as far as the nullifier
+  let last: Awaited<ReturnType<Chain['attempt']>> | undefined;
+  await waitFor('the vault to refuse the fresh proof as PartAlreadyRedeemed', 240_000, async () => {
+    last = await chain.attempt(redeemData(fresh.ret.encoded), me, url);
+    if (last.result !== undefined) throw new Error(`the vault ACCEPTED a fresh proof of the redeemed burn: ${last.result}`);
+    return last.revert === spent ? true : undefined;
+  }, 3000).catch((e: unknown) => {
+    throw new Error(`${e instanceof Error ? e.message : String(e)}; the last refusal: ${JSON.stringify(last)}`);
+  });
+  out.freshReplay = { anchors: freshView.anchors, sha256: freshView.sha256, bytes: freshView.bytes, refusal: last!.revert };
+  console.log(`  a fresh proof of the redeemed burn (seal epoch ${freshView.anchors.map((a) => a.rootEpoch).join(',')}, round ${newest(freshView)}): refused (PartAlreadyRedeemed)`);
+
+  // 3. tampered: the fresh envelope with its return recipient changed in the burn's return reason (the certified transaction no longer hashes),
+  // refused by the composition. The reason, not the bare address, is replaced: the wallet that locked is often the recipient, so its address also
+  // occurs in the mint's lock proof
+  const reasonFor = (to: Uint8Array) => returnReason(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, to, amountBytes(BigInt(t.amountWei)));
+  const changed = replaceOnce(fresh.ret.encoded, reasonFor(fresh.ret.verified.outcome.releaseTo), reasonFor(unhex(OTHER_RECIPIENT.slice(2))), 'the burn\'s return reason');
+  const r3 = await chain.attempt(redeemData(changed), me, url);
+  const s3 = bridgeRejectedStatus(r3.revert);
+  if (s3 !== V2_STATUS.ErrCDMismatch) throw new Error(`the envelope with its recipient changed was not refused by the composition as ErrCDMismatch (${V2_STATUS.ErrCDMismatch}): ${JSON.stringify(r3)}`);
+  out.changedRecipient = { recipient: OTHER_RECIPIENT, revert: r3.revert, status: s3, statusName: 'ErrCDMismatch' };
+
+  // 4. tampered: the fresh proofs with their seal re-signed by unknown keys: refused by the plug-in (no quorum) and by the composition
+  const forged = new Map<string, UnicityCertificate>();
+  for (const p of fresh.proofs) {
+    const k = hex(p.unicityCertificate.toCBOR());
+    if (!forged.has(k)) forged.set(k, await unknownKeyCertificate(p.unicityCertificate));
+  }
+  const forgedProofs = fresh.proofs.map((p) => new InclusionProof(p.certificationData, p.referenceTime, p.inclusionCertificate, forged.get(hex(p.unicityCertificate.toCBOR()))!));
+  let pluginRefusal = '';
+  try {
+    await bridge.verifyNativeToken(await refreshToken(token, forgedProofs), 'return');
+  } catch (e) {
+    pluginRefusal = String(e).slice(0, 300);
+  }
+  if (!/ErrQuorumNotMet/.test(pluginRefusal)) throw new Error(`the plug-in did not refuse the unknown-key seal as no quorum: ${pluginRefusal || 'accepted'}`);
+  const r4 = await chain.attempt(redeemData(assembleEnvelope(dep, projectToken(token), forgedProofs).encoded), me, url);
+  const s4 = bridgeRejectedStatus(r4.revert);
+  if (s4 !== V2_STATUS.ErrAnchorAuth) throw new Error(`the unknown-key forgery was not refused by the composition as ErrAnchorAuth (${V2_STATUS.ErrAnchorAuth}): ${JSON.stringify(r4)}`);
+  out.unknownKeyForgery = { label: 'unknown-key forgery (not a retired committee)', seals: forged.size, pluginRefusal, revert: r4.revert, status: s4, statusName: 'ErrAnchorAuth' };
+
+  // 5. a conflicting burn of the same pre-burn state, to another address: the state is spent, so the aggregator must not certify it. A read right
+  // after the submission says nothing (the aggregator has not yet built a block with it), so the verdict is read only after the aggregator has
+  // certified a sentinel submitted after the conflict and its block height is at least two past the one current at the submission
+  const [version, genesis, txs] = D.decodeArray(D.decodeTag(bytes).data, 3);
+  const history = D.decodeArray(txs);
+  const preBurn = await Token.fromCBOR(C.encodeTag(39040, arr(version, genesis, arr(...history.slice(0, -1)))));
+  const burned = token.transactions[token.transactions.length - 1].inclusionProof;
+  const reason = returnReason(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, unhex(OTHER_RECIPIENT.slice(2)), amountBytes(BigInt(t.amountWei)));
+  const conflicting = await TransferTransaction.create(preBurn, BurnPredicate.create(sha256(reason)), StateMask.generate(), { data: reason });
+  const ccd = await CertificationData.fromTransaction(conflicting, await SignaturePredicateUnlockScript.create(conflicting, w.owner(t.holder)));
+  const sid = await StateId.fromCertificationData(ccd);
+  if (hex(sid.data) !== hex((await StateId.fromCertificationData(burned.certificationData)).data)) throw new Error('the conflicting burn does not spend the burned state');
+  if (hex(ccd.transactionHash.data) === hex(burned.certificationData.transactionHash.data)) throw new Error('the conflicting burn is the same transaction');
+  // the answer is recorded, not asserted: a server may queue it, refuse it, or fail the call; what it serves for the state is the verdict
+  const submission = await client.submitCertificationRequest(ccd).then((r) => String(r.status), (e: unknown) => `error: ${String(e).slice(0, 200)}`);
+  const submittedAtBlock = await client.getLatestBlockNumber();
+  const servedNow = async () => {
+    const r = await client.getInclusionProof(sid);
+    if (!r.inclusionProof) throw new Error('the aggregator serves no proof for the burned state');
+    return { blockNumber: r.blockNumber, proof: r.inclusionProof };
+  };
+  const first = await servedNow();
+  const sentinelTx = await MintTransaction.create(NetworkId.fromId(vaultCfg.network), SignaturePredicate.create(SigningService.generate().publicKey));
+  const sentinelCd = await CertificationData.fromMintTransaction(sentinelTx);
+  const sentinelSid = await StateId.fromCertificationData(sentinelCd);
+  await client.submitCertificationRequest(sentinelCd);
+  const sentinel = await waitFor('the sentinel submitted after the conflict to be certified', 180_000, async () => {
+    const r = await client.getInclusionProof(sentinelSid);
+    return r.inclusionProof ? { blockNumber: r.blockNumber } : undefined;
+  });
+  const settledAtBlock = await waitFor(`the aggregator to reach block ${submittedAtBlock + 2n}`, 180_000, async () => {
+    const h = await client.getLatestBlockNumber();
+    return h >= submittedAtBlock + 2n ? h : undefined;
+  }, 1000);
+  const after = await servedNow();
+  const served = after.proof;
+  for (const [when, r] of [['right after the submission', first], ['after the sentinel', after]] as const) {
+    if (hex(r.proof.certificationData.transactionHash.data) !== hex(burned.certificationData.transactionHash.data)) {
+      throw new Error(`the aggregator serves another transaction than the first burn for the burned state (${when})`);
+    }
+  }
+  // the certificate may be a newer one on the re-read; the certified transaction must not change
+  if (hex(after.proof.certificationData.toCBOR()) !== hex(first.proof.certificationData.toCBOR())) {
+    throw new Error('the burned state\'s certified transaction changed after the conflicting submission');
+  }
+  let conflictingRefusal = '';
+  try {
+    await buildReturnProof(bridge, await Token.fromCBOR(C.encodeTag(39040, arr(version, genesis, arr(...history.slice(0, -1), arr(conflicting.toCBOR(), served.toCBOR()))))));
+  } catch (e) {
+    conflictingRefusal = String(e).slice(0, 300);
+  }
+  if (!conflictingRefusal) throw new Error('the plug-in built a return proof of the conflicting burn');
+  out.conflictingBurn = {
+    stateId: hex(sid.data), recipient: OTHER_RECIPIENT, submission, servedTransactionHash: hex(served.certificationData.transactionHash.data),
+    conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefusal,
+    waited: {
+      what: 'a sentinel mint submitted after the conflict certified, and the aggregator\'s block height at least two past the one at the submission',
+      submittedAtBlock, sentinelStateId: hex(sentinelSid.data), sentinelBlock: sentinel.blockNumber, settledAtBlock,
+      firstRead: { blockNumber: first.blockNumber, transactionHash: hex(first.proof.certificationData.transactionHash.data) },
+      reRead: { blockNumber: after.blockNumber, transactionHash: hex(after.proof.certificationData.transactionHash.data), sameProof: hex(after.proof.toCBOR()) === hex(first.proof.toCBOR()) },
+    },
+  };
+  console.log(`  a conflicting burn of the burned state (submission: ${submission} at block ${submittedAtBlock}; sentinel certified, block ${settledAtBlock}): still the first burn's proof is served; the plug-in refuses: ${conflictingRefusal.slice(0, 120)}`);
+
+  const json = JSON.stringify(out, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
+  writeFileSync(`${w.tokenDir(recordId(t))}/replays.json`, `${json}\n`);
+  console.log(json);
 }
 
 // ---- the command line -------------------------------------------------------------------------------------------------------------------------
-const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem [--per-sid] | envelope | claim [--to 0x..] | trust [--refresh] [--token id]; ' +
+const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem [--per-sid] | envelope | replays | claim [--to 0x..] | trust [--refresh] [--token id]; ' +
   'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce or part, e.g. 5.1> (default the newest)';
 
 export async function main(argv: string[]): Promise<void> {
@@ -577,6 +784,8 @@ export async function main(argv: string[]): Promise<void> {
       return redeem(w, values.token, values['per-sid'] ?? false);
     case 'envelope':
       return envelopeCmd(w, values.token);
+    case 'replays':
+      return replays(w, values.token);
     case 'claim':
       return claim(w, values.to);
     case 'trust':

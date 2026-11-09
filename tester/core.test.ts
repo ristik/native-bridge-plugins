@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { encodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
+import { AGG_PARTITION, makeRoot, makeUc } from '../packages/native-bridge-plugin/test/world.js';
 import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
+  amountBytes, appendTransaction, BRIDGE_REJECTED, bridgeRejectedStatus, calldata, checkNetwork, decBytes, describeEnvelope, PART_ALREADY_REDEEMED, partAlreadyRedeemed, redeemArgument, replaceOnce, revertOf, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
   parseAmount,
-  RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
+  RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord, V2_STATUS,
 } from './core.js';
 
 test('the vault ABI: selectors and the Locked topic match cast at the contracts pin', () => {
@@ -183,4 +186,65 @@ test('the gateway\'s busy answer is retried like a rate limit; its partial-broad
   } finally {
     server.close();
   }
+});
+
+test('envelope: the anchors\' seals are read from their certificates (root epoch and round), with the size and SHA-256 of the bytes', async () => {
+  const root = await makeRoot(1, 4, 10);
+  const uc = (rootEpoch: bigint, round: bigint) => makeUc(root, {
+    partition: AGG_PARTITION, conf: new Uint8Array(32).fill(3), epochIr: 0n, rootEpoch, round, timestamp: 1_700_000_000n,
+    stateHash: new Uint8Array(32).fill(Number(round & 0xffn)), blockHash: null, signers: 3,
+  });
+  const anchor = async (rootEpoch: bigint, round: bigint) => ({
+    partition: AGG_PARTITION, shard: Uint8Array.of(0x80), shardConfHash: new Uint8Array(32), expectedStateRoot: new Uint8Array(32), expectedIRHash: new Uint8Array(32),
+    uc: (await uc(rootEpoch, round)).toCBOR(), inputRecord: new Uint8Array(),
+  });
+  const leaf = (anchorIndex: number) => ({ anchorIndex, bitmap: new Uint8Array(32), siblings: [] });
+  const bytes = encodeEnvelope({ policyBody: Uint8Array.of(1), history: new Uint8Array(), anchors: [await anchor(1n, 185n), await anchor(2n, 301n)], leafProofs: [leaf(0), leaf(1), leaf(1)] });
+  const v = describeEnvelope(bytes);
+  assert.deepEqual(v.anchors.map((a) => [a.index, a.partition, a.shard, a.rootEpoch, a.rootRound]), [[0, AGG_PARTITION, '80', '1', '185'], [1, AGG_PARTITION, '80', '2', '301']]);
+  assert.equal(v.leafProofs, 3);
+  assert.equal(v.bytes, bytes.length);
+  assert.equal(v.envelopeHex, hex(bytes));
+  assert.equal(v.sha256, hex(sha256(bytes)));
+  assert.throws(() => describeEnvelope(bytes.subarray(0, bytes.length - 40)), 'a truncated envelope is refused, not described');
+});
+
+test('replays: the vault\'s refusals read from eth_call errors; the redeem input\'s envelope; one exact replacement', () => {
+  const id = new Uint8Array(32).fill(0xab);
+  const spent = partAlreadyRedeemed(5n, id);
+  assert.equal(spent, `${PART_ALREADY_REDEEMED}${'0'.repeat(63)}5${'ab'.repeat(32)}`);
+  assert.equal(revertOf(new Error(`eth_call: execution reverted (${spent.toUpperCase().replace('0X', '0x')})`)), spent);
+  assert.equal(revertOf(new Error('eth_call: execution reverted')), undefined, 'no data, no refusal');
+  const rejected = (code: number) => `${BRIDGE_REJECTED}${code.toString(16).padStart(64, '0')}`;
+  assert.equal(bridgeRejectedStatus(rejected(7)), 7);
+  assert.equal(bridgeRejectedStatus(rejected(0)), undefined, 'status 0 is not a refusal');
+  assert.equal(bridgeRejectedStatus(spent), undefined, 'another error is not the composition\'s');
+  assert.equal(bridgeRejectedStatus(BRIDGE_REJECTED), undefined, 'truncated');
+  const env = Uint8Array.from({ length: 45 }, (_, i) => i);
+  assert.deepEqual(redeemArgument(calldata('redeem(bytes)', encBytes(env))), env);
+  assert.throws(() => redeemArgument(calldata('claim(uint256,address)', encUint(1n), encUint(2n))), /not a redeem/);
+  const b = unhex('00112233aa4455aa66');
+  assert.deepEqual(replaceOnce(b, unhex('4455'), unhex('dead'), 'x'), unhex('00112233aadeadaa66'));
+  assert.throws(() => replaceOnce(b, unhex('aa'), unhex('bb'), 'x'), /occur 2 times/);
+  assert.throws(() => replaceOnce(b, unhex('77'), unhex('bb'), 'x'), /occur 0 times/);
+  // a match at an odd nibble offset is not a byte match: '12' occurs in 0x0123 only across the byte boundary
+  assert.throws(() => replaceOnce(unhex('0123'), unhex('12'), unhex('34'), 'x'), /occur 0 times/);
+  // and an odd-offset match does not hide an overlapping byte match: in 0x011111, '1111' is at nibble 1 (no) and at nibble 2 (the byte match)
+  assert.deepEqual(replaceOnce(unhex('011111'), unhex('1111'), unhex('3434'), 'x'), unhex('013434'));
+  assert.throws(() => replaceOnce(b, unhex('4455'), unhex('de'), 'x'), /as long/);
+});
+
+test('the V2 statuses the replays expect are the protocol vectors\' codes of those names', () => {
+  const doc = JSON.parse(readFileSync(new URL('../protocol/vectors/split/config/compose-status-v2.json', import.meta.url), 'utf8')) as unknown;
+  const codes = new Map<string, number>();
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      if (typeof o.name === 'string' && typeof o.code === 'number') codes.set(o.name, o.code);
+      Object.values(o).forEach(walk);
+    }
+  };
+  walk(doc);
+  for (const [name, code] of Object.entries(V2_STATUS)) assert.equal(codes.get(name), code, name);
 });
