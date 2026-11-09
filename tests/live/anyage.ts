@@ -69,6 +69,7 @@ import {
 import { TrustInput } from '../../packages/native-bridge-plugin/src/trust.js';
 import { NativeBridge } from '../../packages/native-bridge-plugin/src/verifier.js';
 import { minimalGas } from './gassearch.js';
+import { servedAfterConflict } from './conflict.js';
 import { hex, LaneConfig, loadConfig, rpc, run, signLegacyTx, sleep, until, unhex } from './lib.js';
 
 // ---- lane parameters -------------------------------------------------------------------------------------------------------------------
@@ -648,10 +649,11 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   assert.equal(hex(csid.data), hex((await StateId.fromCertificationData(firstProof.certificationData)).data), 'the conflicting burn spends the same state as the first');
   assert.notEqual(hex(ccd.transactionHash.data), hex(firstProof.certificationData.transactionHash.data), 'the conflicting burn is another transaction');
   // the answer is recorded, not asserted: a server may accept it into its queue, refuse it, or fail the call
-  const submitted = await c.aggOf(csid).submitCertificationRequest(ccd).then((r) => r.status, (e: unknown) => `error: ${String(e).slice(0, 200)}`);
-  const served = await until('the proof the aggregator serves for the burned state', 120_000, async () => (await c.aggOf(csid).getInclusionProof(csid)).inclusionProof ?? undefined);
+  // the verdict is read only after the aggregator has built later blocks (tests/live/conflict.ts), not on the first poll
+  const { submission: submitted, served, waited } = await servedAfterConflict(c.aggOf, csid, ccd, cfg.network);
+  assert.ok(waited.settledAtBlock >= waited.submittedAtBlock + 2n, 'the verdict is read two blocks after the submission');
   assert.equal(hex(served.certificationData.transactionHash.data), hex(firstProof.certificationData.transactionHash.data),
-    'the aggregator certifies only the first burn: the conflicting one is never certified');
+    'the aggregator certifies only the first burn: the conflicting one is not certified once later blocks are built');
   let conflictingRefused = '';
   try {
     await buildReturnProof(bridge, await Token.fromCBOR(C.encodeTag(39040, arr(version, genesis, arr(...CborDeserializer.decodeArray(txs).slice(0, -1), arr(conflicting.toCBOR(), served.toCBOR()))))));
@@ -659,7 +661,8 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
     conflictingRefused = String(e).slice(0, 300);
   }
   assert.ok(conflictingRefused, 'the plug-in refuses to build a return proof of the conflicting burn with the served proof');
-  console.log(`CONFLICTING BURN submission ${submitted}; the first burn's proof is served; the plug-in refuses: ${conflictingRefused}`);
+  console.log(`CONFLICTING BURN submission ${submitted} at block ${waited.submittedAtBlock}; sentinel ${waited.sentinelStateId.slice(0, 16)} certified at block ${waited.sentinelBlock}; `
+    + `re-read at block ${waited.settledAtBlock}: the first burn's proof is still served; the plug-in refuses: ${conflictingRefused}`);
 
   // 2. a fresh proof of the redeemed burn: consolidated now, under a seal newer than every saved anchor. The vault refuses it on the nullifier
   // (PartAlreadyRedeemed of this nonce and token), not for its certificate, so a replay does not depend on the age of the proof.
@@ -695,7 +698,7 @@ async function negatives(cfgPath: string, savedPath: string): Promise<void> {
   const record = {
     nonce, nullifier: saved.nullifier,
     conflictingBurn: { stateId: hex(csid.data), recipient: THIRD_PARTY_ADDR, submission: submitted, servedTransactionHash: hex(served.certificationData.transactionHash.data),
-      conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefused },
+      conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefused, waited },
     freshReplay: { anchors: conAnchors, newestSavedRound: newest, envelopeSha256: sha(ret.encoded), envelopeBytes: ret.encoded.length, refusedAtBlock: accepted, revertData: refusal },
     unknownKeyForgery: { label: 'unknown-key forgery (not a retired committee)', seals: forgedUcs.size, pluginRefusal: forgedPluginRefusal, composition: forgedChain },
   };
