@@ -3,12 +3,15 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { encodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
+import { AGG_PARTITION, makeRoot, makeUc } from '../packages/native-bridge-plugin/test/world.js';
 import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, describeEnvelope, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
   parseAmount,
   RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
 } from './core.js';
@@ -183,4 +186,25 @@ test('the gateway\'s busy answer is retried like a rate limit; its partial-broad
   } finally {
     server.close();
   }
+});
+
+test('envelope: the anchors\' seals are read from their certificates (root epoch and round), with the size and SHA-256 of the bytes', async () => {
+  const root = await makeRoot(1, 4, 10);
+  const uc = (rootEpoch: bigint, round: bigint) => makeUc(root, {
+    partition: AGG_PARTITION, conf: new Uint8Array(32).fill(3), epochIr: 0n, rootEpoch, round, timestamp: 1_700_000_000n,
+    stateHash: new Uint8Array(32).fill(Number(round & 0xffn)), blockHash: null, signers: 3,
+  });
+  const anchor = async (rootEpoch: bigint, round: bigint) => ({
+    partition: AGG_PARTITION, shard: Uint8Array.of(0x80), shardConfHash: new Uint8Array(32), expectedStateRoot: new Uint8Array(32), expectedIRHash: new Uint8Array(32),
+    uc: (await uc(rootEpoch, round)).toCBOR(), inputRecord: new Uint8Array(),
+  });
+  const leaf = (anchorIndex: number) => ({ anchorIndex, bitmap: new Uint8Array(32), siblings: [] });
+  const bytes = encodeEnvelope({ policyBody: Uint8Array.of(1), history: new Uint8Array(), anchors: [await anchor(1n, 185n), await anchor(2n, 301n)], leafProofs: [leaf(0), leaf(1), leaf(1)] });
+  const v = describeEnvelope(bytes);
+  assert.deepEqual(v.anchors.map((a) => [a.index, a.partition, a.shard, a.rootEpoch, a.rootRound]), [[0, AGG_PARTITION, '80', '1', '185'], [1, AGG_PARTITION, '80', '2', '301']]);
+  assert.equal(v.leafProofs, 3);
+  assert.equal(v.bytes, bytes.length);
+  assert.equal(v.envelopeHex, hex(bytes));
+  assert.equal(v.sha256, hex(sha256(bytes)));
+  assert.throws(() => describeEnvelope(bytes.subarray(0, bytes.length - 40)), 'a truncated envelope is refused, not described');
 });

@@ -11,8 +11,9 @@
  *   bridge-tester.ts burn [--token <id>] [--recipient <0x address>]              burn the token (or a part) for its return to an EVM address (default: this wallet's)
  *   bridge-tester.ts redeem [--token <nonce>] [--per-sid]                        the return proof (consolidated by the aggregator), redeemed in the vault; --per-sid: the
  *                                                                                proofs as certified, one anchor per certificate, no consolidation and no fallback
- *   bridge-tester.ts envelope [--token <nonce>]                                  the submitted return envelope (envelope.bin) decoded: each anchor's partition and the
- *                                                                                root epoch and round of its seal, the envelope's size and SHA-256
+ *   bridge-tester.ts envelope [--token <nonce>]                                  the return envelope built for the last redeem attempt (envelope.bin, written before
+ *                                                                                the send, so not proof it landed: compare with the transaction's input) decoded: each
+ *                                                                                anchor's partition and the root epoch and round of its seal, its size and SHA-256
  *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
  *   bridge-tester.ts trust [--refresh] [--token <id>]                            the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries;
  *                                                                                --token adds the root epoch and round that sealed each of the token's proofs
@@ -52,8 +53,6 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { DeploymentRegistry, makeDeployment } from '../packages/native-bridge-plugin/src/deployment.js';
 import { configHashOfPdr, encodeJustification } from '../packages/native-bridge-plugin/src/lockproof.js';
 import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin/src/proof.js';
-import { decodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
-import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
 import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { needsNewerEntry, withTrustRefresh } from '../packages/native-bridge-plugin/src/trustrefresh.js';
@@ -63,7 +62,7 @@ import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../pac
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, describeEnvelope, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
   RECORD_ID, recordId, requirePhase, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
 
@@ -522,18 +521,15 @@ async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<
   console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries, ...(seals ? { token: tokenId, seals } : {}) }, null, 2));
 }
 
-/** The return envelope the last redeem built and submitted (envelope.bin, the bytes of its redeem(bytes) call), decoded: each anchor's seal. */
+/**
+ * The return envelope built for the token's last redeem attempt (envelope.bin, the argument of its redeem(bytes) call), decoded: each anchor's seal.
+ * It is written before the send, so it need not be what landed: the transaction's input on chain says that.
+ */
 async function envelopeCmd(w: Wallet, nonce?: string): Promise<void> {
   const t = w.record(nonce);
   const file = `${w.tokenDir(recordId(t))}/envelope.bin`;
   if (!existsSync(file)) throw new Error(`token ${recordId(t)} has no envelope: run redeem first`);
-  const bytes = Uint8Array.from(readFileSync(file));
-  const env = decodeEnvelope(bytes);
-  const anchors = env.anchors.map((a, i) => {
-    const seal = UnicityCertificate.fromCBOR(a.uc).unicitySeal;
-    return { index: i, partition: a.partition, shard: hex(a.shard), rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
-  });
-  console.log(JSON.stringify({ token: recordId(t), bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length }, null, 2));
+  console.log(JSON.stringify({ token: recordId(t), ...describeEnvelope(Uint8Array.from(readFileSync(file))) }, null, 2));
 }
 
 // ---- the command line -------------------------------------------------------------------------------------------------------------------------

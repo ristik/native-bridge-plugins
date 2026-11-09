@@ -4,6 +4,9 @@ import { dirname, resolve } from 'node:path';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { CborDeserializer as D } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+import { decodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
 import { arr, keccak256 } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, sleep, unhex } from '../tests/live/lib.js';
 
@@ -204,4 +207,23 @@ export async function jsonRpc(url: string, method: string, params: unknown[], wa
   const r = JSON.parse(text) as { result?: unknown; error?: { message: string; data?: string } };
   if (r.error) throw new Error(`${method}: ${r.error.message}${r.error.data ? ` (${r.error.data})` : ''}`);
   return r.result;
+}
+
+/** A decoded return envelope, as `envelope` prints it: each anchor's partition, shard and the root epoch and round of its certificate's seal. */
+export interface EnvelopeView {
+  bytes: number;
+  sha256: string;
+  envelopeHex: string;
+  anchors: { index: number; partition: number; shard: string; rootEpoch: string; rootRound: string }[];
+  leafProofs: number;
+}
+
+/** Decode the envelope's bytes (the redeem(bytes) argument): the seals are read from the anchors' certificates, the ones the vault verifies. */
+export function describeEnvelope(bytes: Uint8Array): EnvelopeView {
+  const env = decodeEnvelope(bytes);
+  const anchors = env.anchors.map((a, i) => {
+    const seal = UnicityCertificate.fromCBOR(a.uc).unicitySeal;
+    return { index: i, partition: a.partition, shard: hex(a.shard), rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
+  });
+  return { bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length };
 }
