@@ -645,8 +645,11 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   out.freshReplay = { anchors: freshView.anchors, sha256: freshView.sha256, bytes: freshView.bytes, refusal: last!.revert };
   console.log(`  a fresh proof of the redeemed burn (seal epoch ${freshView.anchors.map((a) => a.rootEpoch).join(',')}, round ${newest(freshView)}): refused (PartAlreadyRedeemed)`);
 
-  // 3. tampered: the fresh envelope with its return recipient changed (the certified transaction no longer hashes), refused by the composition
-  const changed = replaceOnce(fresh.ret.encoded, fresh.ret.verified.outcome.releaseTo, unhex(OTHER_RECIPIENT.slice(2)), 'the return recipient');
+  // 3. tampered: the fresh envelope with its return recipient changed in the burn's return reason (the certified transaction no longer hashes),
+  // refused by the composition. The reason, not the bare address, is replaced: the wallet that locked is often the recipient, so its address also
+  // occurs in the mint's lock proof
+  const reasonFor = (to: Uint8Array) => returnReason(vaultCfg.chainId, vaultCfg.vault, vaultCfg.zeroAddress, vaultCfg.ty, vaultCfg.aid, to, amountBytes(BigInt(t.amountWei)));
+  const changed = replaceOnce(fresh.ret.encoded, reasonFor(fresh.ret.verified.outcome.releaseTo), reasonFor(unhex(OTHER_RECIPIENT.slice(2))), 'the burn\'s return reason');
   const r3 = await chain.attempt(redeemData(changed), me, url);
   const s3 = bridgeRejectedStatus(r3.revert);
   if (s3 === undefined) throw new Error(`the envelope with its recipient changed was not refused by the composition (BridgeRejected): ${JSON.stringify(r3)}`);
