@@ -6,7 +6,8 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 
 import type { ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
-import { fetchTrustBaseEntries } from '@unicitylabs/state-transition-sdk/lib/util/TrustBaseUtils.js';
+import { TRUST_BASE_PAGE_LIMITS } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
+import { TrustBaseUpdater } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseUpdater.js';
 
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { TrustPersistError } from '../packages/native-bridge-plugin/src/trustrefresh.js';
@@ -28,11 +29,11 @@ export async function loadHeldTrust(bundleFile: string, pinFile: string, history
   const shipped = await TrustInput.fromBundle(Uint8Array.from(readFileSync(bundleFile)), pin);
   if (!existsSync(historyFile)) return shipped;
   const held = await TrustInput.fromBundle(Uint8Array.from(readFileSync(historyFile)), pin);
-  for (let e = shipped.history.genesisEpoch; e <= shipped.history.tipEpoch; e++) {
+  for (const entry of shipped.history.entries) {
     try {
-      await held.history.append(shipped.history.bytes(e)!);
+      await held.history.append(entry);
     } catch (cause) {
-      throw new Error(`${historyFile} does not extend the shipped trust bundle at epoch ${e}`, { cause });
+      throw new Error(`${historyFile} does not extend the shipped trust bundle at epoch ${entry.epoch}`, { cause });
     }
   }
   return held;
@@ -45,31 +46,28 @@ export function persistTrustFile(historyFile: string, bundle: Uint8Array): void 
 }
 
 /**
- * Fetch every entry after the held tip, page by page, persisting after each page that appended. A refused page keeps its authenticated prefix: when the
- * tip advanced it is persisted, then the refusal propagates; a failed write stops with TrustPersistError (the refusal its cause, when there is one).
- * Returns the entries appended.
+ * Fetch every entry after the held tip through the SDK's update (pages of `maxEntries`, each entry authenticated from its predecessor as it is appended),
+ * persisting what was appended. A refused page keeps its authenticated prefix: when the tip advanced it is persisted, then the refusal propagates; a failed
+ * write stops with TrustPersistError (the refusal its cause, when there is one). Returns the entries appended.
  */
 export async function refreshAll(trust: TrustInput, source: ITrustBaseSource, maxEntries: number, persist: (bundle: Uint8Array) => void): Promise<number> {
-  let total = 0;
+  const tip = () => trust.history.tip?.epoch ?? 0n;
   const write = async (refused?: unknown) => {
     try {
-      persist(await trust.history.exportBundle());
+      persist(await trust.history.toBundle());
     } catch (e) {
-      throw new TrustPersistError(`the held trust-base history (tip ${trust.history.tipEpoch}) could not be persisted: ${e instanceof Error ? e.message : String(e)}`,
+      throw new TrustPersistError(`the held trust-base history (tip ${tip()}) could not be persisted: ${e instanceof Error ? e.message : String(e)}`,
         refused === undefined ? e : new AggregateError([e, refused], 'the write failed after the fetch was refused'));
     }
   };
-  for (;;) {
-    const before = trust.history.tipEpoch;
-    let n: number;
-    try {
-      n = await fetchTrustBaseEntries(trust.history, source, { maxEntries });
-    } catch (refused) {
-      if (trust.history.tipEpoch > before) await write(refused);
-      throw refused;
-    }
-    if (n === 0) return total;
-    total += n;
-    await write();
+  const before = tip();
+  let appended: number;
+  try {
+    appended = await TrustBaseUpdater.update(trust.history, [source], { limits: { ...TRUST_BASE_PAGE_LIMITS, maxEntries } });
+  } catch (refused) {
+    if (tip() > before) await write(refused);
+    throw refused;
   }
+  if (appended > 0) await write();
+  return appended;
 }

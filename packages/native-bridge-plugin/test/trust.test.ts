@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { TrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponse.js';
+import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
+import { TrustBaseBundle } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js';
 
-import { TrustInput } from '../src/trust.js';
+import { certificateFailure, TrustInput } from '../src/trust.js';
 import { rejects } from './util.js';
 import { buildToken, makeRoot, makeUc, makeWorld, nextEpoch, spec, successorEntry, type Root } from './world.js';
 
@@ -60,9 +61,9 @@ test("installation: the bundle's genesis must be the pin; a broken or incomplete
   await rejects(TrustInput.fromBundle(Uint8Array.of(...r.bundle, 0), r.pin), 'ErrTrustBase');
   const r3 = await nextEpoch(r, 1000n, 4, 30);
   // a successor witnessed by a committee other than its predecessor's: the chain does not authenticate
-  const forged = await TrustBaseResponse.encodeBundle([r.entries[0], await successorEntry(r, 1000n, 4, 31, undefined, r3.signers)]);
+  const forged = await TrustBaseBundle.encode([r.entries[0], await successorEntry(r, 1000n, 4, 31, undefined, r3.signers)].map((e) => RootTrustBaseV2.decode(e)));
   await rejects(TrustInput.fromBundle(forged, r.pin), 'ErrTrustBase');
-  assert.equal((await TrustInput.fromBundle(r3.bundle, r.pin)).history.tipEpoch, 3n);
+  assert.equal((await TrustInput.fromBundle(r3.bundle, r.pin)).history.tip?.epoch, 3n);
 });
 
 test('a foreign epoch inside a lock proof is retryable end to end', async () => {
@@ -81,8 +82,21 @@ test('the shared dev trust-base fixture (the same bytes as both SDKs) installs u
   const t = await TrustInput.fromBundle(bundle, pin);
   assert.deepEqual(t.id, pin);
   assert.equal(t.network.id, 3);
-  assert.equal(t.history.genesisEpoch, 1n);
-  assert.equal(t.history.tipEpoch, 4n);
+  assert.equal(t.history.entries[0].epoch, 1n);
+  assert.equal(t.history.tip?.epoch, 4n);
   // epoch 2's committee is weighted (1, 2, 3, 4): W = 10, threshold 7
-  assert.equal(t.history.committee(2n)!.threshold, 7n);
+  assert.equal(t.history.entryForEpoch(2n)!.quorumThreshold, 7n);
+});
+
+test("the SDK's own trace names the missing epoch (retryable) and, for an epoch before the genesis, the final seal epoch failure", async () => {
+  const { UnicityCertificateVerifier } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/verification/UnicityCertificateVerifier.js');
+  const { UnicitySealQuorumSignaturesVerificationRule } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js');
+  const { Secp256k1SignatureVerifier } = await import('@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js');
+  const r2 = await makeRoot(2, 4, 10);
+  const r3 = await nextEpoch(r2, 1000n, 4, 30);
+  const held = await TrustInput.fromBundle(r2.bundle, r2.pin);
+  const verifier = new UnicityCertificateVerifier(new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: 16 }));
+  const trace = async (uc: Awaited<ReturnType<typeof ucOf>>) => verifier.verifyCertificate(held.history, uc, { partitionId: uc.unicityTreeCertificate.partitionIdentifier });
+  assert.equal(certificateFailure(await trace(await ucOf(r3, 3, undefined, 3n, 1500n))), 'ErrNoEntryForEpoch');
+  assert.equal(certificateFailure(await trace(await ucOf(r2, 3, undefined, 1n, 200n))), 'ErrSealEpoch');
 });

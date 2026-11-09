@@ -247,7 +247,7 @@ function withHeldTrust<T>(w: Wallet, trust: TrustInput, agg: AggregatorClient, v
     onFetch: (e) => console.log(`  trust: fetched from epoch ${e.fromEpoch} (max ${maxEntries}): ${e.appended} appended, tip ${e.tipBefore} -> ${e.tipAfter}`),
   }).catch((e: unknown) => {
     // the same name whichever verification met it first (the plug-in, or the SDK's consolidation): the trust base lacks a newer epoch
-    if (needsNewerEntry(e)) throw new Error(`ErrNoEntryForEpoch: a certificate is of an epoch after the held trust base's tip ${trust.history.tipEpoch}${fetchOn ? ' (the aggregator did not have it either)' : ' (BRIDGE_TRUST_FETCH=0: not fetched)'}`, { cause: e });
+    if (needsNewerEntry(e)) throw new Error(`ErrNoEntryForEpoch: a certificate is of an epoch after the held trust base's tip ${(trust.history.tip?.epoch ?? 0n)}${fetchOn ? ' (the aggregator did not have it either)' : ' (BRIDGE_TRUST_FETCH=0: not fetched)'}`, { cause: e });
     throw e;
   });
 }
@@ -541,9 +541,8 @@ async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<
   if (refresh) await refreshAll(trust, new AggregatorClient(w.config.aggUrl), maxEntriesOf(), (b) => persistTrust(w, b));
   const h = trust.history;
   const entries: { epoch: string; entryId: string; startRound: string }[] = [];
-  for (let e = h.genesisEpoch; e <= h.tipEpoch; e++) {
-    const entry = h.entry(e)!;
-    entries.push({ epoch: e.toString(), entryId: hex(await entry.entryId()), startRound: entry.epochStartRound.toString() });
+  for (const entry of h.entries) {
+    entries.push({ epoch: entry.epoch.toString(), entryId: hex(await entry.entryId()), startRound: entry.epochStartRound.toString() });
   }
   let seals: { step: string; rootEpoch: string; rootRound: string }[] | undefined;
   if (tokenId !== undefined) {
@@ -553,7 +552,7 @@ async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<
       return { step: i === 0 ? 'mint' : `transaction ${i}`, rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
     });
   }
-  console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries, ...(seals ? { token: tokenId, seals } : {}) }, null, 2));
+  console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.entries[0].epoch.toString(), tipEpoch: h.tip!.epoch.toString(), entries, ...(seals ? { token: tokenId, seals } : {}) }, null, 2));
 }
 
 /**

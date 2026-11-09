@@ -11,7 +11,7 @@ import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bf
 import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicitySeal.js';
 import { UnicityTreeCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityTreeCertificate.js';
 import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
-import { TrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponse.js';
+import { TrustBaseBundle } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js';
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import { InclusionCertificate } from '@unicitylabs/state-transition-sdk/lib/api/InclusionCertificate.js';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
@@ -26,6 +26,8 @@ import { BurnPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/b
 import { SignaturePredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicate.js';
 import { SignaturePredicateUnlockScript } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicateUnlockScript.js';
 import { EncodedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/EncodedPredicate.js';
+import { CborMap } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborMap.js';
+import { CborMapEntry } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborMapEntry.js';
 import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radix/SparseMerkleTree.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
@@ -184,6 +186,20 @@ export interface Root {
 
 const members = (signers: [string, SigningService][], weights?: number[]) =>
   signers.map(([nodeId, s], i) => ({ nodeId, signingKey: s.publicKey, weight: BigInt(weights?.[i] ?? 1) }));
+/** A version-2 trust base entry (tag 39000) of the fixture network, encoded at the CBOR level: the SDK's entry class has no public constructor. */
+function entryBytes(f: {
+  epoch: bigint; epochStartRound: bigint; previousEntryId: Uint8Array; quorumThreshold: bigint;
+  rootNodes: { nodeId: string; signingKey: Uint8Array; weight: bigint }[]; signatures: Map<string, Uint8Array> | null;
+}): Uint8Array {
+  return C.encodeTag(39000n, C.encodeArray(
+    C.encodeUnsignedInteger(2n), C.encodeUnsignedInteger(BigInt(NETWORK)), C.encodeUnsignedInteger(f.epoch), C.encodeUnsignedInteger(f.epochStartRound),
+    C.encodeArray(...f.rootNodes.map((m) => C.encodeArray(C.encodeTextString(m.nodeId), C.encodeByteString(m.signingKey), C.encodeUnsignedInteger(m.weight)))),
+    C.encodeUnsignedInteger(f.quorumThreshold), C.encodeNull(), C.encodeNull(), C.encodeByteString(f.previousEntryId),
+    f.signatures === null ? C.encodeNull()
+      : C.encodeMap(new CborMap([...f.signatures].map(([id, sig]) => new CborMapEntry(C.encodeTextString(id), C.encodeByteString(sig))))),
+  ));
+}
+
 const thresholdOf = (weights: bigint[]): bigint => (2n * weights.reduce((a, b) => a + b, 0n)) / 3n + 1n;
 
 function committee(n: number, seed: number): [string, SigningService][] {
@@ -192,7 +208,7 @@ function committee(n: number, seed: number): [string, SigningService][] {
 }
 
 async function rootOf(signers: [string, SigningService][], entries: Uint8Array[], pin: Uint8Array): Promise<Root> {
-  const bundle = await TrustBaseResponse.encodeBundle(entries);
+  const bundle = await TrustBaseBundle.encode(entries.map((e) => RootTrustBaseV2.decode(e)));
   return { signers, entries, bundle, pin, trust: await TrustInput.fromBundle(bundle, pin) };
 }
 
@@ -200,11 +216,11 @@ async function rootOf(signers: [string, SigningService][], entries: Uint8Array[]
 export async function makeRoot(epoch: number, n: number, seed: number, weights?: number[]): Promise<Root> {
   const signers = committee(n, seed);
   const rootNodes = members(signers, weights);
-  const genesis = RootTrustBaseV2.create({
-    changeRecordHash: null, epoch: BigInt(epoch), epochStartRound: 1n, networkId: NETWORK, previousEntryId: new Uint8Array(32),
-    quorumThreshold: thresholdOf(rootNodes.map((m) => m.weight)), rootNodes, stateHash: null,
+  const genesisBytes = entryBytes({
+    epoch: BigInt(epoch), epochStartRound: 1n, previousEntryId: new Uint8Array(32), quorumThreshold: thresholdOf(rootNodes.map((m) => m.weight)), rootNodes,
+    signatures: null,
   });
-  return rootOf(signers, [genesis.toCBOR()], await genesis.entryId());
+  return rootOf(signers, [genesisBytes], await RootTrustBaseV2.decode(genesisBytes).entryId());
 }
 
 /**
@@ -217,16 +233,14 @@ export async function nextEpoch(root: Root, start: bigint, n: number, seed: numb
 
 /** The canonical bytes of the entry {@link nextEpoch} appends, witnessed by `witnesses` (the current committee unless given). */
 export async function successorEntry(root: Root, start: bigint, n: number, seed: number, weights?: number[], witnesses = root.signers): Promise<Uint8Array> {
-  const tip = RootTrustBaseV2.fromCBOR(root.entries[root.entries.length - 1]);
+  const tip = RootTrustBaseV2.decode(root.entries[root.entries.length - 1]);
   const rootNodes = members(committee(n, seed), weights);
-  const next = RootTrustBaseV2.create({
-    changeRecordHash: null, epoch: tip.epoch + 1n, epochStartRound: start, networkId: NETWORK, previousEntryId: await tip.entryId(),
-    quorumThreshold: thresholdOf(rootNodes.map((m) => m.weight)), rootNodes, stateHash: null,
-  });
-  const hash = await new DataHasher(HashAlgorithm.SHA256).update(next.sigBytes()).digest();
+  const fields = { epoch: tip.epoch + 1n, epochStartRound: start, previousEntryId: await tip.entryId(), quorumThreshold: thresholdOf(rootNodes.map((m) => m.weight)), rootNodes };
+  // the entry id and the witnesses' message are over the entry with a null signature field
+  const hash = await new DataHasher(HashAlgorithm.SHA256).update(entryBytes({ ...fields, signatures: null })).digest();
   const signatures = new Map<string, Uint8Array>();
   for (const [id, s] of witnesses) signatures.set(id, (await s.sign(hash)).encode());
-  return next.withSignatures(signatures).toCBOR();
+  return entryBytes({ ...fields, signatures });
 }
 
 export interface UcSpec {

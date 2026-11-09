@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
+import type { ITrustBaseRequest, ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
 import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
-import { TrustBaseResponse, TrustBaseResponseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponse.js';
-import { TrustBaseUpdateError } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseUpdateError.js';
+import { TrustBaseUpdateError } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseError.js';
+import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
+import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponseWire.js';
 import { ConsolidationError } from '@unicitylabs/state-transition-sdk/lib/consolidation/ConsolidationError.js';
 import { VerificationResult } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationResult.js';
 import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
@@ -18,34 +19,33 @@ import { makeRoot, makeUc, NETWORK, nextEpoch, successorEntry, type Root } from 
 const ucOf = (r: Root, signers: number, rootEpoch: bigint, round: bigint) =>
   makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch, round, timestamp: 1_700_000_000n, stateHash: new Uint8Array(32), blockHash: new Uint8Array(32).fill(2), signers });
 
-// the SDK's response type has a private constructor; a test source builds its pages with it, and the SDK's strict decoder checks them
-const Response = TrustBaseResponse as unknown as new (...a: unknown[]) => TrustBaseResponse;
-
 /** An untrusted source serving `entries` (canonical bytes, ascending, the genesis first) as GetTrustBase pages; it records every request. */
 function sourceOf(entries: Uint8Array[], network = NETWORK) {
   const requests: [bigint, number][] = [];
   const source: ITrustBaseSource = {
-    async getTrustBaseEntries(fromEpoch: bigint, maxEntries: number) {
+    async getTrustBasePage(request: ITrustBaseRequest) {
+      const fromEpoch = request.fromEpoch;
+      const maxEntries = request.maxEntries;
       requests.push([fromEpoch, maxEntries]);
-      const decoded = entries.map((e) => RootTrustBaseV2.fromCBOR(e));
+      const decoded = entries.map((e) => RootTrustBaseV2.decode(e));
       const tip = decoded[decoded.length - 1];
       const at = decoded.findIndex((e) => e.epoch === fromEpoch);
-      if (at < 0) return new Response(network, TrustBaseResponseStatus.NOT_YET_AVAILABLE, fromEpoch, tip.epoch, await tip.entryId(), [], null, []).toCBOR();
+      if (at < 0) return encodeTrustBaseResponse({ effectiveEnd: tip.epoch, endEntryId: null, entries: [], fromEpoch, network, nextEpoch: null, status: BigInt(TrustBaseStatus.NOT_YET_AVAILABLE) });
       const page = entries.slice(at, at + maxEntries);
       const last = decoded[at + page.length - 1];
       const next = last.epoch < tip.epoch ? last.epoch + 1n : null;
-      return new Response(network, TrustBaseResponseStatus.OK, fromEpoch, tip.epoch, await tip.entryId(), page, next, []).toCBOR();
+      return encodeTrustBaseResponse({ effectiveEnd: tip.epoch, endEntryId: await tip.entryId(), entries: page, fromEpoch, network, nextEpoch: next, status: BigInt(TrustBaseStatus.OK) });
     },
   };
   return { source, requests };
 }
 
-test('a certificate of a newer epoch: the wallet fetches the missing contiguous entries one page at a time, appends and retries', async () => {
+test('a certificate of a newer epoch: the SDK update fetches the missing contiguous entries one page at a time in one pass, appends and the wallet retries', async () => {
   const r2 = await makeRoot(2, 4, 10);
   const r3 = await nextEpoch(r2, 1000n, 4, 30);
   const r4 = await nextEpoch(r3, 2000n, 4, 50);
   const held = await TrustInput.fromBundle(r2.bundle, r2.pin);
-  const genesisBytes = held.history.bytes(2n);
+  const genesisBytes = held.history.entryForEpoch(2n)!.encode();
   const uc = await ucOf(r4, 3, 4n, 2500n);
   // fetch disabled (one attempt): the verification fails for the missing entry
   await rejects(withTrustRefresh(held, sourceOf(r4.entries).source, () => held.verifyEmbeddedUc(uc), { attempts: 1 }), 'ErrNoEntryForEpoch');
@@ -54,13 +54,14 @@ test('a certificate of a newer epoch: the wallet fetches the missing contiguous 
   const persisted: Uint8Array[] = [];
   await withTrustRefresh(held, source, () => held.verifyEmbeddedUc(uc), { maxEntries: 1, onFetch: (e) => events.push(e), persist: (b) => void persisted.push(b) });
   assert.deepEqual(requests, [[3n, 1], [4n, 1]], 'one-entry pages from the held tip + 1');
-  assert.deepEqual(events.map((e) => [e.tipBefore, e.tipAfter, e.appended]), [[2n, 3n, 1], [3n, 4n, 1]]);
-  assert.equal(held.history.tipEpoch, 4n);
-  assert.deepEqual(held.history.bytes(2n), genesisBytes, 'the held genesis entry is untouched');
-  for (const e of [3n, 4n]) assert.deepEqual(held.history.bytes(e), r4.entries[Number(e) - 2], `epoch ${e} is the source's entry`);
+  // the SDK's update follows the cursor itself: one fetch event for the whole range
+  assert.deepEqual(events.map((e) => [e.tipBefore, e.tipAfter, e.appended]), [[2n, 4n, 2]]);
+  assert.equal(held.history.tip?.epoch, 4n);
+  assert.deepEqual(held.history.entryForEpoch(2n)!.encode(), genesisBytes, 'the held genesis entry is untouched');
+  for (const e of [3n, 4n]) assert.deepEqual(held.history.entryForEpoch(e)!.encode(), r4.entries[Number(e) - 2], `epoch ${e} is the source's entry`);
   // the persisted history is the held one: it reinstalls under the same pin, at the new tip
-  assert.equal(persisted.length, 2);
-  assert.equal((await TrustInput.fromBundle(persisted[1], r2.pin)).history.tipEpoch, 4n);
+  assert.equal(persisted.length, 1);
+  assert.equal((await TrustInput.fromBundle(persisted[0], r2.pin)).history.tip?.epoch, 4n);
   // idempotent: the same verification again needs no fetch
   await withTrustRefresh(held, source, () => held.verifyEmbeddedUc(uc));
   assert.equal(requests.length, 2);
@@ -74,8 +75,8 @@ test('a successor that does not authenticate is refused: nothing is appended and
   const forged = await successorEntry(r2, 1000n, 4, 30, undefined, r3.signers);
   const uc = await ucOf(r3, 3, 3n, 1500n);
   await assert.rejects(withTrustRefresh(held, sourceOf([r2.entries[0], forged]).source, () => held.verifyEmbeddedUc(uc), { persist: () => assert.fail('nothing to persist') }),
-    (e: unknown) => TrustBaseUpdateError.is(e) && e.reason === 'rejected');
-  assert.equal(held.history.tipEpoch, 2n);
+    (e: unknown) => e instanceof TrustBaseUpdateError);
+  assert.equal(held.history.tip?.epoch, 2n);
 });
 
 test('a held epoch is never replaced: a source with another epoch-3 entry after the held one is refused', async () => {
@@ -85,13 +86,13 @@ test('a held epoch is never replaced: a source with another epoch-3 entry after 
   const other3 = await nextEpoch(r2, 1100n, 4, 70);
   const other4 = await nextEpoch(other3, 2000n, 4, 90);
   const held = await TrustInput.fromBundle(r3.bundle, r2.pin);
-  const held3 = held.history.bytes(3n);
+  const held3 = held.history.entryForEpoch(3n)!.encode();
   // the other chain's epoch 4 links to the other epoch 3, not the held one
   const uc = await ucOf(r4, 3, 4n, 2500n);
   await assert.rejects(withTrustRefresh(held, sourceOf(other4.entries).source, () => held.verifyEmbeddedUc(uc)),
-    (e: unknown) => TrustBaseUpdateError.is(e));
-  assert.equal(held.history.tipEpoch, 3n);
-  assert.deepEqual(held.history.bytes(3n), held3);
+    (e: unknown) => e instanceof TrustBaseUpdateError);
+  assert.equal(held.history.tip?.epoch, 3n);
+  assert.deepEqual(held.history.entryForEpoch(3n)!.encode(), held3);
 });
 
 test('only a missing epoch is retried: another failure propagates without a fetch', async () => {
@@ -111,7 +112,7 @@ test('a source without the epoch yet: the wallet pauses, and gives up with the r
   const uc = await ucOf(r3, 3, 3n, 1500n);
   await rejects(withTrustRefresh(held, source, () => held.verifyEmbeddedUc(uc), { attempts: 3, intervalMs: 1 }), 'ErrNoEntryForEpoch');
   assert.deepEqual(requests, [[3n, 64], [3n, 64]]);
-  assert.equal(held.history.tipEpoch, 2n);
+  assert.equal(held.history.tip?.epoch, 2n);
 });
 
 test('the missing epoch is recognised from the plug-in and from an SDK consolidation integrity error, nothing else', async () => {
@@ -152,15 +153,15 @@ test('a refused page keeps its authenticated prefix durable: entry 3 accepted, e
   let verifications = 0;
   const persisted: Uint8Array[] = [];
   await assert.rejects(withTrustRefresh(held, sourceOf([...r3.entries, forged4]).source, () => { verifications++; return held.verifyEmbeddedUc(uc); },
-    { persist: (b) => void persisted.push(b) }), (e: unknown) => TrustBaseUpdateError.is(e) && e.reason === 'rejected');
+    { persist: (b) => void persisted.push(b) }), (e: unknown) => e instanceof TrustBaseUpdateError);
   assert.equal(verifications, 1, 'the refusal is not retried');
-  assert.equal(held.history.tipEpoch, 3n, 'the authenticated prefix is held in memory');
+  assert.equal(held.history.tip?.epoch, 3n, 'the authenticated prefix is held in memory');
   assert.equal(persisted.length, 1, 'and persisted once');
   // a fresh load of what was written, under the same pin: entry 3 is there, unchanged, and nothing past it
   const reloaded = await TrustInput.fromBundle(persisted[0], r2.pin);
-  assert.equal(reloaded.history.tipEpoch, 3n);
-  assert.deepEqual(reloaded.history.bytes(3n), r3.entries[1]);
-  assert.deepEqual(reloaded.history.bytes(2n), r2.entries[0]);
+  assert.equal(reloaded.history.tip?.epoch, 3n);
+  assert.deepEqual(reloaded.history.entryForEpoch(3n)!.encode(), r3.entries[1]);
+  assert.deepEqual(reloaded.history.entryForEpoch(2n)!.encode(), r2.entries[0]);
 });
 
 test('a failed write stops the operation: after a refused page with both errors, after a good fetch without a retry', async () => {
@@ -174,7 +175,7 @@ test('a failed write stops the operation: after a refused page with both errors,
   await assert.rejects(withTrustRefresh(a, sourceOf([...r3.entries, forged4]).source, () => a.verifyEmbeddedUc(uc4), { persist: diskFull }), (e: unknown) => {
     assert.ok(e instanceof TrustPersistError);
     const both = (e as Error).cause as AggregateError;
-    assert.ok(both instanceof AggregateError && (both.errors[0] as Error).message === 'ENOSPC' && TrustBaseUpdateError.is(both.errors[1]));
+    assert.ok(both instanceof AggregateError && (both.errors[0] as Error).message === 'ENOSPC' && both.errors[1] instanceof TrustBaseUpdateError);
     return true;
   });
   const b = await TrustInput.fromBundle(r2.bundle, r2.pin);
@@ -194,5 +195,5 @@ test('the history is written before the report: a failing onFetch cannot prevent
   await assert.rejects(withTrustRefresh(held, sourceOf(r3.entries).source, () => held.verifyEmbeddedUc(uc),
     { persist: (b) => void persisted.push(b), onFetch: () => { throw new Error('report failed'); } }), /report failed/);
   assert.equal(persisted.length, 1);
-  assert.equal((await TrustInput.fromBundle(persisted[0], r2.pin)).history.tipEpoch, 3n);
+  assert.equal((await TrustInput.fromBundle(persisted[0], r2.pin)).history.tip?.epoch, 3n);
 });

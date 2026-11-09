@@ -142,8 +142,8 @@ test('the pinned genesis must be the installed trust input\'s; a grown history o
   assert.equal(validateManifest(entry(w), artifacts).deployments.length, 1);
   // the authority is the genesis pin: a history grown past the named bundle, exported and reinstalled (a wallet's own bundle) installs
   const grown = await nextEpoch(w.agg, 1000n, 4, 30);
-  const exported = await TrustInput.fromBundle(await grown.trust.history.exportBundle(), w.agg.pin);
-  assert.equal(exported.history.tipEpoch, 3n);
+  const exported = await TrustInput.fromBundle(await grown.trust.history.toBundle(), w.agg.pin);
+  assert.equal(exported.history.tip?.epoch, 3n);
   loadManifests(registry(entry(w)), artifacts).install(exported);
   // another genesis is another trust input
   throwsReason(() => loadManifests(registry(entry(w)), artifacts).install(other.trust), 'ErrTrustBaseDigest');

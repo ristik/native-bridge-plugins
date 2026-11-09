@@ -13,8 +13,8 @@ use core::cell::Cell;
 
 use unicity_token::transaction::{CertifiedMintTransaction, TokenType, Transaction};
 use unicity_token::verify::{
-    MintJustificationRegistry, MintJustificationVerifier, TokenDataVerifier, VerificationContext,
-    VerificationError,
+    Authority, MintJustificationRegistry, MintJustificationVerifier, TokenDataVerifier,
+    VerificationContext, VerificationError,
 };
 
 use crate::error::{Family, NativeError as E, Result};
@@ -109,7 +109,8 @@ impl MintJustificationVerifier for NativeLockJustificationVerifier {
         // One fixed base throughout: a caller-supplied different history (network or genesis) is
         // outside the profile.
         // The same genesis is the same history; the genesis entry names its network.
-        if context.history().genesis_id() != self.bridge.trust.history().genesis_id() {
+        let same = matches!(context.authority(), Authority::History(held) if held.genesis_id() == self.bridge.trust.history().genesis_id());
+        if !same {
             self.last.set(Some(E::TrustBase));
             return Err(VerificationError::UnsupportedMintJustification);
         }
