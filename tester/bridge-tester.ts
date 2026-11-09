@@ -70,6 +70,7 @@ import { loadHeldTrust, maxEntriesOf, persistTrustFile, refreshAll } from './tru
 import { NativeBridge } from '../packages/native-bridge-plugin/src/verifier.js';
 import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../packages/native-bridge-plugin/src/splitflow.js';
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
+import { servedAfterConflict } from '../tests/live/conflict.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
   amountBytes, appendTransaction, bridgeRejectedStatus, V2_STATUS, calldata, checkNetwork, decBytes, describeEnvelope, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
@@ -688,36 +689,9 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   if (hex(sid.data) !== hex((await StateId.fromCertificationData(burned.certificationData)).data)) throw new Error('the conflicting burn does not spend the burned state');
   if (hex(ccd.transactionHash.data) === hex(burned.certificationData.transactionHash.data)) throw new Error('the conflicting burn is the same transaction');
   // the answer is recorded, not asserted: a server may queue it, refuse it, or fail the call; what it serves for the state is the verdict
-  const submission = await client.submitCertificationRequest(ccd).then((r) => String(r.status), (e: unknown) => `error: ${String(e).slice(0, 200)}`);
-  const submittedAtBlock = await client.getLatestBlockNumber();
-  const servedNow = async () => {
-    const r = await client.getInclusionProof(sid);
-    if (!r.inclusionProof) throw new Error('the aggregator serves no proof for the burned state');
-    return { blockNumber: r.blockNumber, proof: r.inclusionProof };
-  };
-  const first = await servedNow();
-  const sentinelTx = await MintTransaction.create(NetworkId.fromId(vaultCfg.network), SignaturePredicate.create(SigningService.generate().publicKey));
-  const sentinelCd = await CertificationData.fromMintTransaction(sentinelTx);
-  const sentinelSid = await StateId.fromCertificationData(sentinelCd);
-  await client.submitCertificationRequest(sentinelCd);
-  const sentinel = await waitFor('the sentinel submitted after the conflict to be certified', 180_000, async () => {
-    const r = await client.getInclusionProof(sentinelSid);
-    return r.inclusionProof ? { blockNumber: r.blockNumber } : undefined;
-  });
-  const settledAtBlock = await waitFor(`the aggregator to reach block ${submittedAtBlock + 2n}`, 180_000, async () => {
-    const h = await client.getLatestBlockNumber();
-    return h >= submittedAtBlock + 2n ? h : undefined;
-  }, 1000);
-  const after = await servedNow();
-  const served = after.proof;
-  for (const [when, r] of [['right after the submission', first], ['after the sentinel', after]] as const) {
-    if (hex(r.proof.certificationData.transactionHash.data) !== hex(burned.certificationData.transactionHash.data)) {
-      throw new Error(`the aggregator serves another transaction than the first burn for the burned state (${when})`);
-    }
-  }
-  // the certificate may be a newer one on the re-read; the certified transaction must not change
-  if (hex(after.proof.certificationData.toCBOR()) !== hex(first.proof.certificationData.toCBOR())) {
-    throw new Error('the burned state\'s certified transaction changed after the conflicting submission');
+  const { submission, served, waited } = await servedAfterConflict(() => client, sid, ccd, vaultCfg.network);
+  if (hex(served.certificationData.transactionHash.data) !== hex(burned.certificationData.transactionHash.data)) {
+    throw new Error('the aggregator serves another transaction than the first burn for the burned state');
   }
   let conflictingRefusal = '';
   try {
@@ -729,14 +703,9 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   out.conflictingBurn = {
     stateId: hex(sid.data), recipient: OTHER_RECIPIENT, submission, servedTransactionHash: hex(served.certificationData.transactionHash.data),
     conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefusal,
-    waited: {
-      what: 'a sentinel mint submitted after the conflict certified, and the aggregator\'s block height at least two past the one at the submission',
-      submittedAtBlock, sentinelStateId: hex(sentinelSid.data), sentinelBlock: sentinel.blockNumber, settledAtBlock,
-      firstRead: { blockNumber: first.blockNumber, transactionHash: hex(first.proof.certificationData.transactionHash.data) },
-      reRead: { blockNumber: after.blockNumber, transactionHash: hex(after.proof.certificationData.transactionHash.data), sameProof: hex(after.proof.toCBOR()) === hex(first.proof.toCBOR()) },
-    },
+    waited,
   };
-  console.log(`  a conflicting burn of the burned state (submission: ${submission} at block ${submittedAtBlock}; sentinel certified, block ${settledAtBlock}): still the first burn's proof is served; the plug-in refuses: ${conflictingRefusal.slice(0, 120)}`);
+  console.log(`  a conflicting burn of the burned state (submission: ${submission} at block ${waited.submittedAtBlock}; sentinel certified, block ${waited.settledAtBlock}): still the first burn's proof is served; the plug-in refuses: ${conflictingRefusal.slice(0, 120)}`);
 
   const json = JSON.stringify(out, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
   writeFileSync(`${w.tokenDir(recordId(t))}/replays.json`, `${json}\n`);
