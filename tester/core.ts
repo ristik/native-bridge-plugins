@@ -232,6 +232,8 @@ export function describeEnvelope(bytes: Uint8Array): EnvelopeView {
 /** BridgeVault's PartAlreadyRedeemed(uint256 nonce, bytes32 partId) and BridgeRejected(uint256 status) selectors. */
 export const PART_ALREADY_REDEEMED = '0xe8f8709e';
 export const BRIDGE_REJECTED = '0x2896c49d';
+/** The composition's V2 statuses the replay negatives expect (protocol/vectors/split/config/compose-status-v2.json, by name). */
+export const V2_STATUS = { ErrCDMismatch: 36, ErrAnchorAuth: 61 } as const;
 
 /** PartAlreadyRedeemed of this lock nonce and token ID, as the vault's revert data. */
 export const partAlreadyRedeemed = (nonce: bigint, tokenId: Uint8Array): string => `${PART_ALREADY_REDEEMED}${word(nonce)}${hex(tokenId)}`;

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -13,7 +13,7 @@ import { hex, unhex } from '../tests/live/lib.js';
 import {
   amountBytes, appendTransaction, BRIDGE_REJECTED, bridgeRejectedStatus, calldata, checkNetwork, decBytes, describeEnvelope, PART_ALREADY_REDEEMED, partAlreadyRedeemed, redeemArgument, replaceOnce, revertOf, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
   parseAmount,
-  RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
+  RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord, V2_STATUS,
 } from './core.js';
 
 test('the vault ABI: selectors and the Locked topic match cast at the contracts pin', () => {
@@ -232,4 +232,19 @@ test('replays: the vault\'s refusals read from eth_call errors; the redeem input
   // and an odd-offset match does not hide an overlapping byte match: in 0x011111, '1111' is at nibble 1 (no) and at nibble 2 (the byte match)
   assert.deepEqual(replaceOnce(unhex('011111'), unhex('1111'), unhex('3434'), 'x'), unhex('013434'));
   assert.throws(() => replaceOnce(b, unhex('4455'), unhex('de'), 'x'), /as long/);
+});
+
+test('the V2 statuses the replays expect are the protocol vectors\' codes of those names', () => {
+  const doc = JSON.parse(readFileSync(new URL('../protocol/vectors/split/config/compose-status-v2.json', import.meta.url), 'utf8')) as unknown;
+  const codes = new Map<string, number>();
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      if (typeof o.name === 'string' && typeof o.code === 'number') codes.set(o.name, o.code);
+      Object.values(o).forEach(walk);
+    }
+  };
+  walk(doc);
+  for (const [name, code] of Object.entries(V2_STATUS)) assert.equal(codes.get(name), code, name);
 });

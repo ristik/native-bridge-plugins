@@ -19,7 +19,7 @@
  *                                                                                own): its redeemed envelope again (eth_call, then mined: status 0), a fresh consolidated
  *                                                                                proof of the redeemed burn (PartAlreadyRedeemed), that proof with its recipient changed
  *                                                                                and re-signed by unknown keys (BridgeRejected), and a conflicting burn of the pre-burn
- *                                                                                state (never certified); writes replays.json next to the token. Sends one transaction
+ *                                                                                state (not certified once a later block is built; still the first burn's proof); writes replays.json next to the token. Sends one transaction
  *   bridge-tester.ts trust [--refresh] [--token <id>]                            the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries;
  *                                                                                --token adds the root epoch and round that sealed each of the token's proofs
  *
@@ -72,7 +72,7 @@ import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../pac
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
 import { hex, signLegacyTx, sleep, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, bridgeRejectedStatus, calldata, checkNetwork, decBytes, describeEnvelope, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
+  amountBytes, appendTransaction, bridgeRejectedStatus, V2_STATUS, calldata, checkNetwork, decBytes, describeEnvelope, GATEWAY_MAX_BODY, HttpError, jsonRpc, encAddress, encBytes, encUint, ethAddress, isAddress, loadTesterConfig, LOCKED_TOPIC, parseAmount,
   partAlreadyRedeemed, RECORD_ID, recordId, redeemArgument, replaceOnce, requirePhase, revertOf, splitAmounts, TesterConfig, TokenRecord,
 } from './core.js';
 
@@ -652,8 +652,8 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   const changed = replaceOnce(fresh.ret.encoded, reasonFor(fresh.ret.verified.outcome.releaseTo), reasonFor(unhex(OTHER_RECIPIENT.slice(2))), 'the burn\'s return reason');
   const r3 = await chain.attempt(redeemData(changed), me, url);
   const s3 = bridgeRejectedStatus(r3.revert);
-  if (s3 === undefined) throw new Error(`the envelope with its recipient changed was not refused by the composition (BridgeRejected): ${JSON.stringify(r3)}`);
-  out.changedRecipient = { recipient: OTHER_RECIPIENT, revert: r3.revert, status: s3 };
+  if (s3 !== V2_STATUS.ErrCDMismatch) throw new Error(`the envelope with its recipient changed was not refused by the composition as ErrCDMismatch (${V2_STATUS.ErrCDMismatch}): ${JSON.stringify(r3)}`);
+  out.changedRecipient = { recipient: OTHER_RECIPIENT, revert: r3.revert, status: s3, statusName: 'ErrCDMismatch' };
 
   // 4. tampered: the fresh proofs with their seal re-signed by unknown keys: refused by the plug-in (no quorum) and by the composition
   const forged = new Map<string, UnicityCertificate>();
@@ -671,10 +671,12 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   if (!/ErrQuorumNotMet/.test(pluginRefusal)) throw new Error(`the plug-in did not refuse the unknown-key seal as no quorum: ${pluginRefusal || 'accepted'}`);
   const r4 = await chain.attempt(redeemData(assembleEnvelope(dep, projectToken(token), forgedProofs).encoded), me, url);
   const s4 = bridgeRejectedStatus(r4.revert);
-  if (s4 === undefined) throw new Error(`the unknown-key forgery was not refused by the composition (BridgeRejected): ${JSON.stringify(r4)}`);
-  out.unknownKeyForgery = { label: 'unknown-key forgery (not a retired committee)', seals: forged.size, pluginRefusal, revert: r4.revert, status: s4 };
+  if (s4 !== V2_STATUS.ErrAnchorAuth) throw new Error(`the unknown-key forgery was not refused by the composition as ErrAnchorAuth (${V2_STATUS.ErrAnchorAuth}): ${JSON.stringify(r4)}`);
+  out.unknownKeyForgery = { label: 'unknown-key forgery (not a retired committee)', seals: forged.size, pluginRefusal, revert: r4.revert, status: s4, statusName: 'ErrAnchorAuth' };
 
-  // 5. a conflicting burn of the same pre-burn state, to another address: the state is spent, so the aggregator certifies only the first burn
+  // 5. a conflicting burn of the same pre-burn state, to another address: the state is spent, so the aggregator must not certify it. A read right
+  // after the submission says nothing (the aggregator has not yet built a block with it), so the verdict is read only after the aggregator has
+  // certified a sentinel submitted after the conflict and its block height is at least two past the one current at the submission
   const [version, genesis, txs] = D.decodeArray(D.decodeTag(bytes).data, 3);
   const history = D.decodeArray(txs);
   const preBurn = await Token.fromCBOR(C.encodeTag(39040, arr(version, genesis, arr(...history.slice(0, -1)))));
@@ -687,9 +689,35 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   if (hex(ccd.transactionHash.data) === hex(burned.certificationData.transactionHash.data)) throw new Error('the conflicting burn is the same transaction');
   // the answer is recorded, not asserted: a server may queue it, refuse it, or fail the call; what it serves for the state is the verdict
   const submission = await client.submitCertificationRequest(ccd).then((r) => String(r.status), (e: unknown) => `error: ${String(e).slice(0, 200)}`);
-  const served = await waitFor('the proof served for the burned state', 120_000, async () => (await client.getInclusionProof(sid)).inclusionProof ?? undefined);
-  if (hex(served.certificationData.transactionHash.data) !== hex(burned.certificationData.transactionHash.data)) {
-    throw new Error('the aggregator serves another transaction than the first burn for the burned state');
+  const submittedAtBlock = await client.getLatestBlockNumber();
+  const servedNow = async () => {
+    const r = await client.getInclusionProof(sid);
+    if (!r.inclusionProof) throw new Error('the aggregator serves no proof for the burned state');
+    return { blockNumber: r.blockNumber, proof: r.inclusionProof };
+  };
+  const first = await servedNow();
+  const sentinelTx = await MintTransaction.create(NetworkId.fromId(vaultCfg.network), SignaturePredicate.create(SigningService.generate().publicKey));
+  const sentinelCd = await CertificationData.fromMintTransaction(sentinelTx);
+  const sentinelSid = await StateId.fromCertificationData(sentinelCd);
+  await client.submitCertificationRequest(sentinelCd);
+  const sentinel = await waitFor('the sentinel submitted after the conflict to be certified', 180_000, async () => {
+    const r = await client.getInclusionProof(sentinelSid);
+    return r.inclusionProof ? { blockNumber: r.blockNumber } : undefined;
+  });
+  const settledAtBlock = await waitFor(`the aggregator to reach block ${submittedAtBlock + 2n}`, 180_000, async () => {
+    const h = await client.getLatestBlockNumber();
+    return h >= submittedAtBlock + 2n ? h : undefined;
+  }, 1000);
+  const after = await servedNow();
+  const served = after.proof;
+  for (const [when, r] of [['right after the submission', first], ['after the sentinel', after]] as const) {
+    if (hex(r.proof.certificationData.transactionHash.data) !== hex(burned.certificationData.transactionHash.data)) {
+      throw new Error(`the aggregator serves another transaction than the first burn for the burned state (${when})`);
+    }
+  }
+  // the certificate may be a newer one on the re-read; the certified transaction must not change
+  if (hex(after.proof.certificationData.toCBOR()) !== hex(first.proof.certificationData.toCBOR())) {
+    throw new Error('the burned state\'s certified transaction changed after the conflicting submission');
   }
   let conflictingRefusal = '';
   try {
@@ -701,8 +729,14 @@ async function replays(w: Wallet, nonce?: string): Promise<void> {
   out.conflictingBurn = {
     stateId: hex(sid.data), recipient: OTHER_RECIPIENT, submission, servedTransactionHash: hex(served.certificationData.transactionHash.data),
     conflictingTransactionHash: hex(ccd.transactionHash.data), pluginRefusal: conflictingRefusal,
+    waited: {
+      what: 'a sentinel mint submitted after the conflict certified, and the aggregator\'s block height at least two past the one at the submission',
+      submittedAtBlock, sentinelStateId: hex(sentinelSid.data), sentinelBlock: sentinel.blockNumber, settledAtBlock,
+      firstRead: { blockNumber: first.blockNumber, transactionHash: hex(first.proof.certificationData.transactionHash.data) },
+      reRead: { blockNumber: after.blockNumber, transactionHash: hex(after.proof.certificationData.transactionHash.data), sameProof: hex(after.proof.toCBOR()) === hex(first.proof.toCBOR()) },
+    },
   };
-  console.log(`  a conflicting burn of the burned state (submission: ${submission}): the first burn's proof is served; the plug-in refuses: ${conflictingRefusal.slice(0, 120)}`);
+  console.log(`  a conflicting burn of the burned state (submission: ${submission} at block ${submittedAtBlock}; sentinel certified, block ${settledAtBlock}): still the first burn's proof is served; the plug-in refuses: ${conflictingRefusal.slice(0, 120)}`);
 
   const json = JSON.stringify(out, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
   writeFileSync(`${w.tokenDir(recordId(t))}/replays.json`, `${json}\n`);
