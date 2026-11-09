@@ -11,7 +11,7 @@ import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verifi
 
 import { NativeError } from '../src/errors.js';
 import { TrustInput } from '../src/trust.js';
-import { needsNewerEntry, withTrustRefresh, type TrustRefreshEvent } from '../src/trustrefresh.js';
+import { needsNewerEntry, TrustPersistError, withTrustRefresh, type TrustRefreshEvent } from '../src/trustrefresh.js';
 import { rejects } from './util.js';
 import { makeRoot, makeUc, NETWORK, nextEpoch, successorEntry, type Root } from './world.js';
 
@@ -139,4 +139,60 @@ test('the missing epoch is recognised from the plug-in and from an SDK consolida
   assert.equal(needsNewerEntry(new ConsolidationError('integrity', 'The token does not verify.', { cause: other, outcome: 'invalid_input' })), false);
   assert.equal(needsNewerEntry(new ConsolidationError('timeout', 'late')), false);
   assert.equal(needsNewerEntry(new Error('ErrNoEntryForEpoch')), false);
+});
+
+test('a refused page keeps its authenticated prefix durable: entry 3 accepted, entry 4 refused, the operation refused without a retry', async () => {
+  const r2 = await makeRoot(2, 4, 10);
+  const r3 = await nextEpoch(r2, 1000n, 4, 30);
+  const r4 = await nextEpoch(r3, 2000n, 4, 50);
+  // epoch 4 witnessed by its own committee instead of epoch 3's: structurally a page, refused at append
+  const forged4 = await successorEntry(r3, 2000n, 4, 50, undefined, r4.signers);
+  const held = await TrustInput.fromBundle(r2.bundle, r2.pin);
+  const uc = await ucOf(r4, 3, 4n, 2500n);
+  let verifications = 0;
+  const persisted: Uint8Array[] = [];
+  await assert.rejects(withTrustRefresh(held, sourceOf([...r3.entries, forged4]).source, () => { verifications++; return held.verifyEmbeddedUc(uc); },
+    { persist: (b) => void persisted.push(b) }), (e: unknown) => TrustBaseUpdateError.is(e) && e.reason === 'rejected');
+  assert.equal(verifications, 1, 'the refusal is not retried');
+  assert.equal(held.history.tipEpoch, 3n, 'the authenticated prefix is held in memory');
+  assert.equal(persisted.length, 1, 'and persisted once');
+  // a fresh load of what was written, under the same pin: entry 3 is there, unchanged, and nothing past it
+  const reloaded = await TrustInput.fromBundle(persisted[0], r2.pin);
+  assert.equal(reloaded.history.tipEpoch, 3n);
+  assert.deepEqual(reloaded.history.bytes(3n), r3.entries[1]);
+  assert.deepEqual(reloaded.history.bytes(2n), r2.entries[0]);
+});
+
+test('a failed write stops the operation: after a refused page with both errors, after a good fetch without a retry', async () => {
+  const r2 = await makeRoot(2, 4, 10);
+  const r3 = await nextEpoch(r2, 1000n, 4, 30);
+  const r4 = await nextEpoch(r3, 2000n, 4, 50);
+  const forged4 = await successorEntry(r3, 2000n, 4, 50, undefined, r4.signers);
+  const uc4 = await ucOf(r4, 3, 4n, 2500n);
+  const diskFull = () => { throw new Error('ENOSPC'); };
+  const a = await TrustInput.fromBundle(r2.bundle, r2.pin);
+  await assert.rejects(withTrustRefresh(a, sourceOf([...r3.entries, forged4]).source, () => a.verifyEmbeddedUc(uc4), { persist: diskFull }), (e: unknown) => {
+    assert.ok(e instanceof TrustPersistError);
+    const both = (e as Error).cause as AggregateError;
+    assert.ok(both instanceof AggregateError && (both.errors[0] as Error).message === 'ENOSPC' && TrustBaseUpdateError.is(both.errors[1]));
+    return true;
+  });
+  const b = await TrustInput.fromBundle(r2.bundle, r2.pin);
+  const uc3 = await ucOf(r3, 3, 3n, 1500n);
+  let verifications = 0;
+  await assert.rejects(withTrustRefresh(b, sourceOf(r3.entries).source, () => { verifications++; return b.verifyEmbeddedUc(uc3); }, { persist: diskFull }),
+    (e: unknown) => e instanceof TrustPersistError && ((e as Error).cause as Error).message === 'ENOSPC');
+  assert.equal(verifications, 1, 'the verification is not retried after a failed write');
+});
+
+test('the history is written before the report: a failing onFetch cannot prevent the write', async () => {
+  const r2 = await makeRoot(2, 4, 10);
+  const r3 = await nextEpoch(r2, 1000n, 4, 30);
+  const held = await TrustInput.fromBundle(r2.bundle, r2.pin);
+  const uc = await ucOf(r3, 3, 3n, 1500n);
+  const persisted: Uint8Array[] = [];
+  await assert.rejects(withTrustRefresh(held, sourceOf(r3.entries).source, () => held.verifyEmbeddedUc(uc),
+    { persist: (b) => void persisted.push(b), onFetch: () => { throw new Error('report failed'); } }), /report failed/);
+  assert.equal(persisted.length, 1);
+  assert.equal((await TrustInput.fromBundle(persisted[0], r2.pin)).history.tipEpoch, 3n);
 });

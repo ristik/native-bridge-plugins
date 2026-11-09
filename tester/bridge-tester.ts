@@ -52,6 +52,7 @@ import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin
 import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { needsNewerEntry, withTrustRefresh } from '../packages/native-bridge-plugin/src/trustrefresh.js';
+import { loadHeldTrust, maxEntriesOf, persistTrustFile, refreshAll } from './trust.js';
 import { NativeBridge } from '../packages/native-bridge-plugin/src/verifier.js';
 import { planSplit, runSplit, type SplitJournal, type SplitRecord } from '../packages/native-bridge-plugin/src/splitflow.js';
 import { consolidatedProofs, createNativeBridgePlugin } from '../packages/native-bridge-plugin/src/wallet.js';
@@ -187,39 +188,20 @@ class Chain {
   }
 }
 
-/**
- * The wallet's held trust: the operator's shipped bundle under its pin, or the wallet's own durable history (written only by {@link persistTrust},
- * from appends) when it has one. The held history must extend the shipped one: every shipped epoch with identical bytes; shipped entries it lacks
- * are appended (authenticated) rather than replacing anything.
- */
-async function heldTrust(w: Wallet): Promise<TrustInput> {
+/** The wallet's held trust (tester/trust.ts loadHeldTrust): its durable history when it has one, else the shipped bundle, under the operator's pin. */
+function heldTrust(w: Wallet): Promise<TrustInput> {
   const cfg = w.config;
-  const pin = unhex(readFileSync(cfg.files.trustEntryId, 'utf8').trim());
-  const shipped = await TrustInput.fromBundle(Uint8Array.from(readFileSync(cfg.files.trustBundle)), pin);
-  const file = `${w.dir}/trust-history.cbor`;
-  if (!existsSync(file)) return shipped;
-  const held = await TrustInput.fromBundle(Uint8Array.from(readFileSync(file)), pin);
-  for (let e = shipped.history.genesisEpoch; e <= shipped.history.tipEpoch; e++) {
-    const mine = held.history.bytes(e);
-    const theirs = shipped.history.bytes(e)!;
-    if (mine === null) await held.history.append(theirs);
-    else if (hex(mine) !== hex(theirs)) throw new Error(`${file} conflicts with the shipped trust bundle at epoch ${e}`);
-  }
-  return held;
+  return loadHeldTrust(cfg.files.trustBundle, cfg.files.trustEntryId, `${w.dir}/trust-history.cbor`);
 }
 
-/** Write the held history (tag 39015) atomically. */
 function persistTrust(w: Wallet, bundle: Uint8Array): void {
-  const file = `${w.dir}/trust-history.cbor`;
-  writeFileSync(`${file}.tmp`, bundle);
-  renameSync(`${file}.tmp`, file);
+  persistTrustFile(`${w.dir}/trust-history.cbor`, bundle);
 }
 
 /** Run a verification against the held trust, fetching newer entries from the aggregator while it lacks an epoch (module comment). */
 function withHeldTrust<T>(w: Wallet, trust: TrustInput, agg: AggregatorClient, verify: () => Promise<T>): Promise<T> {
   const fetchOn = process.env.BRIDGE_TRUST_FETCH !== '0';
-  const maxEntries = Number(process.env.BRIDGE_TRUST_MAX_ENTRIES ?? '64');
-  if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > 64) throw new Error('BRIDGE_TRUST_MAX_ENTRIES must be 1 to 64');
+  const maxEntries = maxEntriesOf();
   return withTrustRefresh(trust, agg, verify, {
     attempts: fetchOn ? 8 : 1, maxEntries,
     persist: (b) => persistTrust(w, b),
@@ -515,15 +497,7 @@ async function claim(w: Wallet, to?: string): Promise<void> {
 /** The held trust-base history; --refresh first fetches the entries after the held tip (as many pages as the aggregator has). */
 async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<void> {
   const trust = await heldTrust(w);
-  if (refresh) {
-    const { fetchTrustBaseEntries } = await import('@unicitylabs/state-transition-sdk/lib/util/TrustBaseUtils.js');
-    const agg = new AggregatorClient(w.config.aggUrl);
-    const maxEntries = Number(process.env.BRIDGE_TRUST_MAX_ENTRIES ?? '64');
-    for (let n = 1; n > 0;) {
-      n = await fetchTrustBaseEntries(trust.history, agg, { maxEntries });
-      if (n > 0) persistTrust(w, await trust.history.exportBundle());
-    }
-  }
+  if (refresh) await refreshAll(trust, new AggregatorClient(w.config.aggUrl), maxEntriesOf(), (b) => persistTrust(w, b));
   const h = trust.history;
   const entries: { epoch: string; entryId: string; startRound: string }[] = [];
   for (let e = h.genesisEpoch; e <= h.tipEpoch; e++) {

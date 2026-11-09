@@ -7,8 +7,15 @@
  *   `TrustBaseHistory.append`, which authenticates it from its predecessor): the pin and every held entry stay, an entry that does not authenticate,
  *   of another network or conflicting with a held epoch is refused (`TrustBaseUpdateError`, propagated), and nothing is ever replaced.
  * - Only "no entry for epoch" is retried: the plug-in's `ErrNoEntryForEpoch`, or an SDK consolidation `integrity` error whose verification trace
- *   names the missing epoch. Every other failure propagates unchanged on the first attempt.
- * - `persist` receives the whole held history after every fetch that appended entries (`exportBundle`), so a durable wallet keeps what it learnt.
+ *   names a missing epoch. Every other failure propagates unchanged on the first attempt. A consolidation trace can hold a missing epoch AND another
+ *   failure; the retry is then bounded, not narrowed: each attempt runs the complete verification again from the start, so once the epoch is held
+ *   the other failure is what fails (not retried), and if the source never has the epoch the last failure propagates after `attempts`. It fails
+ *   closed either way. `verify` must be a pure verification: it never submits a transaction, so a retry never replays one.
+ * - `persist` receives the whole held history after every fetch that appended entries (`exportBundle`), so a durable wallet keeps what it learnt;
+ *   it is called before `onFetch`, so a reporting failure cannot prevent the write.
+ * - A refused page keeps its authenticated prefix: the SDK appends a page entry by entry and stops at the first refusal, leaving the entries before
+ *   it held. When the held tip advanced, that prefix is persisted, then the original refusal propagates (no retry of the verification). If the
+ *   write itself fails the operation stops with the write's error, the refusal as its `cause`.
  */
 import type { ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
 import { CertificateVerificationResult } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/CertificateVerdict.js';
@@ -40,6 +47,25 @@ export interface TrustRefreshEvent {
   readonly appended: number;
 }
 
+/** Persist the held history; a failed write stops the operation (with `refused`, the fetch's own refusal, as its cause when there is one). */
+async function persistOrStop(trust: TrustInput, options: TrustRefreshOptions, refused?: unknown): Promise<void> {
+  if (!options.persist) return;
+  try {
+    await options.persist(await trust.history.exportBundle());
+  } catch (e) {
+    throw new TrustPersistError(`the held trust-base history (tip ${trust.history.tipEpoch}) could not be persisted: ${e instanceof Error ? e.message : String(e)}`,
+      refused === undefined ? e : new AggregateError([e, refused], 'the write failed after the fetch was refused'));
+  }
+}
+
+/** A failed write of the held history: the operation stops. `cause` is the write's error, or both it and the fetch's refusal. */
+export class TrustPersistError extends Error {
+  public constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = 'TrustPersistError';
+  }
+}
+
 /** True when `e` is a verification that failed only for want of a newer trust-base entry. */
 export function needsNewerEntry(e: unknown): boolean {
   if (e instanceof NativeError) return e.reason === 'ErrNoEntryForEpoch';
@@ -64,10 +90,17 @@ export async function withTrustRefresh<T>(trust: TrustInput, source: ITrustBaseS
       if (!needsNewerEntry(e) || attempt >= attempts) throw e;
     }
     const tipBefore = trust.history.tipEpoch;
-    const appended = await fetchTrustBaseEntries(trust.history, source, { maxEntries });
+    let appended: number;
+    try {
+      appended = await fetchTrustBaseEntries(trust.history, source, { maxEntries });
+    } catch (refused) {
+      // the authenticated prefix before the refused entry stays held: keep it durable, then report the refusal itself
+      if (trust.history.tipEpoch > tipBefore) await persistOrStop(trust, options, refused);
+      throw refused;
+    }
     const tipAfter = trust.history.tipEpoch;
+    if (appended > 0) await persistOrStop(trust, options);
     options.onFetch?.({ attempt, fromEpoch: tipBefore + 1n, tipBefore, tipAfter, appended });
-    if (appended > 0) await options.persist?.(await trust.history.exportBundle());
-    else await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    if (appended === 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
