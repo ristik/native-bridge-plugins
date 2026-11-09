@@ -9,7 +9,10 @@
  *   bridge-tester.ts transfer [--token <nonce>] [--count <n>]                    certified transfers to fresh keys of this wallet
  *   bridge-tester.ts split [--token <id>] --amounts <a,b,...>                     split the token into parts (each a token: --token <id>.1, <id>.2, ...)
  *   bridge-tester.ts burn [--token <id>] [--recipient <0x address>]              burn the token (or a part) for its return to an EVM address (default: this wallet's)
- *   bridge-tester.ts redeem [--token <nonce>]                                    the return proof (consolidated by the aggregator), redeemed in the vault
+ *   bridge-tester.ts redeem [--token <nonce>] [--per-sid]                        the return proof (consolidated by the aggregator), redeemed in the vault; --per-sid: the
+ *                                                                                proofs as certified, one anchor per certificate, no consolidation and no fallback
+ *   bridge-tester.ts envelope [--token <nonce>]                                  the submitted return envelope (envelope.bin) decoded: each anchor's partition and the
+ *                                                                                root epoch and round of its seal, the envelope's size and SHA-256
  *   bridge-tester.ts claim [--to <0x address>]                                   withdraw this wallet's whole credit from the vault
  *   bridge-tester.ts trust [--refresh] [--token <id>]                            the held trust-base history (genesis, tip, each EntryID); --refresh fetches newer entries;
  *                                                                                --token adds the root epoch and round that sealed each of the token's proofs
@@ -49,6 +52,8 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { DeploymentRegistry, makeDeployment } from '../packages/native-bridge-plugin/src/deployment.js';
 import { configHashOfPdr, encodeJustification } from '../packages/native-bridge-plugin/src/lockproof.js';
 import { buildReturnProof, refreshToken } from '../packages/native-bridge-plugin/src/proof.js';
+import { decodeEnvelope } from '../packages/native-bridge-plugin/src/envelope.js';
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
 import { decodeCfg, decodePolicy, deriveSalt, deriveTokenId, keccak256, lockDigest, lockRecord, returnReason, u, arr, valueEnvelope } from '../packages/native-bridge-plugin/src/profile.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { needsNewerEntry, withTrustRefresh } from '../packages/native-bridge-plugin/src/trustrefresh.js';
@@ -424,7 +429,7 @@ async function burn(w: Wallet, nonce: string | undefined, recipient?: string): P
   console.log(`burned token ${recordId(t)} for its return to ${to}; next: redeem`);
 }
 
-async function redeem(w: Wallet, nonce?: string): Promise<void> {
+async function redeem(w: Wallet, nonce?: string, perSid = false): Promise<void> {
   const t = w.record(nonce);
   requirePhase(t, 'burned', 'redeem');
   const cfg = w.config;
@@ -436,6 +441,8 @@ async function redeem(w: Wallet, nonce?: string): Promise<void> {
   const client = new AggregatorClient(cfg.aggUrl);
   // the return proof is verified under the held trust: a certificate of a newer epoch fetches the entries and the whole assembly runs again
   const ret = await withHeldTrust(w, trust, client, async () => {
+    // the per-SID path on request: the proofs as certified (their own seals), never consolidated, and no fallback either way
+    if (perSid) return buildReturnProof(bridge, token);
     const proofClient = new TokenProofClient({ routing: ShardRouting.single(client), verificationContext: await bridge.context() });
     let cons: Awaited<ReturnType<typeof consolidatedProofs>> | undefined;
     for (let attempt = 1; attempt <= 4; attempt++) {
@@ -515,8 +522,22 @@ async function trustCmd(w: Wallet, refresh: boolean, tokenId?: string): Promise<
   console.log(JSON.stringify({ pin: hex(trust.id), genesisEpoch: h.genesisEpoch.toString(), tipEpoch: h.tipEpoch.toString(), entries, ...(seals ? { token: tokenId, seals } : {}) }, null, 2));
 }
 
+/** The return envelope the last redeem built and submitted (envelope.bin, the bytes of its redeem(bytes) call), decoded: each anchor's seal. */
+async function envelopeCmd(w: Wallet, nonce?: string): Promise<void> {
+  const t = w.record(nonce);
+  const file = `${w.tokenDir(recordId(t))}/envelope.bin`;
+  if (!existsSync(file)) throw new Error(`token ${recordId(t)} has no envelope: run redeem first`);
+  const bytes = Uint8Array.from(readFileSync(file));
+  const env = decodeEnvelope(bytes);
+  const anchors = env.anchors.map((a, i) => {
+    const seal = UnicityCertificate.fromCBOR(a.uc).unicitySeal;
+    return { index: i, partition: a.partition, shard: hex(a.shard), rootEpoch: seal.epoch.toString(), rootRound: seal.rootChainRoundNumber.toString() };
+  });
+  console.log(JSON.stringify({ token: recordId(t), bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length }, null, 2));
+}
+
 // ---- the command line -------------------------------------------------------------------------------------------------------------------------
-const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem | claim [--to 0x..] | trust [--refresh] [--token id]; ' +
+const USAGE = 'usage: bridge-tester.ts init --config <file> [--eth-key-file <file>] | status | lock --amount <ether|Nwei> | mint | transfer [--count n] | split --amounts a,b[,..] | burn [--recipient 0x..] | redeem [--per-sid] | envelope | claim [--to 0x..] | trust [--refresh] [--token id]; ' +
   'options: --wallet <dir> (default $BRIDGE_TESTER_WALLET or ./bridge-wallet), --token <nonce or part, e.g. 5.1> (default the newest)';
 
 export async function main(argv: string[]): Promise<void> {
@@ -524,7 +545,7 @@ export async function main(argv: string[]): Promise<void> {
     args: argv, allowPositionals: true, strict: true,
     options: {
       wallet: { type: 'string' }, config: { type: 'string' }, 'eth-key-file': { type: 'string' }, token: { type: 'string' }, amount: { type: 'string' },
-      count: { type: 'string' }, refresh: { type: 'boolean' }, recipient: { type: 'string' }, to: { type: 'string' }, amounts: { type: 'string' },
+      count: { type: 'string' }, refresh: { type: 'boolean' }, 'per-sid': { type: 'boolean' }, recipient: { type: 'string' }, to: { type: 'string' }, amounts: { type: 'string' },
     },
   });
   const w = new Wallet(values.wallet ?? process.env.BRIDGE_TESTER_WALLET ?? './bridge-wallet');
@@ -553,7 +574,9 @@ export async function main(argv: string[]): Promise<void> {
     case 'burn':
       return burn(w, values.token, values.recipient);
     case 'redeem':
-      return redeem(w, values.token);
+      return redeem(w, values.token, values['per-sid'] ?? false);
+    case 'envelope':
+      return envelopeCmd(w, values.token);
     case 'claim':
       return claim(w, values.to);
     case 'trust':
