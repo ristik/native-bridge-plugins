@@ -11,7 +11,7 @@ import { CborSerializer as C } from '@unicitylabs/state-transition-sdk/lib/seria
 import { arr, bs, u } from '../packages/native-bridge-plugin/src/profile.js';
 import { hex, unhex } from '../tests/live/lib.js';
 import {
-  amountBytes, appendTransaction, calldata, checkNetwork, decBytes, describeEnvelope, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
+  amountBytes, appendTransaction, BRIDGE_REJECTED, bridgeRejectedStatus, calldata, checkNetwork, decBytes, describeEnvelope, PART_ALREADY_REDEEMED, partAlreadyRedeemed, redeemArgument, replaceOnce, revertOf, HttpError, jsonRpc, RATE_LIMIT_RETRIES, encAddress, encBytes, encUint, ethAddress, loadTesterConfig, LOCKED_TOPIC, MAX_LOCK_WEI,
   parseAmount,
   RECORD_ID, recordId, requirePhase, selector, splitAmounts, TokenRecord,
 } from './core.js';
@@ -207,4 +207,29 @@ test('envelope: the anchors\' seals are read from their certificates (root epoch
   assert.equal(v.envelopeHex, hex(bytes));
   assert.equal(v.sha256, hex(sha256(bytes)));
   assert.throws(() => describeEnvelope(bytes.subarray(0, bytes.length - 40)), 'a truncated envelope is refused, not described');
+});
+
+test('replays: the vault\'s refusals read from eth_call errors; the redeem input\'s envelope; one exact replacement', () => {
+  const id = new Uint8Array(32).fill(0xab);
+  const spent = partAlreadyRedeemed(5n, id);
+  assert.equal(spent, `${PART_ALREADY_REDEEMED}${'0'.repeat(63)}5${'ab'.repeat(32)}`);
+  assert.equal(revertOf(new Error(`eth_call: execution reverted (${spent.toUpperCase().replace('0X', '0x')})`)), spent);
+  assert.equal(revertOf(new Error('eth_call: execution reverted')), undefined, 'no data, no refusal');
+  const rejected = (code: number) => `${BRIDGE_REJECTED}${code.toString(16).padStart(64, '0')}`;
+  assert.equal(bridgeRejectedStatus(rejected(7)), 7);
+  assert.equal(bridgeRejectedStatus(rejected(0)), undefined, 'status 0 is not a refusal');
+  assert.equal(bridgeRejectedStatus(spent), undefined, 'another error is not the composition\'s');
+  assert.equal(bridgeRejectedStatus(BRIDGE_REJECTED), undefined, 'truncated');
+  const env = Uint8Array.from({ length: 45 }, (_, i) => i);
+  assert.deepEqual(redeemArgument(calldata('redeem(bytes)', encBytes(env))), env);
+  assert.throws(() => redeemArgument(calldata('claim(uint256,address)', encUint(1n), encUint(2n))), /not a redeem/);
+  const b = unhex('00112233aa4455aa66');
+  assert.deepEqual(replaceOnce(b, unhex('4455'), unhex('dead'), 'x'), unhex('00112233aadeadaa66'));
+  assert.throws(() => replaceOnce(b, unhex('aa'), unhex('bb'), 'x'), /occur 2 times/);
+  assert.throws(() => replaceOnce(b, unhex('77'), unhex('bb'), 'x'), /occur 0 times/);
+  // a match at an odd nibble offset is not a byte match: '12' occurs in 0x0123 only across the byte boundary
+  assert.throws(() => replaceOnce(unhex('0123'), unhex('12'), unhex('34'), 'x'), /occur 0 times/);
+  // and an odd-offset match does not hide an overlapping byte match: in 0x011111, '1111' is at nibble 1 (no) and at nibble 2 (the byte match)
+  assert.deepEqual(replaceOnce(unhex('011111'), unhex('1111'), unhex('3434'), 'x'), unhex('013434'));
+  assert.throws(() => replaceOnce(b, unhex('4455'), unhex('de'), 'x'), /as long/);
 });

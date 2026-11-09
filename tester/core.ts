@@ -227,3 +227,41 @@ export function describeEnvelope(bytes: Uint8Array): EnvelopeView {
   });
   return { bytes: bytes.length, sha256: hex(sha256(bytes)), envelopeHex: hex(bytes), anchors, leafProofs: env.leafProofs.length };
 }
+
+// ---- the replay negatives (bridge-tester.ts replays) ------------------------------------------------------------------------------------------
+/** BridgeVault's PartAlreadyRedeemed(uint256 nonce, bytes32 partId) and BridgeRejected(uint256 status) selectors. */
+export const PART_ALREADY_REDEEMED = '0xe8f8709e';
+export const BRIDGE_REJECTED = '0x2896c49d';
+
+/** PartAlreadyRedeemed of this lock nonce and token ID, as the vault's revert data. */
+export const partAlreadyRedeemed = (nonce: bigint, tokenId: Uint8Array): string => `${PART_ALREADY_REDEEMED}${word(nonce)}${hex(tokenId)}`;
+
+/** The revert data of a failed eth_call as jsonRpc reports it (`eth_call: <message> (0x...)`), or undefined when it carries none. */
+export function revertOf(e: unknown): string | undefined {
+  const m = /\((0x[0-9a-fA-F]*)\)$/.exec(e instanceof Error ? e.message : String(e));
+  return m ? m[1].toLowerCase() : undefined;
+}
+
+/** The composition's refusal: BridgeRejected's nonzero V2 status, or undefined for any other revert. */
+export function bridgeRejectedStatus(revert: string | undefined): number | undefined {
+  if (!revert?.startsWith(BRIDGE_REJECTED) || revert.length < 74) return undefined;
+  const code = Number(BigInt(`0x${revert.slice(10, 74)}`));
+  return code === 0 ? undefined : code;
+}
+
+/** The envelope a redeem(bytes) transaction's input carries. */
+export function redeemArgument(input: string): Uint8Array {
+  if (!input.toLowerCase().startsWith(`0x${selector('redeem(bytes)')}`)) throw new Error('not a redeem(bytes) call');
+  return decBytes(`0x${input.slice(10)}`);
+}
+
+/** One byte string replaced by another of the same length; it must occur exactly once in `b` (at a byte boundary). */
+export function replaceOnce(b: Uint8Array, from: Uint8Array, to: Uint8Array, what: string): Uint8Array {
+  if (from.length !== to.length || from.length === 0) throw new Error(`${what}: the replacement must be as long as the original`);
+  const h = hex(b);
+  const f = hex(from);
+  const at: number[] = [];
+  for (let i = h.indexOf(f); i >= 0; i = h.indexOf(f, i + 1)) if (i % 2 === 0) at.push(i);
+  if (at.length !== 1) throw new Error(`${what}: the bytes occur ${at.length} times in the envelope, not once`);
+  return unhex(h.slice(0, at[0]) + hex(to) + h.slice(at[0] + f.length));
+}
