@@ -1,8 +1,9 @@
 # Native bridge plug-ins (PR3): TypeScript plug-in and Rust `sdk-ext`
 
-Scope: design `nbp-design.md` §§2–5 as amended by `nbp-design-v2.md` (fixed SDK trust base). Neither
-state-transition SDK is forked or patched; both are consumed through public APIs only
-(`@unicitylabs/state-transition-sdk@3.0.1`, `unicity-token` tag `v3.0.1`).
+Scope: design `nbp-design.md` §§2–5 as amended by `nbp-design-v2.md`; the trust input is the SDK
+trust-base history ([protocol/trust-base.md](../protocol/trust-base.md)). Neither state-transition SDK
+is forked or patched; both are consumed through public APIs only
+(`@unicitylabs/state-transition-sdk` `4.0.0-utb.c5840ef`, vendored; `unicity-token` at `de79e6c1`).
 
 | | TypeScript `packages/native-bridge-plugin` | Rust `crates/native-bridge-sdk-ext` |
 |---|---|---|
@@ -10,7 +11,7 @@ state-transition SDK is forked or patched; both are consumed through public APIs
 | Issuance policy | `BridgedTokenIssuancePolicy` (`WalletIssuancePolicy`) | `verifier::BridgedTokenIssuancePolicy` (`TokenDataVerifier`) |
 | Strict unlock | `src/unlock.ts` | `src/unlock.rs` |
 | Full-history wrapper | `NativeBridge.verifyNativeToken`, `NativeBridgeTokenVerifier` (`ITokenVerifier`) | `token::NativeBridge::verify_native_token` |
-| Embedded EVM UC | SDK rules `UnicitySealHashMatchesWithRootHashRule` + `UnicitySealQuorumSignaturesVerificationRule` | `trust::verify_embedded_uc` (SDK composition reproduced with public primitives; it is private in the Rust SDK) |
+| Embedded EVM UC | `TrustInput.verifyEmbeddedUc`: SDK `UnicityCertificateVerifier.verifyCertificate` over the history (`maxSignatures: 16`) | `trust::verify_embedded_uc`: SDK `verify_certificate_of_partition` over the history |
 | Account/storage MPT, header, PDR pins | `mpt.ts`, `header.ts`, `lockproof.ts` | `mpt.rs`, `header.rs`, `lockproof.rs` |
 | Manifests | `manifest.ts` | `manifest.rs` (feature `std`) |
 | Return proof, refresh | `envelope.ts`, `proof.ts` | `envelope.rs`, `proof.rs` |
@@ -25,15 +26,16 @@ admission, `t ≤ IR.timestamp`) → **the SDK's own ordinary verification with 
 trust base** and this bridge's justification/issuance registrations. Nothing in these paths has a
 network capability (source scan + a sandboxed no-network run in both suites).
 
-## Fixed-base profile (design v2)
+## Trust input: the trust-base history
 
-One pinned SDK `RootTrustBase`: unit weights, one epoch, SDK count quorum `N − (N−1)/3`.
-`trustBaseId = SHA256(B)` of the exact SDK JSON document bytes; `TrustInput::from_json` /
-`TrustInput.fromJson` hash the installed bytes. Epoch changes, appended records, fetching newer
-bases and arbitrary weights are **DEFERRED** to the common SDK work (ristik/bft-core#421); weighted
-and rotating scenarios are `#[ignore]` / skipped placeholders, not passing coverage. Known
-SDK/native limitations (TS binds seal recovery parity, Rust does not; B1 accepts 64-byte seals) are
-not papered over here.
+`TrustInput.fromBundle` / `TrustInput::from_bundle` install a complete release bundle (tag 39015)
+whose genesis EntryID equals the pin; that EntryID is the `trustBaseId` a lock proof and the
+manifest name. Every certificate is verified under the committee and interval of its own seal epoch,
+with weighted quorum `floor(2W/3)+1` and at most 16 supplied signatures (the B1 bound, also passed to
+the TS SDK rule as `maxSignatures: 16`). An epoch newer than the history's tip is the retryable
+`ErrNoEntryForEpoch`: the wallet appends the newer entries through the SDK fetch (TS:
+`withTrustRefresh`) and retries. Receipt verification itself fetches nothing. The normative rules
+and their order are in [protocol/trust-base.md](../protocol/trust-base.md).
 
 ## Reconciliation with PR1 (`protocol/`)
 
