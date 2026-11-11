@@ -58,6 +58,16 @@ test('quorum: one short is rejected, three of four is enough, a stranger counts 
   );
 });
 
+// B1 bounds a seal at 16 supplied signatures (a gas bound of the registry). The SDK's own default is 256 since js#24 (wallets), so the B1
+// verifiers (trust.ts verifyEmbeddedUc, verifier.ts) are built with { maxSignatures: 16 }; this test fails if either drops it.
+test('B1 bound: a seal with 16 supplied signatures verifies, 17 are refused (unknown signers count like any other)', async () => {
+  const strangers = (n: number): [string, ReturnType<typeof signer>][] => Array.from({ length: n }, (_, i) => [`stranger${i}`, signer(100 + i)]);
+  // 4 members + 12 strangers = 16
+  await mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: strangers(12) })));
+  // 4 members + 13 strangers = 17: a full quorum among them does not help
+  await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { extra: strangers(13) }))), 'ErrLockUC');
+});
+
 test('certificate checks: false root, wrong network, an epoch not held yet, an epoch before the genesis', async () => {
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { sealHash: new Uint8Array(32).fill(1) }))), 'ErrLockUC');
   await rejects(mutated(async (w, p) => void (p.uc = await resignUc(w, p, { network: 4 }))), 'ErrSealNetwork');
