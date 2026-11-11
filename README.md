@@ -1,7 +1,9 @@
 # Native bridge plug-ins
 
 Bridge-owned native UCT protocol and SDK extensions, licensed MIT OR Apache-2.0.
-The TS and Rust SDK 3.0.1 extensions and shared corpus are implemented. Native
+The TS and Rust extensions over the SDK 4.0 trust-base history (JS SDK
+`4.0.0-utb.c5840ef`, vendored; Rust `unicity-token` at `de79e6c1`) and the
+shared corpus are implemented. Native
 activation and a deployed bridge remain gated on joined acceptance. Package
 publication is disabled.
 
@@ -23,10 +25,12 @@ The layout follows `unicitynetwork/unicity-bridge` at
 unicity-pos-contracts; execution in ureth; the independent semantic oracle in
 bft-core. External SDKs are dependencies, never copied or patched here.
 
-This unreleased profile supports one fixed SDK RootTrustBase, unit validator
-weights and SDK count quorum. Epoch evolution, arbitrary weights and trust-base
-append/fetch are deferred to [common SDK work #421](https://github.com/ristik/bft-core/issues/421).
-See [the trust-base history and UC contract](protocol/trust-base.md).
+Certificates verify against the network's Unicity Trust Base history: one
+RootTrustBaseV2 entry per root epoch, installed from a release bundle under its
+genesis EntryID pin, with weighted quorum under each epoch's own committee. The
+wallet appends newer entries through the SDK's trust-base fetch; receipt
+verification itself fetches nothing. See
+[the trust-base history and UC contract](protocol/trust-base.md).
 
 ```sh
 npm ci
