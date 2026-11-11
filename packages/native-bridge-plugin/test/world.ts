@@ -414,6 +414,8 @@ export interface Tweaks {
   ucPartitionAt?: [number, number];
   /** The aggregation partition every leaf is certified in (default the deployment's). */
   ucPartition?: number;
+  /** Extra signatures on every aggregator certificate (strangers count toward the supplied-signature bound). */
+  ucExtra?: [string, SigningService][];
 }
 
 export interface TokenOut {
@@ -514,7 +516,7 @@ export async function assembleToken(w: World, s: MintSpec, mint: MintTransaction
     const root = await smt.calculateRoot();
     const uc = await makeUc(w.agg, {
       partition: tw.ucPartitionAt?.[0] === g.members[0] && g.members.length === 1 ? tw.ucPartitionAt[1] : tw.ucPartition ?? AGG_PARTITION, conf: w.aggConfs[g.row], epochIr: 1n, rootEpoch: 2n, round: g.round, timestamp: ucTs, stateHash: root.hash.data,
-      blockHash: null, signers: 4,
+      blockHash: null, signers: 4, extra: tw.ucExtra,
       shard: { bytes: shardOf(w, g.row), siblings: w.depth === 0 ? [] : [sha(text(`sibling of shard ${g.row}`))] },
     });
     for (const i of g.members) certOf[i] = { root, uc };

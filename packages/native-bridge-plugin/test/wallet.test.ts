@@ -251,6 +251,19 @@ test('SDK seam: NativeBridgeTokenVerifier composes SDK and strict verification',
   assert.equal(v.lastError, 'ErrLockDigest');
 });
 
+test('SDK context: the B1 bound of 16 supplied signatures also holds for token certificates (the SDK default is 256)', async () => {
+  const w = await makeWorld();
+  const { signer } = await import('./world.js');
+  const strangers = (n: number): [string, ReturnType<typeof signer>][] => Array.from({ length: n }, (_, i) => [`stranger${i}`, signer(100 + i)]);
+  const ctx = await w.bridge.context();
+  // 4 members + 12 strangers = 16
+  const ok = await buildToken(w, spec(1), [], T0, UC_TS, { ucExtra: strangers(12) });
+  assert.equal((await ok.token.verify(ctx)).status, VerificationStatus.OK);
+  // 4 members + 13 strangers = 17: a full quorum among them does not help
+  const over = await buildToken(w, spec(1), [], T0, UC_TS, { ucExtra: strangers(13) });
+  assert.equal((await over.token.verify(ctx)).status, VerificationStatus.FAIL);
+});
+
 test('SDK context registers the justification verifier and one issuance policy per type', async () => {
   const w = await makeWorld();
   const out = await buildToken(w, spec(1), [], T0, UC_TS);
