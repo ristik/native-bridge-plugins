@@ -20,7 +20,7 @@ SDK_RUST_FORK_COMMIT = 'de79e6c1e393a1846b75bca0640b9ec9a55aa143'
 
 # Protocol 7 artifacts the old plug-in code and its corpus still consume. They moved to protocol/legacy-v7/ when the
 # native bridge v2 profile replaced them (bft-core#1097); the corpus keeps their original names. Removed by bft-core#1106.
-LEGACY_V7 = {'protocol/interop.md', 'protocol/abi.json', 'protocol/manifest.schema.json'}
+LEGACY_V7 = {'protocol/interop.md', 'protocol/abi.json', 'protocol/manifest.schema.json', 'protocol/trust-base.md'}
 
 
 def legacy_path(name):

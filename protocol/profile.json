@@ -1,10 +1,19 @@
 {
-  "artifactVersion": 2,
+  "artifactVersion": 3,
   "nativeBridgeProtocolVersion": 9,
   "name": "native-bridge-v2",
   "status": "development-frozen-unactivated",
   "specification": "ristik/bft-core docs/design/native-bridge-v2.md (NB2-01, bft-core#1097)",
   "identityFamily": "unicity-native-nb2",
+  "nativeCodec": {
+    "module": "github.com/unicitynetwork/bft-go-base",
+    "version": "v1.1.1-0.20261109140746-dbf94198f25e",
+    "scope": "UC and trust-base objects, inline or inside byte strings, including signature maps and signer text keys; duplicate map keys rejected"
+  },
+  "sdkPins": {
+    "js": "c5840ef5f59201c52ea6cf7034ee02cb48d54007",
+    "rust": "de79e6c1e393a1846b75bca0640b9ec9a55aa143"
+  },
   "hashes": {
     "unicity": "sha256",
     "evm": "keccak256"
@@ -63,6 +72,7 @@
     "depositNumber": 56,
     "qmaxMaximum": "22300745198530623141535718272648361505980415"
   },
+  "headerSchema": "go-ethereum v1.14.11 Cancun types.Header: 20 fields ending at parentBeaconBlockRoot, no requestsHash; difficulty 0, empty uncle hash, empty withdrawals root, blobGasUsed = excessBlobGas = 0, nonzero u64 base fee, extraData <= 32 bytes, number <= 2^63-1, exact canonical re-encoding",
   "limits": {
     "justificationBytes": 65536,
     "ucBytes": 16384,
@@ -72,6 +82,8 @@
     "receiptLeafNodeBytes": 49152,
     "admittedReceiptTypes": [0, 1, 2, 3],
     "cborDepth": 16,
+    "cborDepthRule": "per decoding unit (top-level input or byte string decoded as CBOR); top item depth 0; each array, map or tag opening adds 1; children above 16 are InputTooLarge; the evidence scan includes inline UCs",
+    "justificationBytesScope": "root reason J (tag 39051) only; never a split justification (tag 39044)",
     "rlpDepth": 16,
     "firstOwnerBytes": 42
   },
@@ -83,7 +95,9 @@
     "segmentCommitment": { "candidates": ["circular-gap", "compressed-radix", "adjacent-leaf-multiproof"], "default": "circular-gap", "fixedBy": "bft-core#1098" },
     "gasReserve": { "default": 620000, "fixedBy": "bft-core#1098" },
     "maxEncodedTxBytes": { "candidates": [131072, 524288], "default": 524288, "fixedBy": "owner decision, measured by bft-core#1105" },
-    "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" }
+    "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" },
+    "maxJump": { "default": 64, "scope": "stateReadOnly deployments only (ImplausibleIndex)" },
+    "testAdmittedSet": { "K": [4, 8], "B": [2, 4], "scope": "test builds only; production admits only the K and B candidates" }
   },
   "trustModel": {
     "scope": "unicity-trust-base-history",
@@ -97,9 +111,9 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "4134f2ad11d899f328535f3969675c59aaf8d4083fc423052cc95f98ca618bb3",
+    "protocol/interop.md": "c9d0b495ffe20744310959a8a95e53406ae5bf22cfdbf28892b9d83975eae4ab",
     "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
-    "protocol/trust-base.md": "48c8ad020417f6ea1e85d0c1f2d3ee5e878892ba2cfb39574ae188954cc70a64"
+    "protocol/trust-base.md": "47e837ced27c9fa8303420f4ce5bee372007b8b20454e570f0b4b2931ac3db7e"
   },
   "legacy": "protocol/legacy-v7/ and protocol/vectors/ are the protocol 7 artifacts and corpus that the old plug-in code still tests against; not part of this profile; removed by bft-core#1106 (NB2-10)."
 }
