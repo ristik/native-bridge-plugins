@@ -180,8 +180,7 @@ fn invalid_signatures_of_known_members_count_zero() {
     // Two genuine plus two corrupt: no quorum.
     let e = mutated(|w, p, _| {
         resign(&w.evm_root, &mut p.uc, 2);
-        for k in 2..4 {
-            let (id, sg) = &w.evm_root.signers[k];
+        for (id, sg) in &w.evm_root.signers[2..4] {
             let mut bad = sg
                 .sign(&p.uc.unicity_seal.calculate_hash())
                 .encode()

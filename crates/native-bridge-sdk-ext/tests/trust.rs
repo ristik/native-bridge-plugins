@@ -106,12 +106,10 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
     let mut uc = proof.unicity_certificate.clone();
     uc.unicity_seal.signatures.truncate(2);
     let d = uc.unicity_seal.calculate_hash();
-    for k in 2..4 {
-        let mut bad = r.signers[k].1.sign(&d).encode().to_vec();
+    for (id, sg) in &r.signers[2..4] {
+        let mut bad = sg.sign(&d).encode().to_vec();
         bad[3] ^= 1;
-        uc.unicity_seal
-            .signatures
-            .push((r.signers[k].0.clone(), bad));
+        uc.unicity_seal.signatures.push((id.clone(), bad));
     }
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::QuorumNotMet);
     assert_eq!(
