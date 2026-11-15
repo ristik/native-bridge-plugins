@@ -1,5 +1,5 @@
 {
-  "artifactVersion": 6,
+  "artifactVersion": 7,
   "nativeBridgeProtocolVersion": 9,
   "name": "native-bridge-v2",
   "status": "development-frozen-unactivated",
@@ -75,7 +75,8 @@
   "headerSchema": "go-ethereum v1.14.11 Cancun types.Header: 20 fields ending at parentBeaconBlockRoot, no requestsHash; difficulty 0, empty uncle hash, empty withdrawals root, blobGasUsed = excessBlobGas = 0, nonzero u64 base fee, extraData <= 32 bytes, number <= 2^63-1, exact canonical re-encoding",
   "limits": {
     "justificationBytes": 65536,
-    "ucBytes": 16384,
+    "evmUcBytes": 16384,
+    "aggregatorUcBytes": 24576,
     "headerBytes": 2048,
     "receiptNodes": 65,
     "receiptBranchNodeBytes": 1024,
@@ -116,7 +117,7 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "867999a030232e7d773a8dded34b562c166d214f1686e31e8e21f308cb830b94",
+    "protocol/interop.md": "d8b969b69a0ddf99bd398ab13dc3bc968e15b0da7e8b3ffdb48856e5df199216",
     "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
     "protocol/trust-base.md": "4824915c6c47223dda3db9c943c602eec9664b883d60fde842aba8bb37e8f6ef"
   },

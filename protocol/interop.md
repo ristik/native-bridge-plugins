@@ -38,7 +38,8 @@ Nesting depth (`cborDepth` 16): a decoding unit is a top-level input (Γ, `evide
 decodes as CBOR (`J` or a split justification in a mint's `b(J)`, `R` in transfer data, `data`). Its top-level item is
 at depth 0 and each array, map or tag opening adds 1 for its children; children above depth 16 are `InputTooLarge`. A
 byte-string-wrapped child is scanned afresh from depth 0, so lineage depth never accumulates. The `evidence` scan
-includes the inline aggregator UCs.
+includes the inline aggregator UCs. UC size bounds: the EVM receipt UC `evmUcBytes` 16,384, each aggregator UC
+`aggregatorUcBytes` 24,576 (bft-core `b1ref.MaxUCBytes`).
 
 Domain literals are ASCII byte strings. Hashes, salts, IDs and identifiers are 32 bytes, addresses 20, compressed
 secp256k1 keys 33. An amount is a minimal positive unsigned big-endian bstr of 1..32 bytes (no leading zero); in the EVM
@@ -133,7 +134,7 @@ data = tag(39050,[1,[[b(aid),b(v)]],null])
 `J` body arity 5. `DepositProof` has arity 6 and is inline; any other arity, including the arity-7 protocol 8 draft
 that carried a PDR, is rejected (`Shape`). `evmUC` is the complete canonical native UnicityCertificate.
 `n` in [1, 2^56-1], indices below 2^32. The receipt is the value
-of the last trie node, never carried twice. Bounds (`profile.json` `limits`) apply before any cryptography.
+of the last trie node, never carried twice. Bounds (`profile.json` `limits`, `evmUcBytes` 16,384 for `evmUC`) apply before any cryptography.
 `justificationBytes` bounds the root reason `J` (tag 39051, with its `DepositProof`) only, never a split justification
 (tag 39044), which embeds its parent token: a lineage has no depth cap beyond the evidence size, `L_max` and gas.
 
@@ -382,7 +383,7 @@ selector, topic and data length.
    complete encoded transaction or a conservative upper bound. An old seal receipt consumes capacity before the burn.
    If it leaves insufficient reserve, obtain a newer authenticated receipt or refuse. Freshness and future inclusion
    remain availability assumptions: even this check does not guarantee redemption against an indefinitely stale view
-   or arbitrary subsequent traffic. `L_T` before the burn is a conservative upper bound: the held evidence plus the burn transfer with its exact `R`, its CD, and an inclusion proof at the decoder bounds (an RSMT path of up to 256 siblings and an aggregator UC up to 24 KiB). At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
+   or arbitrary subsequent traffic. `L_T` before the burn is a conservative upper bound: the held evidence plus the burn transfer with its exact `R`, its CD, and an inclusion proof at the decoder bounds (an RSMT path of up to 256 siblings and an aggregator UC up to `aggregatorUcBytes` = 24,576 bytes). At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
    (`CapacityExceeded`). This release has no recovery for an oversized claim
    (bft-core#1108 is deferred).
 6. **Recipient.** Default to a controlled EOA. Simulation of a contract recipient is not a guarantee.
