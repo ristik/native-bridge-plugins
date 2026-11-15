@@ -1,49 +1,18 @@
-//! Native Unicity bridge extensions over the `unicity-token` SDK (tag v3.0.1), with no SDK change.
+//! Native Unicity bridge v2 (protocol 9) extensions over the `unicity-token` SDK, with no SDK change: module [`nb2`], the wallet
+//! plug-in, over the shared trust input ([`trust`]) and native certificate scan ([`resources`]). The protocol 7 plug-in (lock proofs,
+//! per-part nullifiers, the claim step) was removed with that bridge (bft-core#1106).
 //!
-//! The pure core is `alloc`-compatible. Verification is fully offline: a token plus a pinned
-//! deployment allow-list and trust bundle is all a receipt check ever reads.
+//! The pure core is `alloc`-compatible. Verification is fully offline.
 
 #![cfg_attr(not(feature = "host"), no_std)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-pub mod certgroups;
-pub mod compose;
-#[cfg(feature = "consolidation")]
-pub mod consolidation;
-pub mod deployment;
-pub mod envelope;
 pub mod error;
-pub mod gas;
-pub mod header;
-pub mod history;
 pub mod limits;
-pub mod lineage;
-pub mod lockproof;
-#[cfg(feature = "host")]
-pub mod manifest;
-pub mod mpt;
 pub mod nb2;
-pub mod profile;
-pub mod proof;
-pub mod readiness;
 pub mod resources;
-pub mod rlp;
-pub mod scan;
-pub mod sdktoken;
-pub mod split;
-pub mod splitpart;
-pub mod token;
 pub mod trust;
-pub mod unlock;
-pub mod verifier;
 
 pub use error::{Family, NativeError, Result};
-
-/// Native bridge protocol version (`NATIVE_BRIDGE_PROTO_VERSION=7`).
-pub const NATIVE_BRIDGE_PROTO_VERSION: u8 = 7;
-/// Bridge identity family.
-pub const NATIVE_BRIDGE_FAMILY: &str = "unicity-native";
-/// SDK the byte profile is built for.
-pub const SDK_VERSION: &str = "4.0.0";

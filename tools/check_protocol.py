@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""PR1 structural validation and exact dependency/ABI pin checks."""
+"""Native bridge v2 profile/ABI digest checks and exact dependency pin checks."""
 import base64
 import hashlib
 import json
 from pathlib import Path
 import sys
-import subprocess
 import tarfile
 import tomllib
 
-from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
 # the installed SDKs, the ones protocol/interop.md pins: the ristik lines (integration/enshrined-evm)
@@ -18,77 +16,8 @@ SDK_JS_FORK_VERSION = '4.0.0-utb.c5840ef'
 SDK_RUST_FORK_COMMIT = 'de79e6c1e393a1846b75bca0640b9ec9a55aa143'
 
 
-# Protocol 7 artifacts the old plug-in code and its corpus still consume. They moved to protocol/legacy-v7/ when the
-# native bridge v2 profile replaced them (bft-core#1097); the corpus keeps their original names. Removed by bft-core#1106.
-LEGACY_V7 = {'protocol/interop.md', 'protocol/abi.json', 'protocol/manifest.schema.json', 'protocol/trust-base.md'}
-
-
-def legacy_path(name):
-    return name.replace('protocol/', 'protocol/legacy-v7/', 1) if name in LEGACY_V7 else name
-
-
 def load(path):
     return json.loads((ROOT / path).read_text())
-
-
-def validator():
-    schema = load('protocol/legacy-v7/manifest.schema.json')
-    Draft202012Validator.check_schema(schema)
-    return Draft202012Validator(schema, format_checker=FormatChecker())
-
-
-def cbor_head(major, n):
-    if n < 24:
-        return bytes([major << 5 | n])
-    if n < 1 << 8:
-        return bytes([major << 5 | 24, n])
-    if n < 1 << 16:
-        return bytes([major << 5 | 25]) + n.to_bytes(2, 'big')
-    if n < 1 << 32:
-        return bytes([major << 5 | 26]) + n.to_bytes(4, 'big')
-    return bytes([major << 5 | 27]) + n.to_bytes(8, 'big')
-
-
-def cbor_bytes(b):
-    return cbor_head(2, len(b)) + b
-
-
-def policy_body(partition):
-    """Canonical C(b("UNICITY_BR_AGG_PARTITION"),2,partition): the partition only (AGG_PARTITION_V2)."""
-    return cbor_head(4, 3) + cbor_bytes(b'UNICITY_BR_AGG_PARTITION') + cbor_head(0, 2) + cbor_head(0, partition)
-
-
-def validate_policy(policy):
-    """Policy shape: the partition-only body in its canonical encoding; no depth, shard list or configuration."""
-    assert set(policy) == {'bodyHex', 'sha256', 'partition'}, 'policy carries fields the partition-only body does not have'
-    assert policy_body(policy['partition']).hex() == policy['bodyHex'], 'policy body is not the canonical encoding'
-
-
-def validate_manifest(registry):
-    """Schema plus cross-field identity checks; not full trust installation."""
-    validator().validate(registry)
-    for key, entry in registry.items():
-        assert key == entry['tokenTypeHex'], 'registry key mismatch'
-        chain = entry['evmChainId']
-        assert 1 <= int(chain) <= (1 << 64) - 1, 'chain ID outside uint64'
-        assert entry['chainRef'] == 'eip155:' + chain, 'chainRef mismatch'
-        d = ':'.join([str(entry['networkId']), entry['rootGenesisHash'], entry['executionGenesisHash'], chain, entry['asset']])
-        assert key == hashlib.sha256(('unicity-bridge:unicity-native:' + d).encode()).hexdigest(), 'token type mismatch'
-        assert entry['coinIdHex'] == hashlib.sha256(('unicity-bridge-coin:unicity-native:' + d).encode()).hexdigest(), 'coin ID mismatch'
-        trust = entry['trustBase']
-        assert (trust['networkId'], trust['rootGenesisHash']) == (entry['networkId'], entry['rootGenesisHash']), 'trust anchor mismatch'
-        vaults = set()
-        for dep in [entry['activeDeployment'], *entry['replacedDeployments']]:
-            vault = dep['vaultAddress']
-            assert vault != '0' * 40 and vault not in vaults, 'zero/ambiguous vault'
-            vaults.add(vault)
-            assert dep['tokenVerifierAddress'] != '0' * 40, 'zero verifier'
-            assert dep['aggregatorPolicy']['partition'] != dep['evmBackingPolicy']['partition'], 'partition collision'
-            validate_policy(dep['aggregatorPolicy'])
-            for data, expected in [(bytes.fromhex(dep['cfgHex']), dep['cfgHash']), (bytes.fromhex(dep['aggregatorPolicy']['bodyHex']), dep['aggregatorPolicy']['sha256'])]:
-                assert hashlib.sha256(data).hexdigest() == expected, 'canonical bytes digest mismatch'
-    # Full Cfg/Policy parsing and installing the release bundle under
-    # genesisEntryId (the SDK verifies every link) are installation gates.
 
 
 def check_v2_profile():
@@ -110,28 +39,6 @@ def check_v2_profile():
 
 def main():
     check_v2_profile()
-    validator()
-    abi = load('protocol/legacy-v7/abi.json')
-    assert abi['protocolVersion'] == 7
-    assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
-    assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
-    assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
-    assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
-    assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/legacy-v7/profile-v7.json')
-    assert profile['nativeBridgeProtocolVersion'] == 7 and profile['sdkVersion'] == '4.0.0'
-    assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
-    assert profile['trustModel']['scope'] == 'unicity-trust-base-history'
-    assert profile['trustModel']['trustDocumentFormat'] == 'utb-release-bundle-v1 (tag 39015)'
-    assert profile['deferred'] == []
-    for name, expected in profile['normativeArtifactSha256'].items():
-        assert hashlib.sha256((ROOT / legacy_path(name)).read_bytes()).hexdigest() == expected, 'normative artifact digest mismatch'
-    # every corpus trust input and the shared dev fixture install with the pinned SDK
-    subprocess.run(['node', str(ROOT / 'tools/utb_trust_fixture.mjs')], check=True)
-    interop = (ROOT / 'protocol/legacy-v7/interop.md').read_text()
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=7' in interop
-    # protocol/interop.md names the SDK pins of its last sealing; it is digest-bound to the oracle corpus (profile-v7.json, config/semantic-profile.json),
-    # so the installed SDKs are checked against the vendored provenance and Cargo.toml below, not against that sentence
     package = load('packages/native-bridge-plugin/package.json')
     assert package['private'] and package['license'] == 'MIT OR Apache-2.0'
     deps = package['dependencies']
@@ -181,9 +88,7 @@ def main():
     # the pin is the commit: the crate's own version string on the staging line is 3.0.1 (the SDK reconcile did not bump it), so no version is asserted
     assert len(sdk_rust) == 1
     assert sdk_rust[0]['source'].endswith('#' + SDK_RUST_FORK_COMMIT)
-    for path in sorted((ROOT / 'deployments').glob('*.json')):
-        validate_manifest(json.loads(path.read_text()))
-    print('protocol/schema/dependency/ABI checks passed (no full installation authorization)')
+    print('protocol/dependency/ABI checks passed (no full installation authorization)')
 
 
 if __name__ == '__main__':

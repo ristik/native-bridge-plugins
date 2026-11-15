@@ -1,7 +1,7 @@
 /**
  * Native bridge v2 (protocol 9) wallet plug-in: `@unicitylabs/native-bridge-plugin/nb2`. The high-level API is {@link NativeBridgeV2};
  * the pure verifier, the segment and gap-proof functions, the journal format and the RPC adapters are exported for wallets that compose
- * their own flow. The protocol 7 plug-in at the package root stays until NB2-10 (bft-core#1106) removes it.
+ * their own flow. The package root holds only the shared bytes, errors and trust input (the protocol 7 plug-in was removed, bft-core#1106).
  */
 export * from './errors.js';
 export * from './config.js';

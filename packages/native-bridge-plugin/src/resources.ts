@@ -1,16 +1,12 @@
-/** Bounded canonical scan before SDK decoding, including CBOR hidden in payload byte strings.
+/** Bounded canonical scan of a native unicity certificate before SDK decoding.
  * Native UC sublimits: summary 256 bytes; shard 256 bits/33 bytes/256 siblings;
  * Unicity path 32 steps; seal 64 signatures; signer ID 128 UTF-8 bytes.
  */
 import { NativeError, fail } from './errors.js';
-import { justificationTag } from './split.js';
-import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_JUSTIFICATION_BYTES, MAX_HEADER_BYTES, MAX_MPT_NODES, MAX_MPT_NODE_BYTES, MAX_MPT_TOTAL_BYTES, MAX_PDR_BYTES, MAX_TOKEN_BYTES, MAX_UC_BYTES, TAG_SPLIT_JUSTIFICATION } from './limits.js';
+import { MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_UC_BYTES } from './limits.js';
 
 type Node = { major: number; arg: bigint; start: number; end: number; depth: number; data: Uint8Array; kids: Node[] };
-/**
- * Items of the object being scanned, within its own limit. Paths are bounded per certificate and per proof, never in sum (owner
- * section 36); a whole token has no item aggregate (only `MAX_TOKEN_BYTES`), each nested payload its own `MAX_CBOR_ITEMS`.
- */
+/** Items of the object being scanned, within its own limit. */
 class Budget {
   items = 0;
   constructor(readonly limit: number = MAX_CBOR_ITEMS) {}
@@ -92,63 +88,6 @@ function uc(n: Node, budget: Budget, maxBytes = MAX_UC_BYTES): void {
     const sig = sigs[i + 1];
     if (sig.major !== 2) unsupported();
   }
-}
-function visit(n: Node, budget: Budget): void {
-  if (n.major === 6) {
-    if (n.arg === 39001n) { uc(n, budget); return; }
-    const body = n.kids[0];
-    if (body.major === 4) {
-      const k = body.kids;
-      // `token`: a split reason `tag(39044,[token,[proof]])` carries its whole burned parent, which is checked as a token in its own
-      // right: the scan starts two levels up, so the parent token sits at a top-level token's depth (every lineage level gets the bounds
-      // of an ordinary token, and the lineage depth is not capped by nesting), its items bounded by its bytes; any other payload
-      // continues its container's depth under its own item budget
-      const nested = (x: Node | undefined, max: number, certificate = false, token = false): void => {
-        if (!x || x.major !== 2) return;
-        if (x.data.length > max) fail('ErrProofTooLarge');
-        let root: Node;
-        const own = token ? new Budget(Number.MAX_SAFE_INTEGER) : new Budget();
-        try { root = scan(x.data, own, token ? -2 : x.depth + 1); } catch (e) {
-          if (e instanceof NativeError && e.family !== 'budget') { if (certificate) unsupported(); return; }
-          throw e;
-        }
-        if (certificate) uc(root, own); else visit(root, own);
-      };
-      if (n.arg === 39032n) nested(k[1], MAX_TOKEN_BYTES); // The predicate code is CBOR in a bstr.
-      if (n.arg === 39041n) {
-        // a split reason (protocol 6) embeds its whole burned parent token: it is bounded as a token, a lock reason as a justification
-        const split = k[5]?.major === 2 && justificationTag(k[5].data) === TAG_SPLIT_JUSTIFICATION;
-        nested(k[5], split ? MAX_TOKEN_BYTES : MAX_JUSTIFICATION_BYTES, false, split);
-        nested(k[6], MAX_TOKEN_BYTES);
-      }
-      if (n.arg === 39045n) nested(k[3], MAX_TOKEN_BYTES);
-      if (n.arg === 39049n && k[5]?.major === 4) {
-        const lp = k[5].kids;
-        if (lp[5]?.major === 2 && lp[5].data.length > MAX_HEADER_BYTES) fail('ErrProofTooLarge');
-        let total = 0;
-        for (const list of [lp[6], lp[7]]) if (list?.major === 4) {
-          if (list.kids.length > MAX_MPT_NODES) fail('ErrProofTooLarge');
-          for (const node of list.kids) if (node.major === 2) {
-            if (node.data.length > MAX_MPT_NODE_BYTES || node.data.length > MAX_MPT_TOTAL_BYTES - total) fail('ErrProofTooLarge');
-            total += node.data.length;
-          }
-        }
-        nested(lp[3], MAX_PDR_BYTES); nested(lp[4], MAX_UC_BYTES, true);
-      }
-      if (n.arg === 39033n && k[3]?.major === 2) {
-        const len = k[3].data.length;
-        if (len < 32 || len % 32 !== 0) unsupported();
-        const paths = (len - 32) / 32; if (paths > 256) fail('ErrProofTooLarge');
-        if (k[4]) uc(k[4], budget); else unsupported();
-        return; // UC paths have already been counted.
-      }
-    }
-  }
-  for (const child of n.kids) visit(child, budget);
-}
-export function preflightToken(bytes: Uint8Array): void {
-  if (bytes.length > MAX_TOKEN_BYTES) fail('ErrInputTooLarge');
-  const budget = new Budget(Number.MAX_SAFE_INTEGER); visit(scan(bytes, budget), budget);
 }
 /**
  * The native certificate sublimit scan alone (the step bft-core `scanCertificate` takes from `b1ref.ScanUC`), with the B1 byte cap

@@ -7,7 +7,7 @@ import { TrustBaseBundle } from '@unicitylabs/state-transition-sdk/lib/api/bft/t
 
 import { certificateFailure, TrustInput } from '../src/trust.js';
 import { rejects } from './util.js';
-import { buildToken, makeRoot, makeUc, makeWorld, nextEpoch, spec, successorEntry, type Root } from './world.js';
+import { makeRoot, makeUc, nextEpoch, successorEntry, type Root } from './rootfixture.js';
 
 const ucOf = (r: Root, signers: number, extra: Parameters<typeof makeUc>[1]['extra'] = undefined, rootEpoch = 2n, round = 200n) =>
   makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch, round, timestamp: 1_700_000_000n, stateHash: new Uint8Array(32), blockHash: new Uint8Array(32).fill(2), signers, extra });
@@ -34,7 +34,7 @@ test('embedded UC rejects false root and wrong network like the SDK', async () =
 
 test('an unknown or wrong-key signer counts zero: it neither fails an honest quorum nor makes up for a missing signer', async () => {
   const r = await makeRoot(2, 4, 10);
-  const { signer } = await import('./world.js');
+  const { signer } = await import('./rootfixture.js');
   await r.trust.verifyEmbeddedUc(await ucOf(r, 3, [['stranger', signer(250)]]));
   await rejects(r.trust.verifyEmbeddedUc(await ucOf(r, 2, [['stranger', signer(250)]])), 'ErrQuorumNotMet');
   // an EMPTY signer ID is refused by the native seal validation, even with a real signature behind it
@@ -64,15 +64,6 @@ test("installation: the bundle's genesis must be the pin; a broken or incomplete
   const forged = await TrustBaseBundle.encode([r.entries[0], await successorEntry(r, 1000n, 4, 31, undefined, r3.signers)].map((e) => RootTrustBaseV2.decode(e)));
   await rejects(TrustInput.fromBundle(forged, r.pin), 'ErrTrustBase');
   assert.equal((await TrustInput.fromBundle(r3.bundle, r.pin)).history.tip?.epoch, 3n);
-});
-
-test('a foreign epoch inside a lock proof is retryable end to end', async () => {
-  const w = await makeWorld();
-  const { lockParts } = await import('./world.js');
-  const s = spec(1);
-  const p = await lockParts(w, s);
-  p.uc = await makeUc(w.evm, { ...p.ucSpec, rootEpoch: 9n });
-  await rejects(w.bridge.verifyNativeToken((await buildToken(w, s, [], 1_700_000_040n, 1_700_000_900n, {}, p)).token, 'receipt'), 'ErrNoEntryForEpoch');
 });
 
 test('the shared dev trust-base fixture (the same bytes as both SDKs) installs under its pin, epochs 1 to 4', async () => {
