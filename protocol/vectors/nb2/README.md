@@ -9,8 +9,9 @@ go run ./nb2ref/cmd/nb2vectors -out <this directory>     # in a ristik/bft-core 
 ```
 
 The output is a pure function of the code, and bft-core `nb2ref/testdata/nb2-vectors.json.sha256` pins the same digest.
-While the file is generated, the reference replays every vector. A negative vector isolates one rule: every other
-check of its input holds.
+While the file is generated, the reference replays every vector. Negative vectors are isolated: each faults one rule,
+and every other check of its input holds. The exceptions are the deliberate multi-fault ordering vectors
+`LogEmitter-before-topics` and `SealRoot-before-epoch`, which combine two faults to pin the frozen check order.
 
 | Key | Contents |
 |---|---|
@@ -24,11 +25,12 @@ check of its input holds.
 | `wallet` | seal companion answers (`EvidencePruned`), the capacity preflight and redemption refusals, and the `stateReadOnly` index check |
 | `primitives` | minter scalars and the section 3 and 13 constants |
 
-A rejection's `expect` carries the rule name, the custom error's arguments, the exact on-chain `revert` bytes (selector and
-ABI arguments) and, where the on-chain primitive reports another name (`SealEpoch` and `NoEntryForEpoch` are
-`QuorumNotMet` for aggregator UCs and `DepositUC` for the EVM UC), `onChainError`. Every vault step records the state
-after it (accounting word, tag words, heads, live buffers) and its events; accepted seal receipts and segment logs record
-their authenticated outputs.
+A rejection's `expect` carries the rule name and the custom error's arguments. For outcomes with an on-chain
+counterpart it also carries the exact on-chain `revert` bytes (selector and ABI arguments) and, where the on-chain
+primitive reports another name (`SealEpoch` and `NoEntryForEpoch` are `QuorumNotMet` for aggregator UCs and `DepositUC`
+for the EVM UC), `onChainError`. Wallet-only refusals (section 14.6 and the outcomes without a rule) have no on-chain
+counterpart and omit `revert`. Every vault step records the state after it (accounting word, tag words, heads, live
+buffers) and its events; accepted seal receipts and segment logs record their authenticated outputs.
 
 Judge each deployment under its own build: production admits only (K, B) = (64, 16); a test build admits
 K in {4, 8}, B in {2, 4} instead. Error names are the section 14 rules; `StateReadNotAdmitted`, `CompanionUnknown` and
