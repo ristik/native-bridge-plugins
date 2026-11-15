@@ -15,7 +15,7 @@ import { ConfigError, buildParams, construct, decodeConfig, domainOf, type Build
 import { revertData, selectorOf, signatureOf, SELECTOR } from '../../src/nb2/abi.js';
 import { TAG_ARCHIVE_GENESIS, TAG_ARCHIVE_STEP, TAG_DEPOSIT_SECRET, TOPIC } from '../../src/nb2/deposit.js';
 import { ASSET_UCT } from '../../src/nb2/config.js';
-import { minterScalarValid } from '../../src/nb2/crypto.js';
+import { minterScalarValid, verifyUnlockDigest } from '../../src/nb2/crypto.js';
 import { burnIndex, capacityExceeded, capacityPreflight, checkCompanion, checkStateRead, maxProofs, verifySealReceipt } from '../../src/nb2/rules.js';
 import { checkSegmentLog, foldHistory, gapProofLen, gapRoot } from '../../src/nb2/segment.js';
 import { TrustInput } from '../../src/nb2/trust.js';
@@ -56,6 +56,8 @@ function expectOf(e: unknown): Expect {
     for (let x: Nb2Error | undefined = e; x; x = x.inner) if (x.rule === 'DepositUC') on = 'DepositUC';
     out.onChainError = on;
   }
+  // a seal receipt wrapping the retryable NoEntryForEpoch: the same EVM UC is DepositUC on chain
+  if (e.rule === 'SealReceipt') for (let x: Nb2Error | undefined = e.inner; x; x = x.inner) if (x.rule === 'NoEntryForEpoch') out.onChainError = 'DepositUC';
   if (!['SealReceipt', 'SegmentLog', 'CapacityPreflight', 'CapacityExceeded', 'ImplausibleIndex', 'EvidencePruned'].includes(on)) out.revert = h0x(revertData(on));
   return out;
 }
@@ -104,6 +106,16 @@ test('primitives', () => {
   for (const k of ['deposit', 'redeem', 'domain', 'config', 'state', 'verifyReturn'] as const) assert.equal(h0x(SELECTOR[k]), c[`selector.${k}`], k);
   for (const k of ['Deposited', 'Paid', 'SegmentSealed'] as const) assert.equal(h0x(TOPIC[k]), c[`topic0.${k}`], k);
   for (const v of F.primitives.minterScalars) assert.equal(minterScalarValid(hx(v.scalar)), v.valid, v.scalar);
+  assert.ok(F.primitives.unlockRecovery.length >= 9);
+  for (const v of F.primitives.unlockRecovery) {
+    let e: unknown = null;
+    try {
+      verifyUnlockDigest(hx(v.key), hx(v.digest), hx(v.unlock));
+    } catch (x) {
+      e = x;
+    }
+    assert.equal(norm(expectOf(e)), norm(v.expect), v.id);
+  }
 });
 
 test('deployments decode under their build', async () => {

@@ -26,6 +26,11 @@ export const unlockMessage = (sourceHash: Uint8Array, txHash: Uint8Array): Uint8
  * the compact verification (defense in depth, reported as `UnlockKey`). Nothing is normalised.
  */
 export function verifyUnlock(key33: Uint8Array, sourceHash: Uint8Array, txHash: Uint8Array, unlock: Uint8Array): void {
+  verifyUnlockDigest(key33, unlockMessage(sourceHash, txHash), unlock);
+}
+
+/** The unlock rule over a given 32-byte message (the vectors' `primitives.unlockRecovery` form). */
+export function verifyUnlockDigest(key33: Uint8Array, digest: Uint8Array, unlock: Uint8Array): void {
   if (unlock.length !== 65) fail('UnlockLength');
   const r = beInt(unlock.subarray(0, 32));
   const s = beInt(unlock.subarray(32, 64));
@@ -34,7 +39,6 @@ export function verifyUnlock(key33: Uint8Array, sourceHash: Uint8Array, txHash: 
   // NB2-eligible unlocks use recovery ID 0 or 1 (astra delta review 2026-11-15): 2 and 3 are refused everywhere, so a lineage holding
   // one is not returnable even though it stays valid natively
   if (id > 1) fail('UnlockRecovery');
-  const digest = unlockMessage(sourceHash, txHash);
   let recovered: Uint8Array | null;
   try {
     recovered = secp256k1.Signature.fromBytes(concat(Uint8Array.of(id), unlock.subarray(0, 64)), 'recovered').recoverPublicKey(digest).toBytes(true);

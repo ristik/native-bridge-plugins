@@ -133,6 +133,8 @@ export class VaultModel {
     for (const [buf, pop] of scan) {
       for (let i = 0; i < pop; i++) if (this.tagAt(buf, i) === b && eq(this.S[buf][i], eta)) throw argsErr('AlreadyPaid', eta);
     }
+    // a revert longer than MAX_VERIFIER_REVERT is VerifierBadReturn: the vault never copies unbounded revert data
+    if ('revert' in ver && ver.revert.length > MAX_VERIFIER_REVERT) fail('VerifierBadReturn');
     if ('revert' in ver) throw argsErr('VerifierRefused', ver.revert);
     const vd = decodeVerdictAbi(ver.ret);
     if (vd === null) fail('VerifierBadReturn');
@@ -237,6 +239,9 @@ export class VaultModel {
     });
   }
 }
+
+/** The longest verifier revert the vault relays as VerifierRefused(revertData). */
+export const MAX_VERIFIER_REVERT = 1024;
 
 /** words(K, B) = ceil(K / floor(256 / log2 B)). */
 export function tagWords(K: bigint, B: bigint): number {

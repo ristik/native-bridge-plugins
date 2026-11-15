@@ -125,12 +125,11 @@ export function decodeConfig(b: Uint8Array, p: Params): Config {
   const semanticProfileHash = at(13, () => bytesN(k[13], 32));
   const verifier = at(14, () => bytesN(k[14], 20));
   const verifierCodeHash = at(15, () => bytesN(k[15], 32));
+  // field 16 is complete (K in the build's admitted set) before field 17 is read (section 4.1 stage order)
   const K = at(16, () => uintIn(k[16], 2n, MAX_K));
+  if (!(p.K.includes(K) && pow2(K))) throw new ConfigError(16, new Nb2Error('IntRange'));
   const B = at(17, () => uintIn(k[17], 2n, MAX_K));
-  if (!admits(p, K, B)) {
-    if (!(p.K.includes(K) && pow2(K))) throw new ConfigError(16, new Nb2Error('IntRange'));
-    throw new ConfigError(17, new Nb2Error('IntRange'));
-  }
+  if (!admits(p, K, B)) throw new ConfigError(17, new Nb2Error('IntRange'));
   const Qmax = at(18, () => amount(k[18]));
   if (Qmax > QMAX_LIMIT) throw new ConfigError(18, new Nb2Error('IntRange'));
   return {

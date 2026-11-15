@@ -206,8 +206,7 @@ export class EvmReader {
     const childHash = HE(encodeHeader(childHeader));
     const l = await this.rpc.call<{ status: string; horizon?: unknown; companion?: { witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(childHash)]);
     const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
-    // the node answers "found" (bft-core scripts/nb2-evidence); section 12.7 and the vectors call it "ok"
-    checkCompanion(l.status === 'found' ? 'ok' : l.status, witnesses.length);
+    checkCompanion(l.status, witnesses.length);
     return bytesOf(witnesses[0], 'companion witness 0');
   }
 

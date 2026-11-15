@@ -94,9 +94,9 @@ export function checkStateRead(stateReadOnly: boolean, read: bigint, verified: b
   if (read < verified || read - verified > maxJump) fail('ImplausibleIndex');
 }
 
-/** A seal companion answer (section 12.7): "ok" with exactly two witnesses is usable; "unavailable" is EvidencePruned. */
+/** A seal companion answer (section 12.7): "found" with exactly two witnesses is usable; "unavailable" is EvidencePruned; anything else ("ok" included) is a provider fault. */
 export function checkCompanion(status: string, witnesses: number): void {
-  if (status === 'ok' && witnesses === 2) return;
+  if (status === 'found' && witnesses === 2) return;
   if (status === 'unavailable') fail('EvidencePruned');
   if (status === 'unknown') refuse('CompanionUnknown');
   refuse('CompanionProvider');
