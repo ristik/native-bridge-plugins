@@ -1,0 +1,125 @@
+{
+  "artifactVersion": 7,
+  "nativeBridgeProtocolVersion": 9,
+  "name": "native-bridge-v2",
+  "status": "development-frozen-unactivated",
+  "specification": "ristik/bft-core docs/design/native-bridge-v2.md (NB2-01, bft-core#1097)",
+  "identityFamily": "unicity-native-nb2",
+  "nativeCodec": {
+    "module": "github.com/unicitynetwork/bft-go-base",
+    "version": "v1.1.1-0.20261109140746-dbf94198f25e",
+    "scope": "UC and trust-base objects, inline or inside byte strings, including signature maps and signer text keys; duplicate map keys rejected"
+  },
+  "sdkPins": {
+    "js": "c5840ef5f59201c52ea6cf7034ee02cb48d54007",
+    "rust": "de79e6c1e393a1846b75bca0640b9ec9a55aa143"
+  },
+  "hashes": {
+    "unicity": "sha256",
+    "evm": "keccak256"
+  },
+  "tags": {
+    "predicate": 39032,
+    "mint": 39041,
+    "transfer": 39045,
+    "certificationData": 39031,
+    "token": 39040,
+    "inclusionProof": 39033,
+    "value": 39050,
+    "splitJustification": 39044,
+    "splitManifest": 39046,
+    "receiptBacking": 39051,
+    "segmentReturn": 39052
+  },
+  "rejectedTags": [39047, 39048, 39049],
+  "versions": {
+    "config": 1,
+    "receiptBacking": 1,
+    "depositProof": 1,
+    "depositProofArity": 6,
+    "segmentReturn": 1,
+    "evidence": 1
+  },
+  "cborDomains": {
+    "config": "UNICITY_NB2_CFG",
+    "depositIntent": "UNICITY_NB2_DEPOSIT_INTENT",
+    "depositSalt": "UNICITY_NB2_DEPOSIT_SALT",
+    "burn": "UNICITY_NB2_BURN",
+    "redemption": "UNICITY_NB2_REDEMPTION",
+    "splitOutput": "UNICITY_SPLIT_OUTPUT",
+    "tokenType": "unicity-bridge:unicity-native-nb2:",
+    "coin": "unicity-bridge-coin:unicity-native-nb2:",
+    "asset": "unicity-nb2-asset:native-uct"
+  },
+  "evmDomainTags": {
+    "UNICITY_NB2_DEPOSIT_SECRET": "dfa87a7a4c6db3c7c307e4f2c3cc2d4a07e33d349f542b47f8e0bba49f62e645",
+    "UNICITY_NB2_ARCHIVE_GENESIS": "45076af3d8858f1d7a9bb6e037bb5ca4270d0b4fa90f9397eb7adb905590a339",
+    "UNICITY_NB2_ARCHIVE_STEP": "c68efdc45f5c9a20bf6abfda6493e8e295d8e31495fd1e744cd4c35f74785dfa"
+  },
+  "merkleTags": {
+    "leaf": 0,
+    "node": 1
+  },
+  "widths": {
+    "accounting": {
+      "layout": "n << 200 | c << 152 | m << 144 | Q",
+      "n": 56,
+      "c": 48,
+      "m": 8,
+      "Q": 144
+    },
+    "segmentIndex": 48,
+    "depositNumber": 56,
+    "qmaxMaximum": "22300745198530623141535718272648361505980415"
+  },
+  "headerSchema": "go-ethereum v1.14.11 Cancun types.Header: 20 fields ending at parentBeaconBlockRoot, no requestsHash; difficulty 0, empty uncle hash, empty withdrawals root, blobGasUsed = excessBlobGas = 0, nonzero u64 base fee, extraData <= 32 bytes, number <= 2^63-1, exact canonical re-encoding",
+  "limits": {
+    "justificationBytes": 65536,
+    "evmUcBytes": 16384,
+    "aggregatorUcBytes": 24576,
+    "headerBytes": 2048,
+    "receiptNodes": 65,
+    "receiptBranchNodeBytes": 1024,
+    "receiptLeafNodeBytes": 49152,
+    "admittedReceiptTypes": [0, 1, 2, 3],
+    "cborDepth": 16,
+    "cborDepthRule": "per decoding unit (top-level input or byte string decoded as CBOR); top item depth 0; each array, map or tag opening adds 1; children above 16 are InputTooLarge; the evidence scan includes inline UCs",
+    "justificationBytesScope": "root reason J (tag 39051) only; never a split justification (tag 39044)",
+    "rlpDepth": 16,
+    "firstOwnerBytes": 42
+  },
+  "parameters": {
+    "note": "K, B, the recent-buffer layout, the segment commitment and gasReserve are fixed by bft-core#1098 (measured, ristik/unicity-pos-contracts#80 bench/nb2/RESULTS.md); the rest are deployment values.",
+    "K": { "value": 64, "immutable": "constructor", "fixedBy": "bft-core#1098" },
+    "B": { "value": 16, "immutable": "constructor", "fixedBy": "bft-core#1098" },
+    "admittedKB": { "production": [[64, 16]], "test": { "K": [4, 8], "B": [2, 4] }, "rule": "a build admits either the production or the test set, never both" },
+    "recentBufferLayout": { "value": "position-tags", "fixedBy": "bft-core#1098" },
+    "segmentCommitment": { "value": "circular-gap", "fixedBy": "bft-core#1098" },
+    "gasReserve": { "value": 500000, "definition": "most expensive redeem call minus the cheapest, including segments 0 and 1, rounded up", "measured": { "worstSeal": 229830, "worstScan": 282548, "worstCall": 487339, "envelopeSteady": 433765, "envelopeFirstSegments": 453641 }, "fixedBy": "bft-core#1098" },
+    "maxEncodedTxBytes": { "candidates": [131072, 524288], "default": 524288, "fixedBy": "owner decision, measured by bft-core#1105" },
+    "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" },
+    "maxJump": { "default": 64, "scope": "stateReadOnly deployments only (ImplausibleIndex)" }
+  },
+  "unlockRestriction": {
+    "recoveryIds": [0, 1],
+    "refused": "recovery ID 2 or 3 is UnlockRecovery in every implementation (wallets, plug-in admission, Go reference, Solidity)",
+    "scope": "NB2 bridge eligibility only; narrows the pinned SDK relation (IDs 0..3); such a token stays a valid native token but cannot be returned"
+  },
+  "trustModel": {
+    "scope": "unicity-trust-base-history",
+    "document": "protocol/trust-base.md",
+    "sealRule": "upstream: each signature judged alone; exactly 65 bytes r||s||v recovering to the member counts its weight, anything else counts zero; floor(2W/3)+1 of the seal epoch's entry",
+    "missingEpoch": "NoEntryForEpoch, retryable once the history holds the epoch"
+  },
+  "normativeArtifacts": [
+    "protocol/interop.md",
+    "protocol/abi.json",
+    "protocol/trust-base.md"
+  ],
+  "normativeArtifactSha256": {
+    "protocol/interop.md": "d8b969b69a0ddf99bd398ab13dc3bc968e15b0da7e8b3ffdb48856e5df199216",
+    "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
+    "protocol/trust-base.md": "4824915c6c47223dda3db9c943c602eec9664b883d60fde842aba8bb37e8f6ef"
+  },
+  "legacy": "protocol/legacy-v7/ and protocol/vectors/ are the protocol 7 artifacts and corpus that the old plug-in code still tests against; not part of this profile; removed by bft-core#1106 (NB2-10)."
+}

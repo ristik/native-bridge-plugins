@@ -1,198 +1,124 @@
 {
-  "protocolVersion": 7,
-  "kernelAddress": "0x0000000000000000000000000000000000000104",
-  "reservedAddress": "0x0000000000000000000000000000000000000103",
-  "input": [
-    "uint8 operation",
-    "bytes cfg",
-    "bytes payload"
-  ],
-  "operations": {
-    "prepareLock": 0,
-    "mint": 1,
-    "return": 2
-  },
-  "output": [
-    "bytes32 marker",
-    "bool valid",
-    "Result result"
-  ],
-  "markerAscii": "UNICITY_TOKEN_SEMANTICS",
-  "result": [
-    "bytes32 cfg",
-    "uint256 nonce",
-    "uint256 amount",
-    "bytes32 tokenId",
-    "bytes32 salt",
-    "bytes32 firstPredicateHash",
-    "bytes32 lockDigest",
-    "address releaseTo",
-    "bytes32 nullifier",
-    "Leaf[] leaves"
-  ],
-  "leaf": [
-    "bytes32 sid",
-    "bytes32 txHash",
-    "uint64 referenceTime",
-    "bytes32 leafValue"
-  ],
-  "outputOffsets": {
-    "marker": 0,
-    "valid": 32,
-    "resultOffset": 64,
-    "cfg": 96,
-    "nonce": 128,
-    "amount": 160,
-    "tokenId": 192,
-    "salt": 224,
-    "firstPredicateHash": 256,
-    "lockDigest": 288,
-    "releaseTo": 320,
-    "nullifier": 352,
-    "leavesOffset": 384,
-    "leafCount": 416,
-    "firstLeaf": 448
-  },
-  "resultOffsetValue": 96,
-  "leavesOffsetValue": 320,
-  "outputFixedBytes": 448,
-  "leafStrideBytes": 128,
-  "envelope": [
-    "bytes policyBody",
-    "bytes history",
-    "Anchor[] anchors",
-    "LeafProof[] leafProofs"
-  ],
-  "anchor": [
-    "uint32 partition",
-    "bytes shard",
-    "bytes32 shardConfHash",
-    "bytes32 expectedStateRoot",
-    "bytes32 expectedIRHash",
-    "bytes uc",
-    "bytes inputRecord"
-  ],
-  "leafProof": [
-    "uint16 anchorIndex",
-    "bytes32 bitmap",
-    "bytes32[] siblings"
-  ],
-  "b1ResultBytes": 64,
-  "b1Result": [
-    "uint256(1)",
-    "bool(true)"
-  ],
-  "certBatch": {
-    "address": "0x0000000000000000000000000000000000000100",
-    "operation": "CERT_BATCH_V2",
-    "request": [
-      "uint8 version=2",
-      "uint8 flags=0",
-      "uint16 K",
-      "Claim[K]"
+  "nativeBridgeProtocolVersion": 9,
+  "specification": "ristik/bft-core docs/design/native-bridge-v2.md sections 11 and 13",
+  "vault": {
+    "constructor": { "inputs": [{ "name": "gamma", "type": "bytes" }] },
+    "functions": [
+      {
+        "name": "deposit", "selector": "3489c151", "stateMutability": "payable",
+        "inputs": [{ "name": "firstOwner", "type": "bytes" }, { "name": "rho", "type": "bytes32" }],
+        "outputs": []
+      },
+      {
+        "name": "redeem", "selector": "91de2955", "stateMutability": "nonpayable",
+        "inputs": [
+          { "name": "evidence", "type": "bytes" },
+          { "name": "claimedEta", "type": "bytes32" },
+          { "name": "claimedStart", "type": "uint64" },
+          { "name": "history", "type": "bytes" }
+        ],
+        "outputs": []
+      },
+      { "name": "domain", "selector": "c2fb26a6", "stateMutability": "view", "inputs": [], "outputs": [{ "name": "", "type": "bytes32" }] },
+      { "name": "config", "selector": "79502c55", "stateMutability": "view", "inputs": [], "outputs": [{ "name": "", "type": "bytes" }] },
+      {
+        "name": "state", "selector": "c19d93fb", "stateMutability": "view", "inputs": [],
+        "outputs": [
+          { "name": "deposits", "type": "uint64" },
+          { "name": "segment", "type": "uint64" },
+          { "name": "population", "type": "uint16" },
+          { "name": "outstanding", "type": "uint256" },
+          { "name": "head", "type": "bytes32" },
+          { "name": "previousHead", "type": "bytes32" }
+        ]
+      }
     ],
-    "claim": [
-      "uint32 partition",
-      "uint16 shardLen",
-      "bytes shard",
-      "bytes32 shardConfHash",
-      "bytes32 expectedStateRoot",
-      "bytes32 expectedIRHash",
-      "uint32 ucLen",
-      "bytes uc"
+    "events": [
+      {
+        "name": "Deposited", "topic0": "853a9d825910065273b44cf4f0ad33d2525f875d3da0a53f967ae40b7508d2b8",
+        "inputs": [
+          { "name": "nonce", "type": "uint64", "indexed": true },
+          { "name": "domain", "type": "bytes32", "indexed": false },
+          { "name": "amount", "type": "uint256", "indexed": false },
+          { "name": "rho", "type": "bytes32", "indexed": false },
+          { "name": "firstOwner", "type": "bytes", "indexed": false }
+        ],
+        "dataBytes": 224
+      },
+      {
+        "name": "Paid", "topic0": "606160394df2742a67735645b7e783304d61d2dbc5b550e8c6acfaf27b6291d7",
+        "inputs": [
+          { "name": "eta", "type": "bytes32", "indexed": true },
+          { "name": "recipient", "type": "address", "indexed": true },
+          { "name": "amount", "type": "uint256", "indexed": false }
+        ],
+        "dataBytes": 32
+      },
+      {
+        "name": "SegmentSealed", "topic0": "06e724201a1c72937156cbdb3b9522d26b3818ee33ace10cd7cda65bb9cae916",
+        "inputs": [
+          { "name": "segment", "type": "uint64", "indexed": true },
+          { "name": "headBefore", "type": "bytes32", "indexed": false },
+          { "name": "headAfter", "type": "bytes32", "indexed": false },
+          { "name": "ids", "type": "bytes", "indexed": false }
+        ],
+        "dataBytes": "128 + 32K"
+      }
     ],
-    "claimOrder": "the anchor table, in table order; K = the table length",
-    "resultBytes": 64,
-    "result": [
-      "uint256(2)",
-      "bool(true)"
+    "errors": [
+      { "name": "ZeroValue", "selector": "7c946ed7", "inputs": [] },
+      { "name": "BadFirstOwner", "selector": "ceb54b37", "inputs": [] },
+      { "name": "LiabilityCap", "selector": "5586a2e8", "inputs": ["uint256 outstanding", "uint256 amount", "uint256 cap"] },
+      { "name": "DepositCounterExhausted", "selector": "b6ef324c", "inputs": [] },
+      { "name": "Reentrancy", "selector": "ab143c06", "inputs": [] },
+      { "name": "BadHistoryLength", "selector": "37c8cb02", "inputs": ["uint256 length"] },
+      { "name": "FutureIndex", "selector": "39a15193", "inputs": ["uint64 start", "uint64 current"] },
+      { "name": "StaleEndpoint", "selector": "683c7c78", "inputs": ["uint64 endpoint", "uint64 current"] },
+      { "name": "BadGapProof", "selector": "e7169745", "inputs": ["uint256 position"] },
+      { "name": "ChainMismatch", "selector": "a6226dc5", "inputs": [] },
+      { "name": "AlreadyPaid", "selector": "f4b76a0e", "inputs": ["bytes32 eta"] },
+      { "name": "VerifierRefused", "selector": "3aa84d02", "inputs": ["bytes reason"] },
+      { "name": "VerifierBadReturn", "selector": "f659e897", "inputs": [] },
+      { "name": "DomainMismatch", "selector": "ce548c1e", "inputs": [] },
+      { "name": "AssetMismatch", "selector": "83c1010a", "inputs": [] },
+      { "name": "ClaimMismatch", "selector": "827768e8", "inputs": [] },
+      { "name": "BadRecipient", "selector": "67a2cc26", "inputs": [] },
+      { "name": "ZeroAmount", "selector": "1f2a2005", "inputs": [] },
+      { "name": "LiabilityUnderflow", "selector": "f9c1fdc7", "inputs": ["uint256 outstanding", "uint256 amount"] },
+      { "name": "SegmentCounterExhausted", "selector": "011469c0", "inputs": [] },
+      { "name": "PayoutFailed", "selector": "3b1ab104", "inputs": [] },
+      { "name": "BadConfig", "selector": "0dad7c22", "inputs": ["uint256 field"] }
+    ],
+    "redeemCheckOrder": [
+      "Reentrancy", "BadHistoryLength", "FutureIndex", "StaleEndpoint", "BadGapProof", "ChainMismatch", "AlreadyPaid",
+      "VerifierRefused", "VerifierBadReturn", "DomainMismatch", "AssetMismatch", "ClaimMismatch", "BadRecipient",
+      "ZeroAmount", "LiabilityUnderflow", "SegmentCounterExhausted", "PayoutFailed"
     ]
   },
-  "policy": {
-    "domain": "UNICITY_BR_AGG_PARTITION",
-    "version": 2,
-    "maxBytes": 512,
-    "fields": [
-      "bytes domain",
-      "uint version",
-      "uint32 aggregatorPartition"
+  "verifier": {
+    "interface": "INativeBridgeVerifierV2",
+    "functions": [
+      {
+        "name": "verifyReturn", "selector": "df447dca", "stateMutability": "view",
+        "inputs": [{ "name": "gamma", "type": "bytes" }, { "name": "evidence", "type": "bytes" }],
+        "outputs": [
+          { "name": "domain", "type": "bytes32" },
+          { "name": "eta", "type": "bytes32" },
+          { "name": "minSegment", "type": "uint64" },
+          { "name": "asset", "type": "bytes32" },
+          { "name": "recipient", "type": "address" },
+          { "name": "amount", "type": "uint256" }
+        ],
+        "returnBytes": 192
+      }
     ],
-    "shardDepth": "per anchor: 8*len(shard) - trailingZeroBits(lastByte) - 1, 0..256"
+    "refusal": "revert with the custom error <RuleName>() of the specification's section 14; selector keccak256(\"<RuleName>()\")[0:4]"
   },
-  "anchorRule": "one anchor per distinct complete UC (pairwise distinct UC bytes), of the policy partition with a canonical shard ID, ordered by first use in kernel leaf order; each leaf's anchorIndex is an already-used index or the next unused one and names an anchor whose shard prefix (its first d bits) the leaf's SID carries; no unused anchors",
-  "gas": {
-    "txBudget": 7000000,
-    "reserve": 1000000,
-    "batchScanBase": 60000,
-    "batchPerByte": 16,
-    "batchPerPair": 500,
-    "batchCommonReads": 1100,
-    "batchPerEpoch": 29900,
-    "batchPerSignature": 6000,
-    "batchPerClaim": 2000,
-    "batchPerStep": 250,
-    "rsmtBase": 2000,
-    "rsmtRequestFixed": 136,
-    "rsmtPerSibling": 32,
-    "rsmtPerByte": 16,
-    "rsmtPerStep": 250,
-    "b2Base": 26000,
-    "b2PerByte": 20,
-    "b2PerLeaf": 14000,
-    "b2RequestFixed": 160,
-    "intrinsicBase": 21000,
-    "intrinsicPerCallDataByte": 16,
-    "callDataFixed": 132,
-    "intrinsicExecPerByte": 80,
-    "perBridgeCborItem": 1000,
-    "bridgeCborItemsMax": 4096
+  "history": {
+    "empty": "P = 0",
+    "layout": "startHead(32) || proof_0 || ... || proof_{P-1}",
+    "proof": "u8(i) || l(32) || u(32) || siblings(32 * log2 K)",
+    "proofBytes": "65 + 32 * log2(K)"
   },
-  "compose": {
-    "address": "0x0000000000000000000000000000000000000105",
-    "operation": "BRIDGE_COMPOSE_V2",
-    "input": [
-      "uint8 operation",
-      "bytes cfg",
-      "bytes envelope"
-    ],
-    "operations": {
-      "mint": 1,
-      "return": 2
-    },
-    "markerAscii": "UNICITY_BRIDGE_COMPOSE_V2",
-    "output": [
-      "bytes32 marker",
-      "uint256 status",
-      "bytes32 cfg",
-      "uint256 nonce",
-      "uint256 amount",
-      "bytes32 tokenId",
-      "bytes32 salt",
-      "bytes32 firstPredicateHash",
-      "bytes32 lockDigest",
-      "address releaseTo",
-      "bytes32 nullifier",
-      "uint256 leafCount",
-      "bytes32 partTokenId",
-      "uint256 partAmount",
-      "uint256 splitDepth"
-    ],
-    "outputBytes": 480,
-    "rootFields": [
-      "nonce",
-      "amount",
-      "tokenId",
-      "salt",
-      "firstPredicateHash",
-      "lockDigest"
-    ],
-    "partFields": [
-      "releaseTo",
-      "nullifier",
-      "partTokenId",
-      "partAmount",
-      "splitDepth"
-    ],
-    "statusTable": "config/compose-status-v2.json"
-  }
+  "firstOwnerPrefixHex": "d99878830141015821", "firstOwnerKeyPrefixes": ["02", "03"]
 }

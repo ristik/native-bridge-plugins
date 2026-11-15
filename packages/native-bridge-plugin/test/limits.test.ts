@@ -10,7 +10,7 @@ import { batchGas } from '../src/certgroups.js';
 import { b2Gas, intrinsicGas, itemGas, kernelRequestBytes, projectedGate, rsmtGas } from '../src/gas.js';
 import * as L from '../src/limits.js';
 
-const PROFILE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'profile-v7.json');
+const PROFILE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'protocol', 'legacy-v7', 'profile-v7.json');
 
 test('the named bounds are the limits of profile-v7.json, the one source of the contract, oracle and plug-ins', () => {
   const lim = (JSON.parse(readFileSync(PROFILE, 'utf8')) as { limits: Record<string, number> }).limits;

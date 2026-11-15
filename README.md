@@ -9,10 +9,9 @@ publication is disabled.
 
 | Path | Responsibility |
 | --- | --- |
-| `protocol/interop.md` | Sole normative native byte contract, protocol v3 |
-| `protocol/manifest.schema.json` | Strict deployment registry schema v1 |
-| `protocol/abi.json` | Frozen cross-stack ABI layout |
-| `protocol/vectors/` | Sole released corpus, pinned to the merged oracle |
+| `protocol/interop.md` | Sole normative native byte contract: native bridge v2, protocol 9 (bft-core#1097) |
+| `protocol/profile.json`, `protocol/abi.json` | v2 semantic profile and frozen vault/verifier ABI |
+| `protocol/legacy-v7/`, `protocol/vectors/` | Protocol 7 contract, schema and corpus that the current code still tests against; removed by bft-core#1106 |
 | `packages/native-bridge-plugin/` | TypeScript verifier/wallet adapter, version 0.1.0 |
 | `crates/native-bridge-sdk-ext/` | alloc-compatible Rust extension, version 0.1.0 |
 | `deployments/` | Frozen manifests (none installed yet) |

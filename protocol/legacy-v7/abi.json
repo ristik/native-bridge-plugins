@@ -1,0 +1,198 @@
+{
+  "protocolVersion": 7,
+  "kernelAddress": "0x0000000000000000000000000000000000000104",
+  "reservedAddress": "0x0000000000000000000000000000000000000103",
+  "input": [
+    "uint8 operation",
+    "bytes cfg",
+    "bytes payload"
+  ],
+  "operations": {
+    "prepareLock": 0,
+    "mint": 1,
+    "return": 2
+  },
+  "output": [
+    "bytes32 marker",
+    "bool valid",
+    "Result result"
+  ],
+  "markerAscii": "UNICITY_TOKEN_SEMANTICS",
+  "result": [
+    "bytes32 cfg",
+    "uint256 nonce",
+    "uint256 amount",
+    "bytes32 tokenId",
+    "bytes32 salt",
+    "bytes32 firstPredicateHash",
+    "bytes32 lockDigest",
+    "address releaseTo",
+    "bytes32 nullifier",
+    "Leaf[] leaves"
+  ],
+  "leaf": [
+    "bytes32 sid",
+    "bytes32 txHash",
+    "uint64 referenceTime",
+    "bytes32 leafValue"
+  ],
+  "outputOffsets": {
+    "marker": 0,
+    "valid": 32,
+    "resultOffset": 64,
+    "cfg": 96,
+    "nonce": 128,
+    "amount": 160,
+    "tokenId": 192,
+    "salt": 224,
+    "firstPredicateHash": 256,
+    "lockDigest": 288,
+    "releaseTo": 320,
+    "nullifier": 352,
+    "leavesOffset": 384,
+    "leafCount": 416,
+    "firstLeaf": 448
+  },
+  "resultOffsetValue": 96,
+  "leavesOffsetValue": 320,
+  "outputFixedBytes": 448,
+  "leafStrideBytes": 128,
+  "envelope": [
+    "bytes policyBody",
+    "bytes history",
+    "Anchor[] anchors",
+    "LeafProof[] leafProofs"
+  ],
+  "anchor": [
+    "uint32 partition",
+    "bytes shard",
+    "bytes32 shardConfHash",
+    "bytes32 expectedStateRoot",
+    "bytes32 expectedIRHash",
+    "bytes uc",
+    "bytes inputRecord"
+  ],
+  "leafProof": [
+    "uint16 anchorIndex",
+    "bytes32 bitmap",
+    "bytes32[] siblings"
+  ],
+  "b1ResultBytes": 64,
+  "b1Result": [
+    "uint256(1)",
+    "bool(true)"
+  ],
+  "certBatch": {
+    "address": "0x0000000000000000000000000000000000000100",
+    "operation": "CERT_BATCH_V2",
+    "request": [
+      "uint8 version=2",
+      "uint8 flags=0",
+      "uint16 K",
+      "Claim[K]"
+    ],
+    "claim": [
+      "uint32 partition",
+      "uint16 shardLen",
+      "bytes shard",
+      "bytes32 shardConfHash",
+      "bytes32 expectedStateRoot",
+      "bytes32 expectedIRHash",
+      "uint32 ucLen",
+      "bytes uc"
+    ],
+    "claimOrder": "the anchor table, in table order; K = the table length",
+    "resultBytes": 64,
+    "result": [
+      "uint256(2)",
+      "bool(true)"
+    ]
+  },
+  "policy": {
+    "domain": "UNICITY_BR_AGG_PARTITION",
+    "version": 2,
+    "maxBytes": 512,
+    "fields": [
+      "bytes domain",
+      "uint version",
+      "uint32 aggregatorPartition"
+    ],
+    "shardDepth": "per anchor: 8*len(shard) - trailingZeroBits(lastByte) - 1, 0..256"
+  },
+  "anchorRule": "one anchor per distinct complete UC (pairwise distinct UC bytes), of the policy partition with a canonical shard ID, ordered by first use in kernel leaf order; each leaf's anchorIndex is an already-used index or the next unused one and names an anchor whose shard prefix (its first d bits) the leaf's SID carries; no unused anchors",
+  "gas": {
+    "txBudget": 7000000,
+    "reserve": 1000000,
+    "batchScanBase": 60000,
+    "batchPerByte": 16,
+    "batchPerPair": 500,
+    "batchCommonReads": 1100,
+    "batchPerEpoch": 29900,
+    "batchPerSignature": 6000,
+    "batchPerClaim": 2000,
+    "batchPerStep": 250,
+    "rsmtBase": 2000,
+    "rsmtRequestFixed": 136,
+    "rsmtPerSibling": 32,
+    "rsmtPerByte": 16,
+    "rsmtPerStep": 250,
+    "b2Base": 26000,
+    "b2PerByte": 20,
+    "b2PerLeaf": 14000,
+    "b2RequestFixed": 160,
+    "intrinsicBase": 21000,
+    "intrinsicPerCallDataByte": 16,
+    "callDataFixed": 132,
+    "intrinsicExecPerByte": 80,
+    "perBridgeCborItem": 1000,
+    "bridgeCborItemsMax": 4096
+  },
+  "compose": {
+    "address": "0x0000000000000000000000000000000000000105",
+    "operation": "BRIDGE_COMPOSE_V2",
+    "input": [
+      "uint8 operation",
+      "bytes cfg",
+      "bytes envelope"
+    ],
+    "operations": {
+      "mint": 1,
+      "return": 2
+    },
+    "markerAscii": "UNICITY_BRIDGE_COMPOSE_V2",
+    "output": [
+      "bytes32 marker",
+      "uint256 status",
+      "bytes32 cfg",
+      "uint256 nonce",
+      "uint256 amount",
+      "bytes32 tokenId",
+      "bytes32 salt",
+      "bytes32 firstPredicateHash",
+      "bytes32 lockDigest",
+      "address releaseTo",
+      "bytes32 nullifier",
+      "uint256 leafCount",
+      "bytes32 partTokenId",
+      "uint256 partAmount",
+      "uint256 splitDepth"
+    ],
+    "outputBytes": 480,
+    "rootFields": [
+      "nonce",
+      "amount",
+      "tokenId",
+      "salt",
+      "firstPredicateHash",
+      "lockDigest"
+    ],
+    "partFields": [
+      "releaseTo",
+      "nullifier",
+      "partTokenId",
+      "partAmount",
+      "splitDepth"
+    ],
+    "statusTable": "config/compose-status-v2.json"
+  }
+}

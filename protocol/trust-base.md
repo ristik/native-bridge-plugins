@@ -1,4 +1,4 @@
-# Unicity Trust Base trust input (protocol v5)
+# Unicity Trust Base trust input (native bridge v2)
 
 The trust input is the network's Unicity Trust Base history: the append-only
 chain of root trust-base entries (RootTrustBaseV2, tag 39000), one per root
@@ -23,14 +23,11 @@ encoded as CBOR null. An absent `stateHash` or `changeRecordHash` is CBOR null,
 a present one exactly 32 bytes (bft-go-base#3); the shared UTB vectors pin the
 rule for both SDKs.
 
-`trustBaseId` is the genesis EntryID. A lock proof's `trustBaseId` slot and
-every manifest entry's `trustBase.genesisEntryId` name it. Two histories are
-the same trust input exactly when they have the same network and genesis; the
-latest held entry is not part of the identity, so a history that has grown is
-still the one a proof names. The manifest's `trustBase.bundle` names a release
-bundle an installation may start from by exact-file digest; it is installation
-metadata, never the pin. A newer release bundle of the same history, or a
-wallet's own exported history after appends, installs under the same pin.
+Γ.rootGenesis32 is the EntryID of the authenticated genesis trust-base entry.
+Γ.network must equal the installed history's network. A later entry or bundle
+digest is not the identity. Γ.executionGenesis32 identifies the authenticated
+execution genesis of the continuous EVM history bound to that trust input and
+partition/shard by the deployment.
 
 A digest and successful installation establish integrity, not authority:
 provisioning authenticates the genesis out of band (the manifest, an
@@ -40,8 +37,8 @@ predecessor's quorum.
 ## Certificate verification
 
 Every unicity certificate, ordinary (aggregator inclusion proofs) and embedded
-(the EVM lock certificate), is verified by the SDK under the entry of its own
-seal epoch e:
+(the EVM UC of a deposit or seal receipt), is verified under the entry of its
+own seal epoch e:
 
 1. the seal's network is the history's (else `SealNetwork`);
 2. e newer than the latest held entry is `NoEntryForEpoch`, of the
@@ -60,27 +57,25 @@ seal epoch e:
    at most 16 signatures; the counted weights reach e's threshold
    `floor(2W/3)+1` (else `QuorumNotMet`).
 
-The steps run in this order, so an input with several faults gets one verdict
-in every implementation: steps 1-4 select e before any structure, root or
-signature work. On the embedded EVM certificate the lock proof checks steps 1-4,
-then the pinned EVM partition, shard and configuration (the PDR), then steps 5
-and 6. The oracle names a failure of steps 5 or 6 on the embedded certificate
-`LockUC` (the plug-ins `CertStructure`, `SealRoot` or `QuorumNotMet`); the
-oracle's lock family is its own and the plug-ins do not replay it. Known naming
-differences with equal verdicts: a 65-byte signature with recovery byte above 1
-is `UnsupportedCertificateEncoding` in the plug-ins' pre-scan and `LockUC` in the
-oracle; a signature of another length is `UnsupportedCertificateEncoding`
-(invalid) in the plug-ins and `CertSigLength` (malformed) in the oracle; a 17th
-signature is malformed in the SDKs and an unknown signer in the oracle (an entry
-has at most 16 members).
-
-TS uses `UnicityCertificateVerifier.verifyCertificate(history, uc,
-{ partitionId })` for the embedded certificate and the SDK token verifier for
-ordinary proofs; Rust uses `verify_certificate_of_partition` and
-`verify_token_with_policy` with the history. The embedded certificate's own
-partition is passed; the EVM partition, shard and configuration pins stay the
-bridge's checks, on every call. No bridge-owned weighted verifier, epoch
-resolver or trust-base store exists.
+For NB2 the per-UC order is frozen as: encoding
+(UnsupportedCertificateEncoding), step 1 (SealNetwork), step 5 (CertStructure,
+SealRoot), then the authority verdict, steps 2–4 and 6 together (epoch entry,
+round interval, quorum). On chain the generic certificate primitive returns
+one result for the authority verdict, so its on-chain name is QuorumNotMet for
+an aggregator UC and DepositUC for the EVM UC; NoEntryForEpoch and SealEpoch
+are wallet-side refinements. For an EVM receipt UC, require the configured EVM
+partition and shard; supply no independently expected ShardConfHash and no PDR.
+Authenticate the UC's actual ShardConfHash, InputRecord and TRHash through the
+complete shard/unicity paths and seal. Apply native certificate structural
+checks, then the upstream per-signature weighting rule above. A signature that
+fails that weighting rule contributes zero; legacy bridge pre-scans MUST NOT
+introduce an additional rejection solely for its length or recovery byte. This
+does not waive native certificate structural constraints. NoEntryForEpoch
+remains retryable for wallets. Other EVM certificate-verification failures map to
+DepositUC; aggregator certificate failures use the named NB2 certificate rules.
+The deployment-binding and continuous-execution-history assumptions in
+interop.md apply. Protocol 7's LockUC/CertSigLength compatibility notes are
+historical and do not define NB2 acceptance.
 
 A seal signature value may be any byte string: only an exact canonical 65-byte
 recoverable signature of its member has weight, and the recovery byte is
@@ -99,9 +94,9 @@ verified from its predecessor, held entries never replaced) and retries.
 Receipt verification itself has no network capability: the plug-ins verify
 against the history they are given and fetch nothing.
 
-J stays byte-identical after certification. A lock certificate sealed in any
-epoch the history holds verifies under that epoch's committee and interval, so
-historical backing survives later rotations. Refresh may replace aggregator
+J stays byte-identical after certification. A deposit or seal receipt
+certificate sealed in any epoch the history holds verifies under that epoch's
+committee and interval, so historical backing survives later rotations. Refresh may replace aggregator
 paths and certificates under any held epoch while preserving M/T, CD and the
 original t.
 

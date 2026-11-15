@@ -18,12 +18,21 @@ SDK_JS_FORK_VERSION = '4.0.0-utb.c5840ef'
 SDK_RUST_FORK_COMMIT = 'de79e6c1e393a1846b75bca0640b9ec9a55aa143'
 
 
+# Protocol 7 artifacts the old plug-in code and its corpus still consume. They moved to protocol/legacy-v7/ when the
+# native bridge v2 profile replaced them (bft-core#1097); the corpus keeps their original names. Removed by bft-core#1106.
+LEGACY_V7 = {'protocol/interop.md', 'protocol/abi.json', 'protocol/manifest.schema.json', 'protocol/trust-base.md'}
+
+
+def legacy_path(name):
+    return name.replace('protocol/', 'protocol/legacy-v7/', 1) if name in LEGACY_V7 else name
+
+
 def load(path):
     return json.loads((ROOT / path).read_text())
 
 
 def validator():
-    schema = load('protocol/manifest.schema.json')
+    schema = load('protocol/legacy-v7/manifest.schema.json')
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema, format_checker=FormatChecker())
 
@@ -82,26 +91,44 @@ def validate_manifest(registry):
     # genesisEntryId (the SDK verifies every link) are installation gates.
 
 
-def main():
-    validator()
+def check_v2_profile():
+    """Native bridge v2 (protocol 9, bft-core#1097): the profile binds its normative artifacts by digest."""
+    profile = load('protocol/profile.json')
+    assert profile['nativeBridgeProtocolVersion'] == 9 and profile['identityFamily'] == 'unicity-native-nb2'
+    assert profile['tags']['receiptBacking'] == 39051 and profile['tags']['segmentReturn'] == 39052
+    assert profile['versions']['depositProof'] == 1 and profile['versions']['depositProofArity'] == 6
+    assert 'pdrBytes' not in profile['limits']
+    assert set(profile['normativeArtifactSha256']) == set(profile['normativeArtifacts'])
+    for name, expected in profile['normativeArtifactSha256'].items():
+        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, f'v2 normative artifact digest mismatch: {name}'
     abi = load('protocol/abi.json')
+    assert abi['nativeBridgeProtocolVersion'] == 9
+    assert [f['name'] for f in abi['vault']['functions']] == ['deposit', 'redeem', 'domain', 'config', 'state']
+    assert len({e['selector'] for e in abi['vault']['errors']}) == len(abi['vault']['errors'])
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=9' in (ROOT / 'protocol/interop.md').read_text()
+
+
+def main():
+    check_v2_profile()
+    validator()
+    abi = load('protocol/legacy-v7/abi.json')
     assert abi['protocolVersion'] == 7
     assert abi['leaf'] == ['bytes32 sid', 'bytes32 txHash', 'uint64 referenceTime', 'bytes32 leafValue']
     assert abi['anchor'] == ['uint32 partition', 'bytes shard', 'bytes32 shardConfHash', 'bytes32 expectedStateRoot', 'bytes32 expectedIRHash', 'bytes uc', 'bytes inputRecord']
     assert abi['outputFixedBytes'] == 448 and abi['leafStrideBytes'] == 128
     assert abi['operations'] == {'prepareLock': 0, 'mint': 1, 'return': 2}
     assert abi['outputOffsets']['firstLeaf'] == 448 and abi['resultOffsetValue'] == 96 and abi['leavesOffsetValue'] == 320
-    profile = load('protocol/profile-v7.json')
+    profile = load('protocol/legacy-v7/profile-v7.json')
     assert profile['nativeBridgeProtocolVersion'] == 7 and profile['sdkVersion'] == '4.0.0'
     assert profile['limits']['semanticBytes'] == 131072 and profile['limits']['justificationBytes'] == 65536
     assert profile['trustModel']['scope'] == 'unicity-trust-base-history'
     assert profile['trustModel']['trustDocumentFormat'] == 'utb-release-bundle-v1 (tag 39015)'
     assert profile['deferred'] == []
     for name, expected in profile['normativeArtifactSha256'].items():
-        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, 'normative artifact digest mismatch'
+        assert hashlib.sha256((ROOT / legacy_path(name)).read_bytes()).hexdigest() == expected, 'normative artifact digest mismatch'
     # every corpus trust input and the shared dev fixture install with the pinned SDK
     subprocess.run(['node', str(ROOT / 'tools/utb_trust_fixture.mjs')], check=True)
-    interop = (ROOT / 'protocol/interop.md').read_text()
+    interop = (ROOT / 'protocol/legacy-v7/interop.md').read_text()
     assert 'NATIVE_BRIDGE_PROTO_VERSION=7' in interop
     # protocol/interop.md names the SDK pins of its last sealing; it is digest-bound to the oracle corpus (profile-v7.json, config/semantic-profile.json),
     # so the installed SDKs are checked against the vendored provenance and Cargo.toml below, not against that sentence
