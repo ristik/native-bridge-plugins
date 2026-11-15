@@ -174,9 +174,14 @@ export class Journal {
     return id === undefined ? `${this.prefix}${kind}` : `${this.prefix}${kind}/${id}`;
   }
 
-  private async read<T extends AnyRecord>(key: string, kind: T['kind']): Promise<T | null> {
+  /**
+   * Read a record. Only a read `forUpdate` (taken under the key's lock, by the operation that then writes the record) sets the
+   * `expected` of the next compare-and-swap; any other read leaves it alone, so an unlocked reader (`status`, a listing, a wallet's
+   * own look) can never move a locked operation's comparison past another process's write.
+   */
+  private async read<T extends AnyRecord>(key: string, kind: T['kind'], forUpdate = false): Promise<T | null> {
     const s = await this.store.get(key);
-    this.seen.set(key, s);
+    if (forUpdate) this.seen.set(key, s);
     if (s === null) return null;
     const r = JSON.parse(s) as T;
     if (r.format !== JOURNAL_FORMAT || r.version !== JOURNAL_VERSION || r.kind !== kind || r.domain !== hex(this.domain)) {
@@ -205,12 +210,19 @@ export class Journal {
   public intents(): Promise<IntentsRecord | null> {
     return this.read<IntentsRecord>(this.key('intents'), 'intents');
   }
+  /** The intents record, read for the write that follows (under its lock). */
+  public intentsForUpdate(): Promise<IntentsRecord | null> {
+    return this.read<IntentsRecord>(this.key('intents'), 'intents', true);
+  }
   public putIntents(r: IntentsRecord): Promise<void> {
     return this.write(this.key('intents'), r);
   }
 
   public deposit(i: bigint): Promise<DepositRecord | null> {
     return this.read<DepositRecord>(this.key('deposit', dec(i)), 'deposit');
+  }
+  public depositForUpdate(i: bigint): Promise<DepositRecord | null> {
+    return this.read<DepositRecord>(this.key('deposit', dec(i)), 'deposit', true);
   }
   public putDeposit(r: DepositRecord): Promise<void> {
     return this.write(this.key('deposit', r.intent), r);
@@ -225,12 +237,18 @@ export class Journal {
   public split(id: Hex): Promise<SplitRecord | null> {
     return this.read<SplitRecord>(this.key('split', id.slice(2)), 'split');
   }
+  public splitForUpdate(id: Hex): Promise<SplitRecord | null> {
+    return this.read<SplitRecord>(this.key('split', id.slice(2)), 'split', true);
+  }
   public putSplit(r: SplitRecord): Promise<void> {
     return this.write(this.key('split', r.splitId.slice(2)), r);
   }
 
   public ret(id: Hex): Promise<ReturnRecord | null> {
     return this.read<ReturnRecord>(this.key('return', id.slice(2)), 'return');
+  }
+  public retForUpdate(id: Hex): Promise<ReturnRecord | null> {
+    return this.read<ReturnRecord>(this.key('return', id.slice(2)), 'return', true);
   }
   public putReturn(r: ReturnRecord): Promise<void> {
     return this.write(this.key('return', r.returnId.slice(2)), r);
@@ -241,4 +259,34 @@ export class Journal {
     for (const k of keys) out.push((await this.read<ReturnRecord>(k, 'return'))!);
     return out;
   }
+}
+
+/**
+ * The `putIf` contract every wallet journal store must meet, as a check any store can run (its own tests, or a wallet's start-up
+ * self-test against a scratch location). `fresh` opens an empty store; `reopen` opens the same storage again (a new process after a
+ * crash would). It checks the compare-and-swap (one write against absence wins, a stale or absent expectation loses and changes
+ * nothing), atomicity (of `writers` concurrent writes against one text exactly one wins and its value is stored), persistence (a
+ * reopened store reads back every won write) and `list` (sorted keys of a prefix). Throws on the first violation.
+ */
+export async function checkJournalStore<S extends JournalStore>(fresh: () => Promise<S> | S, reopen: (s: S) => Promise<S> | S, writers = 16): Promise<void> {
+  const fail = (m: string): never => {
+    throw new Error(`journal store: ${m}`);
+  };
+  const s = await fresh();
+  const k = 'nb2/v1/conformance/a';
+  const k2 = 'nb2/v1/conformance/b';
+  if ((await s.get(k)) !== null) fail('a fresh store is not empty');
+  if (!(await s.putIf(k, null, 'v1'))) fail('a write against absence lost on an empty key');
+  if (await s.putIf(k, null, 'v1b')) fail('a second write against absence won');
+  if (await s.putIf(k, 'other', 'v1c')) fail('a write against a stale text won');
+  if ((await s.get(k)) !== 'v1') fail('a lost write changed the record');
+  if (!(await s.putIf(k, 'v1', 'v2'))) fail('a write against the stored text lost');
+  if (!(await s.putIf(k2, null, 'w1'))) fail('a write of a second key lost');
+  const wins = await Promise.all(Array.from({ length: writers }, (_, i) => s.putIf(k, 'v2', `race-${i}`).catch(() => false)));
+  const winners = wins.flatMap((w, i) => (w ? [i] : []));
+  if (winners.length !== 1) fail(`${winners.length} of ${writers} concurrent writes against one text won`);
+  if ((await s.get(k)) !== `race-${winners[0]}`) fail('the stored value is not the winner\'s');
+  const again = await reopen(s);
+  if ((await again.get(k)) !== `race-${winners[0]}` || (await again.get(k2)) !== 'w1') fail('a reopened store does not hold every won write');
+  if (JSON.stringify(await again.list('nb2/v1/conformance/')) !== JSON.stringify([k, k2])) fail('list is not the sorted keys of the prefix');
 }

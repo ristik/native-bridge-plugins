@@ -74,6 +74,11 @@ export async function makeRoot(n = 4): Promise<Root> {
 
 const TR_HASH = sha(ascii('technical record'));
 let round = 1000n;
+/** The certificate round counter (a snapshot restores it). */
+export const roundNow = (): bigint => round;
+export const roundAtLeast = (r: bigint): void => {
+  if (r > round) round = r;
+};
 
 export async function makeUc(root: Root, partition: number, stateHash: Uint8Array, blockHash: Uint8Array, timestamp: bigint): Promise<Uint8Array> {
   const ir = new InputRecord(++round, 1n, null, stateHash, new Uint8Array(), timestamp, blockHash, 0n, null);
@@ -102,7 +107,7 @@ export function makeConfig(root: Root, K = 4n, B = 2n): Config {
 // ---- aggregator -----------------------------------------------------------------------------------------
 
 export class FakeAggregator implements Aggregator {
-  private readonly certified = new Map<string, Uint8Array>();
+  public readonly certified = new Map<string, Uint8Array>();
   public time = 1_700_000_000n;
   public calls = 0;
   public constructor(private readonly root: Root) {}
@@ -149,7 +154,7 @@ export class FakeChain implements JsonRpc {
   public readonly blocks: Block[] = [];
   public readonly vault: VaultModel;
   public readonly balances = new Map<string, bigint>();
-  private readonly nonces = new Map<string, bigint>();
+  public readonly nonces = new Map<string, bigint>();
   public readonly code = new Map<string, Uint8Array>();
   public readonly faults: Faults = { ambiguousSends: 0, hideSegments: new Set(), hideAllSeals: false, recipients: new Map() };
   public readonly vaultCode = ascii('fake vault runtime');

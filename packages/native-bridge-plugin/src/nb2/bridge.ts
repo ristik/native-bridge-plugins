@@ -201,10 +201,11 @@ export class NativeBridgeV2 {
     if (amount <= 0n) refuse('BadInput', 'a deposit amount is positive');
     parseKey(ownerKey);
     return this.locked('intents', async () => {
-      const cur = await this.journal.intents();
+      const cur = await this.journal.intentsForUpdate();
       if (cur !== null && cur.keyScheme !== this.keyScheme) refuse('BadInput', `the journal's intents use key scheme ${cur.keyScheme}`);
       const i = cur === null ? 0n : undec(cur.next);
-      const intents: IntentsRecord = { ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(i + 1n) };
+      // a rewrite keeps the record's unknown fields (docs/nb2-journal.md)
+      const intents: IntentsRecord = { ...(cur ?? {}), ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(i + 1n) };
       // the counter moves first, by compare-and-swap: a crash wastes intent i, another writer makes this one fail; i is never reused
       await this.journal.putIntents(intents);
       const r = this.secretOf(i);
@@ -234,7 +235,7 @@ export class NativeBridgeV2 {
   }
 
   private async depositRecord(i: bigint): Promise<DepositRecord> {
-    return (await this.journal.deposit(i)) ?? refuse('JournalNotPersisted', `no journal entry for intent ${i}`);
+    return (await this.journal.depositForUpdate(i)) ?? refuse('JournalNotPersisted', `no journal entry for intent ${i}`);
   }
 
   /** Every Deposited event of the vault carrying `rho`, from block `from`, in chain order. */
@@ -255,11 +256,11 @@ export class NativeBridgeV2 {
   public submitDeposit(plan: DepositPlan | bigint, signer: EvmSigner): Promise<{ txHash: Uint8Array; depositNumber: bigint; blockNumber: bigint }> {
     const i = typeof plan === 'bigint' ? plan : plan.intent;
     return this.locked(`deposit/${i}`, async () => {
-      const rec = await this.journal.deposit(i);
+      const rec = await this.journal.depositForUpdate(i);
       if (rec === null) refuse('JournalNotPersisted', `intent ${i} is not in the journal: plan it first`);
       if (typeof plan !== 'bigint' && (rec!.rho !== hex(plan.rho) || rec!.amount !== dec(plan.amount))) refuse('JournalNotPersisted', 'the journal entry is not this plan');
       if (!eq(rhoOf(this.domain, this.secretOf(i)), unhex(rec!.rho))) refuse('JournalNotPersisted', 'the journal entry does not derive from this wallet key');
-      const hw = await this.journal.intents();
+      const hw = await this.journal.intentsForUpdate();
       if (hw === null || undec(hw.next) <= i) refuse('JournalNotPersisted', 'the intent high-water mark does not cover this intent');
       if (this.opts.requireBackup !== false && !rec!.backedUp) refuse('JournalNotPersisted', 'the high-water mark covering this intent is not backed up');
       if (rec!.status !== 'planned' && rec!.status !== 'submitted') {
@@ -411,8 +412,8 @@ export class NativeBridgeV2 {
    */
   public async recoverDeposits(next: bigint): Promise<bigint[]> {
     await this.locked('intents', async () => {
-      const cur = await this.journal.intents();
-      if (cur === null || undec(cur.next) < next) await this.journal.putIntents({ ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(next) });
+      const cur = await this.journal.intentsForUpdate();
+      if (cur === null || undec(cur.next) < next) await this.journal.putIntents({ ...(cur ?? {}), ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(next) });
     });
     const want = new Map<string, bigint>();
     for (let i = 0n; i < next; i++) want.set(toHex(rhoOf(this.domain, this.secretOf(i))), i);
@@ -427,7 +428,7 @@ export class NativeBridgeV2 {
     const found: bigint[] = [];
     for (const [i, seen] of [...byIntent].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
       await this.locked(`deposit/${i}`, async () => {
-        const rec: DepositRecord = (await this.journal.deposit(i)) ?? {
+        const rec: DepositRecord = (await this.journal.depositForUpdate(i)) ?? {
           ...this.journal.base(), kind: 'deposit', keyScheme: this.keyScheme, intent: dec(i), amount: dec(seen[0].amount),
           ownerKey: hex(seen[0].firstOwner.subarray(9)), firstOwner: hex(seen[0].firstOwner), rho: hex(rhoOf(this.domain, this.secretOf(i))),
           status: 'planned', backedUp: true, sends: [],
@@ -467,7 +468,7 @@ export class NativeBridgeV2 {
   }
 
   private async splitInner(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], id: Uint8Array): Promise<Uint8Array[]> {
-    let rec = await this.journal.split(hex(id));
+    let rec = await this.journal.splitForUpdate(hex(id));
     if (rec === null) {
       const held = await this.verifyToken(token);
       if (outputs.length < 2) refuse('BadInput', 'a split has at least two outputs');
@@ -574,7 +575,7 @@ export class NativeBridgeV2 {
         }
       }
       const pf = await this.preflight(token, held.amount, recipient, a, payer);
-      const existing = await this.journal.ret(hex(returnId));
+      const existing = await this.journal.retForUpdate(hex(returnId));
       if (existing !== null && existing.status !== 'planned') refuse('NotPending', `this part's return is already ${existing.status}`);
       const record: ReturnRecord = {
         ...this.journal.base(), kind: 'return', returnId: hex(returnId), source: hex(token), amount: dec(held.amount), recipient: hex(recipient), a: dec(a),
@@ -608,7 +609,7 @@ export class NativeBridgeV2 {
   }
 
   private async returnRecord(id: Uint8Array): Promise<ReturnRecord> {
-    return (await this.journal.ret(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
+    return (await this.journal.retForUpdate(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
   }
 
   /**
@@ -789,6 +790,8 @@ export class NativeBridgeV2 {
       return { state: 'paid', txHash: tx, blockNumber: rp.blockNumber };
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };
+      // a lost compare-and-swap of the journal is never read as an unverified claim
+      if (e instanceof WalletError && (e.reason === 'JournalConflict' || e.reason === 'JournalNotPersisted')) throw e;
       if (e instanceof Nb2Error || e instanceof WalletError) return null;
       throw e;
     }

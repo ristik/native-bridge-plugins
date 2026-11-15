@@ -24,6 +24,7 @@ pub mod lockproof;
 #[cfg(feature = "host")]
 pub mod manifest;
 pub mod mpt;
+pub mod nb2;
 pub mod profile;
 pub mod proof;
 pub mod readiness;

@@ -12,8 +12,9 @@ default = ["alloc", "host", "consolidation"]
 alloc = []
 # The redemption's consolidated path: the SDK's uc-consolidation outcome types (its `client` feature, alloc only).
 consolidation = ["alloc", "unicity-token/client"]
-# Host conveniences: std error integration, JSON trust-document and manifest loading.
-host = ["alloc", "unicity-token/std", "k256/std", "sha2/std", "sha3/std", "dep:serde", "dep:serde_json"]
+# Host conveniences: std error integration, JSON trust-document and manifest loading, and the nb2 journal, RPC reader and
+# bridge. Native targets only: it uses std threads, clocks and the OS random source (no wasm32-unknown-unknown build).
+host = ["alloc", "unicity-token/std", "k256/std", "sha2/std", "sha3/std", "dep:serde", "dep:serde_json", "dep:getrandom", "unicity-token/client"]
 
 [dependencies]
 unicity-token = { git = "https://github.com/ristik/state-transition-sdk-rust.git", rev = "de79e6c1e393a1846b75bca0640b9ec9a55aa143", default-features = false, features = ["alloc"] }
@@ -23,6 +24,8 @@ sha3 = { version = "=0.10.9", default-features = false }
 num-bigint = { version = "=0.4.8", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1", optional = true }
+getrandom = { version = "0.2", optional = true }
+zeroize = { version = "1", default-features = false }
 
 [dev-dependencies]
 unicity-token = { git = "https://github.com/ristik/state-transition-sdk-rust.git", rev = "de79e6c1e393a1846b75bca0640b9ec9a55aa143", features = ["std", "client", "test-fixtures"] }

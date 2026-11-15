@@ -1,0 +1,1957 @@
+//! The native bridge v2 wallet API (`bridge.ts`, NB2-07 bft-core#1103; this port NB2-08 bft-core#1104). A wallet bridges
+//! native UCT with these calls and does not handle segments, gap proofs or receipt tries itself:
+//!
+//! ```text
+//!   EVM -> Unicity   plan_deposit, submit_deposit, collect_deposit_proof, mint
+//!   circulation      transfer, split (ordinary token operations; nothing touches the EVM)
+//!   Unicity -> EVM   plan_return, burn, build_redeem, submit_redeem, reconcile
+//! ```
+//!
+//! Network adapters fetch bytes; pure functions verify them offline. Every step is journaled BEFORE the step it enables, so a
+//! crash at any point resumes by calling the same function again with the same identifier:
+//! - the deposit secret's intent and its backed-up high-water mark exist before value is sent (`submit_deposit` refuses
+//!   otherwise);
+//! - every signed EVM transaction is journaled before it is broadcast, and an earlier send is reconciled before any new one;
+//! - a burn's exact request is journaled before it is certified, and the certified burn before success is reported;
+//! - the burn index comes from a verified SegmentSealed receipt (or is zero), never from a plain RPC number outside test
+//!   deployments.
+//!
+//! The calls are synchronous; calls on the same journal record are serialized within the process, and the store's
+//! compare-and-swap serializes them across processes.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
+
+use zeroize::Zeroizing;
+
+use num_bigint::BigUint;
+use serde_json::json;
+
+use super::abi::{
+    classify_redeem_error, decode_deposited, decode_paid, decode_revert, deposit_calldata,
+    redeem_calldata, redeem_calldata_length, DecodedError, RedeemAction,
+};
+use super::cbor::{c_arr, c_bytes, head_tag};
+use super::config::{asset_uct, build_params, decode_config, domain_of, tag, Build, Config};
+use super::crypto::{he, hmac_sha256, hu, parse_key};
+use super::deposit::{
+    decode_receipt_backing, deposit_intent_secret, deposit_salt, encode_receipt_backing,
+    first_owner_of, rho_of, topic, verify_deposit_evidence, verify_receipt_log, ReceiptBacking,
+};
+use super::errors::{fail_d, refuse, Error, Nb2Error, Result, Rule, WalletReason};
+use super::evm::{decode_signed_tx, sign_tx, EvmSigner, SignedTx, TxRequest};
+use super::gas::{redeem_tx_framing, GasModel, MeasuredGasModel, RedeemShape};
+use super::journal::*;
+use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
+use super::rules::{
+    burn_index, capacity_exceeded, capacity_preflight, check_state_read, topic_index,
+    verify_seal_receipt, Preflight, PreflightResult, SealReceipt,
+};
+use super::segment::{build_history, check_segment_log, genesis_head, Segment};
+use super::split::decode_split_justification;
+use super::token::{
+    burn_predicate, decode_token, signature_predicate, value_data, MintTx, Token, TransferTx,
+    PRED_SIGNATURE,
+};
+use super::tokenops::{
+    append_transfer, certify_checked, child_mint, fresh_mask, mint_request, split_plan,
+    token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
+};
+use super::trust::{bind_trust, TrustInput};
+use super::util::{arr, be_int, cat};
+use super::verify::{
+    decode_evidence, encode_return_data, evidence_of, verify_held, verify_part, ReturnData, Verdict,
+};
+
+/// The deployment manifest pins outside D (section 4.3).
+#[derive(Debug, Clone)]
+pub struct DeploymentPins {
+    pub gamma: Vec<u8>,
+    pub build: Build,
+    pub vault_runtime_code_hash: [u8; 32],
+    pub max_encoded_tx_bytes: u64,
+    pub user_gas_limit: u64,
+    pub gas_reserve: u64,
+    pub return_reserve_segments: u64,
+    pub deployment_block: u64,
+    pub state_read_only: bool,
+    /// The plausibility bound of a stateReadOnly index read (default 64).
+    pub max_jump: Option<u64>,
+}
+
+type Callback<A, R> = Box<dyn Fn(A) -> R + Send + Sync>;
+
+/// The bridge's inputs.
+pub struct BridgeOptions {
+    pub pins: DeploymentPins,
+    pub trust: TrustInput,
+    pub rpc: Arc<dyn JsonRpc>,
+    pub aggregator: Arc<dyn Aggregator + Send + Sync>,
+    pub journal: Arc<dyn JournalStore>,
+    /// k_w: the 32-byte wallet bridge key, derived from the wallet seed (see [`derive_bridge_key`]).
+    pub bridge_key: Zeroizing<Vec<u8>>,
+    /// The wallet-versioned name of the k_w derivation, recorded in the journal.
+    pub key_scheme: Option<String>,
+    /// Back up the intent high-water mark with the seed (section 12.1). Required unless `require_backup` is false.
+    pub backup: Option<Callback<IntentsRecord, Result<()>>>,
+    /// Default true: a deposit is not sent before its intent's high-water mark is backed up.
+    pub require_backup: Option<bool>,
+    pub gas: Option<Box<dyn GasModel>>,
+    /// Blocks the head must advance, after a send's nonce is seen used without its success receipt, before the send counts as dead.
+    pub dead_after_blocks: Option<u64>,
+    /// A seal receipt older than this many blocks gives a warning (default 7,200).
+    pub max_seal_age_blocks: Option<u64>,
+    /// Extend the trust-base history when a certificate's epoch is not held yet: given the current input, return the extended
+    /// one. A seal receipt or a token refused with the retryable NoEntryForEpoch is retried once after it.
+    pub refresh_trust: Option<Callback<TrustInput, Result<TrustInput>>>,
+    /// Receipt polling.
+    pub receipt_timeout_ms: Option<u64>,
+    pub poll_ms: Option<u64>,
+    pub sleep: Option<Callback<u64, ()>>,
+    pub now: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl BridgeOptions {
+    /// Options with every optional field unset.
+    pub fn new(
+        pins: DeploymentPins,
+        trust: TrustInput,
+        rpc: Arc<dyn JsonRpc>,
+        aggregator: Arc<dyn Aggregator + Send + Sync>,
+        journal: Arc<dyn JournalStore>,
+        bridge_key: &[u8],
+    ) -> Self {
+        BridgeOptions {
+            pins,
+            trust,
+            rpc,
+            aggregator,
+            journal,
+            bridge_key: Zeroizing::new(bridge_key.to_vec()),
+            key_scheme: None,
+            backup: None,
+            require_backup: None,
+            gas: None,
+            dead_after_blocks: None,
+            max_seal_age_blocks: None,
+            refresh_trust: None,
+            receipt_timeout_ms: None,
+            poll_ms: None,
+            sleep: None,
+            now: None,
+        }
+    }
+}
+
+pub const DEFAULT_KEY_SCHEME: &str = "nb2-hmac-sha256-v1";
+
+/// k_w = HMAC-SHA256(key = seed, "unicity-nb2/wallet-bridge-key/v1"): the [`DEFAULT_KEY_SCHEME`] derivation.
+pub fn derive_bridge_key(seed: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(hmac_sha256(seed, b"unicity-nb2/wallet-bridge-key/v1"))
+}
+
+#[derive(Debug, Clone)]
+pub struct DepositPlan {
+    pub intent: u64,
+    pub amount: BigUint,
+    pub rho: [u8; 32],
+    pub first_owner: Vec<u8>,
+    pub calldata: Vec<u8>,
+    pub record: DepositRecord,
+}
+
+/// Either a plan or its intent number.
+pub enum PlanRef<'a> {
+    Plan(&'a DepositPlan),
+    Intent(u64),
+}
+
+impl<'a> From<&'a DepositPlan> for PlanRef<'a> {
+    fn from(p: &'a DepositPlan) -> Self {
+        PlanRef::Plan(p)
+    }
+}
+
+impl From<u64> for PlanRef<'_> {
+    fn from(i: u64) -> Self {
+        PlanRef::Intent(i)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deposited {
+    pub tx_hash: Vec<u8>,
+    pub deposit_number: u64,
+    pub block_number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReturnPlan {
+    pub return_id: [u8; 32],
+    pub amount: BigUint,
+    pub recipient: [u8; 20],
+    pub a: u64,
+    /// The endpoint estimate and the history already owed from a.
+    pub c_obs: u64,
+    pub p_now: u64,
+    /// The proofs that fit beside the evidence (bytes) and the remaining margin: pMax - (pNow + returnReserveSegments).
+    pub p_max: u64,
+    pub margin_segments: i128,
+    pub gas_limit: u64,
+    pub warnings: Vec<String>,
+    pub record: ReturnRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct Burned {
+    pub burned: Vec<u8>,
+    pub eta: [u8; 32],
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedeemTx {
+    pub return_id: [u8; 32],
+    pub calldata: Vec<u8>,
+    pub gas_limit: u64,
+    pub p: u64,
+    pub endpoint: u64,
+    pub history: Vec<u8>,
+    pub eta: [u8; 32],
+    pub claimed_start: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileResult {
+    Paid {
+        tx_hash: Vec<u8>,
+        block_number: u64,
+    },
+    Pending {
+        tx_hash: Vec<u8>,
+    },
+    NotPaid {
+        last_failure: Option<(Vec<u8>, RedeemAction, Option<DecodedError>)>,
+    },
+}
+
+impl ReconcileResult {
+    pub fn state(&self) -> &'static str {
+        match self {
+            ReconcileResult::Paid { .. } => "paid",
+            ReconcileResult::Pending { .. } => "pending",
+            ReconcileResult::NotPaid { .. } => "not-paid",
+        }
+    }
+}
+
+/// A held token's verified facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldToken {
+    pub token_id: [u8; 32],
+    pub amount: BigUint,
+    pub owner: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct SeenLog {
+    tx: Vec<u8>,
+    block_number: u64,
+    n: u64,
+    amount: BigUint,
+    first_owner: Vec<u8>,
+}
+
+enum Landed {
+    Receipt(Box<ReceiptJson>),
+    Pending,
+    None,
+}
+
+fn status_is_ok(r: &ReceiptJson) -> bool {
+    r.success()
+}
+
+/// The bridge for one pinned deployment.
+pub struct NativeBridgeV2 {
+    pub cfg: Config,
+    pub domain: [u8; 32],
+    pub journal: Journal,
+    pub evm: EvmReader<dyn JsonRpc>,
+    pub gas: Box<dyn GasModel>,
+    key_scheme: String,
+    /// k_w, kept out of the options.
+    kw: Zeroizing<[u8; 32]>,
+    pins: DeploymentPins,
+    trust: RwLock<TrustInput>,
+    aggregator: Arc<dyn Aggregator + Send + Sync>,
+    backup: Option<Callback<IntentsRecord, Result<()>>>,
+    require_backup: bool,
+    dead_after_blocks: u64,
+    max_seal_age_blocks: u64,
+    refresh_trust: Option<Callback<TrustInput, Result<TrustInput>>>,
+    receipt_timeout_ms: u64,
+    poll_ms: u64,
+    sleep: Option<Callback<u64, ()>>,
+    now: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
+    /// In-process serialization per journal key (with the store's compare-and-swap across processes).
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl NativeBridgeV2 {
+    fn construct(o: BridgeOptions) -> Result<Self> {
+        let cfg = decode_config(&o.pins.gamma, &build_params(o.pins.build))?;
+        let domain = domain_of(&o.pins.gamma);
+        bind_trust(&o.trust, &cfg)?;
+        if o.bridge_key.len() != 32 {
+            return refuse(WalletReason::BadInput, "k_w is 32 bytes");
+        }
+        let require_backup = o.require_backup != Some(false);
+        if require_backup && o.backup.is_none() {
+            return refuse(WalletReason::BadInput, "a backup of the intent high-water mark is required (or require_backup: false on a test deployment)");
+        }
+        Ok(NativeBridgeV2 {
+            journal: Journal::new(o.journal, domain),
+            evm: EvmReader::new(o.rpc),
+            gas: o.gas.unwrap_or_else(|| Box::new(MeasuredGasModel)),
+            key_scheme: o.key_scheme.unwrap_or_else(|| DEFAULT_KEY_SCHEME.into()),
+            kw: Zeroizing::new(arr(&o.bridge_key)),
+            trust: RwLock::new(o.trust),
+            aggregator: o.aggregator,
+            backup: o.backup,
+            require_backup,
+            dead_after_blocks: o.dead_after_blocks.unwrap_or(6),
+            max_seal_age_blocks: o.max_seal_age_blocks.unwrap_or(7_200),
+            refresh_trust: o.refresh_trust,
+            receipt_timeout_ms: o.receipt_timeout_ms.unwrap_or(60_000),
+            poll_ms: o.poll_ms.unwrap_or(1_000),
+            sleep: o.sleep,
+            now: o.now,
+            locks: Mutex::new(HashMap::new()),
+            pins: o.pins,
+            cfg,
+            domain,
+        })
+    }
+
+    /// Open the bridge for one pinned deployment. The installation check (section 4.3): the chain ID, the vault's exact Γ through
+    /// config() and its runtime code hash. These come from the RPC, which the wallet trusts here exactly as far as its manifest source.
+    pub fn open(o: BridgeOptions) -> Result<Self> {
+        Self::open_checked(o, true)
+    }
+
+    pub fn open_checked(o: BridgeOptions, check: bool) -> Result<Self> {
+        let b = Self::construct(o)?;
+        if check {
+            if b.evm.chain_id()? != b.cfg.chain_id {
+                return refuse(WalletReason::BadDeployment, "the RPC serves another chain");
+            }
+            if b.evm.vault_config(&b.cfg.vault)? != b.pins.gamma {
+                return refuse(
+                    WalletReason::BadDeployment,
+                    "the vault's config() is not the pinned Γ",
+                );
+            }
+            if he(&[&b.evm.code(&b.cfg.vault)?]) != b.pins.vault_runtime_code_hash {
+                return refuse(
+                    WalletReason::BadDeployment,
+                    "the vault runtime code hash is not the pinned one",
+                );
+            }
+        }
+        Ok(b)
+    }
+
+    pub fn pins(&self) -> &DeploymentPins {
+        &self.pins
+    }
+
+    fn sleep_ms(&self, ms: u64) {
+        match &self.sleep {
+            Some(f) => f(ms),
+            None => std::thread::sleep(std::time::Duration::from_millis(ms)),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        match &self.now {
+            Some(f) => f(),
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        }
+    }
+
+    /// Run `f` after every earlier call holding `key` in this instance has finished.
+    fn locked<T>(&self, key: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let m = self
+            .locks
+            .lock()
+            .expect("locks")
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        let _g = m.lock().unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
+    fn trust(&self) -> TrustInput {
+        self.trust.read().expect("trust").clone()
+    }
+
+    /// Run `f`; on a retryable NoEntryForEpoch extend the history (if the wallet gave a way) and run it once more.
+    fn retrying_trust<T>(&self, f: impl Fn(&TrustInput) -> Result<T>) -> Result<T> {
+        let t = self.trust();
+        match f(&t) {
+            Err(e) if e.retryable() && self.refresh_trust.is_some() => {
+                let fresh = (self.refresh_trust.as_ref().expect("checked"))(t)?;
+                *self.trust.write().expect("trust") = fresh.clone();
+                f(&fresh)
+            }
+            r => r,
+        }
+    }
+
+    // ==== EVM -> Unicity ==================================================================================================
+
+    /// r for intent i (never stored unless the wallet asks: it is derivable from k_w and i).
+    pub fn secret_of(&self, i: u64) -> [u8; 32] {
+        deposit_intent_secret(&self.kw[..], &self.domain, i)
+    }
+
+    fn intents_record(&self, next: u64) -> IntentsRecord {
+        IntentsRecord {
+            base: self.journal.base("intents"),
+            key_scheme: self.key_scheme.clone(),
+            next: dec(next),
+            extra: Default::default(),
+        }
+    }
+
+    /// Plan a deposit of `amount` to the Unicity owner `owner_key` (compressed key): allocate a never-used intent i, derive r and
+    /// rho, and journal the plan with the new high-water mark, which is handed to the backup. Serialized: two plans never share
+    /// an intent.
+    pub fn plan_deposit(&self, amount: &BigUint, owner_key: &[u8]) -> Result<DepositPlan> {
+        if amount.bits() == 0 {
+            return refuse(WalletReason::BadInput, "a deposit amount is positive");
+        }
+        parse_key(owner_key)?;
+        self.locked("intents", || {
+            let cur = self.journal.intents_for_update()?;
+            if let Some(c) = &cur {
+                if c.key_scheme != self.key_scheme {
+                    return refuse(
+                        WalletReason::BadInput,
+                        format!("the journal's intents use key scheme {}", c.key_scheme),
+                    );
+                }
+            }
+            let i = match &cur {
+                None => 0,
+                Some(c) => undec64(&c.next)?,
+            };
+            let mut intents = cur.unwrap_or_else(|| self.intents_record(0));
+            let Some(next) = i.checked_add(1) else {
+                return refuse(WalletReason::BadInput, "the intent counter is exhausted");
+            };
+            intents.next = dec(next);
+            intents.key_scheme = self.key_scheme.clone();
+            // the counter moves first, by compare-and-swap: a crash wastes intent i, another writer makes this one fail; i is never reused
+            self.journal.put_intents(&intents)?;
+            let r = self.secret_of(i);
+            let rho = rho_of(&self.domain, &r);
+            let first_owner = first_owner_of(owner_key);
+            let mut rec = DepositRecord {
+                base: self.journal.base("deposit"),
+                key_scheme: self.key_scheme.clone(),
+                intent: dec(i),
+                amount: dec(amount),
+                owner_key: hex(owner_key),
+                first_owner: hex(&first_owner),
+                rho: hex(&rho),
+                status: "planned".into(),
+                backed_up: false,
+                sends: Vec::new(),
+                deposit_tx: None,
+                block_number: None,
+                deposit_number: None,
+                receipt_proof: None,
+                reason: None,
+                token: None,
+                secret: None,
+                planned_block: Some(dec(self.evm.block_number()?)),
+                seen_deposits: None,
+                extra: Default::default(),
+            };
+            self.journal.put_deposit(&rec)?;
+            if let Some(b) = &self.backup {
+                b(intents.clone())?;
+                rec.backed_up = true;
+                self.journal.put_deposit(&rec)?;
+            }
+            Ok(DepositPlan {
+                intent: i,
+                amount: amount.clone(),
+                rho,
+                calldata: deposit_calldata(&first_owner, &rho),
+                first_owner,
+                record: rec,
+            })
+        })
+    }
+
+    /// Record that the wallet backed up the high-water mark covering this intent by other means.
+    pub fn mark_backed_up(&self, intent: u64) -> Result<()> {
+        self.locked(&format!("deposit/{intent}"), || {
+            let mut rec = self.deposit_record(intent)?;
+            rec.backed_up = true;
+            self.journal.put_deposit(&rec)
+        })
+    }
+
+    fn deposit_record(&self, i: u64) -> Result<DepositRecord> {
+        match self.journal.deposit_for_update(i)? {
+            Some(r) => Ok(r),
+            None => refuse(
+                WalletReason::JournalNotPersisted,
+                format!("no journal entry for intent {i}"),
+            ),
+        }
+    }
+
+    /// Every Deposited event of the vault carrying `rho`, from block `from`, in chain order.
+    fn deposits_with_rho(&self, rho: &[u8], from: u64) -> Result<Vec<SeenLog>> {
+        let mut out = Vec::new();
+        let top = self.evm.block_number()?;
+        for l in self.evm.logs(
+            &self.cfg.vault,
+            &json!([hex(&topic::deposited())]),
+            from,
+            top,
+        )? {
+            if let Some(d) = decode_deposited(&l.topics, &l.data) {
+                if l.address == self.cfg.vault && d.domain == self.domain && d.rho == rho {
+                    out.push(SeenLog {
+                        tx: l.transaction_hash.clone(),
+                        block_number: l.block_number,
+                        n: d.n,
+                        amount: d.amount,
+                        first_owner: d.first_owner,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn planned_from(&self, rec: &DepositRecord) -> Result<u64> {
+        match &rec.planned_block {
+            None => Ok(self.pins.deployment_block),
+            Some(b) => undec64(b),
+        }
+    }
+
+    /// Send the deposit. Refuses a plan whose journal entry is not persisted exactly as planned, or whose high-water mark is not
+    /// backed up. Earlier sends of the intent are reconciled first, and before the first send the vault's events are searched for
+    /// a deposit that already carries this rho (another device on the same backup), so a retry never deposits twice.
+    pub fn submit_deposit<'a>(
+        &self,
+        plan: impl Into<PlanRef<'a>>,
+        signer: &dyn EvmSigner,
+    ) -> Result<Deposited> {
+        let plan = plan.into();
+        let i = match &plan {
+            PlanRef::Plan(p) => p.intent,
+            PlanRef::Intent(i) => *i,
+        };
+        self.locked(&format!("deposit/{i}"), || {
+            let Some(mut rec) = self.journal.deposit_for_update(i)? else {
+                return refuse(WalletReason::JournalNotPersisted, format!("intent {i} is not in the journal: plan it first"));
+            };
+            if let PlanRef::Plan(p) = &plan {
+                if rec.rho != hex(&p.rho) || rec.amount != dec(&p.amount) {
+                    return refuse(WalletReason::JournalNotPersisted, "the journal entry is not this plan");
+                }
+            }
+            if rho_of(&self.domain, &self.secret_of(i)).as_slice() != unhex(&rec.rho)? {
+                return refuse(WalletReason::JournalNotPersisted, "the journal entry does not derive from this wallet key");
+            }
+            let hw = self.journal.intents_for_update()?;
+            match &hw {
+                Some(h) if undec64(&h.next)? > i => {}
+                _ => return refuse(WalletReason::JournalNotPersisted, "the intent high-water mark does not cover this intent"),
+            }
+            if self.require_backup && !rec.backed_up {
+                return refuse(WalletReason::JournalNotPersisted, "the high-water mark covering this intent is not backed up");
+            }
+            if rec.status != "planned" && rec.status != "submitted" {
+                return Ok(Deposited {
+                    tx_hash: unhex(rec.deposit_tx.as_deref().unwrap_or(""))?,
+                    deposit_number: undec64(rec.deposit_number.as_deref().unwrap_or(""))?,
+                    block_number: undec64(rec.block_number.as_deref().unwrap_or(""))?,
+                });
+            }
+            let mut sends = rec.sends.clone();
+            let landed = self.landed_send(&mut sends)?;
+            if sends != rec.sends {
+                rec.sends = sends;
+                self.journal.put_deposit(&rec)?;
+            }
+            match landed {
+                Landed::Pending => return refuse(WalletReason::Unconfirmed, "an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly"),
+                Landed::Receipt(r) => return self.record_deposit(&mut rec, &r),
+                Landed::None => {}
+            }
+            if rec.sends.is_empty() {
+                let seen = self.deposits_with_rho(&unhex(&rec.rho)?, self.planned_from(&rec)?)?;
+                if !seen.is_empty() {
+                    return self.adopt_deposits(&mut rec, &seen);
+                }
+            }
+            let value = undec(&rec.amount)?;
+            let tx = self.signed(signer, &self.cfg.vault, &deposit_calldata(&unhex(&rec.first_owner)?, &unhex(&rec.rho)?), value, self.gas.deposit_gas_limit())?;
+            rec.sends.push(self.send_record(&tx));
+            rec.status = "submitted".into();
+            self.journal.put_deposit(&rec)?;
+            let Some(r) = self.broadcast_and_wait(&tx)? else {
+                return refuse(WalletReason::Unconfirmed, format!("deposit {} has no receipt yet: call submit_deposit again to reconcile", hex(&tx.hash)));
+            };
+            if !status_is_ok(&r) {
+                return refuse(WalletReason::Reverted, format!("deposit {} reverted", hex(&tx.hash)));
+            }
+            self.record_deposit(&mut rec, &r)
+        })
+    }
+
+    fn record_deposit(&self, rec: &mut DepositRecord, r: &ReceiptJson) -> Result<Deposited> {
+        let want_topic = hex(&topic::deposited());
+        let l = r.logs.iter().find(|x| {
+            unhex(&x.address.to_lowercase()).is_ok_and(|a| a == self.cfg.vault)
+                && x.topics.len() == 2
+                && x.topics[0].to_lowercase() == want_topic
+        });
+        let Some(l) = l else {
+            return refuse(
+                WalletReason::ProviderFault,
+                "the deposit receipt has no Deposited log",
+            );
+        };
+        let topics = l
+            .topics
+            .iter()
+            .map(|x| unhex(&x.to_lowercase()))
+            .collect::<Result<Vec<_>>>()?;
+        let d = decode_deposited(&topics, &unhex(&l.data.to_lowercase())?);
+        let Some(d) = d.filter(|d| unhex(&rec.rho).is_ok_and(|rho| d.rho == rho)) else {
+            return refuse(
+                WalletReason::ProviderFault,
+                "the Deposited log is not this intent's",
+            );
+        };
+        let block = super::rpc::qty64(&json!(r.block_number), "blockNumber")?;
+        rec.deposit_tx = Some(r.transaction_hash.to_lowercase());
+        rec.block_number = Some(dec(block));
+        rec.deposit_number = Some(dec(d.n));
+        rec.status = "deposited".into();
+        // merge, never replace: the record's own deposit, what was journaled before, and every deposit carrying this rho on chain
+        let mut entries = vec![SeenDeposit {
+            tx: rec.deposit_tx.clone().expect("set"),
+            deposit_number: dec(d.n),
+            block_number: dec(block),
+            amount: dec(&d.amount),
+            first_owner: hex(&d.first_owner),
+            token: None,
+            extra: Default::default(),
+        }];
+        for x in self.deposits_with_rho(&unhex(&rec.rho)?, self.planned_from(rec)?)? {
+            entries.push(seen_entry(&x));
+        }
+        merge_seen(rec, entries)?;
+        self.journal.put_deposit(rec)?;
+        Ok(Deposited {
+            tx_hash: unhex(rec.deposit_tx.as_deref().expect("set"))?,
+            deposit_number: d.n,
+            block_number: block,
+        })
+    }
+
+    /// Journal the deposits found for a record's rho: the first becomes its own, every one is listed (each is a separate root token).
+    fn adopt_deposits(&self, rec: &mut DepositRecord, seen: &[SeenLog]) -> Result<Deposited> {
+        merge_seen(rec, seen.iter().map(seen_entry).collect())?;
+        if rec.status == "planned" || rec.status == "submitted" {
+            let first = &seen[0];
+            rec.deposit_tx = Some(hex(&first.tx));
+            rec.block_number = Some(dec(first.block_number));
+            rec.deposit_number = Some(dec(first.n));
+            rec.amount = dec(&first.amount);
+            rec.first_owner = hex(&first.first_owner);
+            rec.owner_key = hex(&first.first_owner[9..]);
+            rec.status = "deposited".into();
+        }
+        self.journal.put_deposit(rec)?;
+        Ok(Deposited {
+            tx_hash: unhex(rec.deposit_tx.as_deref().unwrap_or(""))?,
+            deposit_number: undec64(rec.deposit_number.as_deref().unwrap_or(""))?,
+            block_number: undec64(rec.block_number.as_deref().unwrap_or(""))?,
+        })
+    }
+
+    /// The receipt proof and J of deposit number `n` of intent `i`, verified offline.
+    fn prove_deposit(
+        &self,
+        i: u64,
+        tx: &[u8],
+        n: u64,
+        amount: &BigUint,
+        first_owner: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let rp = self
+            .evm
+            .receipt_proof(tx, &self.cfg.vault, &topic::deposited())?;
+        let j = ReceiptBacking {
+            d: self.domain,
+            n,
+            r: self.secret_of(i),
+            proof: rp.proof,
+        };
+        let ev =
+            self.retrying_trust(|t| verify_deposit_evidence(&self.cfg, &self.domain, t, &j))?;
+        if ev.v != *amount || ev.first_owner != first_owner {
+            return refuse(
+                WalletReason::ProviderFault,
+                "the certified deposit is not the planned one",
+            );
+        }
+        Ok((rp.encoded, encode_receipt_backing(&j)))
+    }
+
+    /// The ordinary mint with reason J, certified by the aggregator and verified offline.
+    fn mint_with(&self, reason: &[u8], owner_key: &[u8], amount: &BigUint) -> Result<Vec<u8>> {
+        let j = decode_receipt_backing(reason)?;
+        let m = MintTx {
+            network: self.cfg.network,
+            recipient: signature_predicate(owner_key),
+            salt: deposit_salt(&self.domain, j.n, &j.r).to_vec(),
+            ty: self.cfg.ty.to_vec(),
+            justification: Some(reason.to_vec()),
+            data: Some(value_data(&self.cfg.aid, amount)),
+            deadline: None,
+        };
+        let req = mint_request(&m)?;
+        let token = token_of_mint(&req.tx, &certify_checked(&*self.aggregator, &req.cd)?);
+        let decoded = decode_token(&token)?;
+        let held = self.retrying_trust(|t| verify_held(&self.cfg, &self.domain, t, &decoded))?;
+        if held.amount != *amount {
+            return refuse(WalletReason::ProviderFault, "the minted amount differs");
+        }
+        Ok(token)
+    }
+
+    /// Fetch the certified header evidence and the block's receipts, build the receipt proof and verify it offline (section 6.2
+    /// steps 1 to 7), then journal J. Retry `CompanionUnknown` after a round.
+    pub fn collect_deposit_proof(&self, intent: u64) -> Result<(Vec<u8>, u64)> {
+        self.locked(&format!("deposit/{intent}"), || {
+            let mut rec = self.deposit_record(intent)?;
+            if rec.status == "proven" || rec.status == "minted" {
+                return Ok((
+                    unhex(rec.reason.as_deref().unwrap_or(""))?,
+                    undec64(rec.deposit_number.as_deref().unwrap_or(""))?,
+                ));
+            }
+            if rec.status != "deposited" {
+                return refuse(
+                    WalletReason::NotPending,
+                    format!(
+                        "intent {intent} is {}: submit the deposit first",
+                        rec.status
+                    ),
+                );
+            }
+            let n = undec64(rec.deposit_number.as_deref().unwrap_or(""))?;
+            let (proof, reason) = self.prove_deposit(
+                intent,
+                &unhex(rec.deposit_tx.as_deref().unwrap_or(""))?,
+                n,
+                &undec(&rec.amount)?,
+                &unhex(&rec.first_owner)?,
+            )?;
+            rec.receipt_proof = Some(hex(&proof));
+            rec.reason = Some(hex(&reason));
+            rec.status = "proven".into();
+            self.journal.put_deposit(&rec)?;
+            Ok((reason, n))
+        })
+    }
+
+    /// The ordinary SDK mint with the receipt-backed reason J, certified by the aggregator and verified offline.
+    pub fn mint(&self, intent: u64) -> Result<Vec<u8>> {
+        self.locked(&format!("deposit/{intent}"), || {
+            let mut rec = self.deposit_record(intent)?;
+            if rec.status == "minted" {
+                return unhex(rec.token.as_deref().unwrap_or(""));
+            }
+            if rec.status != "proven" {
+                return refuse(
+                    WalletReason::NotPending,
+                    format!(
+                        "intent {intent} is {}: collect the deposit proof first",
+                        rec.status
+                    ),
+                );
+            }
+            let token = self.mint_with(
+                &unhex(rec.reason.as_deref().unwrap_or(""))?,
+                &unhex(&rec.owner_key)?,
+                &undec(&rec.amount)?,
+            )?;
+            rec.token = Some(hex(&token));
+            rec.status = "minted".into();
+            let own = rec.deposit_number.clone();
+            if let Some(mine) = rec.seen_deposits.as_mut().and_then(|s| {
+                s.iter_mut()
+                    .find(|x| Some(&x.deposit_number) == own.as_ref())
+            }) {
+                mine.token = rec.token.clone();
+            }
+            self.journal.put_deposit(&rec)?;
+            Ok(token)
+        })
+    }
+
+    /// Mint a further deposit that carries this intent's rho (`seenDeposits`): a reused secret, or a second device. Its value is
+    /// a separate root token with its own deposit number; nothing is lost.
+    pub fn mint_extra_deposit(&self, intent: u64, deposit_number: u64) -> Result<Vec<u8>> {
+        self.locked(&format!("deposit/{intent}"), || {
+            let mut rec = self.deposit_record(intent)?;
+            let want = dec(deposit_number);
+            let Some(x) = rec
+                .seen_deposits
+                .as_ref()
+                .and_then(|s| s.iter().find(|s| s.deposit_number == want))
+                .cloned()
+            else {
+                return refuse(
+                    WalletReason::NotPending,
+                    format!("no deposit number {deposit_number} is journaled for intent {intent}"),
+                );
+            };
+            if let Some(t) = &x.token {
+                return unhex(t);
+            }
+            // the entry's own first owner: another device may have deposited this rho to another key
+            let first_owner = unhex(&x.first_owner)?;
+            let amount = undec(&x.amount)?;
+            let (_, reason) = self.prove_deposit(
+                intent,
+                &unhex(&x.tx)?,
+                deposit_number,
+                &amount,
+                &first_owner,
+            )?;
+            let token = self.mint_with(&reason, &first_owner[9..], &amount)?;
+            if let Some(e) = rec
+                .seen_deposits
+                .as_mut()
+                .and_then(|s| s.iter_mut().find(|s| s.deposit_number == want))
+            {
+                e.token = Some(hex(&token));
+            }
+            self.journal.put_deposit(&rec)?;
+            Ok(token)
+        })
+    }
+
+    /// Recover deposits from the seed (k_w) and a backed-up high-water mark (section 5.1): every intent below `next` is matched by
+    /// its rho against the vault's Deposited events. A match upgrades a planned or submitted record (or creates the record) to
+    /// deposited; every deposit number seen for a rho is journaled. A look-ahead past the mark does not replace it.
+    pub fn recover_deposits(&self, next: u64) -> Result<Vec<u64>> {
+        self.locked("intents", || {
+            let cur = self.journal.intents_for_update()?;
+            let behind = match &cur {
+                None => true,
+                Some(c) => undec64(&c.next)? < next,
+            };
+            if behind {
+                let mut r = cur.unwrap_or_else(|| self.intents_record(next));
+                r.next = dec(next);
+                r.key_scheme = self.key_scheme.clone();
+                self.journal.put_intents(&r)?;
+            }
+            Ok(())
+        })?;
+        let mut want: HashMap<[u8; 32], u64> = HashMap::new();
+        for i in 0..next {
+            want.insert(rho_of(&self.domain, &self.secret_of(i)), i);
+        }
+        let mut by_intent: BTreeMap<u64, Vec<SeenLog>> = BTreeMap::new();
+        let top = self.evm.block_number()?;
+        for l in self.evm.logs(
+            &self.cfg.vault,
+            &json!([hex(&topic::deposited())]),
+            self.pins.deployment_block,
+            top,
+        )? {
+            let Some(d) = decode_deposited(&l.topics, &l.data) else {
+                continue;
+            };
+            if l.address != self.cfg.vault || d.domain != self.domain {
+                continue;
+            }
+            let Some(&i) = want.get(d.rho.as_slice()) else {
+                continue;
+            };
+            by_intent.entry(i).or_default().push(SeenLog {
+                tx: l.transaction_hash.clone(),
+                block_number: l.block_number,
+                n: d.n,
+                amount: d.amount,
+                first_owner: d.first_owner,
+            });
+        }
+        let mut found = Vec::new();
+        for (i, seen) in by_intent {
+            self.locked(&format!("deposit/{i}"), || {
+                let mut rec = match self.journal.deposit_for_update(i)? {
+                    Some(r) => r,
+                    None => DepositRecord {
+                        base: self.journal.base("deposit"),
+                        key_scheme: self.key_scheme.clone(),
+                        intent: dec(i),
+                        amount: dec(&seen[0].amount),
+                        owner_key: hex(&seen[0].first_owner[9..]),
+                        first_owner: hex(&seen[0].first_owner),
+                        rho: hex(&rho_of(&self.domain, &self.secret_of(i))),
+                        status: "planned".into(),
+                        backed_up: true,
+                        sends: Vec::new(),
+                        deposit_tx: None,
+                        block_number: None,
+                        deposit_number: None,
+                        receipt_proof: None,
+                        reason: None,
+                        token: None,
+                        secret: None,
+                        planned_block: None,
+                        seen_deposits: None,
+                        extra: Default::default(),
+                    },
+                };
+                self.adopt_deposits(&mut rec, &seen).map(|_| ())
+            })?;
+            found.push(i);
+        }
+        Ok(found)
+    }
+
+    // ==== circulation =====================================================================================================
+
+    /// Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount and owner.
+    pub fn verify_token(&self, token: &[u8]) -> Result<HeldToken> {
+        let t = decode_token(token)?;
+        let h = self.retrying_trust(|tr| verify_held(&self.cfg, &self.domain, tr, &t))?;
+        Ok(HeldToken {
+            token_id: h.token_id,
+            amount: h.amount,
+            owner: (h.owner.ty == PRED_SIGNATURE).then_some(h.owner.params),
+        })
+    }
+
+    /// An ordinary transfer to `to_key`; the result is verified before it is returned.
+    pub fn transfer(
+        &self,
+        token: &[u8],
+        owner: &dyn OwnerSigner,
+        to_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.verify_token(token)?;
+        parse_key(to_key)?;
+        let req = transfer_request(
+            token,
+            owner,
+            &TransferTx {
+                recipient: signature_predicate(to_key),
+                mask: fresh_mask().to_vec(),
+                data: None,
+                deadline: None,
+            },
+        )?;
+        let out = append_transfer(
+            token,
+            &req.tx,
+            &certify_checked(&*self.aggregator, &req.cd)?,
+        )?;
+        self.verify_token(&out)?;
+        Ok(out)
+    }
+
+    /// The default split ID: H_U(C(b("UNICITY_NB2_WALLET_SPLIT"), b(source))).
+    pub fn default_split_id(token: &[u8]) -> [u8; 32] {
+        hu(&[&c_arr(&[
+            &c_bytes(b"UNICITY_NB2_WALLET_SPLIT"),
+            &c_bytes(token),
+        ])])
+    }
+
+    /// Split a held token into whole parts (burn-and-mint with the protocol 6 lineage formats). The plan is journaled first, then
+    /// the burn's exact request, the burned parent and each child as it is minted; a call with the same `split_id` resumes.
+    pub fn split(
+        &self,
+        token: &[u8],
+        owner: &dyn OwnerSigner,
+        outputs: &[(Vec<u8>, BigUint)],
+        split_id: Option<[u8; 32]>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let id = split_id.unwrap_or_else(|| Self::default_split_id(token));
+        self.locked(&format!("split/{}", hex(&id)), || {
+            self.split_inner(token, owner, outputs, &id)
+        })
+    }
+
+    fn split_inner(
+        &self,
+        token: &[u8],
+        owner: &dyn OwnerSigner,
+        outputs: &[(Vec<u8>, BigUint)],
+        id: &[u8; 32],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut rec = match self.journal.split_for_update(&hex(id))? {
+            Some(r) => r,
+            None => {
+                let held = self.verify_token(token)?;
+                if outputs.len() < 2 {
+                    return refuse(WalletReason::BadInput, "a split has at least two outputs");
+                }
+                let mut sum = BigUint::default();
+                for (k, a) in outputs {
+                    if a.bits() == 0 {
+                        return refuse(WalletReason::BadInput, "every output amount is positive");
+                    }
+                    parse_key(k)?;
+                    sum += a;
+                }
+                if sum != held.amount {
+                    return refuse(
+                        WalletReason::BadInput,
+                        format!("the outputs sum to {sum}, the token holds {}", held.amount),
+                    );
+                }
+                let r = SplitRecord {
+                    base: self.journal.base("split"),
+                    split_id: hex(id),
+                    source: hex(token),
+                    outputs: outputs
+                        .iter()
+                        .map(|(k, a)| SplitOutputRecord {
+                            owner_key: hex(k),
+                            amount: dec(a),
+                            salt: hex(&fresh_mask()),
+                            token: None,
+                            extra: Default::default(),
+                        })
+                        .collect(),
+                    mask: hex(&fresh_mask()),
+                    status: "planned".into(),
+                    burn_tx: None,
+                    burn_request: None,
+                    burned: None,
+                    extra: Default::default(),
+                };
+                self.journal.put_split(&r)?;
+                r
+            }
+        };
+        let parent = decode_token(&unhex(&rec.source)?)?;
+        let outs = rec
+            .outputs
+            .iter()
+            .map(|o| {
+                Ok(SplitOutput {
+                    owner_key: unhex(&o.owner_key)?,
+                    amount: undec(&o.amount)?,
+                    salt: unhex(&o.salt)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let plan = split_plan(
+            &parent,
+            &outs,
+            &self.cfg.ty,
+            &self.cfg.aid,
+            &unhex(&rec.mask)?,
+            None,
+        )?;
+        if rec.status == "planned" {
+            let req = transfer_request(&unhex(&rec.source)?, owner, &plan.burn)?;
+            rec.burn_tx = Some(hex(&req.tx));
+            rec.burn_request = Some(hex(&req.cd));
+            rec.status = "burn-requested".into();
+            self.journal.put_split(&rec)?;
+        }
+        if rec.status == "burn-requested" {
+            let proof = certify_checked(
+                &*self.aggregator,
+                &unhex(rec.burn_request.as_deref().unwrap_or(""))?,
+            )?;
+            rec.burned = Some(hex(&append_transfer(
+                &unhex(&rec.source)?,
+                &unhex(rec.burn_tx.as_deref().unwrap_or(""))?,
+                &proof,
+            )?));
+            rec.status = "burned".into();
+            self.journal.put_split(&rec)?;
+        }
+        let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
+        for k in 0..rec.outputs.len() {
+            if rec.outputs[k].token.is_some() {
+                continue;
+            }
+            let m = child_mint(&burned, &plan.tree, &plan.children[k])?;
+            let req = mint_request(&m)?;
+            let child = token_of_mint(&req.tx, &certify_checked(&*self.aggregator, &req.cd)?);
+            let v = self.verify_token(&child)?;
+            if v.amount != undec(&rec.outputs[k].amount)? {
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "a split child has another amount",
+                );
+            }
+            rec.outputs[k].token = Some(hex(&child));
+            self.journal.put_split(&rec)?;
+        }
+        rec.status = "minted".into();
+        self.journal.put_split(&rec)?;
+        rec.outputs
+            .iter()
+            .map(|o| unhex(o.token.as_deref().unwrap_or("")))
+            .collect()
+    }
+
+    // ==== Unicity -> EVM ==================================================================================================
+
+    /// The newest verified seal receipt (section 12.2) and its container, or None when the vault has never sealed.
+    pub fn newest_seal_receipt(&self) -> Result<Option<(SealReceipt, Vec<u8>)>> {
+        let Some(log) = self
+            .evm
+            .newest_seal(&self.cfg.vault, self.pins.deployment_block)?
+        else {
+            return Ok(None);
+        };
+        let rp = self.evm.receipt_proof(
+            &log.transaction_hash,
+            &self.cfg.vault,
+            &topic::segment_sealed(),
+        )?;
+        let receipt =
+            self.retrying_trust(|t| verify_seal_receipt(&self.cfg, &self.domain, t, &rp.encoded))?;
+        Ok(Some((receipt, rp.encoded)))
+    }
+
+    /// Plan the return of a whole held part to `recipient` on the EVM: verify its full provenance, pick the index from a verified
+    /// seal receipt, and run the capacity preflight (section 12.5): the complete prospective return with the history already
+    /// owed from `a` plus `returnReserveSegments` must fit the encoded-transaction limit and `userGasLimit`, and `payer` must fund
+    /// that gas limit. Journals the plan; nothing irreversible happens here. `state_read` is the stateReadOnly substitute
+    /// (Some(verified index)).
+    pub fn plan_return(
+        &self,
+        token: &[u8],
+        recipient: &[u8],
+        payer: &[u8],
+        state_read: Option<u64>,
+    ) -> Result<ReturnPlan> {
+        let return_id = hu(&[token]);
+        self.locked(&format!("return/{}", hex(&return_id)), || {
+            let part = decode_token(token)?;
+            let held = self.retrying_trust(|t| verify_held(&self.cfg, &self.domain, t, &part))?;
+            if recipient.len() != 20 {
+                return refuse(WalletReason::BadInput, "an EVM recipient is 20 bytes");
+            }
+            let recipient: [u8; 20] = arr(recipient);
+            if recipient.iter().all(|&x| x == 0) || recipient == self.cfg.vault {
+                return refuse(WalletReason::RecipientRefused, "the zero address and the vault are refused");
+            }
+            let mut warnings = Vec::new();
+            if !self.evm.code(&recipient)?.is_empty() {
+                warnings.push("the recipient is a contract: a payout it refuses strands the burn (simulation is not a guarantee)".to_string());
+            }
+            // the index
+            let (a, start_head);
+            let mut from_block = self.pins.deployment_block;
+            let mut seal_receipt = None;
+            if let Some(verified) = state_read {
+                let st = self.evm.vault_state(&self.cfg.vault)?;
+                check_state_read(self.pins.state_read_only, st.segment, verified, self.pins.max_jump.unwrap_or(64))?;
+                a = st.segment;
+                start_head = if a == 0 { genesis_head(&self.domain, self.cfg.k) } else { st.head };
+            } else {
+                let sr = self.newest_seal_receipt()?;
+                (a, start_head) = burn_index(&self.cfg, &self.domain, sr.as_ref().map(|x| &x.0));
+                if let Some((r, encoded)) = &sr {
+                    from_block = r.block_number;
+                    seal_receipt = Some(hex(encoded));
+                    // availability, not safety: an old receipt anchors the burn low (more history to prove), never in the future
+                    let age = self.evm.block_number()?.saturating_sub(r.block_number);
+                    if age > self.max_seal_age_blocks {
+                        warnings.push(format!("the newest seal receipt served is {age} blocks old: the provider may be hiding newer seals; the burn then owes more history"));
+                    }
+                }
+            }
+            let (c_obs, pf) = self.preflight(token, &held.amount, &recipient, a, payer)?;
+            if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
+                if existing.status != "planned" {
+                    return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
+                }
+            }
+            let record = ReturnRecord {
+                base: self.journal.base("return"),
+                return_id: hex(&return_id),
+                source: hex(token),
+                amount: dec(&held.amount),
+                recipient: hex(&recipient),
+                a: dec(a),
+                start_head: hex(&start_head),
+                from_block: dec(from_block),
+                seal_receipt,
+                status: "planned".into(),
+                burn_tx: None,
+                burn_request: None,
+                burned: None,
+                eta: None,
+                sends: Vec::new(),
+                payer: Some(hex(payer)),
+                first_send_block: None,
+                paid: None,
+                extra: Default::default(),
+            };
+            self.journal.put_return(&record)?;
+            Ok(ReturnPlan {
+                return_id,
+                amount: held.amount,
+                recipient,
+                a,
+                c_obs,
+                p_now: pf.p_now,
+                p_max: pf.p_max,
+                margin_segments: pf.p_max as i128 - pf.need as i128,
+                gas_limit: pf.gas,
+                warnings,
+                record,
+            })
+        })
+    }
+
+    /// The section 12.5 preflight for burning `token` at index `a` to `recipient`, with a fresh endpoint estimate
+    /// (c_obs = max(c, a); the state read is an availability assumption, not evidence) and the payer's funds for the worst-case
+    /// gas limit.
+    fn preflight(
+        &self,
+        token: &[u8],
+        amount: &BigUint,
+        recipient: &[u8; 20],
+        a: u64,
+        payer: &[u8],
+    ) -> Result<(u64, PreflightResult)> {
+        let st = self.evm.vault_state(&self.cfg.vault)?;
+        let c_obs = st.segment.max(a);
+        let r = encode_return_data(&ReturnData {
+            d: self.domain,
+            asset: asset_uct(),
+            recipient: *recipient,
+            amount: amount.clone(),
+            min_index: a,
+        });
+        let l_t = (evidence_of(token).len() + burn_pair_bound(r.len())) as u64;
+        let l_o = other_bytes(l_t as usize) as u64;
+        let lineage = lineage_of(&decode_token(token)?)?;
+        let gas_at = |p: u64| {
+            self.gas.redeem_gas_limit(&RedeemShape {
+                evidence_bytes: l_t as usize,
+                lineage: &lineage,
+                pending_transactions: 1,
+                proofs: p,
+                k: self.cfg.k,
+            })
+        };
+        let pins = &self.pins;
+        let pf = capacity_preflight(&Preflight {
+            l_max: pins.max_encoded_tx_bytes,
+            l_t,
+            l_o,
+            k: self.cfg.k,
+            a,
+            c_obs,
+            reserve: pins.return_reserve_segments,
+            gas_at: &gas_at,
+            user_gas_limit: pins.user_gas_limit,
+        })?;
+        // the payer must fund the worst-case gas limit at the current fee level (twice the base fee plus the priority fee)
+        let (base_fee, priority) = self.evm.fees()?;
+        let cost = BigUint::from(pf.gas) * (BigUint::from(2u8) * base_fee + priority);
+        let bal = self.evm.balance(payer)?;
+        if bal < cost {
+            return refuse(
+                WalletReason::InsufficientFunds,
+                format!(
+                    "the payer holds {bal} wei, the worst-case gas limit {} needs {cost}",
+                    pf.gas
+                ),
+            );
+        }
+        Ok((c_obs, pf))
+    }
+
+    fn return_record(&self, id: &[u8; 32]) -> Result<ReturnRecord> {
+        match self.journal.ret_for_update(&hex(id))? {
+            Some(r) => Ok(r),
+            None => refuse(
+                WalletReason::JournalNotPersisted,
+                format!("no journal entry for return {}", hex(id)),
+            ),
+        }
+    }
+
+    /// Certify the terminal burn of a planned return: R signs the recipient, the amount and the index. The exact request is
+    /// journaled before certification, the certified burn before this returns; a second call resumes the same burn and never
+    /// makes another.
+    pub fn burn(&self, return_id: &[u8; 32], owner: &dyn OwnerSigner) -> Result<Burned> {
+        self.locked(&format!("return/{}", hex(return_id)), || {
+            self.burn_inner(return_id, owner)
+        })
+    }
+
+    fn burn_inner(&self, return_id: &[u8; 32], owner: &dyn OwnerSigner) -> Result<Burned> {
+        let mut rec = self.return_record(return_id)?;
+        let recipient: [u8; 20] = unhex_n(&rec.recipient)?;
+        let amount = undec(&rec.amount)?;
+        let a = undec64(&rec.a)?;
+        if rec.status == "planned" {
+            // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
+            let payer = match &rec.payer {
+                None => recipient.to_vec(),
+                Some(p) => unhex(p)?,
+            };
+            self.preflight(&unhex(&rec.source)?, &amount, &recipient, a, &payer)?;
+            let r = encode_return_data(&ReturnData {
+                d: self.domain,
+                asset: asset_uct(),
+                recipient,
+                amount: amount.clone(),
+                min_index: a,
+            });
+            let req = transfer_request(
+                &unhex(&rec.source)?,
+                owner,
+                &TransferTx {
+                    recipient: burn_predicate(&hu(&[&r])),
+                    mask: fresh_mask().to_vec(),
+                    data: Some(r),
+                    deadline: None,
+                },
+            )?;
+            rec.burn_tx = Some(hex(&req.tx));
+            rec.burn_request = Some(hex(&req.cd));
+            rec.status = "burn-requested".into();
+            self.journal.put_return(&rec)?;
+        }
+        if rec.status == "burn-requested" {
+            let proof = certify_checked(
+                &*self.aggregator,
+                &unhex(rec.burn_request.as_deref().unwrap_or(""))?,
+            )?;
+            let burned = append_transfer(
+                &unhex(&rec.source)?,
+                &unhex(rec.burn_tx.as_deref().unwrap_or(""))?,
+                &proof,
+            )?;
+            let part = decode_evidence(&evidence_of(&burned))?;
+            let v = verify_part(&self.cfg, &self.domain, &self.trust(), &part)?;
+            if v.min_segment != a || v.amount != amount || v.recipient != recipient {
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "the certified burn is not the planned one",
+                );
+            }
+            rec.burned = Some(hex(&burned));
+            rec.eta = Some(hex(&v.eta));
+            rec.status = "burned".into();
+            self.journal.put_return(&rec)?;
+        }
+        let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
+        let verdict = verify_part(
+            &self.cfg,
+            &self.domain,
+            &self.trust(),
+            &decode_evidence(&evidence_of(&burned))?,
+        )?;
+        Ok(Burned {
+            burned,
+            eta: verdict.eta,
+            verdict,
+        })
+    }
+
+    /// Build the redeem transaction of a burned return: one SegmentSealed log per segment a .. c-1 from any provider, each checked
+    /// (length, order, M_j, head link from the journaled start head), the gap proofs, and the gas limit (expected cost plus
+    /// gasReserve). A missing or reordered log is missing evidence, never absence. Refuses with `CapacityExceeded` when the claim
+    /// does not fit.
+    pub fn build_redeem(&self, return_id: &[u8; 32]) -> Result<RedeemTx> {
+        self.locked(&format!("return/{}", hex(return_id)), || {
+            self.build_redeem_inner(return_id)
+        })
+    }
+
+    fn build_redeem_inner(&self, return_id: &[u8; 32]) -> Result<RedeemTx> {
+        let rec = self.return_record(return_id)?;
+        if rec.status != "burned" && rec.status != "submitted" {
+            return refuse(
+                WalletReason::NotPending,
+                format!("return {} is {}", hex(return_id), rec.status),
+            );
+        }
+        let a = undec64(&rec.a)?;
+        let eta: [u8; 32] = unhex_n(rec.eta.as_deref().unwrap_or(""))?;
+        let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
+        let evidence = evidence_of(&burned);
+        let start_head = unhex(&rec.start_head)?;
+        let mut attempt = 0;
+        loop {
+            let st = self.evm.vault_state(&self.cfg.vault)?;
+            if st.segment < a {
+                return refuse(
+                    WalletReason::NotPending,
+                    format!(
+                        "the vault is at segment {}, below the burn index {a}: wait (FutureIndex)",
+                        st.segment
+                    ),
+                );
+            }
+            let logs =
+                self.evm
+                    .segment_logs(&self.cfg.vault, undec64(&rec.from_block)?, a, st.segment)?;
+            let mut segs: Vec<Segment> = Vec::new();
+            let mut before = start_head.clone();
+            for l in &logs {
+                let s = check_segment_log(
+                    &self.domain,
+                    self.cfg.k,
+                    topic_index(&l.topics[1]),
+                    &before,
+                    &l.data,
+                )?;
+                before = s.after.to_vec();
+                segs.push(s);
+            }
+            if before != st.head {
+                // the chain moved between the reads, or the provider is inconsistent: read again once
+                if attempt < 2 {
+                    attempt += 1;
+                    continue;
+                }
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "the served segment logs do not fold to the vault's current head",
+                );
+            }
+            let h = build_history(&segs, &eta, a, st.segment, &start_head)?;
+            if let Some(j) = h.paid {
+                return refuse(
+                    WalletReason::AlreadyPaid,
+                    format!("the redemption ID is in sealed segment {j}: reconcile"),
+                );
+            }
+            let p = st.segment - a;
+            let calldata = redeem_calldata(&evidence, &eta, a, &h.history);
+            let l_o = other_bytes(evidence.len()) as u64;
+            let lineage = lineage_of(&decode_token(&burned)?)?;
+            let Some(mut gas_limit) = self.gas.redeem_gas_limit(&RedeemShape {
+                evidence_bytes: evidence.len(),
+                lineage: &lineage,
+                pending_transactions: 0,
+                proofs: p,
+                k: self.cfg.k,
+            }) else {
+                return fail_d(Rule::CapacityExceeded, "the gas cannot be bounded");
+            };
+            match self
+                .evm
+                .estimate_gas(&rec.recipient_bytes()?, &self.cfg.vault, &calldata, 0)?
+            {
+                Estimate::Gas(g) => {
+                    // fail closed: a limit that overflows is not bounded
+                    let Some(l) = g.checked_add(self.pins.gas_reserve) else {
+                        return fail_d(Rule::CapacityExceeded, "the gas cannot be bounded");
+                    };
+                    gas_limit = l;
+                }
+                Estimate::Revert { data, .. } => {
+                    let e = decode_revert(data.as_deref().unwrap_or(&[]));
+                    let action = classify_redeem_error(e.as_ref());
+                    if action == RedeemAction::RebuildHistory && attempt < 2 {
+                        attempt += 1;
+                        continue;
+                    }
+                    if action == RedeemAction::Reconcile {
+                        return refuse(
+                            WalletReason::AlreadyPaid,
+                            "the vault reports AlreadyPaid: reconcile",
+                        );
+                    }
+                    if let Some(e) = e {
+                        let args = e
+                            .args
+                            .iter()
+                            .map(|x| match x {
+                                super::abi::ErrArg::Int(v) => v.to_string(),
+                                super::abi::ErrArg::Word(w) => hex(w),
+                            })
+                            .collect();
+                        return Err(Error::Rule(Nb2Error {
+                            args,
+                            ..Nb2Error::with_detail(
+                                e.rule,
+                                format!("simulation refused ({})", action.name()),
+                            )
+                        }));
+                    }
+                    // no rule: an RPC without simulation; the model's bound stands
+                }
+            }
+            capacity_exceeded(
+                self.pins.max_encoded_tx_bytes,
+                evidence.len() as u64,
+                l_o,
+                self.cfg.k,
+                p,
+                gas_limit,
+                self.pins.user_gas_limit,
+            )?;
+            return Ok(RedeemTx {
+                return_id: *return_id,
+                calldata,
+                gas_limit,
+                p,
+                endpoint: st.segment,
+                history: h.history,
+                eta,
+                claimed_start: a,
+            });
+        }
+    }
+
+    /// Send the redeem. Earlier sends are reconciled first (a pending one is never doubled; a landed one is the answer). Every
+    /// signed transaction is journaled before broadcast; an ambiguous broadcast is resolved by its receipt. A stale endpoint is
+    /// rebuilt, never the burn; failures are classified by error selector.
+    pub fn submit_redeem(
+        &self,
+        return_id: &[u8; 32],
+        signer: &dyn EvmSigner,
+    ) -> Result<ReconcileResult> {
+        self.locked(&format!("return/{}", hex(return_id)), || {
+            self.submit_redeem_inner(return_id, signer)
+        })
+    }
+
+    fn submit_redeem_inner(
+        &self,
+        return_id: &[u8; 32],
+        signer: &dyn EvmSigner,
+    ) -> Result<ReconcileResult> {
+        let prior = self.reconcile_inner(return_id)?;
+        if !matches!(prior, ReconcileResult::NotPaid { .. }) {
+            return Ok(prior);
+        }
+        let mut gas_bump = 1u64;
+        for _ in 0..4 {
+            let rtx = self.build_redeem_inner(return_id)?;
+            let gas = (rtx.gas_limit.saturating_mul(gas_bump)).min(self.pins.user_gas_limit);
+            let tx = self.signed(
+                signer,
+                &self.cfg.vault,
+                &rtx.calldata,
+                BigUint::default(),
+                gas,
+            )?;
+            let mut fresh = self.return_record(return_id)?;
+            fresh.sends.push(self.send_record(&tx));
+            fresh.status = "submitted".into();
+            if fresh.first_send_block.is_none() {
+                fresh.first_send_block = Some(dec(self.evm.block_number()?));
+            }
+            self.journal.put_return(&fresh)?;
+            let Some(r) = self.broadcast_and_wait(&tx)? else {
+                return Ok(ReconcileResult::Pending {
+                    tx_hash: tx.hash.to_vec(),
+                });
+            };
+            if status_is_ok(&r) {
+                let rec = self.return_record(return_id)?;
+                return Ok(self.verified_paid(rec, &tx.hash)?.unwrap_or(
+                    ReconcileResult::Pending {
+                        tx_hash: tx.hash.to_vec(),
+                    },
+                ));
+            }
+            // reverted: classify by simulating the same call at the current state
+            let (action, e) =
+                match self
+                    .evm
+                    .estimate_gas(&signer.address(), &self.cfg.vault, &rtx.calldata, 0)?
+                {
+                    Estimate::Gas(_) => (RedeemAction::RetryLater, None),
+                    Estimate::Revert { data, .. } => {
+                        let e = decode_revert(data.as_deref().unwrap_or(&[]));
+                        (classify_redeem_error(e.as_ref()), e)
+                    }
+                };
+            match action {
+                RedeemAction::Reconcile => return self.reconcile_inner(return_id),
+                RedeemAction::RebuildHistory | RedeemAction::RepairProof => continue,
+                RedeemAction::RetryLater => {
+                    // an out-of-gas or a transient payout failure: one retry with more gas
+                    gas_bump = 2;
+                    continue;
+                }
+                _ => {
+                    let rule = e.map_or(Rule::PayoutFailed, |e| e.rule);
+                    return Err(Error::Rule(Nb2Error::with_detail(
+                        rule,
+                        format!("redeem {} reverted: stop and tell the user", hex(&tx.hash)),
+                    )));
+                }
+            }
+        }
+        Ok(ReconcileResult::NotPaid { last_failure: None })
+    }
+
+    /// Look for Paid(eta) and the receipts of every journaled send; never changes the burn. A Paid log counts only from the vault
+    /// and only once its receipt is verified under the block's EVM UC (section 6.2 steps 2 to 5): a provider that invents or
+    /// withholds Paid can delay the wallet, never stop its redemption.
+    pub fn reconcile(&self, return_id: &[u8; 32]) -> Result<ReconcileResult> {
+        self.locked(&format!("return/{}", hex(return_id)), || {
+            self.reconcile_inner(return_id)
+        })
+    }
+
+    fn reconcile_inner(&self, return_id: &[u8; 32]) -> Result<ReconcileResult> {
+        let mut rec = self.return_record(return_id)?;
+        if rec.status == "paid" {
+            let p = rec.paid.as_ref().expect("a paid record has paid");
+            return Ok(ReconcileResult::Paid {
+                tx_hash: unhex(&p.tx_hash)?,
+                block_number: undec64(&p.block_number)?,
+            });
+        }
+        let Some(eta_hex) = rec.eta.clone() else {
+            return Ok(ReconcileResult::NotPaid { last_failure: None });
+        };
+        let eta = unhex(&eta_hex)?;
+        for l in self
+            .evm
+            .paid(&self.cfg.vault, &eta, undec64(&rec.from_block)?)?
+        {
+            let Some(p) = decode_paid(&l) else { continue };
+            if l.address != self.cfg.vault || p.eta != eta {
+                continue;
+            }
+            if let Some(v) = self.verified_paid(rec.clone(), &l.transaction_hash)? {
+                return Ok(v);
+            }
+        }
+        let mut sends = rec.sends.clone();
+        let landed = self.landed_send(&mut sends)?;
+        if sends != rec.sends {
+            rec.sends = sends;
+            self.journal.put_return(&rec)?;
+        }
+        match landed {
+            Landed::Pending => Ok(ReconcileResult::Pending {
+                tx_hash: unhex(&rec.sends.last().expect("a send").hash)?,
+            }),
+            Landed::Receipt(r) => {
+                let tx = unhex(&r.transaction_hash.to_lowercase())?;
+                Ok(self
+                    .verified_paid(rec, &tx)?
+                    .unwrap_or(ReconcileResult::Pending { tx_hash: tx }))
+            }
+            Landed::None => Ok(ReconcileResult::NotPaid { last_failure: None }),
+        }
+    }
+
+    /// Verify that transaction `tx` paid this return: its Paid log, from the vault, with topics [Paid, eta, recipient] and data the
+    /// amount, in a receipt verified under the block's certificate. Journals `paid` and returns it; Pending while the block is not
+    /// certified yet; None when the claim does not verify (it is ignored).
+    fn verified_paid(&self, mut rec: ReturnRecord, tx: &[u8]) -> Result<Option<ReconcileResult>> {
+        let r = (|| -> Result<Option<ReconcileResult>> {
+            let eta = unhex(rec.eta.as_deref().unwrap_or(""))?;
+            let rp = self
+                .evm
+                .receipt_proof(tx, &self.cfg.vault, &topic::paid())?;
+            let log = self.retrying_trust(|t| verify_receipt_log(&self.cfg, t, &rp.proof))?;
+            let recipient_word = cat(&[&[0u8; 12], &unhex(&rec.recipient)?]);
+            if log.topics.len() != 3
+                || log.topics[0] != topic::paid()
+                || log.topics[1] != eta
+                || log.topics[2] != recipient_word
+                || log.data.len() != 32
+                || be_int(&log.data) != undec(&rec.amount)?
+            {
+                return Ok(None);
+            }
+            rec.paid = Some(PaidRecord {
+                tx_hash: hex(tx),
+                block_number: dec(rp.block_number),
+                extra: Default::default(),
+            });
+            rec.status = "paid".into();
+            self.journal.put_return(&rec)?;
+            Ok(Some(ReconcileResult::Paid {
+                tx_hash: tx.to_vec(),
+                block_number: rp.block_number,
+            }))
+        })();
+        match r {
+            Err(Error::Wallet(w)) if w.reason == WalletReason::CompanionUnknown => {
+                Ok(Some(ReconcileResult::Pending {
+                    tx_hash: tx.to_vec(),
+                }))
+            }
+            // a lost compare-and-swap of the journal is never read as an unverified claim
+            Err(Error::Wallet(w))
+                if w.reason == WalletReason::JournalConflict
+                    || w.reason == WalletReason::JournalNotPersisted =>
+            {
+                Err(Error::Wallet(w))
+            }
+            Err(Error::Rule(_)) | Err(Error::Wallet(_)) => Ok(None),
+            r => r,
+        }
+    }
+
+    // ==== status ==========================================================================================================
+
+    /// Where every journaled deposit and return stands, in words.
+    pub fn status(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for d in self.journal.deposits()? {
+            let say = match d.status.as_str() {
+                "planned" => "planned: the secret is journaled; send the deposit",
+                "submitted" => "sent: waiting for the receipt (submit_deposit again reconciles)",
+                "deposited" => {
+                    "deposited: waiting for the block certificate (collect_deposit_proof)"
+                }
+                "proven" => "proven: J is journaled; mint",
+                "minted" => "minted",
+                _ => "unknown",
+            };
+            out.push(format!(
+                "deposit intent {} of {}: {say}",
+                d.intent, d.amount
+            ));
+        }
+        for r in self.journal.returns()? {
+            let say = match r.status.as_str() {
+                "planned" => "planned: preflight passed; burn",
+                "burn-requested" => "burn requested: call burn again to finish certification",
+                "burned" => "burned: build and submit the redeem",
+                "submitted" => "redeem sent: reconcile",
+                "paid" => "paid",
+                _ => "unknown",
+            };
+            out.push(format!(
+                "return {} of {} to {} (a = {}): {say}",
+                r.return_id.chars().take(18).collect::<String>(),
+                r.amount,
+                r.recipient,
+                r.a
+            ));
+        }
+        Ok(out)
+    }
+
+    // ==== EVM plumbing ====================================================================================================
+
+    fn signed(
+        &self,
+        signer: &dyn EvmSigner,
+        to: &[u8; 20],
+        data: &[u8],
+        value: BigUint,
+        gas: u64,
+    ) -> Result<SignedTx> {
+        let nonce = self.evm.nonce(&signer.address(), "pending")?;
+        let (base_fee, priority) = self.evm.fees()?;
+        let max_fee = BigUint::from(2u8) * base_fee + &priority;
+        sign_tx(
+            signer,
+            &TxRequest {
+                chain_id: self.cfg.chain_id,
+                nonce,
+                max_priority_fee_per_gas: priority,
+                max_fee_per_gas: max_fee,
+                gas,
+                to: *to,
+                value,
+                data: data.to_vec(),
+            },
+        )
+    }
+
+    fn send_record(&self, tx: &SignedTx) -> SendRecord {
+        SendRecord {
+            hash: hex(&tx.hash),
+            raw: hex(&tx.raw),
+            nonce: dec(tx.request.nonce),
+            gas: dec(tx.request.gas),
+            at: dec(self.now_ms()),
+            nonce_used_at: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn send_raw_tolerant(&self, raw: &[u8]) -> Result<()> {
+        match self.evm.send_raw(raw) {
+            Ok(_) | Err(SendError::Ambiguous { .. }) => Ok(()),
+            Err(SendError::Failed(e)) => Err(e),
+        }
+    }
+
+    /// Broadcast and poll the receipt of the locally computed hash; None when none arrived in time (the send stays journaled).
+    fn broadcast_and_wait(&self, tx: &SignedTx) -> Result<Option<ReceiptJson>> {
+        self.send_raw_tolerant(&tx.raw)?;
+        let deadline = self.now_ms() + self.receipt_timeout_ms;
+        loop {
+            if let Some(r) = self.evm.receipt(&tx.hash)? {
+                return Ok(Some(r));
+            }
+            if self.now_ms() >= deadline {
+                return Ok(None);
+            }
+            self.sleep_ms(self.poll_ms);
+        }
+    }
+
+    /// The outcome of a record's earlier sends: a success receipt (the answer), Pending, or None (none is alive: a new send is
+    /// safe). The account's MINED nonce is read first, then every send's receipt; a success receipt is the answer whenever it is
+    /// seen. A send whose nonce is used without a success receipt is dead only after the head has advanced `dead_after_blocks`
+    /// since that was first seen (journaled in `nonceUsedAt`; the caller persists `sends` when this changes them), the block at
+    /// `nonceUsedAt` has a certificate (a found companion), and every receipt is read again; until then it is pending. A send
+    /// still in a pool is broadcast again (same bytes).
+    fn landed_send(&self, sends: &mut [SendRecord]) -> Result<Landed> {
+        let Some(last) = sends.last() else {
+            return Ok(Landed::None);
+        };
+        let from = decode_signed_tx(&unhex(&last.raw)?)
+            .map_err(Error::Other)?
+            .from;
+        let last_nonce = undec64(&last.nonce)?;
+        let mined = self.evm.nonce(&from, "latest")?;
+        for s in sends.iter() {
+            if let Some(r) = self.evm.receipt(&unhex(&s.hash)?)? {
+                if status_is_ok(&r) {
+                    return Ok(Landed::Receipt(Box::new(r)));
+                }
+            }
+        }
+        if mined <= last_nonce {
+            // the nonce is unused by any mined transaction: the send is alive, in a pool or lost; offer the same bytes again
+            self.send_raw_tolerant(&unhex(&sends.last().expect("a send").raw)?)?;
+            return Ok(Landed::Pending);
+        }
+        // a mined transaction used the nonce, and no success receipt is visible: wait for depth before calling it dead
+        let head = self.evm.block_number()?;
+        let last = sends.last_mut().expect("a send");
+        let Some(used_at) = last.nonce_used_at.clone() else {
+            last.nonce_used_at = Some(dec(head));
+            return Ok(Landed::Pending);
+        };
+        let used_at = undec64(&used_at)?;
+        if head < used_at.saturating_add(self.dead_after_blocks) {
+            return Ok(Landed::Pending);
+        }
+        // and the block at which the nonce was seen used is certified (a found companion, section 12.7): depth alone is not finality
+        let Some((header, hash)) = self.evm.header_by_number(used_at)? else {
+            return Ok(Landed::Pending);
+        };
+        match self.evm.certificate_of(&header, &hash) {
+            Ok(_) => {}
+            Err(Error::Wallet(_)) | Err(Error::Rule(_)) => return Ok(Landed::Pending),
+            Err(e) => return Err(e),
+        }
+        for s in sends.iter() {
+            if let Some(r) = self.evm.receipt(&unhex(&s.hash)?)? {
+                if status_is_ok(&r) {
+                    return Ok(Landed::Receipt(Box::new(r)));
+                }
+            }
+        }
+        Ok(Landed::None)
+    }
+}
+
+impl ReturnRecord {
+    fn recipient_bytes(&self) -> Result<Vec<u8>> {
+        unhex(&self.recipient)
+    }
+}
+
+fn seen_entry(s: &SeenLog) -> SeenDeposit {
+    SeenDeposit {
+        tx: hex(&s.tx),
+        deposit_number: dec(s.n),
+        block_number: dec(s.block_number),
+        amount: dec(&s.amount),
+        first_owner: hex(&s.first_owner),
+        token: None,
+        extra: Default::default(),
+    }
+}
+
+/// Merge deposit entries into `seenDeposits` by deposit number, keeping journaled tokens, in number order.
+fn merge_seen(rec: &mut DepositRecord, entries: Vec<SeenDeposit>) -> Result<()> {
+    let mut known: Vec<SeenDeposit> = rec.seen_deposits.take().unwrap_or_default();
+    for e in entries {
+        if !known.iter().any(|k| k.deposit_number == e.deposit_number) {
+            known.push(e);
+        }
+    }
+    let mut keyed = Vec::new();
+    for k in known {
+        keyed.push((undec(&k.deposit_number)?, k));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    rec.seen_deposits = Some(keyed.into_iter().map(|x| x.1).collect());
+    Ok(())
+}
+
+/// The lineage of a part, root first.
+pub fn lineage_of(part: &Token) -> Result<Vec<Token>> {
+    let mut chain = vec![part.clone()];
+    loop {
+        let cur = &chain[0];
+        let Some(j) = cur
+            .mint
+            .justification
+            .as_deref()
+            .filter(|j| head_tag(j) == Some(tag::SPLIT_JUSTIFICATION))
+        else {
+            break;
+        };
+        let parent = decode_split_justification(j)?.parent;
+        chain.insert(0, parent);
+    }
+    Ok(chain)
+}
+
+/// An upper bound of the encoded [burn transfer, inclusion proof] pair with return data of `r_len` bytes: the transfer, the
+/// certification data, the reference time, an RSMT path of at most 256 siblings and an aggregator UC at its decoder bound.
+pub fn burn_pair_bound(r_len: usize) -> usize {
+    let transfer = 3 + 1 + 45 + 34 + 3 + r_len + 9;
+    let cd = 3 + 1 + 45 + 34 + 34 + 9 + 67;
+    4 + transfer + 3 + 1 + cd + 9 + 3 + 32 + 32 * 256 + (24 << 10)
+}
+
+/// Everything of the redeem transaction besides the evidence and the gap proofs: ABI heads and padding, the start head, the envelope.
+pub fn other_bytes(evidence: usize) -> usize {
+    // the start head, and the history's padding at most 31 bytes
+    let calldata = redeem_calldata_length(evidence, 32) + 31;
+    calldata - evidence + redeem_tx_framing(calldata)
+}

@@ -360,11 +360,19 @@ fn verifier_sources_contain_no_network_or_filesystem_capability() {
         "http://",
         "https://",
     ];
-    for entry in std::fs::read_dir(src).unwrap() {
-        let p = entry.unwrap().path();
-        let text = std::fs::read_to_string(&p).unwrap();
-        for b in banned {
-            assert!(!text.contains(b), "{} mentions {b}", p.display());
+    // every source file, the nb2 module tree included
+    let mut dirs = vec![src];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                dirs.push(p);
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            for b in banned {
+                assert!(!text.contains(b), "{} mentions {b}", p.display());
+            }
         }
     }
 }
