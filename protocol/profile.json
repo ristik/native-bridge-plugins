@@ -1,5 +1,5 @@
 {
-  "artifactVersion": 4,
+  "artifactVersion": 7,
   "nativeBridgeProtocolVersion": 9,
   "name": "native-bridge-v2",
   "status": "development-frozen-unactivated",
@@ -75,7 +75,8 @@
   "headerSchema": "go-ethereum v1.14.11 Cancun types.Header: 20 fields ending at parentBeaconBlockRoot, no requestsHash; difficulty 0, empty uncle hash, empty withdrawals root, blobGasUsed = excessBlobGas = 0, nonzero u64 base fee, extraData <= 32 bytes, number <= 2^63-1, exact canonical re-encoding",
   "limits": {
     "justificationBytes": 65536,
-    "ucBytes": 16384,
+    "evmUcBytes": 16384,
+    "aggregatorUcBytes": 24576,
     "headerBytes": 2048,
     "receiptNodes": 65,
     "receiptBranchNodeBytes": 1024,
@@ -99,6 +100,11 @@
     "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" },
     "maxJump": { "default": 64, "scope": "stateReadOnly deployments only (ImplausibleIndex)" }
   },
+  "unlockRestriction": {
+    "recoveryIds": [0, 1],
+    "refused": "recovery ID 2 or 3 is UnlockRecovery in every implementation (wallets, plug-in admission, Go reference, Solidity)",
+    "scope": "NB2 bridge eligibility only; narrows the pinned SDK relation (IDs 0..3); such a token stays a valid native token but cannot be returned"
+  },
   "trustModel": {
     "scope": "unicity-trust-base-history",
     "document": "protocol/trust-base.md",
@@ -111,9 +117,9 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "904c2df8c052effa6d916a38a98ce68bd5988473f232bc7c01a8a36137175e4f",
+    "protocol/interop.md": "d8b969b69a0ddf99bd398ab13dc3bc968e15b0da7e8b3ffdb48856e5df199216",
     "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
-    "protocol/trust-base.md": "47e837ced27c9fa8303420f4ce5bee372007b8b20454e570f0b4b2931ac3db7e"
+    "protocol/trust-base.md": "4824915c6c47223dda3db9c943c602eec9664b883d60fde842aba8bb37e8f6ef"
   },
   "legacy": "protocol/legacy-v7/ and protocol/vectors/ are the protocol 7 artifacts and corpus that the old plug-in code still tests against; not part of this profile; removed by bft-core#1106 (NB2-10)."
 }
