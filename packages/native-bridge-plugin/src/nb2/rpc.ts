@@ -186,6 +186,14 @@ export class EvmReader {
     return { header, raw };
   }
 
+  /** The header of a block by number and its hash (the hash of its exact re-encoding); null when the node does not hold it. */
+  public async headerByNumber(n: bigint): Promise<{ header: Header; hash: Uint8Array } | null> {
+    const j = await this.rpc.call<Record<string, unknown> | null>('eth_getBlockByNumber', [qty(n), false]);
+    if (j === null) return null;
+    const header = headerOfJson(j);
+    return { header, hash: HE(encodeHeader(header)) };
+  }
+
   /**
    * The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child does not
    * exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.

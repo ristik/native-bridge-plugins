@@ -25,7 +25,7 @@ const bridge = await NativeBridgeV2.open({
   trust,                                 // the network's trust-base history (TrustInput.fromBundle)
   rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway, nothing bridge-specific
   aggregator: new SdkAggregator(aggregatorUrl),
-  journal: store,                        // your durable key-value store (docs/nb2-journal.md)
+  journal: store,                        // your key-value store; its putIf MUST be atomic and durable (docs/nb2-journal.md)
   bridgeKey: deriveBridgeKey(seed),      // k_w
   backup: async (intents) => { /* back up the intent high-water mark with the seed */ },
   refreshTrust: async () => { /* append newer trust-base entries */ },
@@ -107,7 +107,8 @@ Every call can be repeated with the same identifier after a crash, and resumes w
 | The burn request, then the certified burn | before certification, and before you report success | the burn is irreversible. Its index and recipient never change; only the witness is rebuilt. |
 | Every signed redeem transaction | before broadcast | an ambiguous broadcast is resolved by that transaction's receipt |
 
-The plug-in writes all of these through `JournalStore.put`, which must be durable. Segment logs, gap trees, proofs and fee estimates
+The plug-in writes all of these through `JournalStore.putIf`, a compare-and-swap that must be atomic and durable: it resolves only once
+the value survives a crash, and no other write can land between its comparison and its write. Segment logs, gap trees, proofs and fee estimates
 are rebuilt on demand. A wallet that deletes them and keeps the journal still redeems.
 
 `submitDeposit` refuses in these cases:

@@ -98,7 +98,7 @@ export interface DepositRecord extends Base {
    * Every Deposited event seen with this rho (a faulty wallet that reused r, or two devices). The first is the record's own deposit;
    * each further one is a separate root token (its own n), minted with `mintExtraDeposit`.
    */
-  seenDeposits?: { tx: Hex; depositNumber: Dec; blockNumber: Dec; amount: Dec; token?: Hex }[];
+  seenDeposits?: { tx: Hex; depositNumber: Dec; blockNumber: Dec; amount: Dec; firstOwner: Hex; token?: Hex }[];
 }
 
 export type SplitStatus = 'planned' | 'burn-requested' | 'burned' | 'minted';

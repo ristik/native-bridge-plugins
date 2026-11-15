@@ -18,8 +18,9 @@ redeems.
 
 The store is a key-value store of UTF-8 JSON documents, one record per key. Records are written whole.
 
-Every write is a compare-and-swap (`putIf(key, expected, value)`), against the exact text the writer last read or wrote. It must be
-durable before it returns. The plug-in reads every record back, and does not take the step the record enables until the read-back
+Every write is a compare-and-swap (`putIf(key, expected, value)`), against the exact text the writer last read or wrote. `putIf` MUST
+be atomic (no other write can land between its comparison and its write) and durable (it resolves only once the value survives a
+crash); a store that cannot give both is not a journal store. The plug-in reads every record back, and does not take the step the record enables until the read-back
 matches. A writer that loses the compare-and-swap stops with `JournalConflict`, so two processes sharing one store never both advance
 a record. Within one process, calls on the same record are serialized.
 
@@ -77,7 +78,7 @@ and match each `rho` against the certified `Deposited` events (`recoverDeposits`
 | `token` | hex, optional | the certified minted token |
 | `secret` | hex, optional | `r` itself, only when the wallet backs up secrets instead of the high-water mark |
 | `plannedBlock` | dec, optional | the head block at planning; before the first send, the vault's `Deposited` events from here on are searched for this `rho` |
-| `seenDeposits` | array, optional | every `Deposited` event carrying this `rho`, as `{tx, depositNumber, blockNumber, amount, token?}`; the first is the record's own; each further one (a reused secret, or two devices) is a separate root token, minted with `mintExtraDeposit` |
+| `seenDeposits` | array, optional | every `Deposited` event carrying this `rho`, as `{tx, depositNumber, blockNumber, amount, firstOwner, token?}` (the entry's own 42-byte first owner, which its mint goes to); merged, never replaced; the first is the record's own; each further one (a reused secret, or two devices) is a separate root token, minted with `mintExtraDeposit` |
 
 The status moves only forwards:
 
@@ -159,8 +160,8 @@ Before signing a new transaction, the plug-in checks the record's earlier sends,
    step reports pending.
 3. If a mined transaction has used the nonce and no successful receipt is visible, the send is not yet dead. The plug-in records
    `nonceUsedAt` and reports pending.
-4. Only when the head has advanced `deadAfterBlocks` (6 by default) beyond `nonceUsedAt`, and every receipt has been read again without
-   a success, is the send dead. Then a new transaction may be signed.
+4. Only when the head has advanced `deadAfterBlocks` (6 by default) beyond `nonceUsedAt`, the block at `nonceUsedAt` has a certificate
+   (a found companion, spec section 12.7), and every receipt has been read again without a success, is the send dead. Then a new transaction may be signed.
 
 The order covers a send mined between two reads, and backends of a load-balanced gateway that sit at different heights.
 

@@ -9,7 +9,8 @@ import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
 import { LocalKeySigner, signTx, type EvmSigner } from '../../src/nb2/evm.js';
 import { MemoryJournalStore } from '../../src/nb2/journal.js';
 import { localOwner, type OwnerSigner } from '../../src/nb2/tokenops.js';
-import { TOPIC } from '../../src/nb2/deposit.js';
+import { TOPIC, firstOwnerOf } from '../../src/nb2/deposit.js';
+import { depositCalldata } from '../../src/nb2/abi.js';
 import { FakeChain, evmAccount, key, makeConfig, setup, VAULT } from './world.js';
 import { encodeConfig } from '../../src/nb2/config.js';
 
@@ -72,7 +73,9 @@ test('send race windows: lagging receipt, then caught up; a replaced send is dea
   const store = new MemoryJournalStore();
   const real = s.chain.call.bind(s.chain);
   let lag = 0;
+  let companionDown = false;
   s.chain.call = async <T>(m: string, p: any[]): Promise<T> => {
+    if (m === 'unicity_getSealCompanionV1' && companionDown) return { status: 'unknown' } as T;
     if (m === 'eth_getTransactionReceipt' && lag > 0) {
       lag--;
       return null as T;
@@ -103,7 +106,11 @@ test('send race windows: lagging receipt, then caught up; a replaced send is dea
   assert.equal(await reason(w.submitDeposit(p2.intent, payer)), 'Unconfirmed'); // first seen used: pending
   assert.equal(await reason(w.submitDeposit(p2.intent, payer)), 'Unconfirmed'); // not deep enough yet
   for (let k = 0; k < 3; k++) await s.chain.mine([]);
-  assert.equal((await w.submitDeposit(p2.intent, payer)).depositNumber, 2n); // now dead: one new send
+  // deep enough, but the block at nonceUsedAt has no certificate served: still not dead
+  companionDown = true;
+  assert.equal(await reason(w.submitDeposit(p2.intent, payer)), 'Unconfirmed');
+  companionDown = false;
+  assert.equal((await w.submitDeposit(p2.intent, payer)).depositNumber, 2n); // certified and deep: dead, one new send
   assert.equal(s.chain.vault.state().deposits, 2n);
 });
 
@@ -156,6 +163,14 @@ test('recovery: a stale planned record is upgraded, the pre-send scan finds a de
   chain.autoMine = true;
   assert.equal(chain.vault.state().deposits, 2n);
   assert.equal((await w.submitDeposit(plan.intent, payer)).depositNumber, 1n);
+  // the record's own deposit is merged with a rho scan: both numbers are journaled at once
+  assert.deepEqual((await w.journal.deposit(plan.intent))!.seenDeposits!.map((x) => x.depositNumber), ['1', '2']);
+  // device b's own deposit is number 2: its mint tags that entry, not entry 0
+  assert.equal((await b.submitDeposit(plan.intent, payer2)).depositNumber, 2n);
+  await b.collectDepositProof(plan.intent);
+  await b.mint(plan.intent);
+  const bs = (await b.journal.deposit(plan.intent))!.seenDeposits!;
+  assert.deepEqual(bs.map((x) => x.token !== undefined), [false, true]);
   // a third device with the stale planned record: the pre-send scan adopts the deposits, and sends nothing
   const third = new MemoryJournalStore();
   for (const [k, v] of copy.map) if (!k.includes('/deposit/')) third.map.set(k, v);
@@ -171,6 +186,18 @@ test('recovery: a stale planned record is upgraded, the pre-send scan finds a de
   await w.mint(plan.intent);
   const extra = await w.mintExtraDeposit(plan.intent, 2n);
   assert.equal((await w.verifyToken(extra)).amount, 5n);
+  // a deposit of the same rho to another first owner: its entry keeps that owner and its mint goes to it
+  const other = localOwner(key('other owner'));
+  const raw = await signTx(payer, {
+    chainId: 31337n, nonce: BigInt(await chain.call<string>('eth_getTransactionCount', [h(payer.address), 'pending'])), maxPriorityFeePerGas: 1n, maxFeePerGas: 15n,
+    gas: 200_000n, to: VAULT, value: 3n, data: depositCalldata(firstOwnerOf(other.publicKey), plan.rho),
+  });
+  await chain.call('eth_sendRawTransaction', [h(raw.raw)]);
+  await w.recoverDeposits(1n);
+  const third3 = (await w.journal.deposit(plan.intent))!.seenDeposits!.find((x) => x.depositNumber === '3')!;
+  assert.equal(third3.firstOwner, h(firstOwnerOf(other.publicKey)));
+  const t3 = await w.mintExtraDeposit(plan.intent, 3n);
+  assert.deepEqual((await w.verifyToken(t3)).owner, other.publicKey);
 });
 
 test('Paid counts only from the vault and only with a certified receipt: a lying provider cannot stop a redemption', async () => {

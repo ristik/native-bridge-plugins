@@ -298,16 +298,24 @@ export class NativeBridgeV2 {
     rec.blockNumber = dec(BigInt(r.blockNumber));
     rec.depositNumber = dec(d!.n);
     rec.status = 'deposited';
-    rec.seenDeposits = [{ tx: rec.depositTx, depositNumber: rec.depositNumber, blockNumber: rec.blockNumber, amount: dec(d!.amount) }];
+    // merge, never replace: the record's own deposit, what was journaled before, and every deposit carrying this rho on chain
+    const own = { tx: rec.depositTx, depositNumber: rec.depositNumber, blockNumber: rec.blockNumber, amount: dec(d!.amount), firstOwner: hex(d!.firstOwner) };
+    const scan = await this.depositsWithRho(unhex(rec.rho), rec.plannedBlock === undefined ? this.opts.pins.deploymentBlock : undec(rec.plannedBlock));
+    this.mergeSeen(rec, [own, ...scan.map((x) => ({ tx: hex(x.l.transactionHash), depositNumber: dec(x.n), blockNumber: dec(x.l.blockNumber), amount: dec(x.amount), firstOwner: hex(x.firstOwner) }))]);
     await this.journal.putDeposit(rec);
     return { txHash: unhex(rec.depositTx), depositNumber: d!.n, blockNumber: BigInt(r.blockNumber) };
   }
 
+  /** Merge deposit entries into `seenDeposits` by deposit number, keeping journaled tokens, in number order. */
+  private mergeSeen(rec: DepositRecord, entries: NonNullable<DepositRecord['seenDeposits']>): void {
+    const known = new Map((rec.seenDeposits ?? []).map((x) => [x.depositNumber, x]));
+    for (const e of entries) if (!known.has(e.depositNumber)) known.set(e.depositNumber, e);
+    rec.seenDeposits = [...known.values()].sort((a, b) => (undec(a.depositNumber) < undec(b.depositNumber) ? -1 : 1));
+  }
+
   /** Journal the deposits found for a record's rho: the first becomes its own, every one is listed (each is a separate root token). */
   private async adoptDeposits(rec: DepositRecord, seen: { l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[]): Promise<{ txHash: Uint8Array; depositNumber: bigint; blockNumber: bigint }> {
-    const known = new Map((rec.seenDeposits ?? []).map((x) => [x.depositNumber, x]));
-    for (const s of seen) if (!known.has(dec(s.n))) known.set(dec(s.n), { tx: hex(s.l.transactionHash), depositNumber: dec(s.n), blockNumber: dec(s.l.blockNumber), amount: dec(s.amount) });
-    rec.seenDeposits = [...known.values()].sort((a, b) => (undec(a.depositNumber) < undec(b.depositNumber) ? -1 : 1));
+    this.mergeSeen(rec, seen.map((s) => ({ tx: hex(s.l.transactionHash), depositNumber: dec(s.n), blockNumber: dec(s.l.blockNumber), amount: dec(s.amount), firstOwner: hex(s.firstOwner) })));
     if (rec.status === 'planned' || rec.status === 'submitted') {
       const first = seen[0];
       rec.depositTx = hex(first.l.transactionHash);
@@ -373,7 +381,8 @@ export class NativeBridgeV2 {
       const token = await this.mintWith(unhex(rec.reason!), unhex(rec.ownerKey), undec(rec.amount));
       rec.token = hex(token);
       rec.status = 'minted';
-      if (rec.seenDeposits?.[0] !== undefined && rec.seenDeposits[0].depositNumber === rec.depositNumber) rec.seenDeposits[0].token = rec.token;
+      const mine = rec.seenDeposits?.find((x) => x.depositNumber === rec.depositNumber);
+      if (mine !== undefined) mine.token = rec.token;
       await this.journal.putDeposit(rec);
       return token;
     });
@@ -389,8 +398,10 @@ export class NativeBridgeV2 {
       const x = (rec.seenDeposits ?? []).find((s) => s.depositNumber === dec(depositNumber));
       if (x === undefined) refuse('NotPending', `no deposit number ${depositNumber} is journaled for intent ${intent}`);
       if (x!.token !== undefined) return unhex(x!.token);
-      const p = await this.proveDeposit(intent, unhex(x!.tx), depositNumber, undec(x!.amount), unhex(rec.firstOwner));
-      const token = await this.mintWith(p.reason, unhex(rec.ownerKey), undec(x!.amount));
+      // the entry's own first owner: another device may have deposited this rho to another key
+      const firstOwner = unhex(x!.firstOwner);
+      const p = await this.proveDeposit(intent, unhex(x!.tx), depositNumber, undec(x!.amount), firstOwner);
+      const token = await this.mintWith(p.reason, firstOwner.subarray(9), undec(x!.amount));
       x!.token = hex(token);
       await this.journal.putDeposit(rec);
       return token;
@@ -838,7 +849,8 @@ export class NativeBridgeV2 {
    * The order defends against a send mined between reads and against load-balanced backends at different heights: the account's MINED
    * nonce is read first, then every send's receipt; a success receipt is the answer whenever it is seen. A send whose nonce is used
    * without a success receipt is dead only after the head has advanced `deadAfterBlocks` since that was first seen (journaled in
-   * `nonceUsedAt`) and every receipt is read again; until then it is pending. A send still in a pool is broadcast again (same bytes).
+   * `nonceUsedAt`), the block at `nonceUsedAt` has a certificate (a found companion), and every receipt is read again; until then it
+   * is pending. A send still in a pool is broadcast again (same bytes).
    */
   private async landedSend(sends: SendRecord[], save: () => Promise<void>): Promise<ReceiptJson | 'pending' | null> {
     if (sends.length === 0) return null;
@@ -866,6 +878,15 @@ export class NativeBridgeV2 {
       return 'pending';
     }
     if (head < undec(last.nonceUsedAt) + (this.opts.deadAfterBlocks ?? 6n)) return 'pending';
+    // and the block at which the nonce was seen used is certified (a found companion, section 12.7): depth alone is not finality
+    const at = await this.evm.headerByNumber(undec(last.nonceUsedAt));
+    if (at === null) return 'pending';
+    try {
+      await this.evm.certificateOf(at.header, at.hash);
+    } catch (e) {
+      if (e instanceof WalletError || e instanceof Nb2Error) return 'pending';
+      throw e;
+    }
     for (const s of sends) {
       const r = await this.evm.receipt(unhex(s.hash));
       if (r !== null && BigInt(r.status) === 1n) return r;
