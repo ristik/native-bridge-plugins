@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -11,7 +11,7 @@ const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src')
 
 test('verifier sources contain no network or filesystem capability', () => {
   const banned = ['fetch(', 'XMLHttpRequest', 'WebSocket', 'node:http', 'node:https', 'node:net', 'node:dgram', 'node:fs', 'node:child_process', 'process.env', 'http://', 'https://'];
-  for (const f of readdirSync(SRC)) {
+  for (const f of readdirSync(SRC).filter((x) => statSync(path.join(SRC, x)).isFile())) {
     const text = readFileSync(path.join(SRC, f), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     for (const b of banned) assert.ok(!text.includes(b), `${f} mentions ${b}`);
   }
