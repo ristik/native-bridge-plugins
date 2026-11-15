@@ -11,7 +11,9 @@ go run ./nb2ref/cmd/nb2vectors -out <this directory>     # in a ristik/bft-core 
 The output is a pure function of the code, and bft-core `nb2ref/testdata/nb2-vectors.json.sha256` pins the same digest.
 While the file is generated, the reference replays every vector. Negative vectors are isolated: each faults one rule,
 and every other check of its input holds. The exceptions are the deliberate multi-fault ordering vectors
-`LogEmitter-before-topics` and `SealRoot-before-epoch`, which combine two faults to pin the frozen check order.
+`LogEmitter-before-topics`, `SealRoot-before-epoch`, `DepositUC-root-before-epoch`, `seal-root-before-epoch` and the
+`config-constructor-order-*` cases (the staged `BadConfig` order), which combine two or more faults to pin the frozen
+check order.
 
 | Key | Contents |
 |---|---|
@@ -19,16 +21,17 @@ and every other check of its input holds. The exceptions are the deliberate mult
 | `deployments` | Γ, D, K, B, its build (`production` or `test` admitted set), the trust-base bundle and genesis EntryID, the vault environment (`main`, `sharded`: production (K, B) = (64, 16); `k4`, `k8`: test) |
 | `config` | Γ judged by the verifier (`ConfigShape`) and by the constructor (`BadConfig(field)`) |
 | `verifier` | `verifyReturn(Γ, evidence)`: whole tokens with their deposit evidence, lineage and return; the verdict and its 192-byte ABI |
-| `sealReceipts` | the wallet's `SegmentSealed` receipt check (`SealReceipt` and the rule it wraps) |
+| `sealReceipts` | the wallet's `SegmentSealed` receipt check (`SealReceipt` and the rule it wraps; `seal-no-entry-for-epoch` wraps the retryable `NoEntryForEpoch`, `DepositUC` on chain) |
 | `gapProofs`, `chainFolds`, `segmentLogs` | the gap tree, redeem step 3, the wallet's log check |
-| `vault` | call sequences with a mock verifier's return data and the recipient's behaviour; events and final state per step; `harnessState` where no sequence can reach the state |
-| `wallet` | seal companion answers (`EvidencePruned`), the capacity preflight and redemption refusals, and the `stateReadOnly` index check |
-| `primitives` | minter scalars and the section 3 and 13 constants |
+| `vault` | call sequences with a mock verifier's return data or revert (`MAX_VERIFIER_REVERT` = 1024: longer revert data is `VerifierBadReturn`) and the recipient's behaviour; events and final state per step; `harnessState` where no sequence can reach the state |
+| `wallet` | seal companion answers (`"found"`, `"unavailable"` is `EvidencePruned`, `"unknown"`), the capacity preflight and redemption refusals, and the `stateReadOnly` index check |
+| `primitives` | minter scalars, unlock recovery (`unlockRecovery`: `VerifyUnlockDigest(key, digest, unlock)` under the NB2 unlock restriction; `sdkValid` marks a signature the pinned SDK relation would accept, and every recovery ID 2 or 3, valid or not, is `UnlockRecovery`), and the section 3 and 13 constants |
 
 A rejection's `expect` carries the rule name and the custom error's arguments. For outcomes with an on-chain
 counterpart it also carries the exact on-chain `revert` bytes (selector and ABI arguments) and, where the on-chain
 primitive reports another name (`SealEpoch` and `NoEntryForEpoch` are `QuorumNotMet` for aggregator UCs and `DepositUC`
-for the EVM UC), `onChainError`. Wallet-only refusals (section 14.6 and the outcomes without a rule) have no on-chain
+for the EVM UC, and a seal receipt wrapping `NoEntryForEpoch` is `DepositUC`), `onChainError`. Recovery IDs 2 and 3
+are `UnlockRecovery` everywhere, so they carry no `onChainError`. Wallet-only refusals (section 14.6 and the outcomes without a rule) have no on-chain
 counterpart and omit `revert`. Every vault step records the state after it (accounting word, tag words, heads, live
 buffers) and its events; accepted seal receipts and segment logs record their authenticated outputs.
 
