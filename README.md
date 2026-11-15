@@ -9,7 +9,7 @@ publication is disabled.
 
 | Path | Responsibility |
 | --- | --- |
-| `protocol/interop.md` | Sole normative native byte contract: native bridge v2, protocol 8 (bft-core#1097) |
+| `protocol/interop.md` | Sole normative native byte contract: native bridge v2, protocol 9 (bft-core#1097) |
 | `protocol/profile.json`, `protocol/abi.json` | v2 semantic profile and frozen vault/verifier ABI |
 | `protocol/legacy-v7/`, `protocol/vectors/` | Protocol 7 contract, schema and corpus that the current code still tests against; removed by bft-core#1106 |
 | `packages/native-bridge-plugin/` | TypeScript verifier/wallet adapter, version 0.1.0 |

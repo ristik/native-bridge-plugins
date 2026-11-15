@@ -1,7 +1,7 @@
 # Native bridge plug-ins
 
 `protocol/interop.md` is the sole normative native byte contract (native bridge
-v2, protocol 8; design in bft-core `docs/design/native-bridge-v2.md`). Changes to
+v2, protocol 9; design in bft-core `docs/design/native-bridge-v2.md`). Changes to
 bytes or derivations require a protocol version and semantic-profile update, and
 the digests in `protocol/profile.json`. The code still implements protocol 7:
 `protocol/legacy-v7/` and `protocol/vectors/` stay for its tests until

@@ -1,6 +1,6 @@
 {
-  "artifactVersion": 1,
-  "nativeBridgeProtocolVersion": 8,
+  "artifactVersion": 2,
+  "nativeBridgeProtocolVersion": 9,
   "name": "native-bridge-v2",
   "status": "development-frozen-unactivated",
   "specification": "ristik/bft-core docs/design/native-bridge-v2.md (NB2-01, bft-core#1097)",
@@ -27,6 +27,7 @@
     "config": 1,
     "receiptBacking": 1,
     "depositProof": 1,
+    "depositProofArity": 6,
     "segmentReturn": 1,
     "evidence": 1
   },
@@ -65,7 +66,6 @@
   "limits": {
     "justificationBytes": 65536,
     "ucBytes": 16384,
-    "pdrBytes": 16384,
     "headerBytes": 2048,
     "receiptNodes": 65,
     "receiptBranchNodeBytes": 1024,
@@ -97,8 +97,8 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "bbd4f5cdd5ee8da2884ff7a693f36f2d9c7119c36b325d8491d2bcadc70230c6",
-    "protocol/abi.json": "ab40d6bdc7e60d34b0ae3646a89254eb6e8c07ebe6cf7651557c81a058b6f40a",
+    "protocol/interop.md": "4134f2ad11d899f328535f3969675c59aaf8d4083fc423052cc95f98ca618bb3",
+    "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
     "protocol/trust-base.md": "48c8ad020417f6ea1e85d0c1f2d3ee5e878892ba2cfb39574ae188954cc70a64"
   },
   "legacy": "protocol/legacy-v7/ and protocol/vectors/ are the protocol 7 artifacts and corpus that the old plug-in code still tests against; not part of this profile; removed by bft-core#1106 (NB2-10)."

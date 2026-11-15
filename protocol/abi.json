@@ -1,5 +1,5 @@
 {
-  "nativeBridgeProtocolVersion": 8,
+  "nativeBridgeProtocolVersion": 9,
   "specification": "ristik/bft-core docs/design/native-bridge-v2.md sections 11 and 13",
   "vault": {
     "constructor": { "inputs": [{ "name": "gamma", "type": "bytes" }] },

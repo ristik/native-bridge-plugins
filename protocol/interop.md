@@ -1,6 +1,6 @@
 # Native bridge interoperability contract
 
-Status: **native bridge v2, `NATIVE_BRIDGE_PROTO_VERSION=8`, development profile, frozen, not activated.** This document
+Status: **native bridge v2, `NATIVE_BRIDGE_PROTO_VERSION=9`, development profile, frozen, not activated.** This document
 is the sole normative native byte contract of the plug-ins. The design, the plain-language data flow, the safety
 argument and the structural model are in ristik/bft-core `docs/design/native-bridge-v2.md` (NB2-01, bft-core#1097);
 section numbers in brackets below (`[§n]`) point there. The two carry the same bytes; a difference is a bug, and the
@@ -98,17 +98,23 @@ per-deposit storage, no ID derivation on chain.
 
 ```
 J = tag(39051,[1,b(D),n,b(r),DepositProof])
-DepositProof = [1,b(evmPDR),b(evmUC),b(headerRLP),txIndex,logIndex,[b(receiptNodeRLP)...]]
+DepositProof = [1,b(evmUC),b(headerRLP),txIndex,logIndex,[b(receiptNodeRLP)...]]
 M = tag(39041,[2,network,firstOwner,b(salt_n),b(ty),b(J),b(data),e])
 data = tag(39050,[1,[[b(aid),b(v)]],null])
 ```
 
-`J` body arity 5, `DepositProof` arity 7 and inline. `n` in [1, 2^56-1], indices below 2^32. The receipt is the value
+`J` body arity 5. `DepositProof` has arity 6 and is inline; any other arity, including the arity-7 protocol 8 draft
+that carried a PDR, is rejected (`Shape`). `evmUC` is the complete canonical native UnicityCertificate.
+`n` in [1, 2^56-1], indices below 2^32. The receipt is the value
 of the last trie node, never carried twice. Bounds (`profile.json` `limits`) apply before any cryptography.
 
 Verification, in order, each failure a named rule (bft-core §14): `J.D == D` (`MintDomain`); `evmUC` verified under
-its seal epoch's trust-base entry for `evmPartition`/`evmShard` (`DepositUC`); `H(evmPDR)` equals the UC's shard
-configuration hash and the PDR epoch the IR epoch (`DepositPDR`); `K256(headerRLP) == IR.blockHash` and
+the authenticated historical root authority of its own seal epoch for exactly Γ.`evmPartition` and Γ.`evmShard`
+(`DepositUC`): no independently expected shard-configuration hash is supplied; the UC's own 32-byte ShardConfHash
+MUST remain part of the authenticated shard-tree leaf, together with its InputRecord and TRHash (never nil or zero in
+that computation); the complete shard/unicity paths and seal, and all structural, network, epoch-interval and quorum
+checks, are verified; no PDR is supplied and no PDR-to-InputRecord epoch comparison is performed;
+`K256(headerRLP) == IR.blockHash` and
 `header.stateRoot == IR.hash` (`DepositHeader`), the certificate of the block that executed the deposit; the receipt
 path under `header.receiptsRoot` with key `RLP(txIndex)`, canonical nodes, full key consumption, no unused or duplicate
 node (`ReceiptPath`); a legacy receipt or `type||RLP` with type 1..3 (`ReceiptType`); status 1 (`ReceiptStatus`);
@@ -120,6 +126,14 @@ and `v` (`MintData`). A root mint whose reason is not `tag(39051,...)` is `MintR
 
 No per-receipt account or code proof: `D` binds the vault address and chain, the manifest pins the runtime code hash,
 checked once at installation. An RPC log listing or a transaction inclusion proof is never deposit evidence.
+
+**Deployment binding and chain continuity.** Acceptance relies on the authenticated deployment binding Γ's root
+genesis, partition/shard and execution genesis to one continuous EVM history, whose authorized assignment changes
+preserve its execution identity and state. A configuration rotation does not change the authoritative vault address
+or invalidate earlier certified receipts. A chain reset or replacement is a new authenticated deployment/domain, not a
+continuation of this vault. D alone does not prove execution ancestry. Wallets MUST authenticate this deployment
+binding and its pinned vault code (bft-core §4.3, §12.1); the on-chain verifier uses the corresponding
+chain-authenticated historical authority. The same rule applies to seal receipts (wallet obligation 2).
 
 ## SDK wire (unchanged)
 
@@ -164,7 +178,9 @@ rebuild only paths/UCs against an admitted root. RSMT membership uses raw v32.
 
 Every UC, aggregator and EVM alike, is verified under the trust-base entry of its own seal epoch by the upstream seal
 rule ([trust-base.md](trust-base.md), unchanged from protocol 7); `NoEntryForEpoch` is retryable once the history holds
-the epoch. On chain the verifier reads the same history from the chain's permanent seal registry, at any age.
+the epoch. On chain the verifier reads the same history from the chain's permanent seal registry, at any age. Every EVM UC,
+deposit and seal receipt alike, is judged under the deployment-binding and chain-continuity rule above; a validator
+rotation never invalidates an earlier receipt.
 
 ## Split lineage (unchanged formats)
 
@@ -274,7 +290,8 @@ selector, topic and data length.
 1. **Secret.** Journal `(D, i)` and back up `k_w` before submitting value. Build `J` only from a certified deposit
    block.
 2. **Index (R1).** Before burning, fetch the newest `SegmentSealed(j)` receipt available as a `DepositProof` container
-   with topics `[topic0(SegmentSealed), u256(j)]`, verify it exactly like a deposit receipt (`SealReceipt`), and sign
+   with topics `[topic0(SegmentSealed), u256(j)]`, verify it exactly like a deposit receipt, with the
+   same UC rule (no PDR, the UC's own ShardConfHash in the authenticated leaf, exact Γ partition and shard) and deployment binding (`SealReceipt`), and sign
    `a = j + 1`, keeping `headAfter` as the future start head. With no receipt, sign `a = 0` (start head `H_0`). A plain
    `state()` read is allowed only when the manifest's `stateReadOnly` is true; a jump beyond the verified bound is
    refused (`ImplausibleIndex`).
@@ -298,4 +315,8 @@ verifier's rule.
 ## Corpus
 
 v2 vectors are generated once by the bft-core Go reference (NB2-03, bft-core#1099) as one file consumed by digest.
+Required (bft-core §14.7), for deposit receipts and identically for seal receipts: valid receipts before and after an
+authorized validator rotation, each under its own seal epoch's authority; an altered ShardConfHash without a new valid
+seal; the wrong partition, shard or root deployment; InputRecord or header tampering; the old arity-7 DepositProof
+rejected.
 Until then this profile has no corpus; `protocol/vectors/` is the protocol 7 corpus of the legacy code.
