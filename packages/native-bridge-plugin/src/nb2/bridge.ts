@@ -204,7 +204,8 @@ export class NativeBridgeV2 {
       const cur = await this.journal.intents();
       if (cur !== null && cur.keyScheme !== this.keyScheme) refuse('BadInput', `the journal's intents use key scheme ${cur.keyScheme}`);
       const i = cur === null ? 0n : undec(cur.next);
-      const intents: IntentsRecord = { ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(i + 1n) };
+      // a rewrite keeps the record's unknown fields (docs/nb2-journal.md)
+      const intents: IntentsRecord = { ...(cur ?? {}), ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(i + 1n) };
       // the counter moves first, by compare-and-swap: a crash wastes intent i, another writer makes this one fail; i is never reused
       await this.journal.putIntents(intents);
       const r = this.secretOf(i);
@@ -412,7 +413,7 @@ export class NativeBridgeV2 {
   public async recoverDeposits(next: bigint): Promise<bigint[]> {
     await this.locked('intents', async () => {
       const cur = await this.journal.intents();
-      if (cur === null || undec(cur.next) < next) await this.journal.putIntents({ ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(next) });
+      if (cur === null || undec(cur.next) < next) await this.journal.putIntents({ ...(cur ?? {}), ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(next) });
     });
     const want = new Map<string, bigint>();
     for (let i = 0n; i < next; i++) want.set(toHex(rhoOf(this.domain, this.secretOf(i))), i);
@@ -789,6 +790,8 @@ export class NativeBridgeV2 {
       return { state: 'paid', txHash: tx, blockNumber: rp.blockNumber };
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };
+      // a lost compare-and-swap of the journal is never read as an unverified claim
+      if (e instanceof WalletError && (e.reason === 'JournalConflict' || e.reason === 'JournalNotPersisted')) throw e;
       if (e instanceof Nb2Error || e instanceof WalletError) return null;
       throw e;
     }

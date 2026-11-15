@@ -3,6 +3,8 @@
 The TypeScript plug-in (`packages/native-bridge-plugin`, `src/nb2/journal.ts`, NB2-07 bft-core#1103) writes this format, and the
 Rust plug-in (NB2-08, bft-core#1104) must read and write it unchanged. With a common format, a wallet can move between the two
 implementations. This document is the format's definition: when the code and this document disagree, the code is wrong.
+`tests/nb2-journal/` holds a journal written by each plug-in, with a snapshot of the offline test world it refers to; each
+plug-in's tests continue the other's (`test/nb2/journal-interop.test.ts`, `crates/native-bridge-sdk-ext/tests/nb2_journal_interop.rs`).
 
 The journal holds the only state that cannot be rebuilt from public data:
 
