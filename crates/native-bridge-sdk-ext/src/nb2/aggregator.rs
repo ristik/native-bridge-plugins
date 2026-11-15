@@ -5,7 +5,8 @@
 //! Resubmitting the same signed request must be harmless, as in the TypeScript adapter, which accepts the aggregator's
 //! "already submitted" and "state ID queued" answers. The SDK's plain `submit_certification_request` reports both as errors,
 //! so a failed submission is followed by the same wait for the proof: a proof certifying exactly this request is accepted, a
-//! proof of other data is refused, and the submission error is reported only when no proof arrives. A read of the proof that
+//! proof of other data is refused, and the submission error is reported only when a read says no proof exists (a wait that
+//! merely times out is `Unconfirmed`, as for an accepted submission). A read of the proof that
 //! fails with anything but "not yet" (classified by the wallet's `not_yet`, the SDK error types being transport-specific) is
 //! passed through, never turned into a timeout.
 
@@ -74,9 +75,8 @@ where
                 }
                 Err(e) if (self.not_yet)(&e) => {
                     if Instant::now() > deadline {
-                        if let Some(s) = &submitted {
-                            return refused(s);
-                        }
+                        // still not certified: the outcome is unknown, whatever the submission said (a duplicate may
+                        // still land); only a read that says no proof exists is a refusal
                         return refuse(
                             WalletReason::Unconfirmed,
                             "no inclusion proof yet: call again with the same request",

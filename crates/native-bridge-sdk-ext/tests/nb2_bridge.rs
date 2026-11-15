@@ -1388,7 +1388,8 @@ mod sdk_aggregator {
             matches!(&e, Error::Other(m) if m.contains("Unknown")),
             "{e}"
         );
-        // a refused submission with no proof of the request is the submission's error
+        // a refused submission is the submission's error only when a read says no proof exists; a wait that times out is
+        // Unconfirmed (the duplicate may still land)
         assert_eq!(
             adapter(Some(E::Duplicate), vec![Err(E::Unknown)])
                 .certify(&req)
@@ -1401,7 +1402,7 @@ mod sdk_aggregator {
                 .certify(&req)
                 .err()
                 .and_then(|e| e.reason()),
-            Some(WalletReason::Reverted)
+            Some(WalletReason::Unconfirmed)
         );
         assert_eq!(
             adapter(None, vec![Ok(other)])
