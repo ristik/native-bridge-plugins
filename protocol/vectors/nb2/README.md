@@ -24,6 +24,12 @@ check of its input holds.
 | `wallet` | seal companion answers (`EvidencePruned`), the capacity preflight and redemption refusals, and the `stateReadOnly` index check |
 | `primitives` | minter scalars and the section 3 and 13 constants |
 
+A rejection's `expect` carries the rule name, the custom error's arguments, the exact on-chain `revert` bytes (selector and
+ABI arguments) and, where the on-chain primitive reports another name (`SealEpoch` and `NoEntryForEpoch` are
+`QuorumNotMet` for aggregator UCs and `DepositUC` for the EVM UC), `onChainError`. Every vault step records the state
+after it (accounting word, tag words, heads, live buffers) and its events; accepted seal receipts and segment logs record
+their authenticated outputs.
+
 Judge each deployment under its own build: production admits only (K, B) = (64, 16); a test build admits
 K in {4, 8}, B in {2, 4} instead. Error names are the section 14 rules; `StateReadNotAdmitted`, `CompanionUnknown` and
 `CompanionProvider` are wallet outcomes without a rule.
