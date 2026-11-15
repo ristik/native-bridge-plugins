@@ -10,6 +10,10 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
+    },
+    "./nb2": {
+      "types": "./lib/nb2/index.d.ts",
+      "default": "./lib/nb2/index.js"
     }
   },
   "files": [
@@ -21,7 +25,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts test/nb2/*.test.ts"
   },
   "dependencies": {
     "@noble/curves": "2.2.0",
