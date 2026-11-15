@@ -1,106 +1,131 @@
 # Native bridge interoperability contract
 
-Status: protocol v7, development profile; implementation and activation gates
-remain open. This document is the sole normative native byte contract.
-Protocol 7 changes one rule, the seal signature rule: it is upstream's (each supplied
-signature is judged alone; only an exact 65-byte canonical recoverable signature
-of its member counts; an unknown signer or any other signature counts zero and
-never fails the seal; an empty signer ID or value is refused by the native seal
-validation; the witnesses of a trust-base ENTRY stay strict). It replaces the
-B1 rule of protocol 6 (64-byte or 0/1-suffixed compact signatures, any extra
-failing the seal); the wire formats and layouts are unchanged, the acceptance
-and the charge are not, so a v6 deployment is replaced, never upgraded
-(bft-core `briefs/upstream-seal-rule-b1.md`).
-Protocol 6 adds split lineage (section "Split lineage" below; bft-core
-`docs/design/bridge-split-lineage-spec.md`): one part of a split token is
-redeemed against the original lock, through `BRIDGE_COMPOSE_V2`, by a fresh
-vault with per-part accounting. Protocol 5 bytes are unchanged at depth 0; a v5
-deployment is replaced, never upgraded. The v5 draft incorporated the Unicity Trust Base trust model in
-[trust-base.md](trust-base.md) (v4's fixed SDK 3.0.1 trust document is
-abandoned, without compatibility), the any-age registry-backed certificate
-batch of bft-core `briefs/b1-any-age-contract.md` (one `CERT_BATCH_V2` call over
-the anchor table) and the aggregation-partition policy below; the v3 sharded
-policy, per-anchor certificate calls and earlier assumptions are abandoned, with
-no compatibility, migration or acceptance promise.
-`NATIVE_BRIDGE_PROTO_VERSION=7` is independent of SDK Token.VERSION and the
-external bridge's BRIDGE_PROTO_VERSION. Any byte/derivation change MUST bump
-this version and semantic profile. Consensus parsers accept only this profile;
-there is no pre-3.0 decoder, migration or dual-format interpretation.
+Status: **native bridge v2, `NATIVE_BRIDGE_PROTO_VERSION=8`, development profile, frozen, not activated.** This document
+is the sole normative native byte contract of the plug-ins. The design, the plain-language data flow, the safety
+argument and the structural model are in ristik/bft-core `docs/design/native-bridge-v2.md` (NB2-01, bft-core#1097);
+section numbers in brackets below (`[§n]`) point there. The two carry the same bytes; a difference is a bug, and the
+bft-core document is the reference.
+
+v2 replaces protocol 7 outright: lock records, per-lock accounting, lock-proof storage proofs, `0x0104`/`0x0105`
+kernels, the anchor-table envelope and the deployment manifest schema v1 are gone. There is no migration, dual decoder
+or compatibility. The protocol 7 artifacts in `protocol/legacy-v7/` and the corpus in `protocol/vectors/` remain only
+because the old plug-in code still tests against them; they are not part of this profile and bft-core#1106 (NB2-10)
+removes them with that code.
+
+A few values are provisional until the gas bake-off, bft-core#1098 (NB2-02). They are marked **PARAM** and listed in
+`profile.json` `parameters`. A PARAM changes numbers and widths, never the encodings around them.
 
 ## Canonical primitives
 
-`C(x,...)` is deterministic CBOR of an array; `b(x)` a byte string;
-`tag(t,x)` a tagged item; `H` raw SHA-256; `I(h)=0000||h` the SHA-256 imprint.
-Domain literals are ASCII byte strings unless UTF8 is explicitly specified.
-Use shortest unsigned CBOR integers/lengths, definite items, exact arity and
-complete consumption. Reject normalization, extra fields, maps in these array
-objects, indefinite lengths and trailing data. Hashes/salts/IDs are 32 bytes,
-addresses 20 bytes, compressed secp256k1 keys 33 bytes.
-Amount is minimal positive unsigned big-endian bstr, 1..32 bytes (no leading
-zero). Arithmetic is uint256; chain ID and nonzero nonce are u64, network
-is in 1..65535 (SDK NetworkId), partitions uint32. Cfg and mint wire
-decoders reject network zero and values above 65535 with IntRange. JS uses bigint or decimal strings, never lossy number
-conversion. `e` is null or uint64 in [1,2^64-1]; `t` is uint64 Unix seconds.
+`C(x,...)` is deterministic CBOR of an array; `b(x)` a byte string; `tag(t,x)` a tagged item. `H` is raw SHA-256 (the
+Unicity hash) and `K256` is EVM keccak256; they are never substituted. `||` is concatenation; `u8`, `u16`, `u64` are
+fixed-width big-endian; `u256(x)` is a 32-byte big-endian word. `I(h)=0000||h` is the SHA-256 imprint.
 
-## Identity and immutable configuration
+Use shortest unsigned CBOR integers and lengths, definite items, exact arity and complete consumption. Reject maps,
+floats, text strings, simple values other than null, indefinite lengths, extra fields and trailing data. Domain
+literals are ASCII byte strings. Hashes, salts, IDs and identifiers are 32 bytes, addresses 20, compressed secp256k1
+keys 33. An amount is a minimal positive unsigned big-endian bstr of 1..32 bytes (no leading zero); in the EVM ABI it
+is uint256. Network is 1..65535, chain ID a nonzero u64, partitions nonzero u32. JS uses bigint or decimal strings,
+never lossy number conversion. Identifiers compare as unsigned 256-bit big-endian integers.
 
-Bridge identity family is `unicity-native`; transport chainRef remains
-`eip155:<chainIdDecimal>`. Let
-`D=networkDecimal+":"+rootGenesisHex+":"+executionGenesisHex+":"+chainIdDecimal+":"+zeroAddressHex`.
-Decimal integers have no leading zeros; genesis hashes are lowercase hex64,
-zeroAddressHex is 40 zeros; none has a 0x prefix.
+EVM domain tags are `TAG(name) = K256(ASCII(name))`:
 
 ```
-ty  = H(UTF8("unicity-bridge:unicity-native:" + D))
-aid = H(UTF8("unicity-bridge-coin:unicity-native:" + D))
-Cfg = C(b("UNICITY_BR_CFG"),network,b(rootGenesis),chainId,
-        b(executionGenesis),evmPartition,b(evmShard),b(vault20),b(zero20),
-        b(ty),b(aid),b(semanticProfileHash),b(tokenVerifier20),
-        b(tokenVerifierCodeHash),b(b1ProfileHash),b(aggregatorPolicyHash))
-cfg = H(Cfg)
-Policy = C(b("UNICITY_BR_AGG_PARTITION"),2,aggregatorPartition)
-aggregatorPolicyHash = H(Policy)
-salt = H(C(b("UNICITY_BR_SALT"),b(cfg),nonce))
-id = H(C(b(salt),network))
-h0 = H(C(b(id),b(H("TOKENID"))))
-rcpt = H(exact tagged P0 bytes)
-K = [b(zero20),b(ty),b(aid),b(amount),b(id),b(rcpt)]
-d = H(C(b("UNICITY_BR_LOCK"),b(cfg),nonce,K))
+DEPOSIT_SECRET  = dfa87a7a4c6db3c7c307e4f2c3cc2d4a07e33d349f542b47f8e0bba49f62e645  // TAG("UNICITY_NB2_DEPOSIT_SECRET")
+ARCHIVE_GENESIS = 45076af3d8858f1d7a9bb6e037bb5ca4270d0b4fa90f9397eb7adb905590a339  // TAG("UNICITY_NB2_ARCHIVE_GENESIS")
+ARCHIVE_STEP    = c68efdc45f5c9a20bf6abfda6493e8e295d8e31495fd1e744cd4c35f74785dfa  // TAG("UNICITY_NB2_ARCHIVE_STEP")
 ```
 
-### Aggregation partition policy (AGG_PARTITION_V2)
+New CBOR tags: `39051` receipt-backed mint reason `J`, `39052` segment return data `R`. Tags `39047`, `39048` and
+`39049` are rejected wherever a v2 structure is expected.
 
-The aggregator is one native partition, distinct from evmPartition, whose
-certified shard configurations are authorized by the root quorum. The policy
-names only that partition: no depth, shard list, configuration hash or
-allow-list. Each anchor's UC authenticates its own historical shard and shard
-configuration hash; its depth is that of its canonical native shard ID,
-`d = 8*len(shard) - trailingZeroBits(lastByte) - 1` (lastByte nonzero, 1..33
-bytes, 0<=d<=256). A shard ID is the native canonical encoding of the prefix
-bits followed by one set terminator bit and zero padding, never empty bytes or
-ASCII text. Shards of one history need not be prefix-free as one set: a parent
-shard before a topology split and its child after it are both admitted, each
-bound by its own UC. Reject a version other than 2, a zero partition or one
-above 2^32-1, extra or missing fields, noncanonical encodings and any body above
-512 bytes. Check SHA-256(policy body) against the immutable
-Cfg.aggregatorPolicyHash before interpreting it. The v3 `UNICITY_BR_AGG_SHARDED`
-and older `UNICITY_BR_AGG_ONE` bodies are rejected; there is no migration or
-dual decoder. Endpoint URLs are untrusted routing hints and never part of the
-policy. An unsupported token/hash/predicate format fails its pinned semantic
-rule even with a valid UC; certified configurations select no token semantics.
-EVM backing policy is separately pinned, never inferred from a submitted UC.
-Type/coin exclude vault: approved replacement vaults share asset identity but
-never inherit deployment trust. Config, salt, lock and redemption bind their
-own vault. Reject lock digest d=0. The stateless TokenVerifier has no cfg/vault immutable,
-avoiding a code-hash/configuration cycle. Runtime chain/vault MUST match Cfg.
+## Configuration and domain [§4]
 
-## SDK wire
+```
+Γ = C(b("UNICITY_NB2_CFG"),1,network,b(rootGenesis32),b(executionGenesis32),chainId,
+      evmPartition,b(evmShard),aggregatorPartition,b(vault20),b(asset32),b(ty32),b(aid32),
+      b(semanticProfileHash32),b(verifier20),b(verifierCodeHash32),K,B,b(Qmax))
+D = H(Γ)
 
-Pins: the ristik SDK lines (`integration/enshrined-evm`), JS
-`75c5be7fd4d02ef4306b9b1ff14c4365c7468009` (4.0.0-utb), Rust
-`0517256d9417e9ad52f77a3ac9ef593fa7541d95` (unicity-token 4.0.0). The token,
-predicate and certification wire below is unchanged from SDK 3.0.1; predicate
-version and tags are unchanged. No other SDK fork or patch is authorized.
+Dstr  = networkDecimal+":"+rootGenesisHex+":"+executionGenesisHex+":"+chainIdDecimal
+ty    = H(UTF8("unicity-bridge:unicity-native-nb2:"+Dstr))
+aid   = H(UTF8("unicity-bridge-coin:unicity-native-nb2:"+Dstr))
+asset = H(UTF8("unicity-nb2-asset:native-uct"))
+```
+
+Γ has arity 19. `evmShard` is the canonical native shard ID (1..33 bytes). `aggregatorPartition != evmPartition`.
+`semanticProfileHash` is SHA-256 of the exact bytes of `protocol/profile.json`. `K` and `B` are powers of two with
+`2 <= B <= K <= 256`, inside the admitted candidate set; `1 <= Qmax <= 2^144-1`. Decimals have no leading zeros; hex is
+lowercase without `0x`. Type and coin exclude the vault; every token is bound to its own vault by `D` in its mint
+reason.
+
+**PARAM** `K` in {32, 64, 128}, default 64; `B` in {8, 16, 32}, default 16 (bft-core#1098).
+
+The vault constructor takes the exact Γ bytes and rejects them (`BadConfig(field)`) unless `vault20 == address(this)`,
+`chainId == block.chainid`, the verifier's code hash equals `verifierCodeHash32` and `K`, `B`, `Qmax` are admitted.
+The verifier is stateless and receives Γ on every call. The vault is immutable: no owner, upgrade, pause,
+administrative payout, `receive` or `fallback`.
+
+The deployment manifest (schema by bft-core#1105, NB2-09) pins outside `D`: `vaultRuntimeCodeHash`,
+`maxEncodedTxBytes` (`L_max`), `userGasLimit`, `gasReserve`, `returnReserveSegments`, `deploymentBlock` and
+`stateReadOnly` (true only on test deployments). **PARAM** `L_max` in {131072, 524288}, default 524288 (owner decision,
+measured by #1105).
+
+## Deposit [§5]
+
+```
+r     = HMAC-SHA256(key=k_w, msg=C(b("UNICITY_NB2_DEPOSIT_INTENT"),b(D),i))
+rho   = K256(DEPOSIT_SECRET || D || r)
+deposit(bytes firstOwner, bytes32 rho) payable
+firstOwner = d9 98 78 83 01 41 01 58 21 || key33                     // tag(39032,[1,b(01),b(key33)]), 42 bytes
+event Deposited(uint64 indexed nonce, bytes32 domain, uint256 amount, bytes32 rho, bytes firstOwner)
+salt_n = H(C(b("UNICITY_NB2_DEPOSIT_SALT"),b(D),n,b(r)))
+id_n   = H(C(b(salt_n),network))
+h0     = H(C(b(id_n),b(H("TOKENID"))))
+```
+
+`k_w` is the wallet's 32-byte bridge key, derived deterministically from its seed and backed up with it. `i` is a u64
+intent counter, never reused, journaled durably with `D` **before** the deposit transaction is signed. Recovery scans
+`i` from 0 to the journal high-water mark plus 64 and matches `rho` against `Deposited` events. Never derive `r` from a
+public or small value; never reuse it.
+
+The vault, under its reentrancy guard: `msg.value > 0` (`ZeroValue`); `firstOwner` exactly the 42 bytes above with
+`key33[0]` in {02, 03} (`BadFirstOwner`); `msg.value <= Qmax - Q` (`LiabilityCap`); `n < 2^56-1`
+(`DepositCounterExhausted`); then `n += 1`, `Q += msg.value` and the event. Deposit numbers start at 1. No refund, no
+per-deposit storage, no ID derivation on chain.
+
+## Mint reason and deposit proof [§6]
+
+```
+J = tag(39051,[1,b(D),n,b(r),DepositProof])
+DepositProof = [1,b(evmPDR),b(evmUC),b(headerRLP),txIndex,logIndex,[b(receiptNodeRLP)...]]
+M = tag(39041,[2,network,firstOwner,b(salt_n),b(ty),b(J),b(data),e])
+data = tag(39050,[1,[[b(aid),b(v)]],null])
+```
+
+`J` body arity 5, `DepositProof` arity 7 and inline. `n` in [1, 2^56-1], indices below 2^32. The receipt is the value
+of the last trie node, never carried twice. Bounds (`profile.json` `limits`) apply before any cryptography.
+
+Verification, in order, each failure a named rule (bft-core §14): `J.D == D` (`MintDomain`); `evmUC` verified under
+its seal epoch's trust-base entry for `evmPartition`/`evmShard` (`DepositUC`); `H(evmPDR)` equals the UC's shard
+configuration hash and the PDR epoch the IR epoch (`DepositPDR`); `K256(headerRLP) == IR.blockHash` and
+`header.stateRoot == IR.hash` (`DepositHeader`), the certificate of the block that executed the deposit; the receipt
+path under `header.receiptsRoot` with key `RLP(txIndex)`, canonical nodes, full key consumption, no unused or duplicate
+node (`ReceiptPath`); a legacy receipt or `type||RLP` with type 1..3 (`ReceiptType`); status 1 (`ReceiptStatus`);
+`logs[logIndex]` exists (`LogIndex`), is from `vault20` (`LogEmitter`), has exactly the topics
+`[topic0(Deposited), u256(n)]` (`LogTopics`) and exactly the 224-byte data `(D, v, rho, firstOwner)` with offset 0x80,
+length 42 and zero padding, `v > 0` (`LogData`); `rho == K256(DEPOSIT_SECRET||D||r)` (`SecretOpening`); the mint's
+salt is `salt_n` (`MintSalt`), type `ty` (`MintType`), first owner `firstOwner` (`MintOwner`) and data exactly `aid`
+and `v` (`MintData`). A root mint whose reason is not `tag(39051,...)` is `MintReason`.
+
+No per-receipt account or code proof: `D` binds the vault address and chain, the manifest pins the runtime code hash,
+checked once at installation. An RPC log listing or a transaction inclusion proof is never deposit evidence.
+
+## SDK wire (unchanged)
+
+Pins: the ristik SDK lines (`integration/enshrined-evm`), JS `c5840ef5f59201c52ea6cf7034ee02cb48d54007`
+(4.0.0-utb.c5840ef), Rust `de79e6c1e393a1846b75bca0640b9ec9a55aa143` (unicity-token). No other SDK fork or patch is
+authorized.
 
 ```
 P = tag(39032,[1,b(encode_uint(type)),b(params)])
@@ -112,18 +137,12 @@ proof = tag(39033,[1,CD,t,b(bitmap32||siblings32...),UC])
 data = tag(39050,[1,[[b(aid32),b(amount)]],null])
 ```
 
-Signature predicate type=1, params=valid compressed key33. Burn type=2,
-params=raw H(R). Built-in code bytes are 01/02, not strings. P is nested as a
-tagged item, not wrapped in a bstr. M data/J and T's nonnull data are bytes
-containing the exact tagged encodings. The asset collection is inline, exactly
-one entry; no memo, nested token, extra/foreign coin or merge exception. A split
-is admitted only as the lineage of section "Split lineage".
-Intermediate T data MUST be null; terminal burn data MUST equal R.
-
-Mint arity is 8, transfer 5, CD 6, proof 5. CD deadline precedes unlock;
-proof referenceTime follows CD. Certified transactions have exactly two slots;
-there is no third time slot. All certified proof fields are mandatory;
-pending responses are not proofs. These replace pre-3.0 shapes outright.
+Signature predicate type=1, params a valid compressed key33. Burn type=2, params raw `H(R)`. Built-in code bytes are
+01/02, not strings. P is nested as a tagged item, not wrapped in a bstr. M data/J and T's nonnull data are bytes
+containing the exact tagged encodings. The asset collection is inline, exactly one entry; no memo, nested token,
+extra/foreign coin or merge exception. Intermediate T data MUST be null, except a split manifest burn; terminal return
+burn data MUST equal R. Mint arity is 8, transfer 5, CD 6, proof 5. CD deadline precedes unlock; proof referenceTime
+follows CD. All certified proof fields are mandatory; pending responses are not proofs.
 
 ```
 txHash = H(exact tagged M/T bytes)
@@ -134,517 +153,149 @@ unlockMessage = H(C(b(sourceHash32),b(txHash32)))
 minterScalar = H(C(b("I_AM_UNIVERSAL_MINTER_FOR_"),b(id)))
 ```
 
-Reject an invalid minter scalar, never reduce it modulo n. Reconstruct each
-source owner/hash from the previous output; mint source is h0 and the public
-universal-minter signature predicate. Require CD source/tx fields and deadline
-identical to the reconstructed transaction, including null. Token unlock is
-r32||s32||recoveryId: 1<=r<n, 1<=s<=n/2, ID 0..3. Recover using the supplied ID,
-require recovered compressed key equal to the source key, then compact verify.
-Never normalize s/ID. IDs 2/3 require actual matching recovery. This bridge
-wrapper restriction applies to Rust as well; a range-only SDK check is
-insufficient. B1 seal signatures have their separate native signing rules;
-do not substitute those rules for token unlock recovery.
+Reject an invalid minter scalar, never reduce it modulo n. Reconstruct each source owner/hash from the previous
+output; the mint source is h0 and the public universal-minter signature predicate. Require CD source/tx fields and
+deadline identical to the reconstructed transaction, including null. Token unlock is r32||s32||recoveryId: 1<=r<n,
+1<=s<=n/2, ID 0..3. Recover using the supplied ID, require the recovered compressed key equal to the source key, then
+compact verify. Never normalize s/ID. For explicit e require t<e, with equality rejecting. Always require
+`t <= InputRecord.timestamp` of the proof's own authenticated UC. Never compare against wall time, EVM
+block.timestamp or the current root round. Refresh and consolidation preserve exact M/T, CD and original t, and
+rebuild only paths/UCs against an admitted root. RSMT membership uses raw v32.
 
-For explicit e require t<e, with equality rejecting. Always require
-`t <= authenticated anchor InputRecord.timestamp`. Null does not synthesize a
-service deadline. Never compare against current wall time, EVM block.timestamp
-or current root round. Rust's wrapper adds the timestamp upper bound missing
-from the inspected SDK. The authenticated t is the service's report, not proof
-against dishonest aggregator backdating.
+Every UC, aggregator and EVM alike, is verified under the trust-base entry of its own seal epoch by the upstream seal
+rule ([trust-base.md](trust-base.md), unchanged from protocol 7); `NoEntryForEpoch` is retryable once the history holds
+the epoch. On chain the verifier reads the same history from the chain's permanent seal registry, at any age.
 
-Refresh preserves exact M/T, CD and original t, and rebuilds only paths/UCs
-against an admitted root. Archive t: a later certificate cannot reconstruct it.
-RSMT membership uses raw v32, neither txHash nor an imprint. Editing e/J changes
-txHash and invalidates certification. Old locks/tokens are not reinterpreted.
-
-## Immutable embedded lock proof
+## Split lineage (unchanged formats)
 
 ```
-J = tag(39049,[2,chainId,b(vault20),b(zero20),nonce,LockProof])
-LockProof = [1,b(cfg32),b(trustBaseId32),b(evmPDR),b(evmUC),b(headerRLP),
-             [b(accountNodeRLP)...],[b(storageNodeRLP)...]]
-```
-
-J's body arity is 6, LockProof 8; LockProof is inline, not bstr-wrapped.
-Native tags stay 39049 lock / 39048 return; reject external 1330002, old
-pointer-only reasons, null/unknown reasons and detached backing evidence. A
-root mint's reason is J; a split part's mint reason is the split justification
-of section "Split lineage", whose ancestry ends in exactly one J.
-PDR and UC are complete canonical native encodings. UC contains InputRecord,
-shard-tree certificate, Unicity-tree certificate and quorum-signed root seal.
-`trustBaseId` is the EntryID of the genesis entry of the network's Unicity
-Trust Base history ([trust-base.md](trust-base.md)), not a document digest, an
-epoch's entry or a stateHash. It MUST equal the manifest's
-`trustBase.genesisEntryId` and the installed history's genesis; it never
-authorizes keys or another history.
-
-Receipt verification MUST have only token plus locally pinned configuration
-and the installed trust-base history (a release bundle under its genesis
-EntryID). It has no RPC, URL, node or witness-provider capability. Committees,
-weights and thresholds (`floor(2W/3)+1`) are the history's entries'.
-
-Bound and parse canonically before SDK allocation/crypto; match
-chain/vault/native asset/cfg and allow-listed deployment. Every ordinary and
-embedded UC is verified by the SDK under the entry of its own seal epoch:
-network equal to the history's (`SealNetwork`), an epoch newer than the latest
-held one `NoEntryForEpoch` (retryable), an epoch before the genesis or a root
-round outside `[start_e, start_e+1)` `SealEpoch`, native structure
-(`CertStructure`), tree root (`SealRoot`) and the upstream seal rule under the
-epoch's committee (`QuorumNotMet`): each supplied signature is judged alone, an unknown signer and any signature that is not an exact
-65-byte canonical recoverable one of its member count zero, and the valid weights reach the threshold. The embedded EVM UC uses the SDK certificate
-verifier for its own partition (TS `verifyCertificate`, Rust
-`verify_certificate_of_partition`). No plug-in weighted verifier, epoch
-resolver or trust-base store.
-
-Both ordinary and embedded UCs MUST be in the canonical native/SDK-decodable
-intersection: seal signature values that are byte strings of any width (a value
-that is not an exact 65-byte canonical recoverable signature of its member
-counts zero; an empty value is refused by the native seal validation),
-byte-string IR summary, array-valued
-shard siblings and Unicity steps (including empty arrays), valid signature maps,
-SDK integer/key widths, and existing native/bridge bounds. Construction/import/
-refresh fail `UnsupportedCertificateEncoding` outside this subset. Never rewrite
-null to empty or mutate J. Strict token-unlock recovery remains separate and
-unchanged.
-
-After SDK UC verification, enforce the bridge-specific pinned EVM partition,
-shard and configuration relation; hash PDR to UC's configuration commitment,
-require PDR epoch = IR epoch and match pinned execution/genesis/fork settings.
-Require `keccak256(headerRLP)==UC.InputRecord.blockHash` and
-`header.stateRoot==UC.InputRecord.hash`, using pinned header encoding.
-
-Verify account MPT key keccak256(vault20) under header.stateRoot. Canonical
-account RLP codeHash MUST equal pinned vault runtime hash. Its storageRoot
-verifies key `keccak256(keccak256(abi.encode(uint256(nonce),uint256(5))))`.
-Canonical minimal RLP storage integer, left-padded to bytes32, MUST equal d
-reconstructed from actual mint/recipient/asset/amount/ID/config. Check derived
-salt/ID, signature P0 and positive amount. Enforce hex-prefix, embedded-node and
-hash-reference rules, full key consumption, no duplicate/extraneous nodes or
-unused suffixes. RSMT verification cannot verify an EVM MPT. No receipt proof
-alternative exists. A root signature over an unrelated state root is inadequate.
-
-Lock first, obtain certified proof, construct J, then hash/sign/certify M.
-Lock digest excludes J/txHash, so there is no circularity. J cannot be refreshed
-after certification. Historical proof establishes permanent lock existence,
-not current spent=0. Certified single-spend history and live vault nonce guard
-have distinct roles. Historical backing has no B1 certificate-age requirement.
-
-J stays byte-identical after certification. A lock certificate of any epoch the
-history holds verifies under that epoch's committee and interval, so backing
-survives later rotations. Aggregator refresh may replace paths/UCs under any
-held epoch while preserving M/T, CD and original t. Never install a history from
-token input or union keys. Trust-base evolution is the SDK's: the wallet appends
-newer entries (each witnessed by its predecessor) and retries `NoEntryForEpoch`;
-the plug-ins fetch nothing. No bridge-owned epoch artifact, interval sidecar or
-trust-history service exists. Native return B1 keeps its independent consensus,
-registry, window and ABI.
-
-## Whole-token history and return
-
-No merge, partial return (redeem a whole part: to return 3 of 10, split 3+7
-first), time/custom predicate, recursive token other than the split
-justification, foreign mint or burn-followed-by-transfer. P0 and all nonterminal owners are signature
-predicates; first burn is terminal. The universal minter secret is public and
-never authorizes issuance. Mandatory issuance policy claims exactly aid,
-requires the exact J/data and binding certified lock. Other token types claiming
-this coin remain unverified. Dispatcher allow-list is immutable and rejects
-duplicate/ambiguous network/chain/vault entries. Registry installation is an
-application trust decision; a manifest arriving with a token executes no code.
-
-```
-R = tag(39048,[1,chainId,b(vault20),b(zero20),b(ty),b(aid),
-               b(recipient20),b(amount),b(zero20),b(empty),0])
-btid = H(C(b("unicity-burn-transition:v1"),b(sidBurn),b(txHashBurn)))
-eta = H(C(b("UNICITY_BR_NUL"),b(cfg),b(btid)))
-history = C([M,CD0,t0],[[T1,CD1,t1],...])
-```
-
-R has 11 slots; recipient nonzero and not vault, amount equals the redeemed
-token's own genesis amount (the part's amount for a split part).
-Last three fee/deadline slots are fixed as shown; request e is separate.
-Projection tuples have three slots, unlike SDK certified transactions. Strictly
-decode the entire token before export; obtain t only from its proof. All times
-remain untrusted until leaf membership and anchor authentication succeed.
-eta excludes t, paths, anchor round, unlock representation and submitter.
-
-Burn construction uses BurnPredicate(H(R)), journals the full certified blob
-before wallet acknowledgement, preserves original times and certificates and
-provides recoverPendingBurns. Acknowledgement is durable handoff, not payout.
-Return targets original vault and credits R.recipient, never submitter. Confirm
-receipts and on-chain spent/credit before recording settlement.
-
-## Split lineage
-
-A token minted from a lock may be split (the SDK's burn-and-mint `TokenSplit`)
-any number of times, and one part at a time is redeemed against the original
-lock. One asset, a single-parent chain of any depth, whole parts only; no joins,
-several locks or assets, fees or ZK. The wire formats are the SDK's, unchanged:
-
-```
-Manifest = tag(39046,[b(root32)])                      // one root: one asset
+Manifest = tag(39046,[b(root32)])
 leaf     = H(0x10 || key32 || data32 || u256(v))        // key = child token ID
 node     = H(0x11 || u8(depth) || hL || u256(sL) || hR || u256(sR))
 Proof    = [[depth,b(hash32),b(sum)],...]               // leaf first
 data     = H(C(b("UNICITY_SPLIT_OUTPUT"),b(parentId),network,b(P),b(salt),
                b(childId),b(ty),b(exactChildMintData)))
-SplitJ   = tag(39044,[ParentToken,[Proof]])             // the child mint's J
+SplitJ   = tag(39044,[ParentToken,[Proof]])             // the child mint's reason
 ```
 
-Sums are checked in 256 bits, `1 <= v < 2^256`; a key's side at a node is bit
-`depth` of the key, MSB first. A proof has at most 256 steps, depths strictly
-decreasing in 0..255, each sum minimal positive big-endian of at most 32 bytes;
-the empty proof is the one-leaf tree. `P` is the child's first owner predicate
-item (tag 39032), `exactChildMintData` the child mint's data bytes (the value
-envelope tag 39050 with the child's amount), so the commitment is the child
-mint without its justification. `ParentToken` is the complete burned parent
-SDK token (tag 39040) as an inline item; SplitJ carries exactly one proof. The
-parent's terminal transfer is `Burn(H(Manifest))` with the manifest as its
-data. A child's salt is free and its ID `H(C(b(salt),network))`.
+Sums are checked in 256 bits, `1 <= v < 2^256`; a key's side at a node is bit `depth` of the key, MSB first; a proof
+has at most 256 steps with strictly decreasing depths. The verifier walks from the returned part to the root while
+the mint reason is SplitJ; the root's reason must be `J`. One state-ID set covers the lineage (`RepeatedSID`). Every
+non-returned token of the walk ends in its manifest burn (`SplitBurn`, `SplitManifest`); each edge's proof verifies
+against the parent's manifest root (`SplitProof`) and sums to the parent's amount (`SplitSum`). Whole parts return
+independently; no per-lock accounting exists.
 
-Relation (`VerifyLineageReturn(cfg, history)`, bft-core `bridgeprofile`):
-`history` is the redeemed part's own projection (format unchanged); its
-ancestry is read from the exact justification bytes of its mint, nothing is
-duplicated. Walk part to root while the mint reason is SplitJ (strict decode of
-SplitJ and of the embedded token, then its projection); J ends the walk at the
-root; any other reason is `ErrMintJustif`. Verify root first with one state-ID
-set for the whole lineage (a repeated state anywhere, including a reused token
-ID, is `ErrRepeatedSID`): every token gets the whole-token mint and transfer
-checks of this document and at least one transfer; every token but the part
-ends in the manifest burn (`ErrSplitBurn`, `ErrSplitManifest`); the part ends in
-the return burn R with its own amount (`ErrReturnAmount` otherwise). Each edge
-verifies the child's proof for key=child ID, data=commitment, value=child amount
-against the parent's manifest root (`ErrSplitProof`), and the reconstructed sum
-must equal the parent's authenticated amount (`ErrSplitSum`). No time order
-between levels: each leaf is witnessed against its own anchor.
+## Return burn and redemption identifier [§8]
 
-Leaves are exported root first: for each token its mint leaf, then its
-transfers, the burn last; `L = sum(1 + transfers)`. The envelope ABI is
-unchanged and carries one LeafProof per leaf in that order, under the anchor
-rule below. An ancestor's embedded inclusion proofs are part of the child's
-committed mint and are never rewritten: the envelope witnesses every leaf of
-the lineage, so refresh rebuilds paths/UCs only in the envelope. The part's
-nullifier is `eta` of its own burn; the vault keys spending by (root nonce,
-part token ID). Depth is not capped: the lineage is bounded only by the
-envelope (2097152 bytes, which holds every nested token) and by its gas.
+```
+R    = tag(39052,[1,b(D),b(asset32),b(recipient20),b(v),a])
+btid = H(C(b("UNICITY_NB2_BURN"),b(sidBurn),b(txHashBurn)))
+eta  = H(C(b("UNICITY_NB2_REDEMPTION"),b(D),b(btid)))
+bucket(eta) = eta >> (256 - log2 B)
+```
 
-Plug-in obligations (both stacks): the issuance policy fails closed and
-admits a split part only through the full lineage relation under the pinned
-configuration (a root through J, a part through SplitJ to exactly one J, the
-39050 value of exactly aid); split outputs are built from the SDK's frozen
-payment data (`paymentData.encode()` bytes are the committed mint data);
-before the parent's manifest burn the wallet prices the full redemption
-estimate of every part it intends to redeem; the split, the manifest burn and
-each child mint are journaled durably, each step resumable after a crash, and
-no step is acknowledged before its certified blob is stored.
+R has arity 6. `a` in [0, 2^48-1] is the minimum segment index at which the burn may be paid. The final transfer has
+predicate `Burn(H(R))` and data exactly R. `v` is the returned part's own amount; the recipient is nonzero and not the
+vault. No archive hash, fee, deadline or redirection field. `eta` excludes paths, certificates, encodings and the
+submitter.
 
-## Cross-stack ABI
+## Segments and gap proofs [§10]
 
-`abi.json` freezes field order/types/offsets. 0x0103 stays reserved. 0x0104 is
-pure semantics, with canonical ABI `(uint8 operation,bytes Cfg,bytes payload)`:
-0=prepareLock, payload C(nonce,b(amount),P0); 1=mint and 2=return, payload=history.
-Mint requires zero transfers, return at least terminal burn. Unknown operations
-reject. Kernel reconstructs all transaction/CD/source fields, enforces time
-rules and strict recovery, rejects repeated SIDs and exports ordered leaves.
-It does not authenticate aggregator admission or inclusion.
+**PARAM** commitment: circular-gap tree (below), the default; bft-core#1098 compares it with compressed radix and
+adjacent-leaf multiproofs. The archive chain and the event do not depend on this choice.
 
-Output is `abi.encode(bytes32("UNICITY_TOKEN_SEMANTICS"),bool valid,Result)`.
-Result order: cfg,nonce,amount,tokenId,salt,firstPredicateHash,lockDigest,
-releaseTo,nullifier,Leaf[]. Leaf=(bytes32 sid,bytes32 txHash,uint64 referenceTime,
-bytes32 leafValue). Prepare has zero leaves/zero release fields; mint one leaf
-and zero release fields; return all leaves. Failure has valid=false and an
-all-zero/empty Result. Output has exactly 448+128*m bytes. Require canonical
-bool/address/u64 padding, marker, offsets, zero/false shape and complete
-consumption; inactive-address empty success is rejection. Bound before copying.
+```
+z_0 < ... < z_{K-1}                                    // the K ids of sealed segment j, strictly sorted
+leaf_i = K256(0x00 || z_i || z_{(i+1) mod K})
+node   = K256(0x01 || left || right)                   // ordered children, no padding
+M_j    = root over leaf_0..leaf_{K-1}
+H_0     = K256(ARCHIVE_GENESIS || D || u16(K))
+H_{j+1} = K256(ARCHIVE_STEP || D || u64(j) || H_j || M_j)
+proof   = u8(i) || l(32) || u(32) || s_0 .. s_{h-1}   // h = log2 K; exactly 65 + 32h bytes
+```
 
-Envelope is `abi.encode(bytes policyBody,bytes history,Anchor[],LeafProof[])`.
-Anchor order=(uint32 partition,bytes shard,bytes32 shardConfHash,
-bytes32 expectedStateRoot,bytes32 expectedIRHash,bytes uc,bytes inputRecord).
-LeafProof=(uint16 anchorIndex,bytes32 bitmap,bytes32[] siblings). All earlier
-Anchor fields retain order; the native inputRecord opening is appended after UC.
-Reject aliases, noncanonical offsets/padding, trailing bytes and budget overflow.
+Valid for `eta` when `i < K` and either `i < K-1, l < u, l < eta < u` or `i = K-1, l > u, (eta > l or eta < u)`, and
+folding `x = K256(0x00||l||u)` with `s_k` (bit k of i: 0 means `K256(0x01||x||s_k)`, 1 means `K256(0x01||s_k||x)`)
+gives `M_j`. Zero and `2^256-1` are ordinary identifiers.
 
-Anchors (one anchor per distinct complete UC). Each anchor is one
-complete canonical native UC with its claim fields and the two native openings.
-Anchors have pairwise distinct UC bytes (byte-identical UCs are one anchor,
-never two; a repeated or conflicting entry is rejected); several different UCs
-of one shard, even of one root round, are separate anchors. Anchor count is not
-bounded by the shard count, only by the profile parameter A_max below. Every
-anchor's partition must be the policy partition and its shard a canonical
-native shard ID; its shardConfHash, expectedStateRoot and expectedIRHash are
-claim fields the batch authenticates against the UC (B1). The kernel result
-orders exported leaves. Order anchors by first use in kernel leaf order:
-scanning leaves in order, a leaf's anchorIndex is either an already-used index
-or exactly the next unused one, and every anchor must be used. Require exactly
-one LeafProof per leaf in kernel order, retaining duplicate-SID rejection, and
-that the first d bits of each leaf's 32-byte SID equal the prefix bits of the
-anchor it names (d that anchor's shard depth; never the current topology or a
-transaction timestamp). Reject an out-of-range, skipped, unused, duplicated or
-foreign anchor and any anchor table that is not exactly that function of the
-exported leaves. Mint (one leaf) has exactly one anchor. Apply this to mint and
-return alike. There is no convergence requirement: the plug-in submits whatever
-(path, UC) pairs it holds.
+## Vault state [§9]
 
-The whole anchor table is authenticated by one `CERT_BATCH_V2` evaluation (the
-0x0100 relation, run inside BRIDGE_COMPOSE_V2 over the same request bytes):
-`version 2 | flags 0 | K | Claim[K]`, K the table length, claims in table
-order, each `partition:u32 | shardLen:u16 | shard | shardConfHash |
-expectedStateRoot | expectedIRHash | ucLen:u32 | uc`; `0x0101` is never used.
-The composition requires the batch verdict true: one verdict for the table, no
-partial success. Anchors may carry different root rounds, seals and epochs; B1 checks
-each seal against its own epoch's permanent registry entry (any age: start <=
-round <= the usable origin round O, and round < end for a closed epoch), with no
-certificate-age window, common cut or EVM certificate at any anchor's round.
-B1's own scan requires exactly d shard-tree siblings for the UC's own shard.
+```
+A = n << 200 | c << 152 | m << 144 | Q      // 56, 48, 8, 144 bits
+Σ = (A, T_0, T_1, H_c, H_{c-1}, S_0, S_1)
+```
 
-Opening is canonical tag(39002,[1,round,epoch,previousHash,stateHash,summary,
-timestamp,blockHash,fees,executedTransactionsHash]) (arity 10). Version=1;
-round/epoch/timestamp/fees unsigned u64; stateHash bstr32; other hash fields
-null or bstr32; summary null or bstr within B1's summary limit. Enforce all
-native B1 bounds, null/width/canonical rules. Require
-H(inputRecord)==expectedIRHash and stateHash==expectedStateRoot.
+`c` is the current segment, `m < K` its population, `p = c mod 2` the current buffer. `S_p[i]` is the i-th identifier
+paid into buffer p; tag word(s) `T_p` hold `bucket(S_p[i])` at bit offset `log2 B * (i mod t)` of word `floor(i/t)`,
+`t = floor(256/log2 B)`. Live positions are `i < m` (current) and `i < K` (previous, when `c > 0`). Stale cells are
+never cleared. **PARAM** layout: position tags (default) or the v2 sparse per-bucket layout (bft-core#1098); storage
+slot numbers are not part of this contract.
 
-Composition (one native call: BRIDGE_COMPOSE_V2 below)
-checks framing/budgets/Cfg/policy and obtains the kernel result, then derives
-and checks the anchor table above. The one CERT_BATCH_V2 evaluation (the 0x0100
-relation) MUST authenticate both expected root and expected IR hash of every
-anchor. Only after success may an anchor's opened timestamp authorize the
-t<=timestamp comparison of the leaves routed to it (each leaf against its OWN
-anchor only). For each ordered leaf the RSMT membership (the 0x0102 relation)
-is checked with sid, raw leafValue and the root/path of that leaf's own anchor;
-no partial success. The B1 profile hash is the
-deployment's pinned any-age profile; do not invent one. Caller-supplied scalar
-timestamps or unauthenticated IR hashes cannot authorize time checks.
+## Redemption [§11]
 
-## Resource and custody profile
+```
+redeem(bytes evidence, bytes32 claimedEta, uint64 claimedStart, bytes history)
+evidence = C(1, Token)                                   // the returned part, inline tag 39040
+history  = empty                                         // P = 0
+         | startHead32 || proof_0 || ... || proof_{P-1}  // P >= 1
+```
 
-One resource policy (owner section 36; unsupported/budget-exceeded rejects
-offline, never fetches). There is no gas ceiling and no history cap. The
-composition (BRIDGE_COMPOSE_V2) streams the history and the anchor table: it is
-bounded by the direct envelope<=2097152 (the ingress bound the pool and RPC
-carry; B7 PR 3 measured the largest redemption, 1,000 leaves under original
-seals, at 1.45 MB and 48.0M transaction gas, which the 60M ordinary block
-capacity holds), the u16 anchor wire width A<=65535 (the CERT_BATCH_V2 claim count and
-every anchorIndex; A<=L) and its gas. A redemption has no transfer, leaf,
-history-byte or anchor-count aggregate of its own, the anchor table's
-CERT_BATCH_V2 evaluation no request-byte, signature or raw-step aggregate, a
-held token none beyond its bytes (MAX_TOKEN_BYTES), and the history and the
-token no CBOR item aggregate; every item and leaf is paid. The standalone B2
-kernel (0x0104, which `prepareLock` calls) keeps its own bounds: <=64
-transfers including burn, <=65 leaves, semantic history<=131072; a standalone
-CERT_BATCH_V2 call keeps B1's (16 claims, 256 signatures). The rest are
-per-object shape bounds: J<=65536; UC<=16384 plus B1's tighter
-sublimits; PDR<=16384; header<=2048; each MPT<=65 nodes; node<=1024; combined
-MPT bytes<=24576; CBOR/RLP depth<=16, CBOR items<=32768 per object (each UC,
-IR opening, Cfg, policy body and nested payload); anchor
-UC<=8192, IR opening<=512, <=32 RSMT siblings per leaf, <=32 unicity steps and
-exactly d shard-tree siblings per UC (d its own shard's depth, the anchor's
-shard equal to the UC's); Cfg<=1024. These are the named parameters of
-`profile-v7.json` `limits` (the single source for contract, oracle and
-plug-ins). There is no cumulative path-step budget and no shared CBOR item
-budget: path steps and items are charged. An envelope's declared RSMT siblings
-never exceed its bytes/32 in sum (refused before allocation). Bitmap popcount
-must equal the sibling count of every leaf path. Check counts overflow-safely
-before allocation.
+Check order and errors (frozen): reentrancy (`Reentrancy`); history length (`BadHistoryLength`); `a <= c`
+(`FutureIndex`); `e = a + P` is `c` or, when `c > 0`, `c - 1` (`StaleEndpoint`); each proof for `claimedEta`
+(`BadGapProof(position)`) folded from `startHead` through `j = a..e-1` to the stored `H_e` (`ChainMismatch`); the
+current buffer, and the previous one when `e = c - 1`, holds no `claimedEta` among its live positions tagged
+`bucket(claimedEta)` (`AlreadyPaid`); STATICCALL `verifyReturn(config(), evidence)` (`VerifierRefused(reason)`,
+`VerifierBadReturn`); verdict `domain == D` (`DomainMismatch`), `asset` (`AssetMismatch`),
+`(eta, minSegment) == (claimedEta, claimedStart)` (`ClaimMismatch`), recipient (`BadRecipient`), `amount > 0`
+(`ZeroAmount`), `amount <= Q` (`LiabilityUnderflow`). Effects: append eta and its tag, `m += 1`, `Q -= amount`, emit
+`Paid`; at `m = K` seal (`SegmentCounterExhausted` at `c = 2^48-1`); then pay `amount` to the recipient with a plain
+value call (`PayoutFailed`). Nothing is granted before the verdict equality.
 
-### Native composition (BRIDGE_COMPOSE_V2, 0x0105)
+Sealing, in the same transaction: read the K identifiers, distribute by tag, sort each bucket with a bounded
+worst-case sort, concatenate in bucket order, assert strict order, compute `M_c` and `H_{c+1}`, emit
+`SegmentSealed(c, H_c, H_{c+1}, z_0||...||z_{K-1})`, then `H_{c-1} = H_c`, `H_c = H_{c+1}`, `c += 1`, `m = 0`. No
+empty, early or timed seal.
 
-The redemption's whole composition is one native call, `BRIDGE_COMPOSE_V2` at
-`0x0000000000000000000000000000000000000105`, registered by the Unicity EVM
-factory like 0x0100/0x0102/0x0104 on every execution route; it reads the
-registry through the journal and is never result-cached. Its relation is
-bft-core `bridgeprofile.NativeComposeV2`, in order: the operation (mint or
-return), the Cfg and the envelope's framing and the resource bounds above; the
-policy body; the lineage relation of section "Split lineage" (depth 0 is the B2
-kernel's whole-token relation; the mint operation refuses a split reason,
-`ErrMintJustif`); the anchor plan over the lineage's leaves; one CERT_BATCH_V2
-evaluation of the anchor table against the registry; each anchor's IR opening
-and every leaf's time against its own anchor; one RSMT membership per leaf. The
-first failure decides the status. The protocol 5 composition
-(`BRIDGE_COMPOSE_V1`, 384 bytes) is not part of this profile: a protocol 6
-chain registers V2 at the address instead (a fresh deployment, nothing is
-upgraded in place).
+```solidity
+interface INativeBridgeVerifierV2 {
+    function verifyReturn(bytes calldata gamma, bytes calldata evidence) external view
+        returns (bytes32 domain, bytes32 eta, uint64 minSegment, bytes32 asset, address recipient, uint256 amount);
+}
+```
 
-Input: `abi.encode(uint8 op, bytes cfg, bytes envelope)`, canonical, as in
-protocol 5; the envelope is the one above, unchanged. Output, always exactly 480
-bytes (fifteen words) on an EVM success: `abi.encode(bytes32 marker, uint256 status, bytes32 cfg,
-uint256 nonce, uint256 amount, bytes32 tokenId, bytes32 salt,
-bytes32 firstPredicateHash, bytes32 lockDigest, address releaseTo,
-bytes32 nullifier, uint256 leafCount, bytes32 partTokenId, uint256 partAmount,
-uint256 splitDepth)`, marker `bytes32("UNICITY_BRIDGE_COMPOSE_V2")`. Words 3..8 are the ROOT's (the lock nonce, the locked
-amount `lockDigest` commits, never the part's; its token ID, salt, first owner
-and lock digest); releaseTo and nullifier are the part's return; leafCount is L
-of the whole lineage; partTokenId and partAmount the redeemed token (equal to
-tokenId and amount at depth 0), splitDepth d (0 an ordinary redemption). Status
-0 means the relation holds; any other value is the stable reason code of
-`config/compose-status-v2.json` (protocol 5's append-only table, then
-`ErrSplitJustif`, `ErrSplitProofCount`, `ErrSplitProofShape`,
-`ErrSplitManifest`, `ErrSplitBurn`, `ErrSplitProof`, `ErrSplitSum`,
-`ErrCertScan`, `ErrCertSigLength`: an embedded ancestor certificate outside the
-native/SDK codec intersection is a status, never an unmapped error) and every
-result field is then zero. Only out-of-gas and an input that is not the
-canonical ABI halt (all forwarded gas consumed); everything after the ABI decode
-is a status, charged for the work it caused. The Solidity wrapper keeps the
-configuration binding (the verifier address, the chain and the Cfg hash) and the
-vault's atomic lock/redeem/credit/claim logic, forwards all remaining gas,
-decodes exactly 480 bytes and reverts `BridgeRejected(uint256 status)` on a
-nonzero status. `prepareLock` still calls B2 at 0x0104 directly (depth 0 only).
+The verifier decodes Γ (`ConfigShape`) and the evidence (`EvidenceShape`), verifies the whole lineage, every
+transaction, unlock and inclusion proof under the aggregator partition, the root's J, and the return burn (`NotBurn`,
+`BurnNotFinal`, `BurnReason`, `ReturnData`, `ReturnDomain`, `ReturnAsset`, `ReturnAmount`, `ReturnRecipient`,
+`ReturnIndex`), and returns the authenticated tuple. It reverts with `<RuleName>()`. [`abi.json`](abi.json) has every
+selector, topic and data length.
 
-### Gas schedule and estimate
+## Wallet obligations [§12]
 
-The native call charges the trial schedule (bft-core `ComposeGas`)
-`G_compose = 100000 + 2*B + 20*J + 16000*L + 7200*Q + 29900*E + 2000*A + 250*P + 50*K*ceil(log2 K) + G_split`:
-B the input bytes; J the CBOR item heads of the Cfg, the policy body, the
-history, every anchor UC and every anchor IR opening, each encoded occurrence
-counted once (tags and containers, scalar and string heads, every child and map
-key and value; the contents of a byte string are opaque; an IR opening and the
-IR inside its UC are two occurrences); L the leaves; Q the signatures over the
-distinct seals, E the distinct declared epochs, A the distinct claims and K the
-claim occurrences of the anchor table's canonical first-use grouping (bft-core
-`b1ref.Group`); P the shard-tree plus unicity steps of the distinct claims plus
-every leaf's RSMT siblings. The grouping is set/sort-based, never pairwise. Each
-charge is taken before the work it pays for (`100000 + 2*B` before decoding,
-an object's J once it scans, `16000*L` once the kernel has counted the leaves,
-the batch terms once the batch is scanned and grouped, `250*s_i` before each
-RSMT path is hashed); a status is charged what was metered up to its failure,
-with no refund and no charge for work not done. On success the charge is the
-whole formula. It is a trial price to benchmark, not a measurement.
+1. **Secret.** Journal `(D, i)` and back up `k_w` before submitting value. Build `J` only from a certified deposit
+   block.
+2. **Index (R1).** Before burning, fetch the newest `SegmentSealed(j)` receipt available as a `DepositProof` container
+   with topics `[topic0(SegmentSealed), u256(j)]`, verify it exactly like a deposit receipt (`SealReceipt`), and sign
+   `a = j + 1`, keeping `headAfter` as the future start head. With no receipt, sign `a = 0` (start head `H_0`). A plain
+   `state()` read is allowed only when the manifest's `stateReadOnly` is true; a jump beyond the verified bound is
+   refused (`ImplausibleIndex`).
+3. **History.** Fetch one `SegmentSealed` log per segment `a..c-1` from any source; check length `32K`, strict order,
+   `M_j` and the head link (`SegmentLog`). If eta is in a segment it was paid. Build the gap proofs. One rollover in
+   flight is tolerated; after two, rebuild the history without changing the burn.
+4. **Gas.** Gas limit = expected cost + `gasReserve` (worst seal + worst `2K-1` scan). **PARAM** 620,000 at K=64,
+   B=16 (bft-core#1098).
+5. **Size.** With `P_max = floor((L_max - L_T - L_O) / (65 + 32h))`: before burning refuse unless
+   `P_max >= returnReserveSegments` (default 64; `CapacityPreflight`); at redemption refuse if `P > P_max` or the gas
+   exceeds `userGasLimit` (`CapacityExceeded`). This release has no recovery for an oversized claim
+   (bft-core#1108 is deferred).
+6. **Recipient.** Default to a controlled EOA. Simulation of a contract recipient is not a guarantee.
+7. **Burn and retry.** Verify full provenance first; persist the certified burn before reporting success; after a
+   timeout look for `Paid(eta)` before retrying; refresh stale history; never alter the certified burn.
 
-`G_split` is charged in walk order (part to root) on every return, each term
-before the work it pays for: `16*len(outer mint transaction)` first, which at
-depth 0 is the whole of it (no justification is descended into); for each
-split justification descended into `16*len(justification)`, then `20*items` of
-it, then `16000*(1 + transfers)` of the parent (so L above counts every leaf of
-the lineage exactly once); for each edge `20000 + 1500*steps` of its proof. The
-16 gas/byte term pays the quadratic re-hashing of nested prefixes. Trial values
-as above (bft-core `docs/design/bridge-split-lineage-spec.md` section 6).
+Error classification of a failed simulation: `AlreadyPaid` reconcile; `StaleEndpoint` rebuild history; `FutureIndex`
+wait; `BadGapProof`/`ChainMismatch` repair the proof or start head, no new burn; `VerifierRefused` carries the
+verifier's rule.
 
-The plug-ins compute the same dimensions from the same scans. Their
-transaction estimate is `21000 + 16*D_max + G_compose + 1000000`, with the
-call-data allowance `D_max = 4 + 128 + pad32(B_cfg) + pad32(B_env)` (the
-two-bytes-argument TokenVerifier call) and the fixed reserve for the wrapper,
-the call and EIP-150 headroom and vault accounting. The estimate is never an
-admission rule (owner section 36): a wallet sets the transaction gas limit from
-it, and a transaction with too little gas runs out of gas and reverts
-atomically. The only gas bound is the deployment's ordinary block capacity, an
-ordinary profile parameter (the pool admits one transaction of it). A bundle
-above a resource bound is BudgetExceeded or an input-size refusal, never
-truncates history, omits leaves, selects a latest UC or splits a redemption,
-and means "direct exit unavailable", not "token invalid". The corpus `gate`
-cases still publish the protocol-5 composite
-`21000 + 16*D_max + 80*B_env + 1000*J' + G_kernel + G_batch + sum_i G_leaf(i) + 1000000`
-(J' without the history; `G_batch`, `G_leaf`, `G_kernel` the per-call prices of
-0x0100, 0x0102 and 0x0104); it no longer prices a redemption. Bounds are not
-additive entitlements or measured activation prices; native x86-64/arm64
-full-transaction measurements and benchmarked native prices remain required.
+## Corpus
 
-### Assembly and refresh
-
-The plug-in reconstructs every SID of the history and routes each to the
-aggregator shard that serves its prefix (the policy names no topology).
-
-Consolidated path (the default). Before assembling, the plug-in consolidates
-the token with the state-transition SDK's built-in uc-consolidation flow (TS
-`TokenProofClient.consolidate`, Rust `client::consolidate`): one `latest`
-request to the shard of the newest proof returns that shard's proofs with its
-partition view, authenticated against the enclosing UC with one seal-quorum
-check; exact-root requests to the other participating shards return their
-proofs from the same view; every proof is rechecked (binding, expiry, original
-reference time <= the target IR timestamp). Each participating shard's
-ordinary version 1 UC is derived from the authenticated view, so the anchor
-table has one anchor per shard the leaves touch, all under one seal:
-K = m <= min(L, 8), S = 1. The partition view V1 admits at most 8 shards
-(`MaxPartitionViewLeaves`, an admission constant that a later view version may
-raise; no other rule depends on it). The view never goes on chain: B1 and the
-bridge verify each derived UC exactly as any UC, with no new trust assumption.
-This is one deterministic consolidation attempt (two waves, no retry that
-chases a newer seal), not convergence by repetition: the owner's section 14
-rule stands, and the plug-in never re-queries until responses happen to share
-a certificate. The master seal is an anchor like any other: its root round must
-be covered by the registry's usable origin O, so a fresh one is waited for.
-
-Per-SID path (the fallback). A partition with more shards than the view
-admits (`MaxPartitionViewLeaves`, 8; the host's shard routing knows the
-partition's shard count) is assembled per SID without calling consolidation:
-the SDK would refuse that topology as an integrity error, not report it as
-unavailable. Otherwise the plug-in assembles from per-SID proofs when
-consolidation returns `unavailable`, whatever its reason and whether or not the
-SDK marks it retryable (the SDK's reasons: `busy`, `limit_exceeded`,
-`partition_view_unavailable`, `pending_publication`, `state_expired`,
-`state_not_in_root`, `state_pending`, `state_unknown`, `target_not_retained`,
-`unsupported_capability`, `unsupported_configuration`), and keeps the SDK's
-retryable flag only as a hint for a later consolidation attempt. A failed consolidation is
-not unavailability: every `ConsolidationError` (`cancelled`, `input`,
-`integrity`, `invalid_response`, `rejected`, `server`, `timeout`, `transport`)
-is the SDK's error, surfaced as it is and never a silent fallback. For each
-used shard it fetches, concurrently, only the existing
-aggregator `get_inclusion_proof.v2(stateId)` and keeps each response's path and
-its UC as an inseparable pair, verifying locally the path against that UC's
-root and the returned CD and t against the original history. A path is never
-re-paired with a UC it does not independently verify against. The plug-in does
-NOT re-query to make responses share a certificate: it builds the anchor table
-from the distinct UCs it received, in first-use leaf order. A racing or
-mismatched (path, UC) pair gets a bounded retry, then retryable unavailability
-(never BudgetExceeded). The plug-in validates the complete envelope (including
-the gas estimate and every anchor's round against one observed EVM origin O)
-before submission, and BEFORE creating a burn refuses only a burn the resource
-policy cannot carry (more leaves than the native kernel admits, a history or
-envelope over its bound), reporting the best-case estimate (the consolidated
-bundle: K = min(m, L) anchors under one seal, S = 1, smallest certificates,
-shortest paths); the redemption path accepts up to A_max distinct UCs (the
-per-SID fallback) (BudgetExceeded for an over-limit bundle; no truncation or
-partial credit). Pending history and bundle
-are persisted atomically for restart, aged pairs are revalidated or refetched.
-There is no common cut, cross-shard synchronization or guarantee that fresh
-proofs become available. Offline receipt verification is network-free and
-accepts each transaction's own authenticated historical UC and round under the
-historical-trust rules; refresh changes only external paths and UCs,
-preserving exact M/T/CD/t/J.
-
-Vault slots 0..9: lastNonce, locked L, credited D, paid P, entered,
-lockDigest mapping base5, redeemedAmount mapping base6 (nonce => sum of
-redeemed part amounts), claimable mapping base7, lockedAmount mapping base8
-(nonce => amount), spentPart mapping base9 (nonce => partTokenId => eta).
-Nonce starts at 1, never wraps/reuses; locks remain permanently nonzero. No
-administrative withdrawal. A redemption requires the stored digest to equal the
-result's lockDigest, `amount == lockedAmount[nonce]`,
-`0 < partAmount <= lockedAmount - redeemedAmount` and
-`spentPart[nonce][partTokenId] == 0`; it then stores eta there, adds
-partAmount to redeemedAmount and credits partAmount to releaseTo, atomically.
-The part key comes from the verified result, never from the caller. Distinct
-burns of one part contend on its spent word; the parts of one lock together
-never exceed the lock. The vault emits
-`RedemptionCredited(uint256 indexed nonce, bytes32 indexed partId, address indexed recipient, bytes32 nullifier, uint256 amount, uint256 remaining)`
-and exposes `spentPart(nonce, partId)`, `redeemedAmount(nonce)`,
-`lockedAmount(nonce)`, `remaining(nonce)` and `lockComplete(nonce)`.
-`0<=P<=D<=L`, outstanding=L-D, claimable total=D-P,
-balance=L-P+X with donations/forced value X>=0. Donations never authorize mint.
-Claim requires caller credit>=amount>0 and to nonzero/not vault; under shared
-guard debit credit/increase paid before CALL, revert all on failure. Only the
-credited recipient redirects payment. Preserve custody on every verifier error.
-
-## Deployment manifest and corpus
-
-Schema v1 registry is keyed by tokenTypeHex (lowercase hex, no 0x).
-`manifest.schema.json` defines structural rules; application installation also
-MUST recompute identifiers, chainRef, Cfg/cfg, policy hashes, semantic-profile
-hash and runtime/trust pins (the trust-base genesis EntryID; a release bundle by
-exact-file digest), match
-key to tokenTypeHex, reject ambiguous
-network/chain/vault entries and inconsistent replacement records. JSON text is
-never the Cfg preimage. Hash canonical published artifacts exactly, never an
-unspecified JSON serialization. Artifact locations are installation metadata,
-not verification dependencies. rpcUrls/proofEndpoints are optional untrusted
-construction/submission/refresh sources and cannot repair missing embedded proof.
-No invented deployment/runtime/configuration hashes are included in this PR.
-
-The sole released corpus lives here; Go bridgeprofile is an independent oracle
-and reference generator, not a second golden authority. Consumer pins require
-protocol commit plus exact manifest digest, offline cache supported. Candidate
-pins may break bootstrap cycles before merge; releases require merged pins.
-Provenance, import and temporary regeneration rules are in vectors/README.md.
-CI must reject missing/wrong corpus digests. Required families are config, wire,
-unlock, policy, lock, history, proof, return, vault and split (the protocol 6
-lineage corpus: sum-tree, lineage, native V2 and mutation, under `split/`); cases carry preimages,
-bytes, digests, semantic outcomes, leaf obligations, B1 requests/results,
-version/profile and provenance. PR3 adds independent TS/Rust construction;
-reading Go JSON in both stacks alone is not independent construction.
+v2 vectors are generated once by the bft-core Go reference (NB2-03, bft-core#1099) as one file consumed by digest.
+Until then this profile has no corpus; `protocol/vectors/` is the protocol 7 corpus of the legacy code.

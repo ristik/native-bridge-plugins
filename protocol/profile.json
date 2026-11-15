@@ -1,0 +1,105 @@
+{
+  "artifactVersion": 1,
+  "nativeBridgeProtocolVersion": 8,
+  "name": "native-bridge-v2",
+  "status": "development-frozen-unactivated",
+  "specification": "ristik/bft-core docs/design/native-bridge-v2.md (NB2-01, bft-core#1097)",
+  "identityFamily": "unicity-native-nb2",
+  "hashes": {
+    "unicity": "sha256",
+    "evm": "keccak256"
+  },
+  "tags": {
+    "predicate": 39032,
+    "mint": 39041,
+    "transfer": 39045,
+    "certificationData": 39031,
+    "token": 39040,
+    "inclusionProof": 39033,
+    "value": 39050,
+    "splitJustification": 39044,
+    "splitManifest": 39046,
+    "receiptBacking": 39051,
+    "segmentReturn": 39052
+  },
+  "rejectedTags": [39047, 39048, 39049],
+  "versions": {
+    "config": 1,
+    "receiptBacking": 1,
+    "depositProof": 1,
+    "segmentReturn": 1,
+    "evidence": 1
+  },
+  "cborDomains": {
+    "config": "UNICITY_NB2_CFG",
+    "depositIntent": "UNICITY_NB2_DEPOSIT_INTENT",
+    "depositSalt": "UNICITY_NB2_DEPOSIT_SALT",
+    "burn": "UNICITY_NB2_BURN",
+    "redemption": "UNICITY_NB2_REDEMPTION",
+    "splitOutput": "UNICITY_SPLIT_OUTPUT",
+    "tokenType": "unicity-bridge:unicity-native-nb2:",
+    "coin": "unicity-bridge-coin:unicity-native-nb2:",
+    "asset": "unicity-nb2-asset:native-uct"
+  },
+  "evmDomainTags": {
+    "UNICITY_NB2_DEPOSIT_SECRET": "dfa87a7a4c6db3c7c307e4f2c3cc2d4a07e33d349f542b47f8e0bba49f62e645",
+    "UNICITY_NB2_ARCHIVE_GENESIS": "45076af3d8858f1d7a9bb6e037bb5ca4270d0b4fa90f9397eb7adb905590a339",
+    "UNICITY_NB2_ARCHIVE_STEP": "c68efdc45f5c9a20bf6abfda6493e8e295d8e31495fd1e744cd4c35f74785dfa"
+  },
+  "merkleTags": {
+    "leaf": 0,
+    "node": 1
+  },
+  "widths": {
+    "accounting": {
+      "layout": "n << 200 | c << 152 | m << 144 | Q",
+      "n": 56,
+      "c": 48,
+      "m": 8,
+      "Q": 144
+    },
+    "segmentIndex": 48,
+    "depositNumber": 56,
+    "qmaxMaximum": "22300745198530623141535718272648361505980415"
+  },
+  "limits": {
+    "justificationBytes": 65536,
+    "ucBytes": 16384,
+    "pdrBytes": 16384,
+    "headerBytes": 2048,
+    "receiptNodes": 65,
+    "receiptBranchNodeBytes": 1024,
+    "receiptLeafNodeBytes": 49152,
+    "admittedReceiptTypes": [0, 1, 2, 3],
+    "cborDepth": 16,
+    "rlpDepth": 16,
+    "firstOwnerBytes": 42
+  },
+  "parameters": {
+    "note": "Provisional until bft-core#1098 (NB2-02) fixes them by measurement; the encodings around them are frozen.",
+    "K": { "candidates": [32, 64, 128], "default": 64, "fixedBy": "bft-core#1098" },
+    "B": { "candidates": [8, 16, 32], "default": 16, "fixedBy": "bft-core#1098" },
+    "recentBufferLayout": { "candidates": ["position-tags", "sparse-buckets"], "default": "position-tags", "fixedBy": "bft-core#1098" },
+    "segmentCommitment": { "candidates": ["circular-gap", "compressed-radix", "adjacent-leaf-multiproof"], "default": "circular-gap", "fixedBy": "bft-core#1098" },
+    "gasReserve": { "default": 620000, "fixedBy": "bft-core#1098" },
+    "maxEncodedTxBytes": { "candidates": [131072, 524288], "default": 524288, "fixedBy": "owner decision, measured by bft-core#1105" },
+    "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" }
+  },
+  "trustModel": {
+    "scope": "unicity-trust-base-history",
+    "document": "protocol/trust-base.md",
+    "sealRule": "upstream: each signature judged alone; exactly 65 bytes r||s||v recovering to the member counts its weight, anything else counts zero; floor(2W/3)+1 of the seal epoch's entry",
+    "missingEpoch": "NoEntryForEpoch, retryable once the history holds the epoch"
+  },
+  "normativeArtifacts": [
+    "protocol/interop.md",
+    "protocol/abi.json",
+    "protocol/trust-base.md"
+  ],
+  "normativeArtifactSha256": {
+    "protocol/interop.md": "1d409236631a1f8e1a537efac1f1d464d6469f31ea416fc7f2d2182760d55850",
+    "protocol/abi.json": "ab40d6bdc7e60d34b0ae3646a89254eb6e8c07ebe6cf7651557c81a058b6f40a",
+    "protocol/trust-base.md": "48c8ad020417f6ea1e85d0c1f2d3ee5e878892ba2cfb39574ae188954cc70a64"
+  },
+  "legacy": "protocol/legacy-v7/ and protocol/vectors/ are the protocol 7 artifacts and corpus that the old plug-in code still tests against; not part of this profile; removed by bft-core#1106 (NB2-10)."
+}

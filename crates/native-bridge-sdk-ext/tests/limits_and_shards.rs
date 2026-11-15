@@ -21,7 +21,7 @@ fn the_named_bounds_are_the_limits_of_profile_v5_the_one_source() {
     let p: serde_json::Value = serde_json::from_slice(
         &std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../protocol/profile-v7.json"
+            "/../../protocol/legacy-v7/profile-v7.json"
         ))
         .unwrap(),
     )
