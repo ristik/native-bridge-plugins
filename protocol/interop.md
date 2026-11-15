@@ -145,7 +145,8 @@ MUST remain part of the authenticated shard-tree leaf, together with its InputRe
 that computation); the complete shard/unicity paths and seal, and all structural, network, epoch-interval and quorum
 checks, are verified; no PDR is supplied and no PDR-to-InputRecord epoch comparison is performed; every
 EVM-certificate failure (encoding, network, epoch interval, structure, partition/shard, folds, quorum; deposit and
-seal receipts alike) is `DepositUC`, except `NoEntryForEpoch`, which keeps its retryable name;
+seal receipts alike) is `DepositUC`, except that wallets keep the retryable `NoEntryForEpoch` (on chain it is
+`DepositUC` too);
 `K256(headerRLP) == IR.blockHash` and `header.stateRoot == IR.hash` (`DepositHeader`), the certificate of the block
 that executed the deposit, where `headerRLP` is the go-ethereum v1.14.11 Cancun header: the canonical RLP list of
 exactly 20 fields ending at `parentBeaconBlockRoot` (no `requestsHash`), with zero difficulty, the empty uncle hash,
@@ -324,11 +325,18 @@ the nested wire rules); the walk to the root (39044 is a split reason: `SplitJus
 `SplitProofShape`, the inline parent's wire rules; 39051 ends it; anything else `MintReason`); the root's J in its
 order; root first, every token: mint fields (`MintShape`, `MintType`, `MintData`), `NoTransfers`, then the mint and each
 transfer (`CDMismatch`, `DeadlineMismatch`, the unlock rules, `DeadlineExpired`, `RepeatedSID`, then its inclusion
-proof: `UnsupportedCertificateEncoding`, `SealNetwork`/`NoEntryForEpoch`/`SealEpoch`, `CertStructure`, `SealRoot`,
-`QuorumNotMet`, `InclusionProof`, `ReferenceTime`), each intermediate transfer (`BurnNotFinal`, `TransferData`), a
+proof: the UC per-UC order below, then `InclusionProof`, `ReferenceTime`), each intermediate transfer (`BurnNotFinal`, `TransferData`), a
 parent's split burn (`SplitBurn`, `SplitManifest`), each child's edge (`SplitProof`, `SplitSum`); the part's burn
 (`NotBurn`, `ReturnData`, `ReturnIndex`, `ReturnDomain`, `ReturnAsset` against the `a_UCT` constant, `ReturnAmount`,
-`ReturnRecipient`, `BurnReason`); then `btid`, `eta` and the authenticated tuple. It reverts with `<RuleName>()`. [`abi.json`](abi.json) has every
+`ReturnRecipient`, `BurnReason`); then `btid`, `eta` and the authenticated tuple.
+
+Per-UC order (frozen): `UnsupportedCertificateEncoding`, `SealNetwork`, `CertStructure`, `SealRoot`, then the authority
+verdict (epoch entry, round interval, quorum). On chain `0x0100` `CERT_BATCH_V2` returns one bool for that verdict, so
+its on-chain name is `QuorumNotMet` (aggregator UC) or `DepositUC` (EVM UC); `SealEpoch` and `NoEntryForEpoch` are
+wallet-side names only, and wallets, holding the bundle, retry `NoEntryForEpoch`. On chain, recovery IDs 2 and 3 are
+always `UnlockKey` (`ecrecover` takes parity 0/1 only). The verifier puts UC claims into the fewest `0x0100` calls,
+flushes them before raising any later rule and before returning, and on a false result re-checks one claim at a time in
+order and reports the earliest failure. Vectors carry an `onChainError` field wherever the two names differ. It reverts with `<RuleName>()`. [`abi.json`](abi.json) has every
 selector, topic and data length.
 
 ## Wallet obligations [§12]
