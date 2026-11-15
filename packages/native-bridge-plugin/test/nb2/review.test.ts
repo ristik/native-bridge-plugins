@@ -242,12 +242,12 @@ test('the burn re-runs the preflight and checks the owner signature before anyth
   assert.equal((await w.burn(rp.returnId, owner)).verdict.amount, 4n);
 });
 
-test('options: no provisional gas on a production build without opting in; k_w is not in the options; an old seal warns', async () => {
+test('options: the measured gas model is the default; k_w is not in the options; an old seal warns', async () => {
   const s = await setup();
   const o = s.options('w');
   const prodGamma = encodeConfig(makeConfig(s.root, 64n, 16n));
-  assert.equal(await reason(NativeBridgeV2.open({ ...o, pins: { ...o.pins, gamma: prodGamma, build: 'production' } }, false)), 'BadInput');
-  assert.ok(await NativeBridgeV2.open({ ...o, allowProvisionalGas: true, pins: { ...o.pins, gamma: prodGamma, build: 'production' } }, false));
+  // a production build opens with the measured model by default: no opt-in
+  assert.equal((await NativeBridgeV2.open({ ...o, pins: { ...o.pins, gamma: prodGamma, build: 'production' } }, false)).gas.name, 'measured-nb2-05');
   const w = await NativeBridgeV2.open({ ...o, maxSealAgeBlocks: 0n });
   assert.equal((w as unknown as { opts: Record<string, unknown> }).opts.bridgeKey, undefined);
   // a seal exists after four payments; with a zero age bound the plan carries the freshness warning

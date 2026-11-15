@@ -29,7 +29,7 @@ const bridge = await NativeBridgeV2.open({
   bridgeKey: deriveBridgeKey(seed),      // k_w
   backup: async (intents) => { /* back up the intent high-water mark with the seed */ },
   refreshTrust: async () => { /* append newer trust-base entries */ },
-  gas,                                   // a measured GasModel; or allowProvisionalGas: true to accept the provisional one
+  // gas: optional; the default is the measured MeasuredGasModel (NB2-05), replaceable by any GasModel
 });
 ```
 
@@ -170,9 +170,20 @@ On top of these:
 
 - **Reserve.** Every return's gas limit is the expected cost plus `gasReserve = 500,000`. Other users' payments can make any return the
   sealing one, or the worst scan. The reserve is limit, not spend, but the paying account must hold it (`InsufficientFunds`).
-- **Token verification.** This grows with the token's history: every certificate of the lineage, the deposit receipt, and every split
-  above the part. The plug-in's estimate is provisional and deliberately high until NB2-05's numbers replace it
-  (`ProvisionalGasModel`; swap in a measured `GasModel`). Typical figures come **after NB2-09**.
+- **Token verification** (measured by NB2-05, unicity-pos-contracts#82 `docs/nb2-verifier.md`, calldata included). It grows with the
+  token's history:
+
+  | Token | Evidence | Verifier gas |
+  |---|---:|---:|
+  | mint + burn | 4.2 KB | 748,672 |
+  | mint + transfer + burn | 5.2 KB | 916,429 |
+  | reference part after two splits | 9.8 KB | 1,851,544 |
+  | 20 transfers | 24.6 KB | 4,316,495 |
+
+  That is about 182,000 gas per further transfer and about 739,000 per nested split level. The plug-in's `MeasuredGasModel` rounds
+  each term up (800,000 base, 190,000 per transfer, 760,000 per split level, plus bytes and signatures beyond the measured shape), adds
+  the worst vault call (487,339) and the reserve, and refuses what it cannot bound. With a 30M `userGasLimit`, about 155 transfers or
+  40 nested split levels fit. Live figures come **after NB2-09**.
 - **Waiting.** A burn's history grows by one gap proof per 64 payments to the vault after the burn's index. At 1 payment per second, that
   is about 5,950 gas and 257 bytes per minute.
 

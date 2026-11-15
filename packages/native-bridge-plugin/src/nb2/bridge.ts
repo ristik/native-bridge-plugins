@@ -23,7 +23,7 @@ import {
 } from './deposit.js';
 import { Nb2Error, WalletError, fail, refuse } from './errors.js';
 import { decodeSignedTx, signTx, type EvmSigner, type SignedTx } from './evm.js';
-import { ProvisionalGasModel, redeemTxFraming, type GasModel } from './gas.js';
+import { MeasuredGasModel, redeemTxFraming, type GasModel } from './gas.js';
 import {
   Journal, dec, hex, undec, unhex, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
@@ -73,8 +73,6 @@ export interface BridgeOptions {
   /** Default true: a deposit is not sent before its intent's high-water mark is backed up. */
   requireBackup?: boolean;
   gas?: GasModel;
-  /** Use the provisional (unmeasured) verifier gas terms on a non-test deployment; without it a measured `gas` model is required. */
-  allowProvisionalGas?: boolean;
   /** Blocks the head must advance, after a send's nonce is seen used without its success receipt, before the send counts as dead. */
   deadAfterBlocks?: bigint;
   /** A seal receipt older than this many blocks gives a warning: the index then reflects a stale view (default 7,200). */
@@ -145,12 +143,9 @@ export class NativeBridgeV2 {
     if (bridgeKey.length !== 32) refuse('BadInput', 'k_w is 32 bytes');
     this.#kw = bridgeKey.slice();
     if (opts.requireBackup !== false && opts.backup === undefined) refuse('BadInput', 'a backup of the intent high-water mark is required (or requireBackup: false on a test deployment)');
-    if (opts.gas === undefined && opts.pins.build !== 'test' && opts.allowProvisionalGas !== true) {
-      refuse('BadInput', 'no measured gas model: pass one, or opt in to the provisional verifier terms with allowProvisionalGas');
-    }
     this.journal = new Journal(opts.journal, this.domain);
     this.evm = new EvmReader(opts.rpc);
-    this.gas = opts.gas ?? new ProvisionalGasModel();
+    this.gas = opts.gas ?? new MeasuredGasModel();
     this.keyScheme = opts.keyScheme ?? DEFAULT_KEY_SCHEME;
   }
 
