@@ -38,7 +38,8 @@ Nesting depth (`cborDepth` 16): a decoding unit is a top-level input (Γ, `evide
 decodes as CBOR (`J` or a split justification in a mint's `b(J)`, `R` in transfer data, `data`). Its top-level item is
 at depth 0 and each array, map or tag opening adds 1 for its children; children above depth 16 are `InputTooLarge`. A
 byte-string-wrapped child is scanned afresh from depth 0, so lineage depth never accumulates. The `evidence` scan
-includes the inline aggregator UCs.
+includes the inline aggregator UCs. UC size bounds: the EVM receipt UC `evmUcBytes` 16,384, each aggregator UC
+`aggregatorUcBytes` 24,576 (bft-core `b1ref.MaxUCBytes`).
 
 Domain literals are ASCII byte strings. Hashes, salts, IDs and identifiers are 32 bytes, addresses 20, compressed
 secp256k1 keys 33. An amount is a minimal positive unsigned big-endian bstr of 1..32 bytes (no leading zero); in the EVM
@@ -84,9 +85,8 @@ Fixed by bft-core#1098 (measured): `K = 64`, `B = 16` (`h = 6`, 4-bit tags, one 
 
 The vault constructor takes the exact Γ bytes and rejects them unless `vault20 == address(this)`,
 `chainId == block.chainid`, the verifier's code hash equals `verifierCodeHash32`, `asset32`, `ty32` and `aid32` equal
-their derivations above, and `K`, `B`, `Qmax` are admitted. `BadConfig(field)` reports the index of the first failing Γ
-field, 0..18 (`chainId` 5, `vault20` 9, `asset32` 10, `ty32` 11, `aid32` 12, `verifierCodeHash32` 15), and 19 for
-array-level failures (not an array of 19, trailing bytes, any scan error).
+their derivations above, and `K`, `B`, `Qmax` are admitted. 
+A refusal is `BadConfig(field)`. Validation is staged, and the stage order is frozen. First the array: not an array of 19, trailing bytes, any scan error or more than 1024 bytes is 19. Then the fields in index order 0..18, reporting the first one that fails its own width, range and admitted-set rule. aggregatorPartition == evmPartition is field 8. (K, B) not admitted is 16 when K itself is not in the build's K set, and 17 otherwise. Only a Γ that decodes completely is checked against the deployment, in this order: asset32 (10), ty32 (11), aid32 (12), vault20 == address(this) (9), chainId == block.chainid (5), verifierCodeHash32 == EXTCODEHASH(verifier20) (15).
 The verifier is stateless and receives Γ on every call. The vault is immutable: no owner, upgrade, pause,
 administrative payout, `receive` or `fallback`.
 
@@ -134,7 +134,7 @@ data = tag(39050,[1,[[b(aid),b(v)]],null])
 `J` body arity 5. `DepositProof` has arity 6 and is inline; any other arity, including the arity-7 protocol 8 draft
 that carried a PDR, is rejected (`Shape`). `evmUC` is the complete canonical native UnicityCertificate.
 `n` in [1, 2^56-1], indices below 2^32. The receipt is the value
-of the last trie node, never carried twice. Bounds (`profile.json` `limits`) apply before any cryptography.
+of the last trie node, never carried twice. Bounds (`profile.json` `limits`, `evmUcBytes` 16,384 for `evmUC`) apply before any cryptography.
 `justificationBytes` bounds the root reason `J` (tag 39051, with its `DepositProof`) only, never a split justification
 (tag 39044), which embeds its parent token: a lineage has no depth cap beyond the evidence size, `L_max` and gas.
 
@@ -145,7 +145,8 @@ MUST remain part of the authenticated shard-tree leaf, together with its InputRe
 that computation); the complete shard/unicity paths and seal, and all structural, network, epoch-interval and quorum
 checks, are verified; no PDR is supplied and no PDR-to-InputRecord epoch comparison is performed; every
 EVM-certificate failure (encoding, network, epoch interval, structure, partition/shard, folds, quorum; deposit and
-seal receipts alike) is `DepositUC`, except `NoEntryForEpoch`, which keeps its retryable name;
+seal receipts alike) is `DepositUC`, except that wallets keep the retryable `NoEntryForEpoch` (on chain it is
+`DepositUC` too);
 `K256(headerRLP) == IR.blockHash` and `header.stateRoot == IR.hash` (`DepositHeader`), the certificate of the block
 that executed the deposit, where `headerRLP` is the go-ethereum v1.14.11 Cancun header: the canonical RLP list of
 exactly 20 fields ending at `parentBeaconBlockRoot` (no `requestsHash`), with zero difficulty, the empty uncle hash,
@@ -205,8 +206,17 @@ minterScalar = H(C(b("I_AM_UNIVERSAL_MINTER_FOR_"),b(id)))
 Reject an invalid minter scalar, never reduce it modulo n. Reconstruct each source owner/hash from the previous
 output; the mint source is h0 and the public universal-minter signature predicate. Require CD source/tx fields and
 deadline identical to the reconstructed transaction, including null. Token unlock is r32||s32||recoveryId: 1<=r<n,
-1<=s<=n/2, ID 0..3. Recover using the supplied ID, require the recovered compressed key equal to the source key, then
-compact verify. Never normalize s/ID. For explicit e require t<e, with equality rejecting. Always require
+1<=s<=n/2, ID 0..3 under the SDK, but **ID 0 or 1 only for NB2** (below). Recover using the supplied ID, require the
+recovered compressed key equal to the source key, then compact verify. Never normalize s/ID.
+
+**NB2 unlock restriction (versioned, protocol 9 profile artifact 5).** An NB2-eligible token's unlock signatures
+must all use recovery ID 0 or 1. Recovery IDs 2 and 3 are refused with `UnlockRecovery` in every implementation: wallets,
+provenance and token admission in the plug-ins, the Go reference and the Solidity verifier. This deliberately narrows
+the pinned SDK's unlock relation (which admits IDs 0..3) for bridge eligibility only; it is not unchanged SDK
+semantics and not an error-name mapping. A token whose lineage contains an ID 2 or 3 unlock remains a valid native
+token but cannot be returned through this bridge.
+
+ For explicit e require t<e, with equality rejecting. Always require
 `t <= InputRecord.timestamp` of the proof's own authenticated UC. Never compare against wall time, EVM
 block.timestamp or the current root round. Refresh and consolidation preserve exact M/T, CD and original t, and
 rebuild only paths/UCs against an admitted root. RSMT membership uses raw v32.
@@ -298,8 +308,9 @@ Check order and errors (frozen): reentrancy (`Reentrancy`); history length (`Bad
 (`FutureIndex`); `e = a + P` is `c` or, when `c > 0`, `c - 1` (`StaleEndpoint`); each proof for `claimedEta`
 (`BadGapProof(position)`) folded from `startHead` through `j = a..e-1` to the stored `H_e` (`ChainMismatch`); the
 current buffer, and the previous one when `e = c - 1`, holds no `claimedEta` among its live positions tagged
-`bucket(claimedEta)` (`AlreadyPaid`); STATICCALL `verifyReturn(config(), evidence)` (`VerifierRefused(reason)`,
-`VerifierBadReturn`); verdict `domain == D` (`DomainMismatch`), `asset` (`AssetMismatch`),
+`bucket(claimedEta)` (`AlreadyPaid`); STATICCALL `verifyReturn(config(), evidence)` (`VerifierRefused(reason)` for
+revert data of at most `MAX_VERIFIER_REVERT` = 1024 bytes; longer revert data, or return data other than exactly 192
+canonical bytes, `VerifierBadReturn`; the vault reads `returndatasize()` first and never copies oversized data); verdict `domain == D` (`DomainMismatch`), `asset` (`AssetMismatch`),
 `(eta, minSegment) == (claimedEta, claimedStart)` (`ClaimMismatch`), recipient (`BadRecipient`), `amount > 0`
 (`ZeroAmount`), `amount <= Q` (`LiabilityUnderflow`). Effects: append eta and its tag, `Q -= amount`, emit `Paid`; if
 `m + 1 == K` seal and store `m = 0`, otherwise store `m + 1` (`m == K` is never stored; `m < K` always holds); sealing
@@ -324,11 +335,20 @@ the nested wire rules); the walk to the root (39044 is a split reason: `SplitJus
 `SplitProofShape`, the inline parent's wire rules; 39051 ends it; anything else `MintReason`); the root's J in its
 order; root first, every token: mint fields (`MintShape`, `MintType`, `MintData`), `NoTransfers`, then the mint and each
 transfer (`CDMismatch`, `DeadlineMismatch`, the unlock rules, `DeadlineExpired`, `RepeatedSID`, then its inclusion
-proof: `UnsupportedCertificateEncoding`, `SealNetwork`/`NoEntryForEpoch`/`SealEpoch`, `CertStructure`, `SealRoot`,
-`QuorumNotMet`, `InclusionProof`, `ReferenceTime`), each intermediate transfer (`BurnNotFinal`, `TransferData`), a
+proof: the UC per-UC order below, then `InclusionProof`, `ReferenceTime`), each intermediate transfer (`BurnNotFinal`, `TransferData`), a
 parent's split burn (`SplitBurn`, `SplitManifest`), each child's edge (`SplitProof`, `SplitSum`); the part's burn
 (`NotBurn`, `ReturnData`, `ReturnIndex`, `ReturnDomain`, `ReturnAsset` against the `a_UCT` constant, `ReturnAmount`,
-`ReturnRecipient`, `BurnReason`); then `btid`, `eta` and the authenticated tuple. It reverts with `<RuleName>()`. [`abi.json`](abi.json) has every
+`ReturnRecipient`, `BurnReason`); then `btid`, `eta` and the authenticated tuple.
+
+Per-UC order (frozen): `UnsupportedCertificateEncoding`, `SealNetwork`, `CertStructure`, `SealRoot`, then the authority
+verdict (epoch entry, round interval, quorum). On chain `0x0100` `CERT_BATCH_V2` returns one bool for that verdict, so
+its on-chain name is `QuorumNotMet` (aggregator UC) or `DepositUC` (EVM UC); `SealEpoch` and `NoEntryForEpoch` are
+wallet-side names only, and wallets, holding the bundle, retry `NoEntryForEpoch`. Recovery IDs 2 and 3 are
+`UnlockRecovery` everywhere, on chain and in wallets (NB2 unlock restriction above). The verifier puts UC claims into the fewest `0x0100` calls,
+flushes them before raising any later rule and before returning, and on a false result re-checks one claim at a time in
+order and reports the earliest failure. Where a rejected authority verdict has different wallet and on-chain names,
+a vector carries its wallet rule name and an `onChainError` field containing the on-chain name. An error-name mapping
+does not authorize an acceptance difference. It reverts with `<RuleName>()`. [`abi.json`](abi.json) has every
 selector, topic and data length.
 
 ## Wallet obligations [§12]
@@ -339,7 +359,9 @@ selector, topic and data length.
 2. **Index (R1).** Before burning, fetch the newest `SegmentSealed(j)` receipt available as a `DepositProof` container
    with topics `[topic0(SegmentSealed), u256(j)]`, verify it exactly like a deposit receipt, with the same UC rule
    (no PDR, the UC's own ShardConfHash in the authenticated leaf, exact Γ partition and shard) and deployment binding
-   (`SealReceipt`, carrying the inner rule, `DepositUC` for any EVM-certificate failure), and sign
+   (`SealReceipt`, carrying the inner rule: retryable `NoEntryForEpoch` for a missing historical entry after the
+   earlier checks pass, otherwise `DepositUC` for an EVM-certificate failure; extend the authenticated history and
+   retry the missing-entry case), and sign
    `a = j + 1`, keeping `headAfter` as the future start head. With no receipt, sign `a = 0` (start head `H_0`). A plain
    `state()` read is allowed only when the manifest's `stateReadOnly` is true, and its `c` must lie in
    `[verified, verified + maxJump]` (`maxJump` 64 by default; else `ImplausibleIndex`). Without `stateReadOnly`, a
@@ -361,21 +383,27 @@ selector, topic and data length.
    complete encoded transaction or a conservative upper bound. An old seal receipt consumes capacity before the burn.
    If it leaves insufficient reserve, obtain a newer authenticated receipt or refuse. Freshness and future inclusion
    remain availability assumptions: even this check does not guarantee redemption against an indefinitely stale view
-   or arbitrary subsequent traffic. At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
+   or arbitrary subsequent traffic. `L_T` before the burn is a conservative upper bound: the held evidence plus the burn transfer with its exact `R`, its CD, and an inclusion proof at the decoder bounds (an RSMT path of up to 256 siblings and an aggregator UC up to `aggregatorUcBytes` = 24,576 bytes). At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
    (`CapacityExceeded`). This release has no recovery for an oversized claim
    (bft-core#1108 is deferred).
 6. **Recipient.** Default to a controlled EOA. Simulation of a contract recipient is not a guarantee.
-7. **Burn and retry.** Verify full provenance first; persist the certified burn before reporting success; after a
+7. **Receiving.** When receiving a token intended for return, verify its whole lineage against the NB2 unlock
+   restriction and refuse or flag it if any unlock uses recovery ID 2 or 3, so a previous owner cannot hand over a
+   token that can never be returned.
+8. **Burn and retry.** Verify full provenance first; persist the certified burn before reporting success; after a
    timeout look for `Paid(eta)` before retrying; refresh stale history; never alter the certified burn.
 
-8. **RPC.** Evidence comes from the ordinary execution RPC behind the deployment's public gateway, verified offline;
+9. **RPC.** Evidence comes from the ordinary execution RPC behind the deployment's public gateway, verified offline;
    bft-core §12.7 is the wallet RPC contract (methods, gateway limits, paging, retention and missing-evidence answers).
+   `unicity_getSealCompanionV1` answers exactly `{"status":"found","companion":{...}}` on success, otherwise
+   `{"status":"unavailable","horizon":H}` or `{"status":"unknown"}`.
    A node that no longer serves a companion, block or receipts the evidence needs is `EvidencePruned`: use another
    provider; it never changes a burn or an index.
 
 Error classification of a failed simulation: `AlreadyPaid` reconcile; `StaleEndpoint` rebuild history; `FutureIndex`
 wait; `BadGapProof`/`ChainMismatch` repair the proof or start head, no new burn; `VerifierRefused` carries the
-verifier's rule.
+verifier's rule. `VerifierBadReturn` means the verifier's rule was not relayed (revert data over 1024 bytes or malformed
+return data): call `verifyReturn` directly or run the wallet's own verifier to read it.
 
 ## Corpus
 
@@ -386,6 +414,10 @@ rotation, each under its own seal epoch's authority; an altered ShardConfHash wi
 partition, shard or root deployment; InputRecord or header tampering; the old arity-7 DepositProof rejected. Also: a
 positive token with an inline aggregator UC carrying a nonempty signature map; the stale-index capacity case (K=64,
 512 KiB, 20 KiB evidence, 2 KiB framing, c=2500, a=0: `CapacityPreflight`); byte-small, gas-oversized evidence
-(`CapacityPreflight`); `cborDepth` and `justificationBytes` boundaries; a seal at the largest admitted `K` storing
+(`CapacityPreflight`); `cborDepth` and `justificationBytes` boundaries; verifier revert data of 1024 bytes
+(`VerifierRefused`), 1025 and 4096 bytes (`VerifierBadReturn`); four multi-fault Γ cases for the `BadConfig` stage
+order; primitive recovery vectors for valid and
+invalid recovery IDs 2 and 3, all `UnlockRecovery` in every implementation; a seal receipt with an otherwise valid UC
+from an epoch absent from the bundle (`SealReceipt` wrapping retryable `NoEntryForEpoch`; `DepositUC` on chain); a seal at the largest admitted `K` storing
 `m = 0`.
 Until then this profile has no corpus; `protocol/vectors/` is the protocol 7 corpus of the legacy code.

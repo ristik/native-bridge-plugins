@@ -57,8 +57,13 @@ own seal epoch e:
    at most 16 signatures; the counted weights reach e's threshold
    `floor(2W/3)+1` (else `QuorumNotMet`).
 
-For NB2, select the authenticated historical entry using steps 1–4 before
-cryptographic verification. For an EVM receipt UC, require the configured EVM
+For NB2 the per-UC order is frozen as: encoding
+(UnsupportedCertificateEncoding), step 1 (SealNetwork), step 5 (CertStructure,
+SealRoot), then the authority verdict, steps 2–4 and 6 together (epoch entry,
+round interval, quorum). On chain the generic certificate primitive returns
+one result for the authority verdict, so its on-chain name is QuorumNotMet for
+an aggregator UC and DepositUC for the EVM UC; NoEntryForEpoch and SealEpoch
+are wallet-side refinements. For an EVM receipt UC, require the configured EVM
 partition and shard; supply no independently expected ShardConfHash and no PDR.
 Authenticate the UC's actual ShardConfHash, InputRecord and TRHash through the
 complete shard/unicity paths and seal. Apply native certificate structural
@@ -66,7 +71,7 @@ checks, then the upstream per-signature weighting rule above. A signature that
 fails that weighting rule contributes zero; legacy bridge pre-scans MUST NOT
 introduce an additional rejection solely for its length or recovery byte. This
 does not waive native certificate structural constraints. NoEntryForEpoch
-remains retryable. Other EVM certificate-verification failures map to
+remains retryable for wallets. Other EVM certificate-verification failures map to
 DepositUC; aggregator certificate failures use the named NB2 certificate rules.
 The deployment-binding and continuous-execution-history assumptions in
 interop.md apply. Protocol 7's LockUC/CertSigLength compatibility notes are
