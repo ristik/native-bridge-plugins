@@ -84,9 +84,8 @@ Fixed by bft-core#1098 (measured): `K = 64`, `B = 16` (`h = 6`, 4-bit tags, one 
 
 The vault constructor takes the exact Γ bytes and rejects them unless `vault20 == address(this)`,
 `chainId == block.chainid`, the verifier's code hash equals `verifierCodeHash32`, `asset32`, `ty32` and `aid32` equal
-their derivations above, and `K`, `B`, `Qmax` are admitted. `BadConfig(field)` reports the index of the first failing Γ
-field, 0..18 (`chainId` 5, `vault20` 9, `asset32` 10, `ty32` 11, `aid32` 12, `verifierCodeHash32` 15), and 19 for
-array-level failures (not an array of 19, trailing bytes, any scan error).
+their derivations above, and `K`, `B`, `Qmax` are admitted. 
+A refusal is `BadConfig(field)`. Validation is staged, and the stage order is frozen. First the array: not an array of 19, trailing bytes, any scan error or more than 1024 bytes is 19. Then the fields in index order 0..18, reporting the first one that fails its own width, range and admitted-set rule. aggregatorPartition == evmPartition is field 8. (K, B) not admitted is 16 when K itself is not in the build's K set, and 17 otherwise. Only a Γ that decodes completely is checked against the deployment, in this order: asset32 (10), ty32 (11), aid32 (12), vault20 == address(this) (9), chainId == block.chainid (5), verifierCodeHash32 == EXTCODEHASH(verifier20) (15).
 The verifier is stateless and receives Γ on every call. The vault is immutable: no owner, upgrade, pause,
 administrative payout, `receive` or `fallback`.
 
@@ -308,8 +307,9 @@ Check order and errors (frozen): reentrancy (`Reentrancy`); history length (`Bad
 (`FutureIndex`); `e = a + P` is `c` or, when `c > 0`, `c - 1` (`StaleEndpoint`); each proof for `claimedEta`
 (`BadGapProof(position)`) folded from `startHead` through `j = a..e-1` to the stored `H_e` (`ChainMismatch`); the
 current buffer, and the previous one when `e = c - 1`, holds no `claimedEta` among its live positions tagged
-`bucket(claimedEta)` (`AlreadyPaid`); STATICCALL `verifyReturn(config(), evidence)` (`VerifierRefused(reason)`,
-`VerifierBadReturn`); verdict `domain == D` (`DomainMismatch`), `asset` (`AssetMismatch`),
+`bucket(claimedEta)` (`AlreadyPaid`); STATICCALL `verifyReturn(config(), evidence)` (`VerifierRefused(reason)` for
+revert data of at most `MAX_VERIFIER_REVERT` = 1024 bytes; longer revert data, or return data other than exactly 192
+canonical bytes, `VerifierBadReturn`; the vault reads `returndatasize()` first and never copies oversized data); verdict `domain == D` (`DomainMismatch`), `asset` (`AssetMismatch`),
 `(eta, minSegment) == (claimedEta, claimedStart)` (`ClaimMismatch`), recipient (`BadRecipient`), `amount > 0`
 (`ZeroAmount`), `amount <= Q` (`LiabilityUnderflow`). Effects: append eta and its tag, `Q -= amount`, emit `Paid`; if
 `m + 1 == K` seal and store `m = 0`, otherwise store `m + 1` (`m == K` is never stored; `m < K` always holds); sealing
@@ -401,7 +401,8 @@ selector, topic and data length.
 
 Error classification of a failed simulation: `AlreadyPaid` reconcile; `StaleEndpoint` rebuild history; `FutureIndex`
 wait; `BadGapProof`/`ChainMismatch` repair the proof or start head, no new burn; `VerifierRefused` carries the
-verifier's rule.
+verifier's rule. `VerifierBadReturn` means the verifier's rule was not relayed (revert data over 1024 bytes or malformed
+return data): call `verifyReturn` directly or run the wallet's own verifier to read it.
 
 ## Corpus
 
@@ -412,7 +413,9 @@ rotation, each under its own seal epoch's authority; an altered ShardConfHash wi
 partition, shard or root deployment; InputRecord or header tampering; the old arity-7 DepositProof rejected. Also: a
 positive token with an inline aggregator UC carrying a nonempty signature map; the stale-index capacity case (K=64,
 512 KiB, 20 KiB evidence, 2 KiB framing, c=2500, a=0: `CapacityPreflight`); byte-small, gas-oversized evidence
-(`CapacityPreflight`); `cborDepth` and `justificationBytes` boundaries; primitive recovery vectors for valid and
+(`CapacityPreflight`); `cborDepth` and `justificationBytes` boundaries; verifier revert data of 1024 bytes
+(`VerifierRefused`), 1025 and 4096 bytes (`VerifierBadReturn`); four multi-fault Γ cases for the `BadConfig` stage
+order; primitive recovery vectors for valid and
 invalid recovery IDs 2 and 3, all `UnlockRecovery` in every implementation; a seal receipt with an otherwise valid UC
 from an epoch absent from the bundle (`SealReceipt` wrapping retryable `NoEntryForEpoch`; `DepositUC` on chain); a seal at the largest admitted `K` storing
 `m = 0`.
