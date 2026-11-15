@@ -13,6 +13,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 FAMILIES = ('config', 'wire', 'unlock', 'policy', 'lock', 'history', 'proof', 'return', 'vault', 'split')
 CONTROL = {'VERSION', 'provenance.json', 'SHA256SUMS', 'MANIFEST.sha256'}
+# protocol/vectors/nb2/ is the native bridge v2 vector file (bft-core#1099), pinned by its own digest
+# (tests/interop/test_nb2_vectors.py); it is not part of this protocol 7 corpus.
+V2_SUBTREE = 'nb2'
 PLACEHOLDERS = {'README.md'} | {f'{f}/.gitkeep' for f in FAMILIES}
 HEX = re.compile(r'^[0-9a-f]{64}$')
 REPOSITORY = 'https://github.com/ristik/bft-core.git'
@@ -43,6 +46,8 @@ def inventory(root):
         if path.is_dir():
             continue
         name = path.relative_to(root).as_posix()
+        if PurePosixPath(name).parts[0] == V2_SUBTREE:
+            continue
         require(path.is_file(), f'not a regular file: {name}')
         if name in PLACEHOLDERS or name in CONTROL:
             continue
@@ -135,7 +140,7 @@ def import_corpus(source, destination, expected):
         destination.mkdir(parents=True, exist_ok=True)
         inventory(destination)  # reject unexpected local files/symlinks before mutation
         for path in list(destination.iterdir()):
-            if path.name == 'README.md':
+            if path.name in ('README.md', V2_SUBTREE):
                 continue
             if path.is_dir():
                 shutil.rmtree(path)
