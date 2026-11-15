@@ -1,5 +1,5 @@
 {
-  "artifactVersion": 4,
+  "artifactVersion": 5,
   "nativeBridgeProtocolVersion": 9,
   "name": "native-bridge-v2",
   "status": "development-frozen-unactivated",
@@ -99,6 +99,11 @@
     "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" },
     "maxJump": { "default": 64, "scope": "stateReadOnly deployments only (ImplausibleIndex)" }
   },
+  "unlockRestriction": {
+    "recoveryIds": [0, 1],
+    "refused": "recovery ID 2 or 3 is UnlockRecovery in every implementation (wallets, plug-in admission, Go reference, Solidity)",
+    "scope": "NB2 bridge eligibility only; narrows the pinned SDK relation (IDs 0..3); such a token stays a valid native token but cannot be returned"
+  },
   "trustModel": {
     "scope": "unicity-trust-base-history",
     "document": "protocol/trust-base.md",
@@ -111,7 +116,7 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "a5070eb1e90a9daca7f07f6ed8773c938e10449cc400f9992879f9e27ff286f3",
+    "protocol/interop.md": "fe6d7799667613a8e9f7969db8cf12b2d4f7f499dc0fd4817bc3ea08ef19c08a",
     "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
     "protocol/trust-base.md": "4824915c6c47223dda3db9c943c602eec9664b883d60fde842aba8bb37e8f6ef"
   },
