@@ -20,5 +20,5 @@
     "old-J validity across rotation",
     "B1 precompile and an SDK verifier compared on the same seal inputs in one joined run (parity under the upstream seal rule is evidenced per repo on the shared 202 b1-seal vectors, not by this tier)"
   ],
-  "pluginsTree": "8db09e452d5994b5f9420265de52a07646405b279e3c341ff4073419b6dd5892"
+  "pluginsTree": "6936bf4ba8bb61ae68daf6052b29641da83da732ad8c9c6ef7165d75ba8f1193"
 }
