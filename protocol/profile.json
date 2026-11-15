@@ -116,7 +116,7 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "fe6d7799667613a8e9f7969db8cf12b2d4f7f499dc0fd4817bc3ea08ef19c08a",
+    "protocol/interop.md": "e1a74927661216ef0d9bce80fa708c2ea83cab62de6bf3ccfbd75cdcdf9021c2",
     "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
     "protocol/trust-base.md": "4824915c6c47223dda3db9c943c602eec9664b883d60fde842aba8bb37e8f6ef"
   },

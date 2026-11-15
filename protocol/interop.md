@@ -382,7 +382,7 @@ selector, topic and data length.
    complete encoded transaction or a conservative upper bound. An old seal receipt consumes capacity before the burn.
    If it leaves insufficient reserve, obtain a newer authenticated receipt or refuse. Freshness and future inclusion
    remain availability assumptions: even this check does not guarantee redemption against an indefinitely stale view
-   or arbitrary subsequent traffic. At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
+   or arbitrary subsequent traffic. `L_T` before the burn is a conservative upper bound: the held evidence plus the burn transfer with its exact `R`, its CD, and an inclusion proof at the decoder bounds (an RSMT path of up to 256 siblings and an aggregator UC up to 24 KiB). At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
    (`CapacityExceeded`). This release has no recovery for an oversized claim
    (bft-core#1108 is deferred).
 6. **Recipient.** Default to a controlled EOA. Simulation of a contract recipient is not a guarantee.
@@ -394,6 +394,8 @@ selector, topic and data length.
 
 9. **RPC.** Evidence comes from the ordinary execution RPC behind the deployment's public gateway, verified offline;
    bft-core §12.7 is the wallet RPC contract (methods, gateway limits, paging, retention and missing-evidence answers).
+   `unicity_getSealCompanionV1` answers exactly `{"status":"found","companion":{...}}` on success, otherwise
+   `{"status":"unavailable","horizon":H}` or `{"status":"unknown"}`.
    A node that no longer serves a companion, block or receipts the evidence needs is `EvidencePruned`: use another
    provider; it never changes a burn or an index.
 
