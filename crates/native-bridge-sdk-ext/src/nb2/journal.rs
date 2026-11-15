@@ -105,7 +105,7 @@ pub fn unhex(s: &str) -> Result<Vec<u8>> {
             WalletReason::BadInput,
             format!(
                 "journal field {} is not lowercase 0x hex",
-                &s[..s.len().min(20)]
+                s.chars().take(20).collect::<String>()
             ),
         );
     }
@@ -117,7 +117,10 @@ pub fn unhex_n<const N: usize>(s: &str) -> Result<[u8; N]> {
     if b.len() != N {
         return refuse(
             WalletReason::BadInput,
-            format!("journal field {} is not {N} bytes", &s[..s.len().min(20)]),
+            format!(
+                "journal field {} is not {N} bytes",
+                s.chars().take(20).collect::<String>()
+            ),
         );
     }
     Ok(super::util::arr(&b))
@@ -380,12 +383,17 @@ impl Journal {
         }
     }
 
-    fn read<T: Record>(&self, key: &str) -> Result<Option<T>> {
+    /// Read a record. Only a read `for_update` (taken under the key's lock, by the operation that then writes the record)
+    /// sets the `expected` of the next compare-and-swap; any other read leaves it alone, so an unlocked reader (`status`, a
+    /// listing, a wallet's own look) can never move a locked operation's comparison past another process's write.
+    fn read<T: Record>(&self, key: &str, for_update: bool) -> Result<Option<T>> {
         let s = self.store.get(key)?;
-        self.seen
-            .lock()
-            .expect("journal")
-            .insert(key.to_string(), s.clone());
+        if for_update {
+            self.seen
+                .lock()
+                .expect("journal")
+                .insert(key.to_string(), s.clone());
+        }
         let Some(s) = s else { return Ok(None) };
         let bad = || {
             refuse(WalletReason::BadInput, format!("journal record {key} is not a version {JOURNAL_VERSION} {} record of this deployment", T::KIND))
@@ -443,7 +451,12 @@ impl Journal {
     }
 
     pub fn intents(&self) -> Result<Option<IntentsRecord>> {
-        self.read(&self.key("intents", None))
+        self.read(&self.key("intents", None), false)
+    }
+
+    /// The intents record, read for the write that follows (under its lock).
+    pub fn intents_for_update(&self) -> Result<Option<IntentsRecord>> {
+        self.read(&self.key("intents", None), true)
     }
 
     pub fn put_intents(&self, r: &IntentsRecord) -> Result<()> {
@@ -451,7 +464,11 @@ impl Journal {
     }
 
     pub fn deposit(&self, i: u64) -> Result<Option<DepositRecord>> {
-        self.read(&self.key("deposit", Some(&dec(i))))
+        self.read(&self.key("deposit", Some(&dec(i))), false)
+    }
+
+    pub fn deposit_for_update(&self, i: u64) -> Result<Option<DepositRecord>> {
+        self.read(&self.key("deposit", Some(&dec(i))), true)
     }
 
     pub fn put_deposit(&self, r: &DepositRecord) -> Result<()> {
@@ -461,7 +478,7 @@ impl Journal {
     pub fn deposits(&self) -> Result<Vec<DepositRecord>> {
         let mut out = Vec::new();
         for k in self.store.list(&self.key("deposit/", None))? {
-            if let Some(r) = self.read::<DepositRecord>(&k)? {
+            if let Some(r) = self.read::<DepositRecord>(&k, false)? {
                 out.push(r);
             }
         }
@@ -474,28 +491,132 @@ impl Journal {
     }
 
     pub fn split(&self, id: &str) -> Result<Option<SplitRecord>> {
-        self.read(&self.key("split", Some(&id[2..])))
+        self.read(&self.key("split", Some(id.get(2..).unwrap_or(""))), false)
+    }
+
+    pub fn split_for_update(&self, id: &str) -> Result<Option<SplitRecord>> {
+        self.read(&self.key("split", Some(id.get(2..).unwrap_or(""))), true)
     }
 
     pub fn put_split(&self, r: &SplitRecord) -> Result<()> {
-        self.write(&self.key("split", Some(&r.split_id[2..])), r)
+        self.write(
+            &self.key("split", Some(r.split_id.get(2..).unwrap_or(""))),
+            r,
+        )
     }
 
     pub fn ret(&self, id: &str) -> Result<Option<ReturnRecord>> {
-        self.read(&self.key("return", Some(&id[2..])))
+        self.read(&self.key("return", Some(id.get(2..).unwrap_or(""))), false)
+    }
+
+    pub fn ret_for_update(&self, id: &str) -> Result<Option<ReturnRecord>> {
+        self.read(&self.key("return", Some(id.get(2..).unwrap_or(""))), true)
     }
 
     pub fn put_return(&self, r: &ReturnRecord) -> Result<()> {
-        self.write(&self.key("return", Some(&r.return_id[2..])), r)
+        self.write(
+            &self.key("return", Some(r.return_id.get(2..).unwrap_or(""))),
+            r,
+        )
     }
 
     pub fn returns(&self) -> Result<Vec<ReturnRecord>> {
         let mut out = Vec::new();
         for k in self.store.list(&self.key("return/", None))? {
-            if let Some(r) = self.read::<ReturnRecord>(&k)? {
+            if let Some(r) = self.read::<ReturnRecord>(&k, false)? {
                 out.push(r);
             }
         }
         Ok(out)
     }
+}
+
+/// The `put_if` contract every wallet journal store must meet, as a check any store can run (its own tests, or a wallet's
+/// start-up self-test against a scratch location). `fresh` opens an empty store; `reopen` opens the same storage again (a new
+/// process after a crash would). It checks:
+///
+/// - compare-and-swap: a write against absence succeeds once; a second write against absence, or against any text but the
+///   stored one, loses and changes nothing; a write against the stored text succeeds;
+/// - atomicity: of `writers` concurrent writes against the same expected text exactly one wins, and the stored value is the
+///   winner's;
+/// - persistence: every value a winning `put_if` returned for is read back by a reopened store;
+/// - `list`: the keys with a prefix, sorted.
+///
+/// This crate has no filesystem capability and ships no durable store: the wallet supplies one (for a file, write a temporary
+/// file, fsync it, rename it over the record, fsync the directory, all under a lock that makes the comparison and the rename
+/// one step) and runs this check against it.
+pub fn check_journal_store<S: JournalStore + 'static>(
+    fresh: impl Fn() -> S,
+    reopen: impl Fn(&S) -> S,
+    writers: usize,
+) -> core::result::Result<(), String> {
+    let fail = |m: &str| Err(format!("journal store: {m}"));
+    let s = fresh();
+    let (k, k2) = ("nb2/v1/conformance/a", "nb2/v1/conformance/b");
+    let ok = |r: Result<bool>| r.map_err(|e| format!("journal store: {e}"));
+    if s.get(k).map_err(|e| e.to_string())?.is_some() {
+        return fail("a fresh store is not empty");
+    }
+    if !ok(s.put_if(k, None, "v1"))? {
+        return fail("a write against absence lost on an empty key");
+    }
+    if ok(s.put_if(k, None, "v1b"))? {
+        return fail("a second write against absence won");
+    }
+    if ok(s.put_if(k, Some("other"), "v1c"))? {
+        return fail("a write against a stale text won");
+    }
+    if s.get(k).map_err(|e| e.to_string())?.as_deref() != Some("v1") {
+        return fail("a lost write changed the record");
+    }
+    if !ok(s.put_if(k, Some("v1"), "v2"))? {
+        return fail("a write against the stored text lost");
+    }
+    if !ok(s.put_if(k2, None, "w1"))? {
+        return fail("a write of a second key lost");
+    }
+    let s = Arc::new(s);
+    let wins: Vec<bool> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..writers)
+            .map(|i| {
+                let s = s.clone();
+                sc.spawn(move || {
+                    s.put_if(k, Some("v2"), &format!("race-{i}"))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+    });
+    let winners: Vec<usize> = wins
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w)
+        .map(|(i, _)| i)
+        .collect();
+    if winners.len() != 1 {
+        return fail(&format!(
+            "{} of {writers} concurrent writes against one text won",
+            winners.len()
+        ));
+    }
+    let want = format!("race-{}", winners[0]);
+    if s.get(k).map_err(|e| e.to_string())?.as_deref() != Some(want.as_str()) {
+        return fail("the stored value is not the winner's");
+    }
+    let s = Arc::try_unwrap(s).map_err(|_| "journal store: still shared".to_string())?;
+    let again = reopen(&s);
+    if again.get(k).map_err(|e| e.to_string())?.as_deref() != Some(want.as_str())
+        || again.get(k2).map_err(|e| e.to_string())?.as_deref() != Some("w1")
+    {
+        return fail("a reopened store does not hold every won write");
+    }
+    if again
+        .list("nb2/v1/conformance/")
+        .map_err(|e| e.to_string())?
+        != [k.to_string(), k2.to_string()]
+    {
+        return fail("list is not the sorted keys of the prefix");
+    }
+    Ok(())
 }

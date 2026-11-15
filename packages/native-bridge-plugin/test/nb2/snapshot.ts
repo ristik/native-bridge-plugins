@@ -57,6 +57,7 @@ export function snapshot(root: Root, chain: FakeChain, agg: FakeAggregator, jour
       tagWords: v.T.map((ws) => ws.map((w) => h(u256(w)))), ids: v.S.map((b) => b.map(h)),
     },
     aggregator: { time: agg.time.toString(), certified: obj(agg.certified, (x: Uint8Array) => h(x)) },
+    pool: (c.pool as Uint8Array[]).map(h),
     journal: Object.fromEntries([...journal.map].sort(([a], [b]) => (a < b ? -1 : 1))),
   };
 }
@@ -91,6 +92,7 @@ export async function restore(s: any) {
   fill(chain.balances, s.balances, BigInt);
   fill(chain.nonces, s.nonces, BigInt);
   fill(chain.code, s.code, unh);
+  (chain as any).pool = (s.pool ?? []).map(unh);
   const v = s.vault;
   const vm = chain.vault;
   vm.A = (BigInt(v.deposits) << 200n) | (BigInt(v.segment) << 152n) | (BigInt(v.population) << 144n) | BigInt(v.outstanding);

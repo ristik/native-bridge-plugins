@@ -80,6 +80,12 @@ impl LocalKeySigner {
     }
 }
 
+impl Drop for LocalKeySigner {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+    }
+}
+
 impl core::fmt::Debug for LocalKeySigner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "LocalKeySigner({})", super::util::hex0x(&self.address))

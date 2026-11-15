@@ -238,6 +238,8 @@ pub struct FakeAggregator {
     pub st: Mutex<AggState>,
     /// The aggregator is unreachable.
     pub down: AtomicBool,
+    /// Certify this many more requests, then fail (None: never).
+    pub fail_after: Mutex<Option<u64>>,
 }
 
 impl FakeAggregator {
@@ -249,6 +251,7 @@ impl FakeAggregator {
                 ..Default::default()
             }),
             down: AtomicBool::new(false),
+            fail_after: Mutex::new(None),
         }
     }
 }
@@ -261,6 +264,14 @@ impl Aggregator for FakeAggregator {
     fn certify(&self, request: &[u8]) -> Result<Vec<u8>> {
         if self.down.load(Ordering::SeqCst) {
             return Err(Error::Other("aggregator unreachable".into()));
+        }
+        {
+            let mut f = self.fail_after.lock().unwrap();
+            match *f {
+                Some(0) => return Err(Error::Other("aggregator unreachable".into())),
+                Some(n) => *f = Some(n - 1),
+                None => {}
+            }
         }
         let mut st = self.st.lock().unwrap();
         st.calls += 1;
@@ -1009,7 +1020,7 @@ impl World {
             self.chain.clone(),
             self.agg.clone(),
             store,
-            &derive_bridge_key(&key(seed)),
+            &derive_bridge_key(&key(seed))[..],
         );
         o.backup = Some(Box::new(|_| Ok(())));
         o.receipt_timeout_ms = Some(0);
@@ -1071,6 +1082,7 @@ impl World {
                 "ids": ids.iter().map(|b| b.iter().map(|x| h(x)).collect::<Vec<_>>()).collect::<Vec<_>>(),
             },
             "aggregator": {"time": agg.time.to_string(), "certified": agg.certified.iter().map(|(k, v)| (h(k), json!(h(v)))).collect::<Map<_, _>>()},
+            "pool": st.pool.iter().map(|r| h(r)).collect::<Vec<_>>(),
             "journal": journal.dump(),
         })
     }
@@ -1157,6 +1169,9 @@ impl World {
                     )
                 })
                 .collect();
+            st.pool = s["pool"]
+                .as_array()
+                .map_or(vec![], |p| p.iter().map(unh).collect());
             st.code = s["code"]
                 .as_object()
                 .unwrap()

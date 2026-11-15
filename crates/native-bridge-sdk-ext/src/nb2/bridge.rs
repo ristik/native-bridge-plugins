@@ -22,6 +22,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
+use zeroize::Zeroizing;
+
 use num_bigint::BigUint;
 use serde_json::json;
 
@@ -87,7 +89,7 @@ pub struct BridgeOptions {
     pub aggregator: Arc<dyn Aggregator + Send + Sync>,
     pub journal: Arc<dyn JournalStore>,
     /// k_w: the 32-byte wallet bridge key, derived from the wallet seed (see [`derive_bridge_key`]).
-    pub bridge_key: Vec<u8>,
+    pub bridge_key: Zeroizing<Vec<u8>>,
     /// The wallet-versioned name of the k_w derivation, recorded in the journal.
     pub key_scheme: Option<String>,
     /// Back up the intent high-water mark with the seed (section 12.1). Required unless `require_backup` is false.
@@ -125,7 +127,7 @@ impl BridgeOptions {
             rpc,
             aggregator,
             journal,
-            bridge_key: bridge_key.to_vec(),
+            bridge_key: Zeroizing::new(bridge_key.to_vec()),
             key_scheme: None,
             backup: None,
             require_backup: None,
@@ -144,8 +146,8 @@ impl BridgeOptions {
 pub const DEFAULT_KEY_SCHEME: &str = "nb2-hmac-sha256-v1";
 
 /// k_w = HMAC-SHA256(key = seed, "unicity-nb2/wallet-bridge-key/v1"): the [`DEFAULT_KEY_SCHEME`] derivation.
-pub fn derive_bridge_key(seed: &[u8]) -> [u8; 32] {
-    hmac_sha256(seed, b"unicity-nb2/wallet-bridge-key/v1")
+pub fn derive_bridge_key(seed: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(hmac_sha256(seed, b"unicity-nb2/wallet-bridge-key/v1"))
 }
 
 #[derive(Debug, Clone)]
@@ -279,7 +281,7 @@ pub struct NativeBridgeV2 {
     pub gas: Box<dyn GasModel>,
     key_scheme: String,
     /// k_w, kept out of the options.
-    kw: [u8; 32],
+    kw: Zeroizing<[u8; 32]>,
     pins: DeploymentPins,
     trust: RwLock<TrustInput>,
     aggregator: Arc<dyn Aggregator + Send + Sync>,
@@ -313,7 +315,7 @@ impl NativeBridgeV2 {
             evm: EvmReader::new(o.rpc),
             gas: o.gas.unwrap_or_else(|| Box::new(MeasuredGasModel)),
             key_scheme: o.key_scheme.unwrap_or_else(|| DEFAULT_KEY_SCHEME.into()),
-            kw: arr(&o.bridge_key),
+            kw: Zeroizing::new(arr(&o.bridge_key)),
             trust: RwLock::new(o.trust),
             aggregator: o.aggregator,
             backup: o.backup,
@@ -414,7 +416,7 @@ impl NativeBridgeV2 {
 
     /// r for intent i (never stored unless the wallet asks: it is derivable from k_w and i).
     pub fn secret_of(&self, i: u64) -> [u8; 32] {
-        deposit_intent_secret(&self.kw, &self.domain, i)
+        deposit_intent_secret(&self.kw[..], &self.domain, i)
     }
 
     fn intents_record(&self, next: u64) -> IntentsRecord {
@@ -435,7 +437,7 @@ impl NativeBridgeV2 {
         }
         parse_key(owner_key)?;
         self.locked("intents", || {
-            let cur = self.journal.intents()?;
+            let cur = self.journal.intents_for_update()?;
             if let Some(c) = &cur {
                 if c.key_scheme != self.key_scheme {
                     return refuse(
@@ -449,7 +451,10 @@ impl NativeBridgeV2 {
                 Some(c) => undec64(&c.next)?,
             };
             let mut intents = cur.unwrap_or_else(|| self.intents_record(0));
-            intents.next = dec(i + 1);
+            let Some(next) = i.checked_add(1) else {
+                return refuse(WalletReason::BadInput, "the intent counter is exhausted");
+            };
+            intents.next = dec(next);
             intents.key_scheme = self.key_scheme.clone();
             // the counter moves first, by compare-and-swap: a crash wastes intent i, another writer makes this one fail; i is never reused
             self.journal.put_intents(&intents)?;
@@ -505,7 +510,7 @@ impl NativeBridgeV2 {
     }
 
     fn deposit_record(&self, i: u64) -> Result<DepositRecord> {
-        match self.journal.deposit(i)? {
+        match self.journal.deposit_for_update(i)? {
             Some(r) => Ok(r),
             None => refuse(
                 WalletReason::JournalNotPersisted,
@@ -560,7 +565,7 @@ impl NativeBridgeV2 {
             PlanRef::Intent(i) => *i,
         };
         self.locked(&format!("deposit/{i}"), || {
-            let Some(mut rec) = self.journal.deposit(i)? else {
+            let Some(mut rec) = self.journal.deposit_for_update(i)? else {
                 return refuse(WalletReason::JournalNotPersisted, format!("intent {i} is not in the journal: plan it first"));
             };
             if let PlanRef::Plan(p) = &plan {
@@ -571,7 +576,7 @@ impl NativeBridgeV2 {
             if rho_of(&self.domain, &self.secret_of(i)).as_slice() != unhex(&rec.rho)? {
                 return refuse(WalletReason::JournalNotPersisted, "the journal entry does not derive from this wallet key");
             }
-            let hw = self.journal.intents()?;
+            let hw = self.journal.intents_for_update()?;
             match &hw {
                 Some(h) if undec64(&h.next)? > i => {}
                 _ => return refuse(WalletReason::JournalNotPersisted, "the intent high-water mark does not cover this intent"),
@@ -861,7 +866,7 @@ impl NativeBridgeV2 {
     /// deposited; every deposit number seen for a rho is journaled. A look-ahead past the mark does not replace it.
     pub fn recover_deposits(&self, next: u64) -> Result<Vec<u64>> {
         self.locked("intents", || {
-            let cur = self.journal.intents()?;
+            let cur = self.journal.intents_for_update()?;
             let behind = match &cur {
                 None => true,
                 Some(c) => undec64(&c.next)? < next,
@@ -906,7 +911,7 @@ impl NativeBridgeV2 {
         let mut found = Vec::new();
         for (i, seen) in by_intent {
             self.locked(&format!("deposit/{i}"), || {
-                let mut rec = match self.journal.deposit(i)? {
+                let mut rec = match self.journal.deposit_for_update(i)? {
                     Some(r) => r,
                     None => DepositRecord {
                         base: self.journal.base("deposit"),
@@ -1009,7 +1014,7 @@ impl NativeBridgeV2 {
         outputs: &[(Vec<u8>, BigUint)],
         id: &[u8; 32],
     ) -> Result<Vec<Vec<u8>>> {
-        let mut rec = match self.journal.split(&hex(id))? {
+        let mut rec = match self.journal.split_for_update(&hex(id))? {
             Some(r) => r,
             None => {
                 let held = self.verify_token(token)?;
@@ -1191,7 +1196,7 @@ impl NativeBridgeV2 {
                 }
             }
             let (c_obs, pf) = self.preflight(token, &held.amount, &recipient, a, payer)?;
-            if let Some(existing) = self.journal.ret(&hex(&return_id))? {
+            if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
                 if existing.status != "planned" {
                     return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
                 }
@@ -1295,7 +1300,7 @@ impl NativeBridgeV2 {
     }
 
     fn return_record(&self, id: &[u8; 32]) -> Result<ReturnRecord> {
-        match self.journal.ret(&hex(id))? {
+        match self.journal.ret_for_update(&hex(id))? {
             Some(r) => Ok(r),
             None => refuse(
                 WalletReason::JournalNotPersisted,
@@ -1470,7 +1475,13 @@ impl NativeBridgeV2 {
                 .evm
                 .estimate_gas(&rec.recipient_bytes()?, &self.cfg.vault, &calldata, 0)?
             {
-                Estimate::Gas(g) => gas_limit = g + self.pins.gas_reserve,
+                Estimate::Gas(g) => {
+                    // fail closed: a limit that overflows is not bounded
+                    let Some(l) = g.checked_add(self.pins.gas_reserve) else {
+                        return fail_d(Rule::CapacityExceeded, "the gas cannot be bounded");
+                    };
+                    gas_limit = l;
+                }
                 Estimate::Revert { data, .. } => {
                     let e = decode_revert(data.as_deref().unwrap_or(&[]));
                     let action = classify_redeem_error(e.as_ref());
@@ -1747,7 +1758,7 @@ impl NativeBridgeV2 {
             };
             out.push(format!(
                 "return {} of {} to {} (a = {}): {say}",
-                &r.return_id[..18],
+                r.return_id.chars().take(18).collect::<String>(),
                 r.amount,
                 r.recipient,
                 r.a
@@ -1853,7 +1864,7 @@ impl NativeBridgeV2 {
             return Ok(Landed::Pending);
         };
         let used_at = undec64(&used_at)?;
-        if head < used_at + self.dead_after_blocks {
+        if head < used_at.saturating_add(self.dead_after_blocks) {
             return Ok(Landed::Pending);
         }
         // and the block at which the nonce was seen used is certified (a found companion, section 12.7): depth alone is not finality

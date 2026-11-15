@@ -61,3 +61,37 @@ test('planDeposit and recoverDeposits keep the unknown fields of the intents rec
   assert.deepEqual(JSON.parse(store.map.get(k)!).futureField, { x: 1 });
   assert.equal(JSON.parse(store.map.get(k)!).next, '5');
 });
+
+test('an unlocked read never moves a locked compare-and-swap past another writer', async () => {
+  const { Journal } = await import('../../src/nb2/journal.js');
+  const store = new MemoryJournalStore();
+  const j1 = new Journal(store, new Uint8Array(32).fill(7));
+  const j2 = new Journal(store, new Uint8Array(32).fill(7));
+  await j1.putIntents({ ...j1.base(), kind: 'intents', keyScheme: 'nb2-hmac-sha256-v1', next: '1' });
+  const r1 = (await j1.intentsForUpdate())!;
+  const r2 = (await j2.intentsForUpdate())!;
+  await j2.putIntents({ ...r2, next: '5' }); // another process advances the record
+  await j1.intents(); // an unlocked reader of the first instance (status, a listing)
+  await assert.rejects(j1.putIntents({ ...r1, next: '2' }), (e) => e instanceof WalletError && e.reason === 'JournalConflict');
+  assert.equal((await j2.intents())!.next, '5');
+});
+
+test('the memory store meets the journal store contract; a forgetful or non-atomic store does not', async () => {
+  const { checkJournalStore } = await import('../../src/nb2/journal.js');
+  const reopen = (s: MemoryJournalStore): MemoryJournalStore => {
+    const t = new MemoryJournalStore();
+    for (const [k, v] of s.map) t.map.set(k, v);
+    return t;
+  };
+  await checkJournalStore(() => new MemoryJournalStore(), reopen);
+  await assert.rejects(checkJournalStore(() => new MemoryJournalStore(), () => new MemoryJournalStore()));
+  class Racy extends MemoryJournalStore {
+    public override async putIf(k: string, expected: string | null, value: string): Promise<boolean> {
+      const ok = (this.map.get(k) ?? null) === expected;
+      await new Promise((r) => setTimeout(r, 1)); // compares, then writes: not atomic
+      if (ok) this.map.set(k, value);
+      return ok;
+    }
+  }
+  await assert.rejects(checkJournalStore(() => new Racy(), (s) => s));
+});

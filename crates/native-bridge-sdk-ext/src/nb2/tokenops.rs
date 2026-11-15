@@ -31,6 +31,12 @@ pub struct LocalOwner {
     public: [u8; 33],
 }
 
+impl Drop for LocalOwner {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+    }
+}
+
 pub fn local_owner(private_key: &[u8]) -> LocalOwner {
     let key: [u8; 32] = super::util::arr(private_key);
     LocalOwner {

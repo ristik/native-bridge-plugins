@@ -449,7 +449,13 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         let child = call(
             &*self.rpc,
             "eth_getBlockByNumber",
-            json!([qty(n + 1), false]),
+            json!([
+                qty(n.checked_add(1).ok_or_else(|| super::errors::wallet_err(
+                    WalletReason::ProviderFault,
+                    "a block number at the u64 bound"
+                ))?),
+                false
+            ]),
         )?;
         if child.is_null() {
             return refuse(WalletReason::CompanionUnknown, format!("block {n} has no child yet: its certificate is not served; retry after a round"));
@@ -616,8 +622,8 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         let mut out = Vec::new();
         let mut lo = from;
         while lo <= to {
-            let mut hi = if lo + LOG_BLOCK_RANGE - 1 < to {
-                lo + LOG_BLOCK_RANGE - 1
+            let mut hi = if lo.saturating_add(LOG_BLOCK_RANGE - 1) < to {
+                lo.saturating_add(LOG_BLOCK_RANGE - 1)
             } else {
                 to
             };
@@ -654,7 +660,10 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
                     }
                 }
             }
-            lo = hi + 1;
+            match hi.checked_add(1) {
+                Some(x) => lo = x,
+                None => break,
+            }
         }
         Ok(out)
     }
@@ -664,7 +673,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         let top = self.block_number()?;
         let mut hi = top;
         while hi >= from {
-            let lo = if hi >= from + LOG_BLOCK_RANGE {
+            let lo = if hi >= from.saturating_add(LOG_BLOCK_RANGE) {
                 hi - LOG_BLOCK_RANGE + 1
             } else {
                 from
@@ -697,8 +706,8 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         let mut want: BTreeMap<u64, RawLog> = BTreeMap::new();
         let mut lo = from;
         while lo <= top && (want.len() as u64) < end - start {
-            let hi = if lo + LOG_BLOCK_RANGE - 1 < top {
-                lo + LOG_BLOCK_RANGE - 1
+            let hi = if lo.saturating_add(LOG_BLOCK_RANGE - 1) < top {
+                lo.saturating_add(LOG_BLOCK_RANGE - 1)
             } else {
                 top
             };
@@ -714,7 +723,10 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
                     }
                 }
             }
-            lo += LOG_BLOCK_RANGE;
+            match lo.checked_add(LOG_BLOCK_RANGE) {
+                Some(x) => lo = x,
+                None => break,
+            }
         }
         let mut out = Vec::new();
         for j in start..end {
@@ -867,18 +879,20 @@ pub fn revert_data_of(e: &RpcError) -> Option<Vec<u8>> {
     {
         return from_hex(d);
     }
-    let m = &e.message;
-    let bytes = m.as_bytes();
+    // the first 0x followed by at least 8 hex digits; byte-wise, so any message text is safe
+    let b = e.message.as_bytes();
     let mut i = 0;
-    while i + 2 <= bytes.len() {
-        if &m[i..i + 2] == "0x" {
-            let run = m[i + 2..]
-                .bytes()
+    while i + 2 <= b.len() {
+        if &b[i..i + 2] == b"0x" {
+            let run = b[i + 2..]
+                .iter()
                 .take_while(|c| c.is_ascii_hexdigit())
                 .count();
             if run >= 8 {
                 // an odd-length run is not hex: None, as the TypeScript fromHex
-                return from_hex(&m[i + 2..i + 2 + run]);
+                return core::str::from_utf8(&b[i + 2..i + 2 + run])
+                    .ok()
+                    .and_then(from_hex);
             }
         }
         i += 1;

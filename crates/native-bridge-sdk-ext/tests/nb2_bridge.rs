@@ -1202,3 +1202,220 @@ fn plan_deposit_and_recover_deposits_keep_the_unknown_fields_of_the_intents_reco
         (json!({"x": 1}), json!("5"))
     );
 }
+
+// ---- review fixes of nbp#77 ----
+
+#[test]
+fn an_unlocked_read_never_moves_a_locked_compare_and_swap_past_another_writer() {
+    use native_bridge_sdk_ext::nb2::journal::{dec, IntentsRecord, Journal};
+    let store = World::store();
+    let j1 = Journal::new(store.clone(), [7; 32]);
+    let j2 = Journal::new(store.clone(), [7; 32]);
+    let rec = IntentsRecord {
+        base: j1.base("intents"),
+        key_scheme: "nb2-hmac-sha256-v1".into(),
+        next: dec(1),
+        extra: Default::default(),
+    };
+    j1.put_intents(&rec).unwrap();
+    let mut r1 = j1.intents_for_update().unwrap().unwrap();
+    let mut r2 = j2.intents_for_update().unwrap().unwrap();
+    r2.next = dec(5);
+    j2.put_intents(&r2).unwrap(); // another process advances the record
+    let _ = j1.intents().unwrap(); // an unlocked reader of the first instance (status, a listing)
+    r1.next = dec(2);
+    assert_eq!(
+        j1.put_intents(&r1).err().and_then(|e| e.reason()),
+        Some(WalletReason::JournalConflict)
+    );
+    assert_eq!(j2.intents().unwrap().unwrap().next, "5");
+}
+
+#[test]
+fn the_memory_store_meets_the_journal_store_contract() {
+    native_bridge_sdk_ext::nb2::journal::check_journal_store(
+        MemoryJournalStore::new,
+        |s| MemoryJournalStore::from_map(s.dump()),
+        16,
+    )
+    .unwrap();
+    // a store that loses its writes on reopen, and one whose compare-and-swap is not atomic, are refused
+    assert!(native_bridge_sdk_ext::nb2::journal::check_journal_store(
+        MemoryJournalStore::new,
+        |_| MemoryJournalStore::new(),
+        4
+    )
+    .is_err());
+    #[derive(Default)]
+    struct Racy(MemoryJournalStore);
+    impl native_bridge_sdk_ext::nb2::journal::JournalStore for Racy {
+        fn get(&self, k: &str) -> Result<Option<String>> {
+            self.0.get(k)
+        }
+        fn put_if(&self, k: &str, e: Option<&str>, v: &str) -> Result<bool> {
+            // compares, then writes unconditionally: not atomic
+            let ok = self.0.get(k)?.as_deref() == e;
+            if ok {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                self.0.map.lock().unwrap().insert(k.into(), v.into());
+            }
+            Ok(ok)
+        }
+        fn list(&self, p: &str) -> Result<Vec<String>> {
+            self.0.list(p)
+        }
+    }
+    assert!(native_bridge_sdk_ext::nb2::journal::check_journal_store(
+        Racy::default,
+        |s| Racy(MemoryJournalStore::from_map(s.0.dump())),
+        8
+    )
+    .is_err());
+}
+
+mod sdk_aggregator {
+    use super::*;
+    use native_bridge_sdk_ext::nb2::aggregator::SdkAggregator;
+    use native_bridge_sdk_ext::nb2::token::{signature_predicate, MintTx};
+    use native_bridge_sdk_ext::nb2::tokenops::{mint_request, Aggregator};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use unicity_token::api::{CertificationData, InclusionProof, StateId};
+    use unicity_token::cbor::Decoder;
+    use unicity_token::client::AggregatorClient;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum E {
+        /// STATE_ID_EXISTS, or a queued duplicate
+        Duplicate,
+        NotYet,
+        Unknown,
+    }
+
+    struct Client {
+        submit: Option<E>,
+        proofs: Mutex<VecDeque<core::result::Result<Vec<u8>, E>>>,
+    }
+
+    impl AggregatorClient for Client {
+        type Error = E;
+        fn submit_certification_request(
+            &self,
+            _: &CertificationData,
+        ) -> core::result::Result<(), E> {
+            self.submit.clone().map_or(Ok(()), Err)
+        }
+        fn get_inclusion_proof(&self, _: &StateId) -> core::result::Result<InclusionProof, E> {
+            let next = self
+                .proofs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(E::NotYet));
+            next.map(|b| InclusionProof::from_cbor(Decoder::new(&b)).unwrap())
+        }
+    }
+
+    fn request(seed: u8) -> Vec<u8> {
+        let m = MintTx {
+            network: NETWORK,
+            recipient: signature_predicate(&local_owner(&key("o")).public_key()),
+            salt: vec![seed; 32],
+            ty: vec![2; 32],
+            justification: None,
+            data: None,
+            deadline: None,
+        };
+        mint_request(&m).unwrap().cd
+    }
+
+    fn adapter(
+        submit: Option<E>,
+        proofs: Vec<core::result::Result<Vec<u8>, E>>,
+    ) -> SdkAggregator<Client> {
+        let mut a = SdkAggregator::new(
+            Client {
+                submit,
+                proofs: Mutex::new(proofs.into()),
+            },
+            Box::new(|e| *e == E::NotYet),
+        );
+        a.sleep = Box::new(|_| {});
+        a.timeout = std::time::Duration::from_millis(200);
+        a
+    }
+
+    #[test]
+    fn a_resubmitted_or_queued_request_is_accepted_when_its_proof_certifies_it() {
+        let w = setup();
+        let req = request(1);
+        let proof = w.agg.certify(&req).unwrap();
+        // the aggregator already holds the request (a resumed burn, a retried mint): its proof is the answer
+        assert_eq!(
+            adapter(Some(E::Duplicate), vec![Ok(proof.clone())])
+                .certify(&req)
+                .unwrap(),
+            proof
+        );
+        // not yet certified, then certified
+        assert_eq!(
+            adapter(
+                None,
+                vec![Err(E::NotYet), Err(E::NotYet), Ok(proof.clone())]
+            )
+            .certify(&req)
+            .unwrap(),
+            proof
+        );
+        assert_eq!(
+            adapter(Some(E::Duplicate), vec![Err(E::NotYet), Ok(proof.clone())])
+                .certify(&req)
+                .unwrap(),
+            proof
+        );
+    }
+
+    #[test]
+    fn other_proof_read_errors_pass_through_and_a_proof_of_other_data_is_refused() {
+        let w = setup();
+        let req = request(2);
+        let other = w.agg.certify(&request(3)).unwrap();
+        // StateUnknown (or expired, auth, config) is passed through at once, not waited out into Unconfirmed
+        let e = adapter(None, vec![Err(E::Unknown)])
+            .certify(&req)
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Other(m) if m.contains("Unknown")),
+            "{e}"
+        );
+        // a refused submission with no proof of the request is the submission's error
+        assert_eq!(
+            adapter(Some(E::Duplicate), vec![Err(E::Unknown)])
+                .certify(&req)
+                .err()
+                .and_then(|e| e.reason()),
+            Some(WalletReason::Reverted)
+        );
+        assert_eq!(
+            adapter(Some(E::Duplicate), vec![])
+                .certify(&req)
+                .err()
+                .and_then(|e| e.reason()),
+            Some(WalletReason::Reverted)
+        );
+        assert_eq!(
+            adapter(None, vec![Ok(other)])
+                .certify(&req)
+                .err()
+                .and_then(|e| e.reason()),
+            Some(WalletReason::ProviderFault)
+        );
+        assert_eq!(
+            adapter(None, vec![])
+                .certify(&req)
+                .err()
+                .and_then(|e| e.reason()),
+            Some(WalletReason::Unconfirmed)
+        );
+    }
+}

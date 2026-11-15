@@ -110,13 +110,24 @@ pub fn encode_deposit_proof(p: &DepositProof) -> Vec<u8> {
     ])
 }
 
-/// J = tag(39051, [1, b(D), n, b(r), DepositProof]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// J = tag(39051, [1, b(D), n, b(r), DepositProof]). Its `Debug` redacts the secret r.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReceiptBacking {
     pub d: [u8; 32],
     pub n: u64,
     pub r: [u8; 32],
     pub proof: DepositProof,
+}
+
+impl core::fmt::Debug for ReceiptBacking {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReceiptBacking")
+            .field("d", &self.d)
+            .field("n", &self.n)
+            .field("r", &"<redacted>")
+            .field("proof", &self.proof)
+            .finish()
+    }
 }
 
 pub fn encode_receipt_backing(j: &ReceiptBacking) -> Vec<u8> {
