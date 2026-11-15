@@ -78,6 +78,7 @@ export type WalletReason =
   | 'CompanionProvider' // a companion whose witnesses are not [certificate, technical record]: use another provider
   | 'TrustInput' // the trust-base history is not the one Γ names
   | 'JournalNotPersisted' // submitDeposit on a plan whose journal entry was not durably written first
+  | 'JournalConflict' // a compare-and-swap of a journal record lost to another writer
   | 'RecipientRefused' // zero or vault recipient (wallet policy; the verifier's rule is ReturnRecipient)
   | 'NotPending' // the requested step does not apply to the journal entry's state
   | 'EvidenceMissing' // a log or receipt the witness needs was not served: never treated as absence

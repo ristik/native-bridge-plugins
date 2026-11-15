@@ -13,7 +13,7 @@ import type { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypt
 import { eq } from '../bytes.js';
 import { array, cArr, raw, scanNative, tagContent } from './cbor.js';
 import { TAG } from './config.js';
-import { HU, minterScalar, signUnlock, unlockMessage } from './crypto.js';
+import { HU, minterScalar, signUnlock, unlockMessage, verifyUnlock } from './crypto.js';
 import { WalletError, refuse } from './errors.js';
 import { encodeSplitJustification, encodeSplitManifest, splitOutputCommitment, SumTree } from './split.js';
 import {
@@ -60,7 +60,9 @@ export function mintRequest(m: MintTx): { tx: Uint8Array; cd: Uint8Array } {
   const h0 = mintSourceHash(id);
   const txHash = HU(tx);
   const key = minterScalar(id);
-  const cd: Certification = { source: signaturePredicate(secp256k1.getPublicKey(key, true)), sourceHash: h0, txHash, deadline: m.deadline, unlock: signUnlock(key, h0, txHash) };
+  const unlock = signUnlock(key, h0, txHash);
+  verifyUnlock(secp256k1.getPublicKey(key, true), h0, txHash, unlock);
+  const cd: Certification = { source: signaturePredicate(secp256k1.getPublicKey(key, true)), sourceHash: h0, txHash, deadline: m.deadline, unlock };
   return { tx, cd: encodeCertification(cd) };
 }
 
@@ -94,6 +96,8 @@ export async function transferRequest(token: Uint8Array, owner: OwnerSigner, tr:
   const tx = encodeTransfer(tr);
   const txHash = HU(tx);
   const unlock = await owner.signUnlock(unlockMessage(head.state, txHash));
+  // the owner's signature is checked by the NB2 unlock rule (recovery ID 0 or 1 included) before anything is journaled or certified
+  verifyUnlock(head.owner.params, head.state, txHash, unlock);
   const cd: Certification = { source: head.owner, sourceHash: head.state, txHash, deadline: tr.deadline, unlock };
   return { tx, cd: encodeCertification(cd) };
 }

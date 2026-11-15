@@ -17,10 +17,14 @@ import { refuse } from './errors.js';
 export const JOURNAL_FORMAT = 'unicity-nb2-journal';
 export const JOURNAL_VERSION = 1;
 
-/** Durable key-value storage. `put` must not resolve before the value survives a crash. */
+/**
+ * Durable key-value storage. `putIf` is a compare-and-swap: it writes `value` only when the stored value is exactly `expected` (null:
+ * absent) and reports whether it did; it must not resolve before the value survives a crash. Two wallets (or two processes) sharing a
+ * store therefore never both advance the same record: the second write is refused and the plug-in stops with `JournalConflict`.
+ */
 export interface JournalStore {
   get(key: string): Promise<string | null>;
-  put(key: string, value: string): Promise<void>;
+  putIf(key: string, expected: string | null, value: string): Promise<boolean>;
   list(prefix: string): Promise<string[]>;
 }
 
@@ -29,9 +33,10 @@ export class MemoryJournalStore implements JournalStore {
   public get(key: string): Promise<string | null> {
     return Promise.resolve(this.map.get(key) ?? null);
   }
-  public put(key: string, value: string): Promise<void> {
+  public putIf(key: string, expected: string | null, value: string): Promise<boolean> {
+    if ((this.map.get(key) ?? null) !== expected) return Promise.resolve(false);
     this.map.set(key, value);
-    return Promise.resolve();
+    return Promise.resolve(true);
   }
   public list(prefix: string): Promise<string[]> {
     return Promise.resolve([...this.map.keys()].filter((k) => k.startsWith(prefix)).sort());
@@ -42,7 +47,15 @@ export type Hex = string; // 0x-prefixed lowercase
 export type Dec = string; // decimal
 
 /** A signed EVM transaction the wallet broadcast (or is about to). */
-export interface SendRecord { hash: Hex; raw: Hex; nonce: Dec; gas: Dec; at: Dec }
+export interface SendRecord {
+  hash: Hex;
+  raw: Hex;
+  nonce: Dec;
+  gas: Dec;
+  at: Dec;
+  /** The head block when a mined transaction of the account was first seen past this nonce without this send's success receipt. */
+  nonceUsedAt?: Dec;
+}
 
 interface Base { format: typeof JOURNAL_FORMAT; version: typeof JOURNAL_VERSION; domain: Hex }
 
@@ -79,6 +92,13 @@ export interface DepositRecord extends Base {
   token?: Hex;
   /** Optional: r itself, when the wallet backs up secrets rather than the high-water mark. */
   secret?: Hex;
+  /** The head block when the plan was made: a deposit carrying this rho is looked for from here before the first send. */
+  plannedBlock?: Dec;
+  /**
+   * Every Deposited event seen with this rho (a faulty wallet that reused r, or two devices). The first is the record's own deposit;
+   * each further one is a separate root token (its own n), minted with `mintExtraDeposit`.
+   */
+  seenDeposits?: { tx: Hex; depositNumber: Dec; blockNumber: Dec; amount: Dec; token?: Hex }[];
 }
 
 export type SplitStatus = 'planned' | 'burn-requested' | 'burned' | 'minted';
@@ -121,6 +141,8 @@ export interface ReturnRecord extends Base {
   burned?: Hex;
   eta?: Hex;
   sends: SendRecord[];
+  /** The EVM account that pays the redeem's gas (its funds are checked before the burn). */
+  payer?: Hex;
   /** The first block at which a redeem was broadcast: Paid(eta) cannot appear before it. */
   firstSendBlock?: Dec;
   paid?: { txHash: Hex; blockNumber: Dec };
@@ -142,6 +164,8 @@ export function undec(s: Dec): bigint {
 /** The typed journal over a store, keyed by deployment. */
 export class Journal {
   public readonly prefix: string;
+  /** The stored text of every record this instance last read or wrote: the `expected` of its next compare-and-swap. */
+  private readonly seen = new Map<string, string | null>();
   public constructor(public readonly store: JournalStore, public readonly domain: Uint8Array) {
     this.prefix = `nb2/v1/${toHex(domain)}/`;
   }
@@ -152,6 +176,7 @@ export class Journal {
 
   private async read<T extends AnyRecord>(key: string, kind: T['kind']): Promise<T | null> {
     const s = await this.store.get(key);
+    this.seen.set(key, s);
     if (s === null) return null;
     const r = JSON.parse(s) as T;
     if (r.format !== JOURNAL_FORMAT || r.version !== JOURNAL_VERSION || r.kind !== kind || r.domain !== hex(this.domain)) {
@@ -163,8 +188,14 @@ export class Journal {
   /** Write a record and read it back: the plug-in proceeds only on a record that is in the store. */
   private async write(key: string, r: AnyRecord): Promise<void> {
     const s = JSON.stringify(r);
-    await this.store.put(key, s);
+    const expected = this.seen.has(key) ? this.seen.get(key)! : await this.store.get(key);
+    if (expected === s) return;
+    if (!(await this.store.putIf(key, expected, s))) {
+      this.seen.delete(key);
+      refuse('JournalConflict', `journal record ${key} changed under this wallet (another process?): reload and retry`);
+    }
     if ((await this.store.get(key)) !== s) refuse('JournalNotPersisted', `journal record ${key} did not read back`);
+    this.seen.set(key, s);
   }
 
   public base(): Base {

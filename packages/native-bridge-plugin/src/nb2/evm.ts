@@ -5,7 +5,7 @@
  */
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 
-import { concat } from '../bytes.js';
+import { concat, eq } from '../bytes.js';
 import { HE } from './crypto.js';
 import { rlpBytes, rlpDecode, rlpList, rlpUint, rlpUintEnc } from './rlp.js';
 
@@ -60,9 +60,24 @@ export class LocalKeySigner implements EvmSigner {
   }
 }
 
+/**
+ * Sign `t` with `signer` and check the signed bytes before they are journaled: an external signer must return exactly this request
+ * (chain ID, nonce, fees, gas, target, value, data), signed by its own address. The journaled request is the decoded one.
+ */
 export async function signTx(signer: EvmSigner, t: TxRequest): Promise<SignedTx> {
   const raw = await signer.signTransaction(t);
-  return { raw, hash: HE(raw), request: t };
+  let d: ReturnType<typeof decodeSignedTx>;
+  try {
+    d = decodeSignedTx(raw);
+  } catch (e) {
+    throw new Error(`nb2: the signer returned a transaction that does not decode: ${String((e as Error)?.message ?? e)}`);
+  }
+  const r = d.request;
+  const same = r.chainId === t.chainId && r.nonce === t.nonce && r.maxPriorityFeePerGas === t.maxPriorityFeePerGas && r.maxFeePerGas === t.maxFeePerGas
+    && r.gas === t.gas && eq(r.to, t.to) && r.value === t.value && eq(r.data, t.data);
+  if (!same) throw new Error('nb2: the signer returned another transaction than the one requested');
+  if (!eq(d.from, signer.address)) throw new Error('nb2: the signed transaction is not from the signer\'s address');
+  return { raw, hash: d.hash, request: r };
 }
 
 /** Decode a signed EIP-1559 transaction and recover its sender (used by the offline simulator and by tests). */

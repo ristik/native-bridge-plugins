@@ -6,6 +6,8 @@
  * closed (returns null, which the preflight reports as `CapacityPreflight`) for anything it cannot bound. NB2-05's measured schedule
  * replaces it without an API change.
  */
+import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
+
 import { gapProofLen } from './segment.js';
 import { redeemCalldataLength } from './abi.js';
 import type { Token } from './token.js';
@@ -91,8 +93,18 @@ export class ProvisionalGasModel implements GasModel {
   }
 }
 
-/** The signature count of a seal (the map at UnicitySeal field 7), from the raw UC; null when it cannot be read. */
+/** The signature count of a UC's seal, from its full canonical decode; null (fail closed) when the UC does not decode. */
 function countSignatures(uc: Uint8Array): number | null {
+  try {
+    const sigs = UnicityCertificate.fromCBOR(uc).unicitySeal.witnesses;
+    return sigs === null ? 0 : sigs.size;
+  } catch {
+    return null;
+  }
+}
+
+/** The byte-level count, kept only as a cross-check in tests. */
+export function countSignaturesRaw(uc: Uint8Array): number | null {
   // a full decode is the trust layer's; a byte-level count of the signature map is enough for a bound: find the seal tag 39005
   // (d9 985d) and read its 8-array's last item
   for (let i = 0; i + 3 < uc.length; i++) {

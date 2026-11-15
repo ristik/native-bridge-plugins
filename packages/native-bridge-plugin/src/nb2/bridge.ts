@@ -13,13 +13,13 @@
  *   - a burn's exact request is journaled before it is certified, and the certified burn before success is reported;
  *   - the burn index comes from a verified SegmentSealed receipt (or is zero), never from a plain RPC number outside test deployments.
  */
-import { eq, toHex } from '../bytes.js';
+import { concat, eq, toHex } from '../bytes.js';
 import { classifyRedeemError, decodeDeposited, decodePaid, decodeRevert, depositCalldata, redeemCalldata, redeemCalldataLength, type DecodedError, type RedeemAction } from './abi.js';
-import { ascii, cArr, cBytes } from './cbor.js';
+import { ascii, beInt, cArr, cBytes } from './cbor.js';
 import { ASSET_UCT, buildParams, decodeConfig, domainOf, log2, type Build, type Config } from './config.js';
 import { HE, HU, parseKey } from './crypto.js';
 import {
-  TOPIC, decodeDepositProof, decodeReceiptBacking, depositIntentSecret, depositSalt, encodeReceiptBacking, firstOwnerOf, rhoOf, verifyDepositEvidence,
+  TOPIC, decodeDepositProof, decodeReceiptBacking, depositIntentSecret, depositSalt, encodeReceiptBacking, firstOwnerOf, rhoOf, verifyDepositEvidence, verifyReceiptLog,
 } from './deposit.js';
 import { Nb2Error, WalletError, fail, refuse } from './errors.js';
 import { decodeSignedTx, signTx, type EvmSigner, type SignedTx } from './evm.js';
@@ -29,6 +29,7 @@ import {
 } from './journal.js';
 import { burnIndex, capacityExceeded, capacityPreflight, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
 import { AmbiguousBroadcast, EvmReader, type JsonRpc, type ReceiptJson } from './rpc.js';
+import type { RawLog } from './abi.js';
 import { buildHistory, checkSegmentLog, gapProofLen, genesisHead, type Segment } from './segment.js';
 import { encodeToken, decodeToken, burnPredicate, signaturePredicate, tokenIdOf, valueData, type Token } from './token.js';
 import {
@@ -72,6 +73,12 @@ export interface BridgeOptions {
   /** Default true: a deposit is not sent before its intent's high-water mark is backed up. */
   requireBackup?: boolean;
   gas?: GasModel;
+  /** Use the provisional (unmeasured) verifier gas terms on a non-test deployment; without it a measured `gas` model is required. */
+  allowProvisionalGas?: boolean;
+  /** Blocks the head must advance, after a send's nonce is seen used without its success receipt, before the send counts as dead. */
+  deadAfterBlocks?: bigint;
+  /** A seal receipt older than this many blocks gives a warning: the index then reflects a stale view (default 7,200). */
+  maxSealAgeBlocks?: bigint;
   /**
    * Extend the trust-base history (append the authenticated successor entries) when a certificate's epoch is not held yet. A seal
    * receipt or a token refused with the retryable NoEntryForEpoch is retried once after it; it is never treated as invalid.
@@ -123,13 +130,24 @@ export class NativeBridgeV2 {
   public readonly evm: EvmReader;
   public readonly gas: GasModel;
   private readonly keyScheme: string;
+  /** k_w, kept out of the options object. */
+  readonly #kw: Uint8Array;
+  private readonly opts: Omit<BridgeOptions, 'bridgeKey'>;
+  /** In-process serialization per journal key (with the store's compare-and-swap across processes). */
+  private readonly locks = new Map<string, Promise<unknown>>();
 
-  private constructor(public readonly opts: BridgeOptions) {
+  private constructor(options: BridgeOptions) {
+    const { bridgeKey, ...opts } = options;
+    this.opts = opts;
     this.cfg = decodeConfig(opts.pins.gamma, buildParams(opts.pins.build));
     this.domain = domainOf(opts.pins.gamma);
     bindTrust(opts.trust, this.cfg);
-    if (opts.bridgeKey.length !== 32) refuse('BadInput', 'k_w is 32 bytes');
+    if (bridgeKey.length !== 32) refuse('BadInput', 'k_w is 32 bytes');
+    this.#kw = bridgeKey.slice();
     if (opts.requireBackup !== false && opts.backup === undefined) refuse('BadInput', 'a backup of the intent high-water mark is required (or requireBackup: false on a test deployment)');
+    if (opts.gas === undefined && opts.pins.build !== 'test' && opts.allowProvisionalGas !== true) {
+      refuse('BadInput', 'no measured gas model: pass one, or opt in to the provisional verifier terms with allowProvisionalGas');
+    }
     this.journal = new Journal(opts.journal, this.domain);
     this.evm = new EvmReader(opts.rpc);
     this.gas = opts.gas ?? new ProvisionalGasModel();
@@ -157,81 +175,118 @@ export class NativeBridgeV2 {
     return (this.opts.now ?? Date.now)();
   }
 
+  /** Run `f` after every earlier call holding `key` in this instance has finished. */
+  private async locked<T>(key: string, f: () => Promise<T>): Promise<T> {
+    const prev = this.locks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => { release = r; });
+    const chained = prev.then(() => mine);
+    this.locks.set(key, chained);
+    await prev.catch(() => undefined);
+    try {
+      return await f();
+    } finally {
+      release();
+      if (this.locks.get(key) === chained) this.locks.delete(key);
+    }
+  }
+
   // ==== EVM -> Unicity ==================================================================================================
 
   /** r for intent i (never stored unless the wallet asks: it is derivable from k_w and i). */
   public secretOf(i: bigint): Uint8Array {
-    return depositIntentSecret(this.opts.bridgeKey, this.domain, i);
+    return depositIntentSecret(this.#kw, this.domain, i);
   }
 
   /**
    * Plan a deposit of `amount` to the Unicity owner `ownerKey` (compressed key): allocate a never-used intent i, derive r and rho, and
-   * journal the plan with the new high-water mark, which is handed to the backup. No network.
+   * journal the plan with the new high-water mark, which is handed to the backup. Serialized: two plans never share an intent.
    */
-  public async planDeposit(amount: bigint, ownerKey: Uint8Array): Promise<DepositPlan> {
+  public planDeposit(amount: bigint, ownerKey: Uint8Array): Promise<DepositPlan> {
     if (amount <= 0n) refuse('BadInput', 'a deposit amount is positive');
     parseKey(ownerKey);
-    const cur = await this.journal.intents();
-    if (cur !== null && cur.keyScheme !== this.keyScheme) refuse('BadInput', `the journal's intents use key scheme ${cur.keyScheme}`);
-    const i = cur === null ? 0n : undec(cur.next);
-    const intents: IntentsRecord = { ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(i + 1n) };
-    // the counter moves first: a crash here wastes intent i, never reuses it
-    await this.journal.putIntents(intents);
-    const r = this.secretOf(i);
-    const rho = rhoOf(this.domain, r);
-    const firstOwner = firstOwnerOf(ownerKey);
-    const rec: DepositRecord = {
-      ...this.journal.base(), kind: 'deposit', keyScheme: this.keyScheme, intent: dec(i), amount: dec(amount), ownerKey: hex(ownerKey),
-      firstOwner: hex(firstOwner), rho: hex(rho), status: 'planned', backedUp: false, sends: [],
-    };
-    await this.journal.putDeposit(rec);
-    if (this.opts.backup) {
-      await this.opts.backup(intents);
-      rec.backedUp = true;
+    return this.locked('intents', async () => {
+      const cur = await this.journal.intents();
+      if (cur !== null && cur.keyScheme !== this.keyScheme) refuse('BadInput', `the journal's intents use key scheme ${cur.keyScheme}`);
+      const i = cur === null ? 0n : undec(cur.next);
+      const intents: IntentsRecord = { ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(i + 1n) };
+      // the counter moves first, by compare-and-swap: a crash wastes intent i, another writer makes this one fail; i is never reused
+      await this.journal.putIntents(intents);
+      const r = this.secretOf(i);
+      const rho = rhoOf(this.domain, r);
+      const firstOwner = firstOwnerOf(ownerKey);
+      const rec: DepositRecord = {
+        ...this.journal.base(), kind: 'deposit', keyScheme: this.keyScheme, intent: dec(i), amount: dec(amount), ownerKey: hex(ownerKey),
+        firstOwner: hex(firstOwner), rho: hex(rho), status: 'planned', backedUp: false, sends: [], plannedBlock: dec(await this.evm.blockNumber()),
+      };
       await this.journal.putDeposit(rec);
-    }
-    return { intent: i, amount, rho, firstOwner, calldata: depositCalldata(firstOwner, rho), record: rec };
+      if (this.opts.backup) {
+        await this.opts.backup(intents);
+        rec.backedUp = true;
+        await this.journal.putDeposit(rec);
+      }
+      return { intent: i, amount, rho, firstOwner, calldata: depositCalldata(firstOwner, rho), record: rec };
+    });
   }
 
   /** Record that the wallet backed up the high-water mark covering this intent by other means. */
-  public async markBackedUp(intent: bigint): Promise<void> {
-    const rec = await this.depositRecord(intent);
-    rec.backedUp = true;
-    await this.journal.putDeposit(rec);
+  public markBackedUp(intent: bigint): Promise<void> {
+    return this.locked(`deposit/${intent}`, async () => {
+      const rec = await this.depositRecord(intent);
+      rec.backedUp = true;
+      await this.journal.putDeposit(rec);
+    });
   }
 
   private async depositRecord(i: bigint): Promise<DepositRecord> {
     return (await this.journal.deposit(i)) ?? refuse('JournalNotPersisted', `no journal entry for intent ${i}`);
   }
 
+  /** Every Deposited event of the vault carrying `rho`, from block `from`, in chain order. */
+  private async depositsWithRho(rho: Uint8Array, from: bigint): Promise<{ l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[]> {
+    const out: { l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[] = [];
+    for (const l of await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], from, await this.evm.blockNumber())) {
+      const d = decodeDeposited(l);
+      if (d !== null && eq(l.address, this.cfg.vault) && eq(d.domain, this.domain) && eq(d.rho, rho)) out.push({ l, n: d.n, amount: d.amount, firstOwner: d.firstOwner });
+    }
+    return out;
+  }
+
   /**
    * Send the deposit. Refuses a plan whose journal entry is not persisted exactly as planned, or whose high-water mark is not backed
-   * up. An earlier send of the same intent is reconciled first, so a retry never deposits twice.
+   * up. Earlier sends of the intent are reconciled first, and before the first send the vault's events are searched for a deposit that
+   * already carries this rho (another device on the same backup), so a retry never deposits twice.
    */
-  public async submitDeposit(plan: DepositPlan | bigint, signer: EvmSigner): Promise<{ txHash: Uint8Array; depositNumber: bigint; blockNumber: bigint }> {
+  public submitDeposit(plan: DepositPlan | bigint, signer: EvmSigner): Promise<{ txHash: Uint8Array; depositNumber: bigint; blockNumber: bigint }> {
     const i = typeof plan === 'bigint' ? plan : plan.intent;
-    const rec = await this.journal.deposit(i);
-    if (rec === null) refuse('JournalNotPersisted', `intent ${i} is not in the journal: plan it first`);
-    if (typeof plan !== 'bigint' && (rec!.rho !== hex(plan.rho) || rec!.amount !== dec(plan.amount))) refuse('JournalNotPersisted', 'the journal entry is not this plan');
-    if (!eq(rhoOf(this.domain, this.secretOf(i)), unhex(rec!.rho))) refuse('JournalNotPersisted', 'the journal entry does not derive from this wallet key');
-    const hw = await this.journal.intents();
-    if (hw === null || undec(hw.next) <= i) refuse('JournalNotPersisted', 'the intent high-water mark does not cover this intent');
-    if (this.opts.requireBackup !== false && !rec!.backedUp) refuse('JournalNotPersisted', 'the high-water mark covering this intent is not backed up');
-    if (rec!.status !== 'planned' && rec!.status !== 'submitted') {
-      return { txHash: unhex(rec!.depositTx!), depositNumber: undec(rec!.depositNumber!), blockNumber: undec(rec!.blockNumber!) };
-    }
-    const landed = await this.landedSend(rec!.sends);
-    if (landed === 'pending') refuse('Unconfirmed', 'an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly');
-    if (landed !== null) return this.recordDeposit(rec!, landed);
-    const value = undec(rec!.amount);
-    const tx = await this.signed(signer, this.cfg.vault, depositCalldata(unhex(rec!.firstOwner), unhex(rec!.rho)), value, this.gas.depositGasLimit());
-    rec!.sends.push(this.sendRecord(tx));
-    rec!.status = 'submitted';
-    await this.journal.putDeposit(rec!);
-    const r = await this.broadcastAndWait(tx);
-    if (r === null) refuse('Unconfirmed', `deposit 0x${toHex(tx.hash)} has no receipt yet: call submitDeposit again to reconcile`);
-    if (BigInt(r!.status) !== 1n) refuse('Reverted', `deposit 0x${toHex(tx.hash)} reverted`);
-    return this.recordDeposit(rec!, r!);
+    return this.locked(`deposit/${i}`, async () => {
+      const rec = await this.journal.deposit(i);
+      if (rec === null) refuse('JournalNotPersisted', `intent ${i} is not in the journal: plan it first`);
+      if (typeof plan !== 'bigint' && (rec!.rho !== hex(plan.rho) || rec!.amount !== dec(plan.amount))) refuse('JournalNotPersisted', 'the journal entry is not this plan');
+      if (!eq(rhoOf(this.domain, this.secretOf(i)), unhex(rec!.rho))) refuse('JournalNotPersisted', 'the journal entry does not derive from this wallet key');
+      const hw = await this.journal.intents();
+      if (hw === null || undec(hw.next) <= i) refuse('JournalNotPersisted', 'the intent high-water mark does not cover this intent');
+      if (this.opts.requireBackup !== false && !rec!.backedUp) refuse('JournalNotPersisted', 'the high-water mark covering this intent is not backed up');
+      if (rec!.status !== 'planned' && rec!.status !== 'submitted') {
+        return { txHash: unhex(rec!.depositTx!), depositNumber: undec(rec!.depositNumber!), blockNumber: undec(rec!.blockNumber!) };
+      }
+      const landed = await this.landedSend(rec!.sends, () => this.journal.putDeposit(rec!));
+      if (landed === 'pending') refuse('Unconfirmed', 'an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly');
+      if (landed !== null) return this.recordDeposit(rec!, landed);
+      if (rec!.sends.length === 0) {
+        const seen = await this.depositsWithRho(unhex(rec!.rho), rec!.plannedBlock === undefined ? this.opts.pins.deploymentBlock : undec(rec!.plannedBlock));
+        if (seen.length > 0) return this.adoptDeposits(rec!, seen);
+      }
+      const value = undec(rec!.amount);
+      const tx = await this.signed(signer, this.cfg.vault, depositCalldata(unhex(rec!.firstOwner), unhex(rec!.rho)), value, this.gas.depositGasLimit());
+      rec!.sends.push(this.sendRecord(tx));
+      rec!.status = 'submitted';
+      await this.journal.putDeposit(rec!);
+      const r = await this.broadcastAndWait(tx);
+      if (r === null) refuse('Unconfirmed', `deposit 0x${toHex(tx.hash)} has no receipt yet: call submitDeposit again to reconcile`);
+      if (BigInt(r!.status) !== 1n) refuse('Reverted', `deposit 0x${toHex(tx.hash)} reverted`);
+      return this.recordDeposit(rec!, r!);
+    });
   }
 
   private async recordDeposit(rec: DepositRecord, r: ReceiptJson): Promise<{ txHash: Uint8Array; depositNumber: bigint; blockNumber: bigint }> {
@@ -243,73 +298,135 @@ export class NativeBridgeV2 {
     rec.blockNumber = dec(BigInt(r.blockNumber));
     rec.depositNumber = dec(d!.n);
     rec.status = 'deposited';
+    rec.seenDeposits = [{ tx: rec.depositTx, depositNumber: rec.depositNumber, blockNumber: rec.blockNumber, amount: dec(d!.amount) }];
     await this.journal.putDeposit(rec);
     return { txHash: unhex(rec.depositTx), depositNumber: d!.n, blockNumber: BigInt(r.blockNumber) };
+  }
+
+  /** Journal the deposits found for a record's rho: the first becomes its own, every one is listed (each is a separate root token). */
+  private async adoptDeposits(rec: DepositRecord, seen: { l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[]): Promise<{ txHash: Uint8Array; depositNumber: bigint; blockNumber: bigint }> {
+    const known = new Map((rec.seenDeposits ?? []).map((x) => [x.depositNumber, x]));
+    for (const s of seen) if (!known.has(dec(s.n))) known.set(dec(s.n), { tx: hex(s.l.transactionHash), depositNumber: dec(s.n), blockNumber: dec(s.l.blockNumber), amount: dec(s.amount) });
+    rec.seenDeposits = [...known.values()].sort((a, b) => (undec(a.depositNumber) < undec(b.depositNumber) ? -1 : 1));
+    if (rec.status === 'planned' || rec.status === 'submitted') {
+      const first = seen[0];
+      rec.depositTx = hex(first.l.transactionHash);
+      rec.blockNumber = dec(first.l.blockNumber);
+      rec.depositNumber = dec(first.n);
+      rec.amount = dec(first.amount);
+      rec.firstOwner = hex(first.firstOwner);
+      rec.ownerKey = hex(first.firstOwner.subarray(9));
+      rec.status = 'deposited';
+    }
+    await this.journal.putDeposit(rec);
+    return { txHash: unhex(rec.depositTx!), depositNumber: undec(rec.depositNumber!), blockNumber: undec(rec.blockNumber!) };
+  }
+
+  /** The receipt proof and J of deposit number `n` of intent `i`, verified offline. */
+  private async proveDeposit(i: bigint, tx: Uint8Array, n: bigint, amount: bigint, firstOwner: Uint8Array): Promise<{ receiptProof: Uint8Array; reason: Uint8Array }> {
+    const rp = await this.evm.receiptProof(tx, this.cfg.vault, TOPIC.Deposited);
+    const j = { d: this.domain, n, r: this.secretOf(i), proof: rp.proof };
+    const ev = await this.retryingTrust(() => verifyDepositEvidence(this.cfg, this.domain, this.opts.trust, j));
+    if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');
+    return { receiptProof: rp.encoded, reason: encodeReceiptBacking(j) };
+  }
+
+  /** The ordinary mint with reason J, certified by the aggregator and verified offline. */
+  private async mintWith(reason: Uint8Array, ownerKey: Uint8Array, amount: bigint): Promise<Uint8Array> {
+    const j = decodeReceiptBacking(reason);
+    const m = {
+      network: this.cfg.network, recipient: signaturePredicate(ownerKey), salt: depositSalt(this.domain, j.n, j.r), type: this.cfg.ty,
+      justification: reason, data: valueData(this.cfg.aid, amount), deadline: null,
+    };
+    const { tx, cd } = mintRequest(m);
+    const token = tokenOfMint(tx, await certifyChecked(this.opts.aggregator, cd));
+    const held = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token)));
+    if (held.amount !== amount) refuse('ProviderFault', 'the minted amount differs');
+    return token;
   }
 
   /**
    * Fetch the certified header evidence and the block's receipts, build the receipt proof and verify it offline (section 6.2 steps 1 to
    * 7), then journal J. Retry `CompanionUnknown` after a round (the block's certificate is served once its child block exists).
    */
-  public async collectDepositProof(intent: bigint): Promise<{ reason: Uint8Array; depositNumber: bigint }> {
-    const rec = await this.depositRecord(intent);
-    if (rec.status === 'proven' || rec.status === 'minted') return { reason: unhex(rec.reason!), depositNumber: undec(rec.depositNumber!) };
-    if (rec.status !== 'deposited') refuse('NotPending', `intent ${intent} is ${rec.status}: submit the deposit first`);
-    const rp = await this.evm.receiptProof(unhex(rec.depositTx!), this.cfg.vault, TOPIC.Deposited);
-    const n = undec(rec.depositNumber!);
-    const j = { d: this.domain, n, r: this.secretOf(intent), proof: rp.proof };
-    const ev = await verifyDepositEvidence(this.cfg, this.domain, this.opts.trust, j);
-    if (ev.v !== undec(rec.amount) || !eq(ev.firstOwner, unhex(rec.firstOwner))) refuse('ProviderFault', 'the certified deposit is not the planned one');
-    rec.receiptProof = hex(rp.encoded);
-    rec.reason = hex(encodeReceiptBacking(j));
-    rec.status = 'proven';
-    await this.journal.putDeposit(rec);
-    return { reason: unhex(rec.reason), depositNumber: n };
+  public collectDepositProof(intent: bigint): Promise<{ reason: Uint8Array; depositNumber: bigint }> {
+    return this.locked(`deposit/${intent}`, async () => {
+      const rec = await this.depositRecord(intent);
+      if (rec.status === 'proven' || rec.status === 'minted') return { reason: unhex(rec.reason!), depositNumber: undec(rec.depositNumber!) };
+      if (rec.status !== 'deposited') refuse('NotPending', `intent ${intent} is ${rec.status}: submit the deposit first`);
+      const n = undec(rec.depositNumber!);
+      const p = await this.proveDeposit(intent, unhex(rec.depositTx!), n, undec(rec.amount), unhex(rec.firstOwner));
+      rec.receiptProof = hex(p.receiptProof);
+      rec.reason = hex(p.reason);
+      rec.status = 'proven';
+      await this.journal.putDeposit(rec);
+      return { reason: p.reason, depositNumber: n };
+    });
   }
 
   /** The ordinary SDK mint with the receipt-backed reason J, certified by the aggregator and verified offline. */
-  public async mint(intent: bigint): Promise<Uint8Array> {
-    const rec = await this.depositRecord(intent);
-    if (rec.status === 'minted') return unhex(rec.token!);
-    if (rec.status !== 'proven') refuse('NotPending', `intent ${intent} is ${rec.status}: collect the deposit proof first`);
-    const j = decodeReceiptBacking(unhex(rec.reason!));
-    const amount = undec(rec.amount);
-    const m = {
-      network: this.cfg.network, recipient: signaturePredicate(unhex(rec.ownerKey)), salt: depositSalt(this.domain, j.n, j.r), type: this.cfg.ty,
-      justification: unhex(rec.reason!), data: valueData(this.cfg.aid, amount), deadline: null,
-    };
-    const { tx, cd } = mintRequest(m);
-    const proof = await certifyChecked(this.opts.aggregator, cd);
-    const token = tokenOfMint(tx, proof);
-    const held = await verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token));
-    if (held.amount !== amount) refuse('ProviderFault', 'the minted amount differs');
-    rec.token = hex(token);
-    rec.status = 'minted';
-    await this.journal.putDeposit(rec);
-    return token;
+  public mint(intent: bigint): Promise<Uint8Array> {
+    return this.locked(`deposit/${intent}`, async () => {
+      const rec = await this.depositRecord(intent);
+      if (rec.status === 'minted') return unhex(rec.token!);
+      if (rec.status !== 'proven') refuse('NotPending', `intent ${intent} is ${rec.status}: collect the deposit proof first`);
+      const token = await this.mintWith(unhex(rec.reason!), unhex(rec.ownerKey), undec(rec.amount));
+      rec.token = hex(token);
+      rec.status = 'minted';
+      if (rec.seenDeposits?.[0] !== undefined && rec.seenDeposits[0].depositNumber === rec.depositNumber) rec.seenDeposits[0].token = rec.token;
+      await this.journal.putDeposit(rec);
+      return token;
+    });
+  }
+
+  /**
+   * Mint a further deposit that carries this intent's rho (`seenDeposits`): a reused secret, or a second device. Its value is a
+   * separate root token with its own deposit number; nothing is lost.
+   */
+  public mintExtraDeposit(intent: bigint, depositNumber: bigint): Promise<Uint8Array> {
+    return this.locked(`deposit/${intent}`, async () => {
+      const rec = await this.depositRecord(intent);
+      const x = (rec.seenDeposits ?? []).find((s) => s.depositNumber === dec(depositNumber));
+      if (x === undefined) refuse('NotPending', `no deposit number ${depositNumber} is journaled for intent ${intent}`);
+      if (x!.token !== undefined) return unhex(x!.token);
+      const p = await this.proveDeposit(intent, unhex(x!.tx), depositNumber, undec(x!.amount), unhex(rec.firstOwner));
+      const token = await this.mintWith(p.reason, unhex(rec.ownerKey), undec(x!.amount));
+      x!.token = hex(token);
+      await this.journal.putDeposit(rec);
+      return token;
+    });
   }
 
   /**
    * Recover deposits from the seed (k_w) and a backed-up high-water mark (section 5.1): every intent below `next` is matched by its rho
-   * against the vault's Deposited events; each match is journaled as deposited (then collectDepositProof and mint continue as usual).
-   * Intents without a matching event stay unjournaled: their value was never sent. A look-ahead past the mark is not a substitute for it.
+   * against the vault's Deposited events. A match upgrades a planned or submitted record (or creates the record) to deposited; every
+   * deposit number seen for a rho is journaled. Intents without a matching event were never funded. A look-ahead past the mark does
+   * not replace it.
    */
   public async recoverDeposits(next: bigint): Promise<bigint[]> {
-    const cur = await this.journal.intents();
-    if (cur === null || undec(cur.next) < next) await this.journal.putIntents({ ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(next) });
+    await this.locked('intents', async () => {
+      const cur = await this.journal.intents();
+      if (cur === null || undec(cur.next) < next) await this.journal.putIntents({ ...this.journal.base(), kind: 'intents', keyScheme: this.keyScheme, next: dec(next) });
+    });
     const want = new Map<string, bigint>();
     for (let i = 0n; i < next; i++) want.set(toHex(rhoOf(this.domain, this.secretOf(i))), i);
-    const logs = await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], this.opts.pins.deploymentBlock, await this.evm.blockNumber());
-    const found: bigint[] = [];
-    for (const l of logs) {
+    const byIntent = new Map<bigint, { l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[]>();
+    for (const l of await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], this.opts.pins.deploymentBlock, await this.evm.blockNumber())) {
       const d = decodeDeposited(l);
-      if (d === null || !eq(d.domain, this.domain)) continue;
+      if (d === null || !eq(l.address, this.cfg.vault) || !eq(d.domain, this.domain)) continue;
       const i = want.get(toHex(d.rho));
-      if (i === undefined || (await this.journal.deposit(i)) !== null) continue;
-      await this.journal.putDeposit({
-        ...this.journal.base(), kind: 'deposit', keyScheme: this.keyScheme, intent: dec(i), amount: dec(d.amount), ownerKey: hex(d.firstOwner.subarray(9)),
-        firstOwner: hex(d.firstOwner), rho: hex(d.rho), status: 'deposited', backedUp: true, sends: [], depositTx: hex(l.transactionHash),
-        blockNumber: dec(l.blockNumber), depositNumber: dec(d.n),
+      if (i === undefined) continue;
+      byIntent.set(i, [...(byIntent.get(i) ?? []), { l, n: d.n, amount: d.amount, firstOwner: d.firstOwner }]);
+    }
+    const found: bigint[] = [];
+    for (const [i, seen] of [...byIntent].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      await this.locked(`deposit/${i}`, async () => {
+        const rec: DepositRecord = (await this.journal.deposit(i)) ?? {
+          ...this.journal.base(), kind: 'deposit', keyScheme: this.keyScheme, intent: dec(i), amount: dec(seen[0].amount),
+          ownerKey: hex(seen[0].firstOwner.subarray(9)), firstOwner: hex(seen[0].firstOwner), rho: hex(rhoOf(this.domain, this.secretOf(i))),
+          status: 'planned', backedUp: true, sends: [],
+        };
+        await this.adoptDeposits(rec, seen);
       });
       found.push(i);
     }
@@ -338,8 +455,12 @@ export class NativeBridgeV2 {
    * Split a held token into whole parts (burn-and-mint with the protocol 6 lineage formats). The plan is journaled first, then the burn's
    * exact request, the burned parent and each child as it is minted; a call with the same `splitId` resumes.
    */
-  public async split(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], splitId?: Uint8Array): Promise<Uint8Array[]> {
+  public split(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], splitId?: Uint8Array): Promise<Uint8Array[]> {
     const id = splitId ?? HU(cArr(cBytes(ascii('UNICITY_NB2_WALLET_SPLIT')), cBytes(token)));
+    return this.locked(`split/${toHex(id)}`, () => this.splitInner(token, owner, outputs, id));
+  }
+
+  private async splitInner(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], id: Uint8Array): Promise<Uint8Array[]> {
     let rec = await this.journal.split(hex(id));
     if (rec === null) {
       const held = await this.verifyToken(token);
@@ -417,36 +538,58 @@ export class NativeBridgeV2 {
    * plan; nothing irreversible happens here.
    */
   public async planReturn(token: Uint8Array, recipient: Uint8Array, payer: Uint8Array, opts: { useStateRead?: boolean; verifiedIndex?: bigint } = {}): Promise<ReturnPlan> {
-    const part = decodeToken(token);
-    const held = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, part));
-    if (recipient.length !== 20) refuse('BadInput', 'an EVM recipient is 20 bytes');
-    if (recipient.every((x) => x === 0) || eq(recipient, this.cfg.vault)) refuse('RecipientRefused', 'the zero address and the vault are refused');
-    const warnings: string[] = [];
-    if ((await this.evm.code(recipient)).length > 0) warnings.push('the recipient is a contract: a payout it refuses strands the burn (simulation is not a guarantee)');
-    // the index
-    let a: bigint;
-    let startHead: Uint8Array;
-    let fromBlock = this.opts.pins.deploymentBlock;
-    let sealReceipt: Uint8Array | undefined;
-    const st = await this.evm.vaultState(this.cfg.vault);
-    if (opts.useStateRead) {
-      checkStateRead(this.opts.pins.stateReadOnly, st.segment, opts.verifiedIndex ?? 0n, this.opts.pins.maxJump ?? 64n);
-      a = st.segment;
-      startHead = a === 0n ? genesisHead(this.domain, this.cfg.K) : st.head;
-    } else {
-      const sr = await this.newestSealReceipt();
-      ({ a, startHead } = burnIndex(this.cfg, this.domain, sr?.receipt ?? null));
-      if (sr !== null) {
-        fromBlock = sr.receipt.blockNumber;
-        sealReceipt = sr.encoded;
+    const returnId = HU(token);
+    return this.locked(`return/${toHex(returnId)}`, async () => {
+      const part = decodeToken(token);
+      const held = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, part));
+      if (recipient.length !== 20) refuse('BadInput', 'an EVM recipient is 20 bytes');
+      if (recipient.every((x) => x === 0) || eq(recipient, this.cfg.vault)) refuse('RecipientRefused', 'the zero address and the vault are refused');
+      const warnings: string[] = [];
+      if ((await this.evm.code(recipient)).length > 0) warnings.push('the recipient is a contract: a payout it refuses strands the burn (simulation is not a guarantee)');
+      // the index
+      let a: bigint;
+      let startHead: Uint8Array;
+      let fromBlock = this.opts.pins.deploymentBlock;
+      let sealReceipt: Uint8Array | undefined;
+      if (opts.useStateRead) {
+        const st = await this.evm.vaultState(this.cfg.vault);
+        checkStateRead(this.opts.pins.stateReadOnly, st.segment, opts.verifiedIndex ?? 0n, this.opts.pins.maxJump ?? 64n);
+        a = st.segment;
+        startHead = a === 0n ? genesisHead(this.domain, this.cfg.K) : st.head;
+      } else {
+        const sr = await this.newestSealReceipt();
+        ({ a, startHead } = burnIndex(this.cfg, this.domain, sr?.receipt ?? null));
+        if (sr !== null) {
+          fromBlock = sr.receipt.blockNumber;
+          sealReceipt = sr.encoded;
+          // availability, not safety: an old receipt anchors the burn low (more history to prove), never in the future
+          const age = (await this.evm.blockNumber()) - sr.receipt.blockNumber;
+          if (age > (this.opts.maxSealAgeBlocks ?? 7_200n)) warnings.push(`the newest seal receipt served is ${age} blocks old: the provider may be hiding newer seals; the burn then owes more history`);
+        }
       }
-    }
+      const pf = await this.preflight(token, held.amount, recipient, a, payer);
+      const existing = await this.journal.ret(hex(returnId));
+      if (existing !== null && existing.status !== 'planned') refuse('NotPending', `this part's return is already ${existing.status}`);
+      const record: ReturnRecord = {
+        ...this.journal.base(), kind: 'return', returnId: hex(returnId), source: hex(token), amount: dec(held.amount), recipient: hex(recipient), a: dec(a),
+        startHead: hex(startHead), fromBlock: dec(fromBlock), ...(sealReceipt ? { sealReceipt: hex(sealReceipt) } : {}), payer: hex(payer), status: 'planned', sends: [],
+      };
+      await this.journal.putReturn(record);
+      return { returnId, amount: held.amount, recipient, a, cObs: pf.cObs, pNow: pf.pNow, pMax: pf.pMax, marginSegments: pf.pMax - pf.need, gasLimit: pf.gas, warnings, record };
+    });
+  }
+
+  /**
+   * The section 12.5 preflight for burning `token` at index `a` to `recipient`, with a fresh endpoint estimate (c_obs = max(c, a); the
+   * state read is an availability assumption, not evidence) and the payer's funds for the worst-case gas limit.
+   */
+  private async preflight(token: Uint8Array, amount: bigint, recipient: Uint8Array, a: bigint, payer: Uint8Array): Promise<{ cObs: bigint; pNow: bigint; need: bigint; pMax: bigint; gas: bigint }> {
+    const st = await this.evm.vaultState(this.cfg.vault);
     const cObs = st.segment > a ? st.segment : a;
-    // the size and gas bounds of the complete prospective return
-    const R = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient, amount: held.amount, minIndex: a });
+    const R = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient, amount, minIndex: a });
     const lT = BigInt(evidenceOf(token).length + burnPairBound(R.length));
     const lO = BigInt(otherBytes(Number(lT)));
-    const lineage = lineageOf(part);
+    const lineage = lineageOf(decodeToken(token));
     const gasAt = (p: bigint): bigint | null => this.gas.redeemGasLimit({ evidenceBytes: Number(lT), lineage, pendingTransactions: 1, proofs: p, K: this.cfg.K });
     const pins = this.opts.pins;
     const pf = capacityPreflight({ lMax: pins.maxEncodedTxBytes, lT, lO, K: this.cfg.K, a, cObs, reserve: pins.returnReserveSegments, gasAt, userGasLimit: pins.userGasLimit });
@@ -455,15 +598,7 @@ export class NativeBridgeV2 {
     const cost = pf.gas * (2n * fees.baseFee + fees.priority);
     const bal = await this.evm.balance(payer);
     if (bal < cost) refuse('InsufficientFunds', `the payer holds ${bal} wei, the worst-case gas limit ${pf.gas} needs ${cost}`);
-    const returnId = HU(token);
-    const existing = await this.journal.ret(hex(returnId));
-    if (existing !== null && existing.status !== 'planned') refuse('NotPending', `this part's return is already ${existing.status}`);
-    const record: ReturnRecord = {
-      ...this.journal.base(), kind: 'return', returnId: hex(returnId), source: hex(token), amount: dec(held.amount), recipient: hex(recipient), a: dec(a),
-      startHead: hex(startHead), fromBlock: dec(fromBlock), ...(sealReceipt ? { sealReceipt: hex(sealReceipt) } : {}), status: 'planned', sends: [],
-    };
-    await this.journal.putReturn(record);
-    return { returnId, amount: held.amount, recipient, a, cObs, pNow: pf.pNow, pMax: pf.pMax, marginSegments: pf.pMax - pf.need, gasLimit: pf.gas, warnings, record };
+    return { cObs, ...pf };
   }
 
   private async returnRecord(id: Uint8Array): Promise<ReturnRecord> {
@@ -474,9 +609,15 @@ export class NativeBridgeV2 {
    * Certify the terminal burn of a planned return: R signs the recipient, the amount and the index. The exact request is journaled
    * before certification, the certified burn before this returns; a second call resumes the same burn and never makes another.
    */
-  public async burn(returnId: Uint8Array, owner: OwnerSigner): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+  public burn(returnId: Uint8Array, owner: OwnerSigner): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner));
+  }
+
+  private async burnInner(returnId: Uint8Array, owner: OwnerSigner): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'planned') {
+      // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
+      await this.preflight(unhex(rec.source), undec(rec.amount), unhex(rec.recipient), undec(rec.a), rec.payer === undefined ? unhex(rec.recipient) : unhex(rec.payer));
       const R = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient: unhex(rec.recipient), amount: undec(rec.amount), minIndex: undec(rec.a) });
       const { tx, cd } = await transferRequest(unhex(rec.source), owner, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
       rec.burnTx = hex(tx);
@@ -504,7 +645,11 @@ export class NativeBridgeV2 {
    * (length, order, M_j, head link from the journaled start head), the gap proofs, and the gas limit (expected cost plus gasReserve).
    * A missing or reordered log is missing evidence, never absence. Refuses with `CapacityExceeded` when the claim does not fit.
    */
-  public async buildRedeem(returnId: Uint8Array): Promise<RedeemTx> {
+  public buildRedeem(returnId: Uint8Array): Promise<RedeemTx> {
+    return this.locked(`return/${toHex(returnId)}`, () => this.buildRedeemInner(returnId));
+  }
+
+  private async buildRedeemInner(returnId: Uint8Array): Promise<RedeemTx> {
     const rec = await this.returnRecord(returnId);
     if (rec.status !== 'burned' && rec.status !== 'submitted') refuse('NotPending', `return ${hexq(returnId)} is ${rec.status}`);
     const a = undec(rec.a);
@@ -555,13 +700,16 @@ export class NativeBridgeV2 {
    * transaction is journaled before broadcast; an ambiguous broadcast is resolved by its receipt. A stale endpoint is rebuilt, never
    * the burn; failures are classified by error selector.
    */
-  public async submitRedeem(returnId: Uint8Array, signer: EvmSigner): Promise<ReconcileResult> {
-    const rec = await this.returnRecord(returnId);
-    const prior = await this.reconcile(returnId);
+  public submitRedeem(returnId: Uint8Array, signer: EvmSigner): Promise<ReconcileResult> {
+    return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, signer));
+  }
+
+  private async submitRedeemInner(returnId: Uint8Array, signer: EvmSigner): Promise<ReconcileResult> {
+    const prior = await this.reconcileInner(returnId);
     if (prior.state === 'paid' || prior.state === 'pending') return prior;
     let gasBump = 1n;
     for (let attempt = 0; attempt < 4; attempt++) {
-      const rtx = await this.buildRedeem(returnId);
+      const rtx = await this.buildRedeemInner(returnId);
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas);
       const fresh = (await this.returnRecord(returnId));
@@ -571,12 +719,12 @@ export class NativeBridgeV2 {
       await this.journal.putReturn(fresh);
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
-      if (BigInt(r.status) === 1n) return this.recordPaid(returnId, r);
+      if (BigInt(r.status) === 1n) return (await this.verifiedPaid(await this.returnRecord(returnId), tx.hash)) ?? { state: 'pending', txHash: tx.hash };
       // reverted: classify by simulating the same call at the current state
       const re = await this.evm.estimateGas({ from: signer.address, to: this.cfg.vault, data: rtx.calldata });
       const e = 'revert' in re ? decodeRevert(re.revert ?? new Uint8Array()) : null;
       const action = 'gas' in re ? 'retry-later' : classifyRedeemError(e);
-      if (action === 'reconcile') return this.reconcile(returnId);
+      if (action === 'reconcile') return this.reconcileInner(returnId);
       if (action === 'rebuild-history' || action === 'repair-proof') continue;
       if (action === 'retry-later') {
         gasBump = 2n; // an out-of-gas or a transient payout failure: one retry with more gas
@@ -587,37 +735,57 @@ export class NativeBridgeV2 {
     return { state: 'not-paid' };
   }
 
-  /** Look for Paid(eta) and the receipts of every journaled send; never changes the burn. */
-  public async reconcile(returnId: Uint8Array): Promise<ReconcileResult> {
+  /**
+   * Look for Paid(eta) and the receipts of every journaled send; never changes the burn. A Paid log counts only from the vault and only
+   * once its receipt is verified under the block's EVM UC (section 6.2 steps 2 to 5): a provider that invents or withholds Paid can
+   * delay the wallet, never stop its redemption.
+   */
+  public reconcile(returnId: Uint8Array): Promise<ReconcileResult> {
+    return this.locked(`return/${toHex(returnId)}`, () => this.reconcileInner(returnId));
+  }
+
+  private async reconcileInner(returnId: Uint8Array): Promise<ReconcileResult> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
     if (rec.eta === undefined) return { state: 'not-paid' };
     const eta = unhex(rec.eta);
-    const logs = await this.evm.paid(this.cfg.vault, eta, undec(rec.fromBlock));
-    for (const l of logs) {
+    for (const l of await this.evm.paid(this.cfg.vault, eta, undec(rec.fromBlock))) {
       const p = decodePaid(l);
-      if (p !== null && eq(p.eta, eta)) {
-        rec.paid = { txHash: hex(l.transactionHash), blockNumber: dec(l.blockNumber) };
-        rec.status = 'paid';
-        await this.journal.putReturn(rec);
-        return { state: 'paid', txHash: l.transactionHash, blockNumber: l.blockNumber };
-      }
+      if (p === null || !eq(l.address, this.cfg.vault) || !eq(p.eta, eta)) continue;
+      const v = await this.verifiedPaid(rec, l.transactionHash);
+      if (v !== null) return v;
     }
-    const landed = await this.landedSend(rec.sends);
+    const landed = await this.landedSend(rec.sends, () => this.journal.putReturn(rec));
     if (landed === 'pending') return { state: 'pending', txHash: unhex(rec.sends[rec.sends.length - 1].hash) };
-    if (landed !== null) return this.recordPaid(returnId, landed);
+    if (landed !== null) {
+      const v = await this.verifiedPaid(rec, unhex(landed.transactionHash.toLowerCase()));
+      return v ?? { state: 'pending', txHash: unhex(landed.transactionHash.toLowerCase()) };
+    }
     return { state: 'not-paid' };
   }
 
-  private async recordPaid(returnId: Uint8Array, r: ReceiptJson): Promise<ReconcileResult> {
-    const rec = await this.returnRecord(returnId);
+  /**
+   * Verify that transaction `tx` paid this return: its Paid log, from the vault, with topics [Paid, eta, recipient] and data the amount,
+   * in a receipt verified under the block's certificate. Journals `paid` and returns it; 'pending' while the block is not certified yet;
+   * null when the claim does not verify (it is ignored).
+   */
+  private async verifiedPaid(rec: ReturnRecord, tx: Uint8Array): Promise<ReconcileResult | null> {
     const eta = unhex(rec.eta!);
-    const l = r.logs.find((x) => x.topics.length === 3 && x.topics[0].toLowerCase() === hex(TOPIC.Paid) && x.topics[1].toLowerCase() === hex(eta));
-    if (l === undefined) refuse('ProviderFault', 'the successful redeem has no Paid(eta) log');
-    rec.paid = { txHash: r.transactionHash.toLowerCase(), blockNumber: dec(BigInt(r.blockNumber)) };
-    rec.status = 'paid';
-    await this.journal.putReturn(rec);
-    return { state: 'paid', txHash: unhex(rec.paid.txHash), blockNumber: undec(rec.paid.blockNumber) };
+    try {
+      const rp = await this.evm.receiptProof(tx, this.cfg.vault, TOPIC.Paid);
+      const log = await this.retryingTrust(() => verifyReceiptLog(this.cfg, this.opts.trust, rp.proof));
+      const recipientWord = concat(new Uint8Array(12), unhex(rec.recipient));
+      if (log.topics.length !== 3 || !eq(log.topics[0], TOPIC.Paid) || !eq(log.topics[1], eta) || !eq(log.topics[2], recipientWord)
+        || log.data.length !== 32 || beInt(log.data) !== undec(rec.amount)) return null;
+      rec.paid = { txHash: hex(tx), blockNumber: dec(rp.blockNumber) };
+      rec.status = 'paid';
+      await this.journal.putReturn(rec);
+      return { state: 'paid', txHash: tx, blockNumber: rp.blockNumber };
+    } catch (e) {
+      if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };
+      if (e instanceof Nb2Error || e instanceof WalletError) return null;
+      throw e;
+    }
   }
 
   // ==== status ==========================================================================================================
@@ -665,25 +833,44 @@ export class NativeBridgeV2 {
     }
   }
 
-  /** The receipt of any earlier send of a record: a mined one, 'pending' when the newest has none and may still land, or null. */
-  private async landedSend(sends: SendRecord[]): Promise<ReceiptJson | 'pending' | null> {
+  /**
+   * The outcome of a record's earlier sends: a success receipt (the answer), 'pending', or null (none is alive: a new send is safe).
+   * The order defends against a send mined between reads and against load-balanced backends at different heights: the account's MINED
+   * nonce is read first, then every send's receipt; a success receipt is the answer whenever it is seen. A send whose nonce is used
+   * without a success receipt is dead only after the head has advanced `deadAfterBlocks` since that was first seen (journaled in
+   * `nonceUsedAt`) and every receipt is read again; until then it is pending. A send still in a pool is broadcast again (same bytes).
+   */
+  private async landedSend(sends: SendRecord[], save: () => Promise<void>): Promise<ReceiptJson | 'pending' | null> {
+    if (sends.length === 0) return null;
+    const last = sends[sends.length - 1];
+    const from = decodeSignedTx(unhex(last.raw)).from;
+    const mined = await this.evm.nonce(from, 'latest');
     for (const s of sends) {
       const r = await this.evm.receipt(unhex(s.hash));
       if (r !== null && BigInt(r.status) === 1n) return r;
     }
-    if (sends.length === 0) return null;
-    const last = sends[sends.length - 1];
-    if ((await this.evm.receipt(unhex(last.hash))) !== null) return null; // mined and reverted
-    // not mined: it is dead once a MINED transaction of the account used its nonce (the pool's count would include it)
-    const from = decodeSignedTx(unhex(last.raw)).from;
-    if ((await this.evm.nonce(from, 'latest')) > undec(last.nonce)) return null;
-    // still in a pool (or never broadcast): rebroadcast the same bytes, never a new transaction
-    try {
-      await this.evm.sendRaw(unhex(last.raw));
-    } catch (e) {
-      if (!(e instanceof AmbiguousBroadcast)) throw e;
+    if (mined <= undec(last.nonce)) {
+      // the nonce is unused by any mined transaction: the send is alive, in a pool or lost; offer the same bytes again
+      try {
+        await this.evm.sendRaw(unhex(last.raw));
+      } catch (e) {
+        if (!(e instanceof AmbiguousBroadcast)) throw e;
+      }
+      return 'pending';
     }
-    return 'pending';
+    // a mined transaction used the nonce, and no success receipt is visible: wait for depth before calling it dead
+    const head = await this.evm.blockNumber();
+    if (last.nonceUsedAt === undefined) {
+      last.nonceUsedAt = dec(head);
+      await save();
+      return 'pending';
+    }
+    if (head < undec(last.nonceUsedAt) + (this.opts.deadAfterBlocks ?? 6n)) return 'pending';
+    for (const s of sends) {
+      const r = await this.evm.receipt(unhex(s.hash));
+      if (r !== null && BigInt(r.status) === 1n) return r;
+    }
+    return null;
   }
 }
 

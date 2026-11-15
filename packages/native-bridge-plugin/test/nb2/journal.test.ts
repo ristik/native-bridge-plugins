@@ -41,7 +41,7 @@ test('secret before value: no deposit without a persisted, backed-up plan', asyn
   // the journal record is the documented version 1 shape
   const r: DepositRecord = (await w.journal.deposit(plan.intent))!;
   assert.equal(r.format, JOURNAL_FORMAT);
-  assert.deepEqual(Object.keys(r).sort(), ['amount', 'backedUp', 'domain', 'firstOwner', 'format', 'intent', 'keyScheme', 'kind', 'ownerKey', 'rho', 'sends', 'status', 'version']);
+  assert.deepEqual(Object.keys(r).sort(), ['amount', 'backedUp', 'domain', 'firstOwner', 'format', 'intent', 'keyScheme', 'kind', 'ownerKey', 'plannedBlock', 'rho', 'sends', 'status', 'version']);
 });
 
 test('crash between send and receipt: the retry reconciles and never deposits twice', async () => {

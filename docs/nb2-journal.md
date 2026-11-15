@@ -16,8 +16,12 @@ redeems.
 
 ## Store
 
-The store is a key-value store of UTF-8 JSON documents, one record per key. Records are written whole. A write must be durable before
-it returns: the plug-in reads every record back, and does not take the step the record enables until the read-back matches.
+The store is a key-value store of UTF-8 JSON documents, one record per key. Records are written whole.
+
+Every write is a compare-and-swap (`putIf(key, expected, value)`), against the exact text the writer last read or wrote. It must be
+durable before it returns. The plug-in reads every record back, and does not take the step the record enables until the read-back
+matches. A writer that loses the compare-and-swap stops with `JournalConflict`, so two processes sharing one store never both advance
+a record. Within one process, calls on the same record are serialized.
 
 | Key | Record |
 |---|---|
@@ -72,6 +76,8 @@ and match each `rho` against the certified `Deposited` events (`recoverDeposits`
 | `reason` | hex, optional | `J = tag(39051, [1, b(D), n, b(r), DepositProof])` |
 | `token` | hex, optional | the certified minted token |
 | `secret` | hex, optional | `r` itself, only when the wallet backs up secrets instead of the high-water mark |
+| `plannedBlock` | dec, optional | the head block at planning; before the first send, the vault's `Deposited` events from here on are searched for this `rho` |
+| `seenDeposits` | array, optional | every `Deposited` event carrying this `rho`, as `{tx, depositNumber, blockNumber, amount, token?}`; the first is the record's own; each further one (a reused secret, or two devices) is a separate root token, minted with `mintExtraDeposit` |
 
 The status moves only forwards:
 
@@ -121,6 +127,7 @@ The plan (`source`, `outputs` with salts, `mask`) fixes the manifest and every c
 | `burned` | hex, optional | the certified burned part: the redeem evidence is `C(1, burned)` |
 | `eta` | hex, optional | the redemption ID, from the offline verdict |
 | `sends` | array | every signed redeem transaction |
+| `payer` | hex, optional | the EVM account that pays the redeem's gas; `burn` re-checks its funds |
 | `firstSendBlock` | dec, optional | the head block at the first broadcast |
 | `paid` | `{txHash, blockNumber}`, optional | the transaction that emitted `Paid(eta)` |
 
@@ -138,18 +145,29 @@ The `sends` arrays of deposits and returns hold objects of this shape:
 | `nonce` | dec | its account nonce |
 | `gas` | dec | its gas limit |
 | `at` | dec | wall-clock milliseconds when it was signed (informational) |
+| `nonceUsedAt` | dec, optional | the head block when a mined transaction of the account was first seen past this nonce without this send's success receipt |
 
-A send is journaled before it is broadcast. Before signing a new transaction, the plug-in checks every earlier send:
+A send is journaled before it is broadcast. The plug-in signs it through an `EvmSigner`, decodes the signed bytes, and refuses them unless they
+are exactly the requested transaction (chain ID, nonce, fees, gas, target, value, data) from the signer's own address. The journaled
+nonce comes from the signed bytes.
 
-- a successful receipt for any earlier send is the answer, and nothing new is signed;
-- if the newest send has no receipt, and no mined transaction of the account has used its nonce yet, the same raw bytes are broadcast
-  again and the step reports pending;
-- only when a mined transaction has used that nonce is the send dead, and only then is a new transaction signed.
+Before signing a new transaction, the plug-in checks the record's earlier sends, in this order:
+
+1. It reads the account's **mined** (`latest`) nonce, then the receipt of every send. A successful receipt is the answer whenever it is
+   seen, and nothing new is signed.
+2. If the mined nonce has not reached the newest send's nonce, that send is still alive. The same raw bytes are broadcast again, and the
+   step reports pending.
+3. If a mined transaction has used the nonce and no successful receipt is visible, the send is not yet dead. The plug-in records
+   `nonceUsedAt` and reports pending.
+4. Only when the head has advanced `deadAfterBlocks` (6 by default) beyond `nonceUsedAt`, and every receipt has been read again without
+   a success, is the send dead. Then a new transaction may be signed.
+
+The order covers a send mined between two reads, and backends of a load-balanced gateway that sit at different heights.
 
 ## Example
 
 ```json
 {"format":"unicity-nb2-journal","version":1,"domain":"0x5c…","kind":"deposit","keyScheme":"nb2-hmac-sha256-v1","intent":"0",
  "amount":"100","ownerKey":"0x02…","firstOwner":"0xd9987883014101582102…","rho":"0x9a…","status":"submitted","backedUp":true,
- "sends":[{"hash":"0x4f…","raw":"0x02f8…","nonce":"0","gas":"147516","at":"1763200000000"}]}
+ "sends":[{"hash":"0x4f…","raw":"0x02f8…","nonce":"0","gas":"147516","at":"1763200000000"}],"plannedBlock":"1204"}
 ```

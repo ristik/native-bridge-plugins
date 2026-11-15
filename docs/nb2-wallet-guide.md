@@ -29,6 +29,7 @@ const bridge = await NativeBridgeV2.open({
   bridgeKey: deriveBridgeKey(seed),      // k_w
   backup: async (intents) => { /* back up the intent high-water mark with the seed */ },
   refreshTrust: async () => { /* append newer trust-base entries */ },
+  gas,                                   // a measured GasModel; or allowProvisionalGas: true to accept the provisional one
 });
 ```
 
@@ -125,6 +126,7 @@ applies them itself.
 | Error | Where | Meaning | What the wallet does |
 |---|---|---|---|
 | `JournalNotPersisted` | submitDeposit | the plan or its backup is not durable | write and back up, then retry; nothing was sent |
+| `JournalConflict` | any journaled step | another process advanced the same record | reload; the record that won is the truth. Run one writer per journal. |
 | `CompanionUnknown` | collectDepositProof, planReturn | the block's certificate is not served yet (no child block), or the node is on another chain | retry after a block |
 | `EvidencePruned` | any evidence read | this node no longer serves the companion, block or receipts | use another provider or an archive |
 | `ProviderFault` | any evidence read | the provider served data that contradicts itself: a wrong hash or root, or an answer over the gateway cap (HTTP 413) | use another provider |
@@ -136,7 +138,7 @@ applies them itself.
 | `InsufficientFunds` | planReturn | the paying EVM account cannot fund the worst-case gas limit | fund it; nothing is burned |
 | `RecipientRefused` | planReturn | the zero address or the vault | choose another recipient |
 | `StateReadNotAdmitted` / `ImplausibleIndex` | planReturn with `useStateRead` | a plain `state()` read is evidence only on a test deployment, and only within `maxJump` | use the seal receipt (the default) |
-| `Unconfirmed` | submitDeposit | a send has no receipt yet | call again later; it reconciles and never sends twice |
+| `Unconfirmed` | submitDeposit | a send has no receipt yet, or its nonce was used by a transaction seen too recently to call the send dead | call again later; it reconciles, and signs a new transaction only after the old one is dead at depth |
 | `CapacityExceeded` | buildRedeem | the claim grew past the limits after the burn | no recovery in this release (continuation, bft-core#1108, is deferred); tell the user |
 | `AlreadyPaid` (vault) | simulation | the identifier is in a recent buffer | reconcile: look for `Paid(eta)` |
 | `StaleEndpoint` (vault) | simulation | two seals since the witness was built | rebuild the witness (automatic); never a new burn |
@@ -174,6 +176,14 @@ On top of these:
   is about 5,950 gas and 257 bytes per minute.
 
 ## Limits
+
+- **Freshness of the index (an availability assumption).** The burn index comes from the newest seal receipt that the provider
+  serves, and `c_obs` from its `state()` view. A provider that hides newer seals cannot push the index into the future; it can only
+  anchor it lower, which means more history to prove. `planReturn` warns when the newest receipt is older than `maxSealAgeBlocks`
+  (7,200 by default). `burn` repeats the preflight against a fresh state before it signs. Neither check guarantees redemption against
+  an indefinitely stale view or arbitrary later traffic.
+- **A reused deposit secret** (two devices restored from one backup, or a faulty wallet) yields two deposits with one `rho`. Each is
+  its own root token: `recoverDeposits` journals both, and `mintExtraDeposit` mints the second.
 
 - **Operating envelope.** The deployment manifest pins:
   - the encoded-transaction limit (`L_max`, 512 KiB by default);
