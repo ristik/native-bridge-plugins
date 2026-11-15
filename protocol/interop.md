@@ -140,8 +140,8 @@ data = tag(39050,[1,[[b(aid32),b(amount)]],null])
 Signature predicate type=1, params a valid compressed key33. Burn type=2, params raw `H(R)`. Built-in code bytes are
 01/02, not strings. P is nested as a tagged item, not wrapped in a bstr. M data/J and T's nonnull data are bytes
 containing the exact tagged encodings. The asset collection is inline, exactly one entry; no memo, nested token,
-extra/foreign coin or merge exception. Intermediate T data MUST be null, except a split manifest burn; terminal return
-burn data MUST equal R. Mint arity is 8, transfer 5, CD 6, proof 5. CD deadline precedes unlock; proof referenceTime
+extra/foreign coin or merge exception. Intermediate T data MUST be null; a token's terminal burn carries its split
+manifest or, for the returned part, exactly R. Mint arity is 8, transfer 5, CD 6, proof 5. CD deadline precedes unlock; proof referenceTime
 follows CD. All certified proof fields are mandatory; pending responses are not proofs.
 
 ```
