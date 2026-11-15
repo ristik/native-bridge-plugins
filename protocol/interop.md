@@ -12,8 +12,9 @@ or compatibility. The protocol 7 artifacts in `protocol/legacy-v7/` and the corp
 because the old plug-in code still tests against them; they are not part of this profile and bft-core#1106 (NB2-10)
 removes them with that code.
 
-A few values are provisional until the gas bake-off, bft-core#1098 (NB2-02). They are marked **PARAM** and listed in
-`profile.json` `parameters`. A PARAM changes numbers and widths, never the encodings around them.
+The gas bake-off (bft-core#1098, NB2-02; ristik/unicity-pos-contracts#80 `bench/nb2/RESULTS.md`) fixed `K = 64`,
+`B = 16`, position-tag recent buffers, the circular-gap commitment and `gasReserve` 500,000. The remaining **PARAM**
+marks are deployment values (`L_max`, `Qmax`, `returnReserveSegments`), listed in `profile.json` `parameters`.
 
 Release prerequisite [§2]: a compatible end-to-end mint-admission remedy (#1039 / ISS-01) remains a prerequisite for
 real-value activation; this profile does not solve the mint-request race. Removing that prerequisite requires an
@@ -74,12 +75,12 @@ asset = H(UTF8("unicity-nb2-asset:native-uct"))
 and its final newline. Do not parse and reserialize or canonicalize JSON before hashing. The profile binds its
 normative artifacts through their exact-file SHA-256 digests. Regenerate those digests and the profile digest after any
 normative edit. `rootGenesis32` is the EntryID of the authenticated genesis trust-base entry. `(K, B)` lies in the
-admitted set: production admits only `K` in {32, 64, 128} and `B` in {8, 16, 32} with `B <= K` (largest `K` 128); a
-test build admits `K` in {4, 8}, `B` in {2, 4} instead, never both; `1 <= Qmax <= 2^144-1`. Decimals have no leading zeros; hex is
-lowercase without `0x`. Type and coin exclude the vault; every token is bound to its own vault by `D` in its mint
+admitted set: production admits only `(K, B) = (64, 16)`; a test build admits `K` in {4, 8} × `B` in {2, 4} instead,
+never both. `K` and `B` are vault constructor immutables. `1 <= Qmax <= 2^144-1`. Decimals have no leading zeros; hex
+is lowercase without `0x`. Type and coin exclude the vault; every token is bound to its own vault by `D` in its mint
 reason.
 
-**PARAM** `K` in {32, 64, 128}, default 64; `B` in {8, 16, 32}, default 16 (bft-core#1098).
+Fixed by bft-core#1098 (measured): `K = 64`, `B = 16` (`h = 6`, 4-bit tags, one tag word per buffer).
 
 The vault constructor takes the exact Γ bytes and rejects them unless `vault20 == address(this)`,
 `chainId == block.chainid`, the verifier's code hash equals `verifierCodeHash32`, `asset32`, `ty32` and `aid32` equal
@@ -252,11 +253,9 @@ submitter.
 
 ## Segments and gap proofs [§10]
 
-**PARAM** commitment: circular-gap tree (below), the default; bft-core#1098 compares it with compressed radix and
-adjacent-leaf multiproofs. The archive chain and the event do not depend on this choice. This section, history sizing
-and the capacity formula instantiate circular gaps only; selecting another commitment replaces all of them, updates the
-profile digest and supplies cross-implementation vectors before that profile is frozen. No decoder may guess an
-alternative history format from calldata.
+The commitment is the circular-gap tree, fixed by bft-core#1098 (measured). This section, history sizing and the
+capacity formula instantiate it; a later change requires a separately versioned profile with cross-implementation
+vectors. No decoder may guess an alternative history format from calldata.
 
 ```
 z_0 < ... < z_{K-1}                                    // the K ids of sealed segment j, strictly sorted
@@ -282,9 +281,9 @@ A = n << 200 | c << 152 | m << 144 | Q      // 56, 48, 8, 144 bits
 `c` is the current segment, `m < K` its population, `p = c mod 2` the current buffer. `S_p[i]` is the i-th identifier
 paid into buffer p; tag word(s) `T_p` hold `bucket(S_p[i])` at bit offset `log2 B * (i mod t)` of word `floor(i/t)`,
 `t = floor(256/log2 B)`. Live positions are `i < m` (current) and `i < K` (previous, when `c > 0`). Stale cells are
-never cleared. **PARAM** layout: position tags (default) or the v2 sparse per-bucket layout (bft-core#1098); storage
-slot numbers are not part of this contract. Every layout preserves the external bounds `n <= 2^56-1`, `c <= 2^48-1`,
-`Qmax <= 2^144-1`, the ABI and the logical transitions; wider physical fields do not authorize wider values.
+never cleared. The layout is position tags, fixed by bft-core#1098 (measured); storage slot numbers are not part of
+this contract. The external bounds are `n <= 2^56-1`, `c <= 2^48-1`, `Qmax <= 2^144-1`; wider physical fields would
+not authorize wider values.
 
 ## Redemption [§11]
 
@@ -348,8 +347,10 @@ selector, topic and data length.
 3. **History.** Fetch one `SegmentSealed` log per segment `a..c-1` from any source; check length `32K`, strict order,
    `M_j` and the head link (`SegmentLog`). If eta is in a segment it was paid. Build the gap proofs. One rollover in
    flight is tolerated; after two, rebuild the history without changing the burn.
-4. **Gas.** Gas limit = expected cost + `gasReserve` (worst seal + worst `2K-1` scan). **PARAM** 620,000 at K=64,
-   B=16 (bft-core#1098).
+4. **Gas.** Gas limit = expected cost + `gasReserve` = 500,000 (bft-core#1098, measured): the envelope of the most
+   expensive redeem call minus the cheapest, including segments 0 and 1, rounded up; not the sum of the worst seal
+   (229,830) and the worst scan (282,548). Worst single call 487,339; envelope 433,765 steady, 453,641 with segments
+   0 and 1.
 5. **Size and gas.** Before certifying the return burn, choose a by obligation 2 and obtain a current endpoint
    estimate c_obs with c_obs >= a. Set P_now = c_obs - a. Refuse with `CapacityPreflight` unless the complete
    prospective return, including its burn transaction and certification evidence, is admitted by every

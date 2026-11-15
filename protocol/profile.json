@@ -1,5 +1,5 @@
 {
-  "artifactVersion": 3,
+  "artifactVersion": 4,
   "nativeBridgeProtocolVersion": 9,
   "name": "native-bridge-v2",
   "status": "development-frozen-unactivated",
@@ -88,16 +88,16 @@
     "firstOwnerBytes": 42
   },
   "parameters": {
-    "note": "Provisional until bft-core#1098 (NB2-02) fixes them by measurement; the encodings around them are frozen.",
-    "K": { "candidates": [32, 64, 128], "default": 64, "fixedBy": "bft-core#1098" },
-    "B": { "candidates": [8, 16, 32], "default": 16, "fixedBy": "bft-core#1098" },
-    "recentBufferLayout": { "candidates": ["position-tags", "sparse-buckets"], "default": "position-tags", "fixedBy": "bft-core#1098" },
-    "segmentCommitment": { "candidates": ["circular-gap", "compressed-radix", "adjacent-leaf-multiproof"], "default": "circular-gap", "fixedBy": "bft-core#1098" },
-    "gasReserve": { "default": 620000, "fixedBy": "bft-core#1098" },
+    "note": "K, B, the recent-buffer layout, the segment commitment and gasReserve are fixed by bft-core#1098 (measured, ristik/unicity-pos-contracts#80 bench/nb2/RESULTS.md); the rest are deployment values.",
+    "K": { "value": 64, "immutable": "constructor", "fixedBy": "bft-core#1098" },
+    "B": { "value": 16, "immutable": "constructor", "fixedBy": "bft-core#1098" },
+    "admittedKB": { "production": [[64, 16]], "test": { "K": [4, 8], "B": [2, 4] }, "rule": "a build admits either the production or the test set, never both" },
+    "recentBufferLayout": { "value": "position-tags", "fixedBy": "bft-core#1098" },
+    "segmentCommitment": { "value": "circular-gap", "fixedBy": "bft-core#1098" },
+    "gasReserve": { "value": 500000, "definition": "most expensive redeem call minus the cheapest, including segments 0 and 1, rounded up", "measured": { "worstSeal": 229830, "worstScan": 282548, "worstCall": 487339, "envelopeSteady": 433765, "envelopeFirstSegments": 453641 }, "fixedBy": "bft-core#1098" },
     "maxEncodedTxBytes": { "candidates": [131072, 524288], "default": 524288, "fixedBy": "owner decision, measured by bft-core#1105" },
     "returnReserveSegments": { "default": 64, "fixedBy": "bft-core#1105" },
-    "maxJump": { "default": 64, "scope": "stateReadOnly deployments only (ImplausibleIndex)" },
-    "testAdmittedSet": { "K": [4, 8], "B": [2, 4], "scope": "test builds only; production admits only the K and B candidates" }
+    "maxJump": { "default": 64, "scope": "stateReadOnly deployments only (ImplausibleIndex)" }
   },
   "trustModel": {
     "scope": "unicity-trust-base-history",
@@ -111,7 +111,7 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "c9d0b495ffe20744310959a8a95e53406ae5bf22cfdbf28892b9d83975eae4ab",
+    "protocol/interop.md": "904c2df8c052effa6d916a38a98ce68bd5988473f232bc7c01a8a36137175e4f",
     "protocol/abi.json": "f401922f32492fb720e16d162c87387c02f223f0a0084e41fe678cf8aa66a9bb",
     "protocol/trust-base.md": "47e837ced27c9fa8303420f4ce5bee372007b8b20454e570f0b4b2931ac3db7e"
   },
