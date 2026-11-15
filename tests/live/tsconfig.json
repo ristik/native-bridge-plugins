@@ -1,5 +1,0 @@
-{
-  "extends": "../../packages/native-bridge-plugin/tsconfig.test.json",
-  "compilerOptions": { "rootDir": "../..", "noEmit": true },
-  "include": ["*.ts"]
-}

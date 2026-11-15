@@ -2,11 +2,10 @@
 //! The trust input: a release bundle under its genesis EntryID; each seal verified by the SDK
 //! under its own epoch's committee (weighted quorum, B1 seal rule, round interval).
 
-mod common;
-use common::*;
-use native_bridge_sdk_ext::profile::from_hex;
+mod rootfixture;
 use native_bridge_sdk_ext::trust::{verify_embedded_uc, TrustInput};
 use native_bridge_sdk_ext::NativeError as E;
+use rootfixture::*;
 use unicity_token::api::bft::{TrustBaseHistory, UnicityCertificate};
 use unicity_token::crypto::signer::Signer;
 
@@ -65,45 +64,21 @@ fn weighted_committee_threshold_is_two_thirds_of_the_weights() {
 }
 
 #[test]
-fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_sdk() {
-    use unicity_token::transaction::Transaction;
-    let w = make_world(20);
-    let r = &w.agg;
+fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count() {
+    let r = &make_root(2, 4, 10);
     let ti = input(r);
-    let out = build_token(&w, &spec(1), &[], 1_700_000_040, 1_700_000_900);
-    let proof = out.token.genesis().inclusion_proof().clone();
-    let sid = unicity_token::api::StateId::derive(
-        out.token.genesis().transaction().lock_script(),
-        out.token.genesis().transaction().source_state_hash(),
-    );
-    verify_embedded_uc(&ti, &proof.unicity_certificate).unwrap();
-    proof
-        .verify_for(&sid, proof.reference_time, ti.history())
-        .unwrap();
-    let sdk_error = |uc: unicity_token::api::bft::UnicityCertificate| {
-        let mut p = proof.clone();
-        p.unicity_certificate = uc;
-        p.verify_for(&sid, p.reference_time, ti.history())
-            .unwrap_err()
-    };
+    let good = uc_with(r, 4);
+    verify_embedded_uc(&ti, &good).unwrap();
     // Wrong network.
-    let mut uc = proof.unicity_certificate.clone();
+    let mut uc = good.clone();
     uc.unicity_seal.network_id = unicity_token::api::NetworkId::new(NETWORK + 1).unwrap();
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::SealNetwork);
-    assert_eq!(
-        sdk_error(uc),
-        unicity_token::verify::VerificationError::SealNetworkMismatch
-    );
     // Wrong root: the seal hash no longer matches the recomputed tree.
-    let mut uc = proof.unicity_certificate.clone();
+    let mut uc = good.clone();
     uc.unicity_seal.hash[0] ^= 1;
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::SealRoot);
-    assert_eq!(
-        sdk_error(uc),
-        unicity_token::verify::VerificationError::SealRootMismatch
-    );
     // Two valid, two corrupt: the corrupt ones count zero and two of four are short of the quorum.
-    let mut uc = proof.unicity_certificate.clone();
+    let mut uc = good.clone();
     uc.unicity_seal.signatures.truncate(2);
     let d = uc.unicity_seal.calculate_hash();
     for (id, sg) in &r.signers[2..4] {
@@ -112,12 +87,8 @@ fn embedded_uc_rejects_wrong_network_root_and_insufficient_valid_count_like_the_
         uc.unicity_seal.signatures.push((id.clone(), bad));
     }
     assert_eq!(verify_embedded_uc(&ti, &uc).unwrap_err(), E::QuorumNotMet);
-    assert_eq!(
-        sdk_error(uc),
-        unicity_token::verify::VerificationError::QuorumNotMet
-    );
     // Three valid and one corrupt: the corrupt one counts zero and does not fail the quorum.
-    let mut uc = proof.unicity_certificate.clone();
+    let mut uc = good.clone();
     uc.unicity_seal.signatures.truncate(3);
     let d = uc.unicity_seal.calculate_hash();
     let mut bad = r.signers[3].1.sign(&d).encode().to_vec();
@@ -222,42 +193,17 @@ fn installation_requires_the_pinned_genesis_and_an_authenticated_chain() {
 }
 
 #[test]
-fn a_foreign_epoch_inside_a_lock_proof_is_retryable_end_to_end() {
-    let w = make_world(20);
-    let s = spec(1);
-    let mut parts = lock_parts(&w, &s);
-    parts.uc.unicity_seal.epoch = 9;
-    resign(&w.evm_root, &mut parts.uc, 4);
-    let out = build_token_with(
-        &w,
-        &s,
-        &parts,
-        &Tweaks::default(),
-        &[],
-        1_700_000_040,
-        1_700_000_900,
-    );
-    assert_eq!(
-        w.bridge
-            .verify_native_token(&out.token, native_bridge_sdk_ext::token::Expect::Receipt)
-            .unwrap_err(),
-        E::NoEntryForEpoch
-    );
-}
-
-#[test]
 fn the_shared_dev_trust_base_fixture_installs_under_its_pin() {
     // the same bytes as both SDKs' dev fixture: epochs 1..4, weighted from epoch 2
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/interop/utb-dev");
     let bundle = std::fs::read(dir.join("bft-trustbase.dev.bundle.cbor")).unwrap();
-    let pin: [u8; 32] = from_hex(
-        std::fs::read_to_string(dir.join("bft-trustbase.dev.genesis.entryid"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
+    let text = std::fs::read_to_string(dir.join("bft-trustbase.dev.genesis.entryid")).unwrap();
+    let text = text.trim();
+    let pin: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
     let t = TrustInput::from_bundle(&bundle, &pin).unwrap();
     assert_eq!(t.id(), pin);
     assert_eq!(t.network_id().id(), 3);

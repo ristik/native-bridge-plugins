@@ -5,13 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Native Unicity bridge extensions over the unicity-token SDK (v3.0.1): lock-proof verification, strict history semantics, return-proof assembly."
+description = "Native Unicity bridge v2 wallet extensions over the unicity-token SDK: deposit and return verification, the vault model and journal."
 
 [features]
-default = ["alloc", "host", "consolidation"]
+default = ["alloc", "host"]
 alloc = []
-# The redemption's consolidated path: the SDK's uc-consolidation outcome types (its `client` feature, alloc only).
-consolidation = ["alloc", "unicity-token/client"]
 # Host conveniences: std error integration, JSON trust-document and manifest loading, and the nb2 journal, RPC reader and
 # bridge. Native targets only: it uses std threads, clocks and the OS random source (no wasm32-unknown-unknown build).
 host = ["alloc", "unicity-token/std", "k256/std", "sha2/std", "sha3/std", "dep:serde", "dep:serde_json", "dep:getrandom", "unicity-token/client"]

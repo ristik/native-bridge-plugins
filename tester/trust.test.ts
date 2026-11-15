@@ -11,7 +11,7 @@ import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/t
 import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponseWire.js';
 
 import { TrustPersistError } from '../packages/native-bridge-plugin/src/trustrefresh.js';
-import { makeRoot, NETWORK, nextEpoch, successorEntry, type Root } from '../packages/native-bridge-plugin/test/world.js';
+import { makeRoot, NETWORK, nextEpoch, successorEntry, type Root } from '../packages/native-bridge-plugin/test/rootfixture.js';
 import { loadHeldTrust, maxEntriesOf, persistTrustFile, refreshAll } from './trust.js';
 
 /** An untrusted source serving `entries` as GetTrustBase pages. */

@@ -14,7 +14,7 @@ import { NativeError } from '../src/errors.js';
 import { TrustInput } from '../src/trust.js';
 import { needsNewerEntry, TrustPersistError, withTrustRefresh, type TrustRefreshEvent } from '../src/trustrefresh.js';
 import { rejects } from './util.js';
-import { makeRoot, makeUc, NETWORK, nextEpoch, successorEntry, type Root } from './world.js';
+import { makeRoot, makeUc, NETWORK, nextEpoch, successorEntry, type Root } from './rootfixture.js';
 
 const ucOf = (r: Root, signers: number, rootEpoch: bigint, round: bigint) =>
   makeUc(r, { partition: 1, conf: new Uint8Array(32).fill(1), epochIr: 1n, rootEpoch, round, timestamp: 1_700_000_000n, stateHash: new Uint8Array(32), blockHash: new Uint8Array(32).fill(2), signers });

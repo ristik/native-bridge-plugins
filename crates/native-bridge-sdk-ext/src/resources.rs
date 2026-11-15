@@ -1,9 +1,8 @@
-//! Bounded canonical scan before SDK decoding, including CBOR hidden in payload byte strings.
+//! Bounded canonical scan of a native unicity certificate before SDK decoding.
 //! Native UC sublimits: summary 256 bytes; shard 256 bits/33 bytes/256 siblings;
 //! Unicity path 32 steps; seal 64 signatures; signer ID 128 UTF-8 bytes.
 use crate::error::{NativeError as E, Result};
-use crate::limits::*;
-use crate::split::justification_tag;
+use crate::limits::{MAX_CBOR_DEPTH, MAX_CBOR_ITEMS, MAX_UC_BYTES};
 use alloc::vec::Vec;
 
 struct Node<'a> {
@@ -11,12 +10,10 @@ struct Node<'a> {
     arg: u64,
     start: usize,
     end: usize,
-    depth: isize,
     data: &'a [u8],
     kids: Vec<Node<'a>>,
 }
-/// Items of the object being scanned, within its own limit. Paths are bounded per certificate and per proof, never in sum (owner
-/// section 36); a whole token has no item aggregate (only `MAX_TOKEN_BYTES`), each nested payload its own `MAX_CBOR_ITEMS`.
+/// Items of the object being scanned, within its own limit.
 struct Budget {
     items: usize,
     limit: usize,
@@ -106,7 +103,6 @@ fn scan<'a>(b: &'a [u8], budget: &mut Budget, depth: isize) -> Result<Node<'a>> 
             arg,
             start,
             end: *pos,
-            depth: d,
             data,
             kids,
         })
@@ -242,132 +238,6 @@ fn uc_within(n: &Node<'_>, max_bytes: usize) -> Result<()> {
         }
     }
     Ok(())
-}
-/// `token`: a split reason `tag(39044,[token,[proof]])` carries its whole burned parent, which is checked as a token in its own right:
-/// the scan starts two levels up, so the parent token sits at a top-level token's depth (every lineage level gets the bounds of an
-/// ordinary token, and the lineage depth is not capped by nesting), its items bounded by its bytes; any other payload continues its
-/// container's depth under its own item budget.
-fn nested(n: Option<&Node<'_>>, max: usize, certificate: bool, token: bool) -> Result<()> {
-    if let Some(x) = n.filter(|x| x.major == 2) {
-        if x.data.len() > max {
-            return Err(E::ProofTooLarge);
-        }
-        let mut own = if token {
-            Budget {
-                items: 0,
-                limit: usize::MAX,
-            }
-        } else {
-            Budget::object()
-        };
-        match scan(x.data, &mut own, if token { -2 } else { x.depth + 1 }) {
-            Ok(root) => {
-                if certificate {
-                    uc(&root)?;
-                } else {
-                    visit(&root)?;
-                }
-            }
-            Err(e) if e.family() != crate::error::Family::Budget => {
-                if certificate {
-                    return Err(E::UnsupportedCertificateEncoding);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-fn visit(n: &Node<'_>) -> Result<()> {
-    if n.major == 6 {
-        if n.arg == 39001 {
-            return uc(n);
-        }
-        let body = &n.kids[0];
-        if body.major == 4 {
-            let k = &body.kids;
-            match n.arg {
-                39032 => nested(k.get(1), MAX_TOKEN_BYTES, false, false)?, // CBOR predicate code.
-                39041 => {
-                    // a split reason (protocol 6) embeds its whole burned parent token: it is bounded as a token, a lock reason as a
-                    // justification
-                    let split = k.get(5).is_some_and(|x| {
-                        x.major == 2
-                            && justification_tag(Some(x.data)) == Some(TAG_SPLIT_JUSTIFICATION)
-                    });
-                    let max = if split {
-                        MAX_TOKEN_BYTES
-                    } else {
-                        MAX_JUSTIFICATION_BYTES
-                    };
-                    nested(k.get(5), max, false, split)?;
-                    nested(k.get(6), MAX_TOKEN_BYTES, false, false)?;
-                }
-                39045 => nested(k.get(3), MAX_TOKEN_BYTES, false, false)?,
-                39049 => {
-                    if let Some(lp) = k.get(5).filter(|x| x.major == 4) {
-                        if lp
-                            .kids
-                            .get(5)
-                            .is_some_and(|x| x.major == 2 && x.data.len() > MAX_HEADER_BYTES)
-                        {
-                            return Err(E::ProofTooLarge);
-                        }
-                        let mut total = 0;
-                        for list in [lp.kids.get(6), lp.kids.get(7)]
-                            .into_iter()
-                            .flatten()
-                            .filter(|x| x.major == 4)
-                        {
-                            if list.kids.len() > MAX_MPT_NODES {
-                                return Err(E::ProofTooLarge);
-                            }
-                            for node in list.kids.iter().filter(|x| x.major == 2) {
-                                if node.data.len() > MAX_MPT_NODE_BYTES
-                                    || node.data.len() > MAX_MPT_TOTAL_BYTES - total
-                                {
-                                    return Err(E::ProofTooLarge);
-                                }
-                                total += node.data.len();
-                            }
-                        }
-                        nested(lp.kids.get(3), MAX_PDR_BYTES, false, false)?;
-                        nested(lp.kids.get(4), MAX_UC_BYTES, true, false)?;
-                    }
-                }
-                39033 => {
-                    if let Some(x) = k.get(3).filter(|x| x.major == 2) {
-                        let len = x.data.len();
-                        if len < 32 || len % 32 != 0 {
-                            return Err(E::UnsupportedCertificateEncoding);
-                        }
-                        let paths = (len - 32) / 32;
-                        if paths > 256 {
-                            return Err(E::ProofTooLarge);
-                        }
-                        uc(k.get(4).ok_or(E::UnsupportedCertificateEncoding)?)?;
-                        return Ok(()); // the UC has been scanned.
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    for child in &n.kids {
-        visit(child)?;
-    }
-    Ok(())
-}
-/// Full token and nested payload budgets, before generic SDK allocation or cryptography.
-pub fn preflight_token(bytes: &[u8]) -> Result<()> {
-    if bytes.len() > MAX_TOKEN_BYTES {
-        return Err(E::InputTooLarge);
-    }
-    let mut budget = Budget {
-        items: 0,
-        limit: usize::MAX,
-    };
-    visit(&scan(bytes, &mut budget, 0)?)
 }
 /// The native certificate sublimit scan alone (the step bft-core `scanCertificate` takes from `b1ref.ScanUC`), with the B1 byte cap
 /// `max_bytes`; any failure is the caller's to classify.
