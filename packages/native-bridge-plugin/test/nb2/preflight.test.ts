@@ -58,9 +58,9 @@ test('preflight: an oversized token, unfundable gas and an unboundable gas cost 
   assert.equal((await ok.w.journal.returns()).length, 0);
   const plan = await ok.w.planReturn(ok.token, r, ok.payer.address);
   assert.ok(plan.gasLimit > 500_000n && plan.gasLimit < 60_000_000n);
-  // the measured model stays above NB2-05's mint + burn token (748,672) plus the worst vault call and the reserve
+  // the bound stays above NB2-05's mint + burn token (748,672) plus the worst vault call and the reserve
   assert.ok(plan.gasLimit >= 748_672n + 487_339n + 500_000n, `gas limit ${plan.gasLimit}`);
-  assert.equal(ok.w.gas.name, 'measured-nb2-05');
+  assert.equal(ok.w.gas.name, 'bound-nb2-1179');
   assert.ok(new ProvisionalGasModel().name.length > 0);
 });
 

@@ -247,7 +247,7 @@ test('options: the measured gas model is the default; k_w is not in the options;
   const o = s.options('w');
   const prodGamma = encodeConfig(makeConfig(s.root, 64n, 16n));
   // a production build opens with the measured model by default: no opt-in
-  assert.equal((await NativeBridgeV2.open({ ...o, pins: { ...o.pins, gamma: prodGamma, build: 'production' } }, false)).gas.name, 'measured-nb2-05');
+  assert.equal((await NativeBridgeV2.open({ ...o, pins: { ...o.pins, gamma: prodGamma, build: 'production' } }, false)).gas.name, 'bound-nb2-1179');
   const w = await NativeBridgeV2.open({ ...o, maxSealAgeBlocks: 0n });
   assert.equal((w as unknown as { opts: Record<string, unknown> }).opts.bridgeKey, undefined);
   // a seal exists after four payments; with a zero age bound the plan carries the freshness warning

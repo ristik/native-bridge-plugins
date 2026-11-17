@@ -3,15 +3,23 @@
 //! The verifier part is a named, replaceable component: [`GasModel`]. The default [`ProvisionalGasModel`] over-estimates by
 //! construction and fails closed (returns None, which the preflight reports as `CapacityPreflight`) for anything it cannot bound.
 
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
+
 use unicity_token::api::bft::UnicityCertificate;
 use unicity_token::cbor::{DecodeLimits, Decoder};
 
 use super::abi::redeem_calldata_length;
-use super::cbor::head_tag;
+use super::cbor::{array, bstr, bytes_n, head_tag, is_uint, raw, scan_native, tag_content};
 use super::config::tag;
+use super::crypto::{he, hu};
 use super::deposit::decode_receipt_backing;
 use super::segment::gap_proof_len;
-use super::token::Token;
+use super::split::decode_split_justification;
+use super::token::{
+    concat, encode_token, mint_source_hash, result_state, state_id, token_id_of, Predicate, Token,
+    PRED_SIGNATURE,
+};
 
 /// What the gas model sees of a prospective redemption.
 pub struct RedeemShape<'a> {
@@ -112,107 +120,624 @@ impl GasModel for ProvisionalGasModel {
     }
 }
 
-/// The measured schedule: NB2-05's verifier (unicity-pos-contracts#82 `docs/nb2-verifier.md`: solc 0.8.37, via-IR, Cancun,
-/// native 0x0100/0x0102 schedules, calldata included) and the vault's replay and settlement (#1098 bake-off and #81 snapshots),
-/// each term rounded up so the model stays above every measured token:
+/// The redeem gas bound (bft-core#1179, `docs/nb2-gas-model.md`; `gas.ts` `REDEEM_GAS`, with identical results): an upper bound of
+/// the vault redeem's gas limit, term by term from the deployed verifier's cost structure, not a fit to the token's length:
 ///
 /// ```text
-///   verifier = 800,000 + 190,000 per further transfer + 760,000 per nested split level
-///              + 136 per evidence byte beyond the measured shape (4,242 + 1,026 per transfer + 3,238 per level)
-///              + 7,500 per seal signature beyond the measured 3
-///   vault    = 487,339 (the worst measured call: previous endpoint, one bucket, sealing) + 6,000 per historical segment
-///   limit    = verifier + vault + history calldata + gasReserve (500,000)
+///   limit = transaction + vault + batch + membership + sha256 + execution + memory + forwarding + gasReserve
 /// ```
 ///
-/// It fails closed: a certificate whose signatures cannot be counted, or more than 16 of them, gives None (`CapacityPreflight`).
-pub mod measured_verifier {
-    pub const BASE: u64 = 800_000;
-    pub const PER_TRANSFER: u64 = 190_000;
-    pub const PER_SPLIT_LEVEL: u64 = 760_000;
-    pub const BASE_BYTES: u64 = 4_242;
-    pub const BYTES_PER_TRANSFER: u64 = 1_026;
-    pub const BYTES_PER_SPLIT_LEVEL: u64 = 3_238;
-    pub const PER_EXCESS_BYTE: u64 = 136;
-    pub const MEASURED_SIGNATURES: usize = 3;
-    pub const PER_EXTRA_SIGNATURE: u64 = 7_500;
-    pub const MAX_SIGNATURES: usize = 16;
+/// The token's own proofs are counted exactly; the pending burn of a preflight at the decoder bounds. A UC that does not parse, or
+/// has more than 16 signatures, gives None (`CapacityPreflight`). See `gas.ts` for each term.
+pub mod redeem_gas {
+    pub const TX_BASE: u64 = 21_000;
+    pub const CALLDATA_BYTE: u64 = 16;
     pub const VAULT_WORST_CALL: u64 = 487_339;
     pub const PER_SEGMENT: u64 = 6_000;
+    pub const COPY_WORD: u64 = 3;
+    pub const BATCH_CALL: u64 = 61_100;
+    pub const BATCH_BYTE: u64 = 16;
+    pub const BATCH_PAIR: u64 = 500;
+    pub const BATCH_EPOCH: u64 = 29_900;
+    pub const BATCH_SIGNATURE: u64 = 7_200;
+    pub const BATCH_CLAIM: u64 = 2_000;
+    pub const BATCH_PATH: u64 = 250;
+    pub const BATCH_CLAIMS: usize = 16;
+    pub const BATCH_BYTES: usize = 262_144;
+    pub const MEMBER_CALL: u64 = 2_000;
+    pub const MEMBER_BYTE: u64 = 16;
+    pub const MEMBER_STEP: u64 = 250;
+    pub const SHA256_CALL: u64 = 60;
+    pub const SHA256_WORD: u64 = 12;
+    pub const VERIFIER_BASE: u64 = 158_000;
+    pub const PER_TOKEN: u64 = 0;
+    pub const PER_EDGE: u64 = 57_149;
+    pub const PER_ALLOC_STEP: u64 = 2_000;
+    pub const PER_STEP: u64 = 16_851;
+    pub const PER_PARENT_STEP: u64 = 15_435;
+    pub const PER_TX_WORD: u64 = 3;
+    pub const PER_SIBLING: u64 = 3;
+    pub const PER_ITEM: u64 = 757;
+    pub const PER_UC_PARSE: u64 = 19_100;
+    pub const PER_UC_BYTE: u64 = 7;
+    pub const PER_UC_IR_BYTE: u64 = 27;
+    pub const PER_UC_SIGNATURE: u64 = 1_784;
+    pub const PER_UC_STC: u64 = 1_648;
+    pub const PER_UC_UTC: u64 = 2_146;
+    pub const PER_UC_SLOW_BYTE: u64 = 315;
+    pub const PER_KEY_LOOKUP: u64 = 0;
+    pub const PER_DECOMPRESS: u64 = 2_100;
+    pub const PER_PROBE: u64 = 271;
+    pub const PER_CLAIM: u64 = 1_039;
+    pub const J_BYTE: u64 = 10;
+    pub const MEM_BASE: usize = 350;
+    pub const MEM_PER_STEP_100: usize = 7_882;
+    pub const MEM_PER_PARENT_STEP_100: usize = 0;
+    pub const MEM_PER_CLAIM_WORD_100: usize = 103;
+    pub const MEM_PER_UC_WORD_100: usize = 263;
+    pub const MEM_PER_PATH_WORD_100: usize = 101;
+    pub const MEM_PER_TOKEN_100: usize = 27_775;
+    pub const MEM_PER_EDGE_100: usize = 0;
+    pub const MEM_PER_ALLOC_STEP_100: usize = 0;
+    pub const PENDING_TX_BYTES: usize = 256;
+    pub const PENDING_UC_BYTES: usize = 24_576;
+    pub const PENDING_SIGNATURES: usize = 16;
+    pub const PENDING_ID_BYTES: usize = 128;
+    pub const PENDING_IR_BYTES: usize = 448;
+    pub const PENDING_STC: usize = 256;
+    pub const PENDING_UTC: usize = 32;
+    pub const PENDING_SHARD_BYTES: usize = 33;
+    pub const PENDING_SIBLINGS: usize = 256;
+    pub const PENDING_UC_ITEMS: usize = 40 + 256 + 3 * 32 + 2 * 16;
+    pub const PENDING_PAIR_ITEMS: usize = 32;
+    pub const MAX_SIGNATURES: usize = 16;
+    pub const KEY_CACHE: usize = 128;
 }
 
-/// The default model: [`measured_verifier`].
+/// One UC as the verifier, its helper and the batch see it.
+#[derive(Clone)]
+struct UcShape {
+    bytes: usize,
+    ir: usize,
+    signatures: usize,
+    stc: usize,
+    utc: usize,
+    slow: usize,
+    epoch: Option<u64>,
+    claim_bytes: usize,
+    claim_key: Option<[u8; 32]>,
+}
+
+/// One distinct claim of the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub bytes: usize,
+    pub signatures: usize,
+    pub path: usize,
+    pub epoch: Option<u64>,
+}
+
+/// What the bound counts, extracted from the lineage (`gas.ts` RedeemFeatures).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemFeatures {
+    pub tokens: usize,
+    pub edges: usize,
+    pub alloc_steps: usize,
+    pub steps: usize,
+    pub parent_steps: usize,
+    pub tx_words: usize,
+    pub max_tx: usize,
+    pub siblings: usize,
+    pub uc_parses: usize,
+    pub uc_bytes: usize,
+    pub uc_ir: usize,
+    pub uc_signatures: usize,
+    pub uc_stc: usize,
+    pub uc_utc: usize,
+    pub uc_slow: usize,
+    pub helper_memory: u64,
+    pub path_words: usize,
+    pub max_uc: usize,
+    pub scratch: usize,
+    pub items: usize,
+    pub j_bytes: usize,
+    pub key_lookups: usize,
+    pub decompressions: usize,
+    pub probes: usize,
+    pub claims: Vec<Claim>,
+}
+
+/// The heads of a CBOR item sequence (definite lengths, string payloads skipped): the items the verifier's scanner visits.
+pub fn cbor_items(b: &[u8]) -> usize {
+    let mut n = 0;
+    let mut p = 0usize;
+    while p < b.len() {
+        let ib = b[p];
+        p += 1;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        let mut arg = ai as usize;
+        if (24..=27).contains(&ai) {
+            let w = 1usize << (ai - 24);
+            arg = 0;
+            for k in 0..w {
+                arg = arg
+                    .wrapping_mul(256)
+                    .wrapping_add(*b.get(p + k).unwrap_or(&0) as usize);
+            }
+            p += w;
+        }
+        if major == 2 || major == 3 {
+            p = p.saturating_add(arg);
+        }
+        n += 1;
+    }
+    n
+}
+
+/// A UC in Nb2Cert.parse's shape: tag 39001 [1, IR, trHash, scHash, STC, UTC, seal]; None when it is not that shape.
+fn uc_shape(uc: &[u8]) -> Option<UcShape> {
+    let it = scan_native(uc).ok()?;
+    let c = array(tag_content(&it, 39001).ok()?, 7).ok()?;
+    let ir = &c[1];
+    let irc = array(tag_content(ir, 39002).ok()?, 10).ok()?;
+    let sch = bytes_n(&c[3], 32).ok()?;
+    let stc = array(tag_content(&c[4], 39003).ok()?, 3).ok()?;
+    let shard = bstr(&stc[1]).ok()?;
+    let utc = array(tag_content(&c[5], 39004).ok()?, 3).ok()?;
+    let seal = array(tag_content(&c[6], 39005).ok()?, 8).ok()?;
+    let sigs = &seal[7];
+    if stc[2].major != 4
+        || !is_uint(&utc[1])
+        || utc[2].major != 4
+        || !is_uint(&seal[3])
+        || sigs.major != 5
+    {
+        return None;
+    }
+    let mut slow = 0;
+    for k in (0..sigs.kids.len()).step_by(2) {
+        let id = sigs.kids[k].data;
+        if id.iter().any(|&x| x >= 0x80) {
+            slow += id.len();
+        }
+    }
+    let state_hash = bytes_n(&irc[4], 32).ok()?;
+    let partition = u32::try_from(utc[1].arg).ok()?;
+    let shard_len = u16::try_from(shard.len()).ok()?;
+    let uc_len = u32::try_from(uc.len()).ok()?;
+    let ir_hash = hu(&[raw(uc, ir)]);
+    let claim = concat(&[
+        &partition.to_be_bytes(),
+        &shard_len.to_be_bytes(),
+        shard,
+        sch,
+        state_hash,
+        &ir_hash,
+        &uc_len.to_be_bytes(),
+        uc,
+    ]);
+    Some(UcShape {
+        bytes: uc.len(),
+        ir: ir.end - ir.start,
+        signatures: sigs.kids.len() / 2,
+        stc: stc[2].kids.len(),
+        utc: utc[2].kids.len(),
+        slow,
+        epoch: Some(seal[3].arg),
+        claim_bytes: claim.len(),
+        claim_key: Some(he(&[&claim])),
+    })
+}
+
+/// One open-addressing table of the verifier (linear probing from the key's low bits), counting its probes and its misses.
+struct ProbeTable {
+    slots: Vec<Option<[u8; 32]>>,
+    probes: usize,
+    misses: usize,
+}
+
+impl ProbeTable {
+    fn new(size: usize) -> Self {
+        Self {
+            slots: alloc::vec![None; size],
+            probes: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up or insert KEY; a full table answers a miss without storing (the key cache).
+    fn lookup(&mut self, key: &[u8; 32]) {
+        let mask = self.slots.len() - 1;
+        let low = u32::from_be_bytes([key[28], key[29], key[30], key[31]]) as usize;
+        let mut i = low & mask;
+        for _ in 0..=mask {
+            self.probes += 1;
+            match &self.slots[i] {
+                Some(s) if s == key => return,
+                None => {
+                    self.slots[i] = Some(*key);
+                    self.misses += 1;
+                    return;
+                }
+                _ => i = (i + 1) & mask,
+            }
+        }
+        self.misses += 1;
+    }
+}
+
+/// The part's current owner and state (`tokenops` head, repeated here to keep this module free of the signing code).
+fn head_of(t: &Token) -> (Predicate, [u8; 32]) {
+    let id = token_id_of(&t.mint.salt, t.mint.network);
+    let mut state = result_state(&mint_source_hash(&id), &id);
+    let mut owner = t.mint.recipient.clone();
+    for tr in &t.transfers {
+        state = result_state(&state, &tr.mask);
+        owner = tr.recipient.clone();
+    }
+    (owner, state)
+}
+
+/// The verifier's table size for N entries (_pow2: at least 16).
+fn pow2_at(n: usize) -> usize {
+    let mut p = 16;
+    while p < n {
+        p <<= 1;
+    }
+    p
+}
+
+const fn ceil32(n: usize) -> usize {
+    n.div_ceil(32)
+}
+
+/// The memory expansion of WORDS words (the Yellow Paper's C_mem).
+pub fn memory_gas(words: usize) -> u64 {
+    let w = words as u64;
+    3 * w + w * w / 512
+}
+
+/// One helper call's frame: the UC copied for the claim, the claim and the ABI answer (about three UCs of memory).
+fn helper_memory(uc_bytes: usize) -> u64 {
+    memory_gas(3 * ceil32(uc_bytes) + 64)
+}
+
+struct StepShape {
+    tx: usize,
+    siblings: usize,
+    uc: UcShape,
+    sid: [u8; 32],
+}
+
+/// The features of a prospective redemption; None when a UC does not parse or has more signatures than the bound.
+pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
+    use redeem_gas as g;
+    let l = s.lineage;
+    if l.is_empty() || s.pending_transactions > 1 {
+        return None;
+    }
+    let pending = s.pending_transactions == 1;
+    let mut cache: BTreeMap<[u8; 32], Option<UcShape>> = BTreeMap::new();
+    let mut shape_of = |uc: &[u8]| -> Option<UcShape> {
+        let k = hu(&[uc]);
+        let u = cache.entry(k).or_insert_with(|| uc_shape(uc)).clone()?;
+        (u.signatures <= g::MAX_SIGNATURES).then_some(u)
+    };
+    let mut steps: Vec<StepShape> = Vec::new();
+    for t in l {
+        let proofs = core::iter::once(&t.mint_proof).chain(t.proofs.iter());
+        let raws = core::iter::once(&t.mint_raw).chain(t.transfers_raw.iter());
+        for (p, r) in proofs.zip(raws) {
+            let uc = shape_of(&p.uc)?;
+            steps.push(StepShape {
+                tx: r.len(),
+                siblings: p.siblings.len(),
+                uc,
+                sid: state_id(&p.cd.source, &p.cd.source_hash),
+            });
+        }
+    }
+    let part = &l[l.len() - 1];
+    let (owner, state) = head_of(part);
+    if pending {
+        let uc = UcShape {
+            bytes: g::PENDING_UC_BYTES,
+            ir: g::PENDING_IR_BYTES,
+            signatures: g::PENDING_SIGNATURES,
+            stc: g::PENDING_STC,
+            utc: g::PENDING_UTC,
+            slow: g::PENDING_SIGNATURES * g::PENDING_ID_BYTES,
+            epoch: None,
+            claim_bytes: 4 + 2 + g::PENDING_SHARD_BYTES + 96 + 4 + g::PENDING_UC_BYTES,
+            claim_key: None,
+        };
+        steps.push(StepShape {
+            tx: g::PENDING_TX_BYTES,
+            siblings: g::PENDING_SIBLINGS,
+            uc,
+            sid: state_id(&owner, &state),
+        });
+    }
+    let n = steps.len();
+    let j = l[0]
+        .mint
+        .justification
+        .as_deref()
+        .filter(|j| head_tag(j) == Some(tag::RECEIPT_BACKING))?;
+    let evm = shape_of(&decode_receipt_backing(j).ok()?.proof.uc)?;
+    let mut items = 2 + cbor_items(&encode_token(part)) + cbor_items(j);
+    if pending {
+        items += g::PENDING_PAIR_ITEMS + g::PENDING_UC_ITEMS;
+    }
+    let mut alloc_steps = 0;
+    for t in &l[1..] {
+        let sj = t.mint.justification.as_deref()?;
+        items += cbor_items(sj);
+        alloc_steps += decode_split_justification(sj).ok()?.proof.len();
+    }
+    let mut keys = ProbeTable::new(g::KEY_CACHE);
+    let mut key_lookups = 0;
+    let mut key = |p: &Predicate, keys: &mut ProbeTable| {
+        if p.ty == PRED_SIGNATURE {
+            key_lookups += 1;
+            keys.lookup(&he(&[&p.params]));
+        }
+    };
+    for (i, t) in l.iter().enumerate().rev() {
+        key(&t.mint.recipient, &mut keys);
+        key(&t.mint_proof.cd.source, &mut keys);
+        for (tr, pr) in t.transfers.iter().zip(t.proofs.iter()) {
+            key(&tr.recipient, &mut keys);
+            key(&pr.cd.source, &mut keys);
+        }
+        if i == l.len() - 1 && pending {
+            key(&owner, &mut keys);
+        }
+    }
+    let mut sids = ProbeTable::new(pow2_at(2 * n));
+    for st in &steps {
+        let mut k = st.sid;
+        if k == [0u8; 32] {
+            k[31] = 1;
+        }
+        sids.lookup(&k);
+    }
+    let mut claim_ids = ProbeTable::new(pow2_at(2 * (n + 1)));
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut claims = Vec::new();
+    let mut unknown_probes = 0;
+    for u in core::iter::once(&evm).chain(steps.iter().map(|st| &st.uc)) {
+        let c = Claim {
+            bytes: u.claim_bytes,
+            signatures: u.signatures,
+            path: u.stc + u.utc,
+            epoch: u.epoch,
+        };
+        match u.claim_key {
+            None => {
+                unknown_probes += seen.len() + 1;
+                claims.push(c);
+            }
+            Some(k) => {
+                claim_ids.lookup(&k);
+                if seen.insert(k) {
+                    claims.push(c);
+                }
+            }
+        }
+    }
+    let mut f = RedeemFeatures {
+        tokens: l.len(),
+        edges: l.len() - 1,
+        alloc_steps,
+        steps: n,
+        parent_steps: l[..l.len() - 1].iter().map(|t| 1 + t.transfers.len()).sum(),
+        tx_words: 0,
+        max_tx: 0,
+        siblings: 0,
+        uc_parses: n + 1,
+        uc_bytes: evm.bytes,
+        uc_ir: evm.ir,
+        uc_signatures: evm.signatures,
+        uc_stc: evm.stc,
+        uc_utc: evm.utc,
+        uc_slow: evm.slow,
+        helper_memory: helper_memory(evm.bytes),
+        path_words: 0,
+        max_uc: evm.bytes,
+        scratch: 24,
+        items,
+        j_bytes: j.len(),
+        key_lookups,
+        decompressions: keys.misses,
+        probes: keys.probes + sids.probes + claim_ids.probes + unknown_probes,
+        claims,
+    };
+    // a transaction is hashed from a copy at the free pointer; every later step allocates at least two copies of its UC over that scratch
+    let mut after = 0usize;
+    for st in steps.iter().rev() {
+        f.scratch = f.scratch.max((ceil32(st.tx) + 1).saturating_sub(after));
+        after += 2 * ceil32(st.uc.bytes);
+    }
+    for st in &steps {
+        f.tx_words += ceil32(st.tx);
+        f.max_tx = f.max_tx.max(st.tx);
+        f.siblings += st.siblings;
+        f.uc_bytes += st.uc.bytes;
+        f.uc_ir += st.uc.ir;
+        f.uc_signatures += st.uc.signatures;
+        f.uc_stc += st.uc.stc;
+        f.uc_utc += st.uc.utc;
+        f.uc_slow += st.uc.slow;
+        f.helper_memory += helper_memory(st.uc.bytes);
+        f.path_words += 1 + ceil32(104 + 32 * (st.siblings + 1));
+        f.max_uc = f.max_uc.max(st.uc.bytes);
+    }
+    Some(f)
+}
+
+/// CERT_BATCH_V2 over the distinct claims in the verifier's batching (_flush): (gas, calls, the largest call's gas).
+pub fn batch_gas(claims: &[Claim]) -> (u64, usize, u64) {
+    use redeem_gas as g;
+    let m = claims.len();
+    if m == 0 {
+        return (0, 0, 0);
+    }
+    let per = m.div_ceil(m.div_ceil(g::BATCH_CLAIMS));
+    let (mut gas, mut largest, mut calls) = (0u64, 0u64, 0usize);
+    let mut s = 0;
+    while s < m {
+        let mut e = s;
+        let mut bytes = 4;
+        while e < m && e - s < per && bytes + claims[e].bytes <= g::BATCH_BYTES {
+            bytes += claims[e].bytes;
+            e += 1;
+        }
+        if e == s {
+            bytes += claims[e].bytes;
+            e += 1;
+        }
+        let k = (e - s) as u64;
+        let mut epochs: BTreeSet<(bool, u64)> = BTreeSet::new();
+        let (mut q, mut p) = (0u64, 0u64);
+        for (i, c) in claims.iter().enumerate().take(e).skip(s) {
+            epochs.insert(match c.epoch {
+                Some(ep) => (true, ep),
+                None => (false, i as u64),
+            });
+            q += c.signatures as u64;
+            p += c.path as u64;
+        }
+        let c = g::BATCH_CALL
+            + g::BATCH_BYTE * bytes as u64
+            + g::BATCH_PAIR * k * (k - 1)
+            + g::BATCH_EPOCH * epochs.len() as u64
+            + g::BATCH_SIGNATURE * q
+            + g::BATCH_CLAIM * k
+            + g::BATCH_PATH * p;
+        gas += c;
+        largest = largest.max(c);
+        calls += 1;
+        s = e;
+    }
+    (gas, calls, largest)
+}
+
+/// The verifier frame's memory high-water bound (words): its hash tables exactly, what else it allocates, its largest scratch use.
+pub fn verifier_memory_words(f: &RedeemFeatures) -> usize {
+    use redeem_gas as g;
+    let n = f.steps;
+    let tables = pow2_at(2 * (n + 1)) + pow2_at(2 * n) + (n + 1) + 2 * g::KEY_CACHE;
+    let per = g::MEM_PER_STEP_100 * n
+        + g::MEM_PER_PARENT_STEP_100 * f.parent_steps
+        + g::MEM_PER_CLAIM_WORD_100 * f.claims.iter().map(|c| ceil32(c.bytes) + 1).sum::<usize>()
+        + g::MEM_PER_UC_WORD_100 * ceil32(f.uc_bytes)
+        + g::MEM_PER_PATH_WORD_100 * f.path_words
+        + g::MEM_PER_TOKEN_100 * f.tokens
+        + g::MEM_PER_EDGE_100 * f.edges
+        + g::MEM_PER_ALLOC_STEP_100 * f.alloc_steps;
+    g::MEM_BASE + per.div_ceil(100) + tables + f.scratch
+}
+
+/// The bound's terms, each an upper bound of its part of the redeem's gas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GasTerms {
+    pub transaction: u64,
+    pub vault: u64,
+    pub batch: u64,
+    pub membership: u64,
+    pub sha256: u64,
+    pub execution: u64,
+    pub memory: u64,
+    pub forwarding: u64,
+    pub reserve: u64,
+    pub limit: u64,
+    pub memory_words: usize,
+}
+
+/// The terms of a redemption with FEATURES, EVIDENCE_BYTES of evidence and PROOFS historical gap proofs at K.
+pub fn price_features(f: &RedeemFeatures, evidence_bytes: usize, proofs: u64, k: u64) -> GasTerms {
+    use redeem_gas as g;
+    let u = |n: usize| n as u64;
+    let history_bytes = if proofs == 0 {
+        0
+    } else {
+        32 + proofs as usize * gap_proof_len(k)
+    };
+    let transaction =
+        g::TX_BASE + g::CALLDATA_BYTE * u(redeem_calldata_length(evidence_bytes, history_bytes));
+    let vw = ceil32(evidence_bytes) + 64;
+    let vault =
+        g::VAULT_WORST_CALL + g::PER_SEGMENT * proofs + g::COPY_WORD * u(vw) + memory_gas(vw);
+    let (batch, _, largest) = batch_gas(&f.claims);
+    let membership = u(f.steps) * (g::MEMBER_CALL + g::MEMBER_BYTE * 136 + g::MEMBER_STEP)
+        + u(f.siblings) * (32 * g::MEMBER_BYTE + g::MEMBER_STEP);
+    let sha256 = u(f.steps) * g::SHA256_CALL + u(f.tx_words) * g::SHA256_WORD;
+    let execution = g::VERIFIER_BASE
+        + g::PER_TOKEN * u(f.tokens)
+        + g::PER_EDGE * u(f.edges)
+        + g::PER_ALLOC_STEP * u(f.alloc_steps)
+        + g::PER_STEP * u(f.steps)
+        + g::PER_PARENT_STEP * u(f.parent_steps)
+        + g::PER_TX_WORD * u(f.tx_words)
+        + g::PER_SIBLING * u(f.siblings)
+        + g::PER_ITEM * u(f.items)
+        + g::PER_UC_PARSE * u(f.uc_parses)
+        + g::PER_UC_BYTE * u(f.uc_bytes)
+        + g::PER_UC_IR_BYTE * u(f.uc_ir)
+        + g::PER_UC_SIGNATURE * u(f.uc_signatures)
+        + g::PER_UC_STC * u(f.uc_stc)
+        + g::PER_UC_UTC * u(f.uc_utc)
+        + g::PER_UC_SLOW_BYTE * u(f.uc_slow)
+        + f.helper_memory
+        + g::PER_KEY_LOOKUP * u(f.key_lookups)
+        + g::PER_DECOMPRESS * u(f.decompressions)
+        + g::PER_PROBE * u(f.probes)
+        + g::PER_CLAIM * u(f.claims.len())
+        + g::J_BYTE * u(f.j_bytes);
+    let memory_words = verifier_memory_words(f);
+    let memory = memory_gas(memory_words);
+    let verifier = batch + membership + sha256 + execution + memory;
+    let inner = largest / 63 + 1;
+    let forwarding = (verifier + inner) / 63 + 1 + inner;
+    let reserve = measured::GAS_RESERVE;
+    let limit = transaction + vault + verifier + forwarding + reserve;
+    GasTerms {
+        transaction,
+        vault,
+        batch,
+        membership,
+        sha256,
+        execution,
+        memory,
+        forwarding,
+        reserve,
+        limit,
+        memory_words,
+    }
+}
+
+/// The terms of a prospective redemption, or None when it cannot be bounded.
+pub fn redeem_gas_terms(s: &RedeemShape<'_>) -> Option<GasTerms> {
+    redeem_features(s).map(|f| price_features(&f, s.evidence_bytes, s.proofs, s.k))
+}
+
+/// The default model: [`redeem_gas`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeasuredGasModel;
 
 impl GasModel for MeasuredGasModel {
     fn name(&self) -> &str {
-        "measured-nb2-05"
+        "bound-nb2-1179"
     }
 
     fn redeem_gas_limit(&self, s: &RedeemShape<'_>) -> Option<u64> {
-        use measured_verifier as m;
-        let levels = s.lineage.len().saturating_sub(1) as u64;
-        // every token of the walk ends in a burn (its split burn, or the return burn, pending or not); further transfers are hops
-        let transfers =
-            s.lineage.iter().map(|t| t.transfers.len()).sum::<usize>() + s.pending_transactions;
-        let hops = transfers.saturating_sub(s.lineage.len()) as u64;
-        let mut extra_sigs = 0u64;
-        let count = |uc: &[u8], extra: &mut u64| -> Option<()> {
-            let n = count_signatures(uc)?;
-            if n > m::MAX_SIGNATURES {
-                return None;
-            }
-            *extra += n.saturating_sub(m::MEASURED_SIGNATURES) as u64;
-            Some(())
-        };
-        for (i, tok) in s.lineage.iter().enumerate() {
-            for pr in core::iter::once(&tok.mint_proof).chain(tok.proofs.iter()) {
-                count(&pr.uc, &mut extra_sigs)?;
-            }
-            // the root's EVM UC inside J
-            if i == 0 {
-                if let Some(evm) = evm_uc_of(tok)? {
-                    count(&evm, &mut extra_sigs)?;
-                }
-            }
-        }
-        // a future certificate at the signature bound
-        extra_sigs +=
-            (s.pending_transactions * (m::MAX_SIGNATURES - m::MEASURED_SIGNATURES)) as u64;
-        let shaped =
-            m::BASE_BYTES + m::BYTES_PER_TRANSFER * hops + m::BYTES_PER_SPLIT_LEVEL * levels;
-        let excess = (s.evidence_bytes as u64).saturating_sub(shaped);
-        let verifier = m::BASE
-            + m::PER_TRANSFER * hops
-            + m::PER_SPLIT_LEVEL * levels
-            + m::PER_EXCESS_BYTE * excess
-            + m::PER_EXTRA_SIGNATURE * extra_sigs;
-        let history_calldata = if s.proofs == 0 {
-            0
-        } else {
-            CALLDATA_NONZERO * (32 + s.proofs * gap_proof_len(s.k) as u64)
-        };
-        Some(
-            verifier
-                + m::VAULT_WORST_CALL
-                + m::PER_SEGMENT * s.proofs
-                + history_calldata
-                + measured::GAS_RESERVE,
-        )
+        redeem_gas_terms(s).map(|t| t.limit)
     }
 
     fn deposit_gas_limit(&self) -> u64 {
         2 * measured::DEPOSIT_FIRST + 50_000
-    }
-}
-
-/// The EVM UC inside a root token's J: Some(None) for a token whose reason is not J (not a root), None when J does not decode.
-fn evm_uc_of(t: &Token) -> Option<Option<alloc::vec::Vec<u8>>> {
-    match t.mint.justification.as_deref() {
-        Some(j) if head_tag(j) == Some(tag::RECEIPT_BACKING) => {
-            decode_receipt_backing(j).ok().map(|b| Some(b.proof.uc))
-        }
-        _ => Some(None),
     }
 }
 
