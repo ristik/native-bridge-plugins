@@ -219,10 +219,12 @@ pinned limits:
 - every probe was executed as it was judged. The admitted ones at 279 and 282 transfers were burned and paid at 52,172,044 and 52,947,159
   gas used. The refused ones at 284, 285 and 289 were refused again, and the ledger showed each still unspent.
 
-After the review of #82 (the forwarding, memory, shard-bit and cold-access fixes), the stage ran again on a fresh generation, with
-this release in its image. The preflight admitted 294 transfers and refused 295. The admitted one was burned and paid at 53,041,966 gas
-used. The refused ones at 295 and 297 were refused again and shown unspent. That tree was younger: fewer RSMT siblings a proof than the
-first run's, which came after several thousand measurement transfers.
+After the reviews of #82 (the forwarding, memory, shard-bit, cold-access, receipt-walk, build and vault fixes), the stage ran twice
+more on fresh generations, with this release's source. The first rerun admitted 294 and refused 295. The last one, on the final model,
+admitted 286 and refused 288; all five probes executed as judged. The ones admitted at 281, 284 and 286 transfers were burned and paid,
+using 51,267,707 to 52,943,887 gas. The ones refused at 288 and 293 were refused again and shown unspent. Fresh tokens of one length vary
+by about a transfer's step between builds, and the trees differed: the first run's had grown through several thousand measurement
+transfers.
 
 The old model admitted about 205.
 
