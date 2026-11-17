@@ -39,7 +39,7 @@ every run.
 
 ### What you need
 
-- **The deployment's public files**, from its operator:
+- **The deployment's public files**, from its operator (a bft-core testnet package publishes them from `GENERATION/bridge/nb2/public/`):
   - `nb2-release.json`, the release manifest. It holds the pins the wallet checks the deployment against (Γ, the vault's runtime code hash, the
     limits, the deployment block), the operating envelope, and the plug-in commit it was released with (`bridge.sources`).
   - `trust-base.bundle.cbor` and `trust-base.genesis.entryid`: the network's trust-base history and its pin.
@@ -59,12 +59,68 @@ Every command is `npx tsx wallet/nb2-wallet.ts [--wallet DIR] COMMAND ...`, writ
 
 ### A deposit and a split return
 
-The transcript below is the `walkthrough` stage of the bft-core testnet lane (`deploy/testnet/bridge/nb2/rehearse_nb2.py`), from a run on a
-four-validator package generation on the dev server, 2026-11-17 (the K = 4 test vault, see [Limits](#limits)). The lane runs the wallet inside
-the package's own network, so the gateway is `http://rpc:8545`, and takes the key from its environment (`--key-env`). Without `--key-env`,
-`init` makes a new secret in the wallet directory. On a public deployment, pass its public gateway URL.
+The transcript below is the `walkthrough` stage of the bft-core testnet lane (`deploy/testnet/bridge/nb2/rehearse_nb2.py`). It comes from
+a full lane run on a throwaway four-validator package generation on the dev server, 2026-11-17, where every stage passed. The vault is the
+K = 4 test build (see [Limits](#limits)), and the walkthrough ran after the lane's other stages, so the vault had already sealed seven
+segments and taken 32 deposits.
 
-TRANSCRIPT
+The lane runs the wallet inside the package's own network, so the gateway is `http://rpc:8545`, and it passes the key through the
+environment (`--key-env`). Without `--key-env`, `init` makes a new secret in the wallet directory. On a public deployment, pass the
+deployment's public gateway URL. The lane runs this stage on every run and keeps the transcript (`nb2/walkthrough.txt` in its evidence), so a
+change that breaks this flow fails the lane.
+
+```console
+$ nb2-wallet init --release /work/nb2/public/nb2-release.json --rpc http://rpc:8545 --key-env NB2_KEY_WALK
+wallet /work/nb2/walkthrough/nb2-wallet for the test vault 0x9c48c45dae0e0f7706964ef9c87813e04d5d2a27 on chain 31337
+installation check passed: chain ID, config() = the pinned Γ, the vault's runtime code hash
+fund this EVM address with UCT for deposits and gas: 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa
+
+$ nb2-wallet address
+EVM address 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa: 5 UCT
+Unicity owner key 0x029301998d3375a6398c3fdfbc01e58a2b6d46a54cea73c5d8acdfaec04ab37f38
+
+$ nb2-wallet deposit coin 0.1
+planned deposit intent 0 of 0.1 UCT as coin; the intent high-water mark is backed up
+deposit 33 in block 885 (tx 0x7646eafa34bb598933a58a9c1cb8ac7d402d3bb4e2f9a6cfd272239b5453772a)
+next: mint coin
+
+$ nb2-wallet mint coin
+minted coin: 0.1 UCT from deposit 33, token 0x3023103f7d33ab62.., J 2150 bytes
+
+$ nb2-wallet split coin keep=0.06 back=0.04
+split coin into keep (0.06 UCT) + back (0.04 UCT)
+
+$ nb2-wallet status
+vault 0x9c48c45dae0e0f7706964ef9c87813e04d5d2a27: segment 7, 33 deposits, 111000000000000000 wei outstanding
+coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 885)
+
+$ nb2-wallet plan-return back
+the preflight passes: back (0.04 UCT) to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa at index a = 7, vault at segment 7
+  gas limit 7639599 of userGasLimit 60000000; room for 3748 historical proofs, 3684 beyond the reserve
+nothing is burned. Run burn back to return it: the preflight runs again on fresh state first
+
+$ nb2-wallet burn back
+the preflight passes again: gas limit 7639599, index a = 7
+burned back for 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa: 0.04 UCT, redemption ID 0xa5200bc365429d29.., 8594 evidence bytes
+next: redeem back
+
+$ nb2-wallet redeem back
+the verifier answers QuorumNotMet: the seal registry has not imported the burn's root round yet (#1125); waiting
+paid 0.04 UCT to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa in block 902 (tx 0x9a9b5bd08e2458a0866e8c42741ba337232efefbde248a6b92cad317b3e4bd5c)
+
+$ nb2-wallet redeem back
+paid 0.04 UCT to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa in block 902 (tx 0x9a9b5bd08e2458a0866e8c42741ba337232efefbde248a6b92cad317b3e4bd5c)
+
+$ nb2-wallet status
+vault 0x9c48c45dae0e0f7706964ef9c87813e04d5d2a27: segment 7, 33 deposits, 71000000000000000 wei outstanding
+coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 885)
+back: return 0x8c320ff3d366ae2b of 40000000000000000 to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa (a = 7): paid
+
+$ nb2-wallet tokens
+back: 0.04 UCT (paid)
+coin: 0.1 UCT (split into keep, back)
+keep: 0.06 UCT
+```
 
 What each step did:
 
@@ -75,15 +131,18 @@ What each step did:
 3. **`mint coin`** waited for the deposit block's certificate (it is served once the next block exists), built the receipt proof `J`, checked
    it offline, and minted an ordinary Unicity token with `J` as its reason.
 4. **`split`** made two whole parts, 0.06 and 0.04. This is the ordinary token split; the vault is not involved.
-5. **`plan-return back`** ran the capacity preflight and burned nothing. It verified the part's whole provenance, chose the burn index from
-   the newest verified `SegmentSealed` receipt (`a = 0` here: no segment sealed yet), and checked that the complete future redemption fits
-   the transaction-size limit and `userGasLimit` with 64 segments of reserve, and that the paying address can fund the worst-case gas.
+5. **`plan-return back`** ran the capacity preflight and burned nothing.
+   - It verified the part's whole provenance.
+   - It chose the burn index from the newest verified `SegmentSealed` receipt: segment 6 was the newest sealed, so `a = 7`.
+   - It checked that the complete future redemption fits the transaction-size limit and `userGasLimit` with 64 segments of reserve. The
+     part has room for 3,748 historical proofs; the gas limit printed is the preflight's conservative bound, not the spend.
+   - It checked that the paying address can fund the worst-case gas.
 6. **`burn back`** ran the preflight again on fresh chain state, then certified the burn. The burn signs the recipient, the amount and the
    index, and its redemption ID `eta` is fixed from here on.
 7. **`redeem back`** read one `SegmentSealed` log per segment since the index, built the gap proofs, sent the redeem transaction and waited
-   for its block's certificate. Here the deployed verifier first answered `QuorumNotMet`: the EVM chain's seal registry had not imported the
-   burn's root round yet (bft-core#1125). The wallet waited and built it again, and the vault paid. The second `redeem` found the payment and
-   sent nothing.
+   for its block's certificate. No segment had sealed since `a`, so no gap proof was needed. The deployed verifier first answered
+   `QuorumNotMet`: the EVM chain's seal registry had not imported the burn's root round yet (bft-core#1125). The wallet waited and built it
+   again, and the vault paid. The second `redeem` found the payment and sent nothing.
 8. **`status`** says where every deposit and return stands, and which command moves it on (`next: ...`). After a crash or a timeout, run that
    command again: every step resumes from the journal and never repeats an irreversible action.
 
@@ -237,14 +296,15 @@ from a simulation or a reverted transaction; `classifyRedeemError` maps them to 
 
 Gas prices are the deployment's; on the package's test network a gas unit cost 10^6 wei. The figures are gas units.
 
-**Measured live** (NB2-09 lane run, bft-core CI run 44037100193, and the walkthrough above; the K = 4 test vault):
+**Measured live** on the K = 4 test vault. The returns are from the NB2-09 lane run (bft-core CI run 44037100193); the dev-server run above
+measured the same within 2%. The deposit and the walkthrough's `back` are from the transcript above.
 
 | Operation | Gas used |
 |---|---:|
 | Deposit (the walkthrough's `deposit`) | 31,751 |
 | Return of an origin-only token (no transfer) | 882,230 |
 | Return after one transfer | 1,056,450 |
-| Return of a part one split level down (the walkthrough's `back`) | 1,385,445 |
+| Return of a part one split level down (the walkthrough's `back`) | 1,389,672 |
 | Return after one transfer and one split (`p60`) | 1,582,088 |
 | Return of a part three split levels down | 2,411,141 |
 | Return after 13 transfers, one certificate each | 3,554,807 |
@@ -255,7 +315,7 @@ Gas prices are the deployment's; on the package's test network a gas unit cost 1
 users' payments can make any return the sealing one (the K-th payment of a segment seals it, up to about 230,000 gas more) or the worst scan
 of the recent buffers (up to about 283,000 more). The reserve is limit, not spend: only the return that seals pays the sealing gas. The preflight before the burn uses
 a larger, conservative bound: the burn is counted at the decoder's bounds (about 4.5M gas) and 64 segments of future history are added. The
-walkthrough's 0.04 part was planned at 7,533,927 gas, sent with a limit of 1,897,608, and used 1,385,445. The paying address must be able to
+walkthrough's 0.04 part was planned at 7,639,599 gas, sent with a limit of 1,901,868, and used 1,389,672 (8,804 bytes of calldata). The paying address must be able to
 fund the preflight's limit at twice the base fee plus the tip, or the preflight refuses with `InsufficientFunds` and nothing is burned.
 
 **How cost grows with the token's history.** The token verifier's gas grows with every transfer and split level in the part's lineage. The
@@ -284,8 +344,9 @@ deployment:
 
 Gas binds long before bytes: the largest return that fits `userGasLimit` carries about 300 KB of evidence. The manifest's `envelope` gives the
 model's estimate (about 280 transfers for an unsplit token, about 4 fewer per split level) and, for a reference part, how long a burn may
-wait before its history no longer fits. In the NB2-09 run the preflight admitted 204 batch-certified transfers and refused 206, and both
-verdicts were confirmed against the chain: the admitted token was burned and paid within `userGasLimit`, and each refused token's state was
+wait before its history no longer fits. On live tokens the bound is lower than the model's estimate, because real tokens carry larger
+inclusion proofs and more signatures than the measured shape. In the NB2-09 run the preflight admitted 204 batch-certified transfers and
+refused 206 (204 and 205 in the dev-server run above), and both verdicts were confirmed against the chain: the admitted token was burned and paid within `userGasLimit`, and each refused token's state was
 shown unspent by a verified non-inclusion proof from the aggregator after the refusal.
 
 **The boundary drifts, so plan right before you burn.** A return's gas depends on the token's own history and on the aggregator's tree,
