@@ -427,7 +427,7 @@ Gas binds just before bytes: the largest unsplit return that passes the prefligh
 about 310 transfers. The manifest's `envelope` gives the bound's estimate: about 290 transfers in 16 certificates for an unsplit token, and
 about 250 at one or two split levels when the whole history lies above the splits. For a reference part it also says how long a burn may
 wait before its history no longer fits. A token consolidated before its plan passes at 300 transfers (59.2M gas at the preflight). In the
-dev-server boundary run (bft-core#1179) the preflight admitted BOUNDARY_ADMITTED transfers in 16 certificates and refused BOUNDARY_REFUSED,
+dev-server boundary run (bft-core#1179) the preflight admitted 282 transfers in 16 certificate groups (36 certificates) and refused 284,
 and every verdict was confirmed against the chain: each admitted token was burned and paid within `userGasLimit`, and each refused token's state was
 shown unspent by a verified non-inclusion proof from the aggregator after the refusal.
 

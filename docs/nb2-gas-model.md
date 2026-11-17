@@ -172,6 +172,15 @@ Over all 87 measurements (21 burns at P = 0 to 17, `validate.jsonl`):
 - the preflight is 1.086 to 4.7 times the real gas;
 - no measurement lies above its bound.
 
+**The live boundary** (the lane's `boundary` stage on this generation, bft-core#1179). It used fresh tokens in 16 certificate groups at the
+pinned limits:
+
+- the preflight admitted 282 transfers and refused 284;
+- every probe was executed as it was judged. The admitted ones at 279 and 282 transfers were burned and paid at 52,172,044 and 52,947,159
+  gas used. The refused ones at 284, 285 and 289 were refused again, and the ledger showed each still unspent.
+
+The old model admitted about 205.
+
 ## Margin
 
 The margin has three parts:
