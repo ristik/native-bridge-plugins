@@ -1,7 +1,8 @@
 //! Size and gas bounds of a redemption (sections 12.4 and 12.5; `gas.ts`). The preflight needs a CONSERVATIVE bound of the
 //! complete redeem transaction before the burn exists: its encoded size and its gas limit (expected cost plus `gasReserve`).
-//! The verifier part is a named, replaceable component: [`GasModel`]. The default [`ProvisionalGasModel`] over-estimates by
-//! construction and fails closed (returns None, which the preflight reports as `CapacityPreflight`) for anything it cannot bound.
+//! The gas part is a named, replaceable component: [`GasModel`]. The default [`MeasuredGasModel`] (bound-nb2-1179,
+//! `docs/nb2-gas-model.md`) bounds the redeem term by term from the deployed verifier's cost structure, with the TypeScript
+//! plug-in's results exactly (`tests/nb2-gas`), and fails closed (None, which the preflight reports as `CapacityPreflight`).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;

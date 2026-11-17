@@ -1,10 +1,9 @@
 /**
  * Size and gas bounds of a redemption (sections 12.4 and 12.5). The preflight needs a CONSERVATIVE bound of the complete redeem
- * transaction before the burn exists: its encoded size and its gas limit (expected cost plus `gasReserve`). Replay and settlement are
- * measured (#1098, unicity-pos-contracts#80); the token verifier is not measured yet (NB2-05, #1101). The verifier part is therefore a
- * named, replaceable component: {@link GasModel}. The default {@link ProvisionalGasModel} over-estimates by construction and fails
- * closed (returns null, which the preflight reports as `CapacityPreflight`) for anything it cannot bound. NB2-05's measured schedule
- * replaces it without an API change.
+ * transaction before the burn exists: its encoded size and its gas limit (expected cost plus `gasReserve`). The gas part is a named,
+ * replaceable component: {@link GasModel}. The default {@link MeasuredGasModel} (bound-nb2-1179, docs/nb2-gas-model.md) bounds the redeem
+ * term by term from the deployed verifier's cost structure and fails closed (null, which the preflight reports as `CapacityPreflight`) for
+ * anything it cannot bound. {@link ProvisionalGasModel} is NB2-07's earlier over-estimate, kept for comparison.
  */
 
 import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
@@ -101,7 +100,7 @@ export class ProvisionalGasModel implements GasModel {
 }
 
 /**
- * The redeem gas bound (bft-core#1179, docs/nb2-gas-model.md): an upper bound of the vault redeem's gas limit, term by term from the deployed
+ * The redeem gas bound (bft-core#1179, docs/nb2-gas-model.md, where the calibration and the soundness argument are): an upper bound of the vault redeem's gas limit, term by term from the deployed
  * verifier's cost structure (unicity-pos-contracts `NativeBridgeVerifierV2`, its receipt helper `Nb2ReceiptVerifier`, the vault), not a fit to
  * the token's length:
  *

@@ -224,7 +224,7 @@ const bridge = await NativeBridgeV2.open({
   bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
   backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
   refreshTrust: async () => { /* append newer trust-base entries (wallet/trust.ts refreshAll) */ },
-  // gas: optional; the default is the measured MeasuredGasModel, replaceable by any GasModel
+  // gas: optional; the default is MeasuredGasModel (the redeem gas bound, docs/nb2-gas-model.md), replaceable by any GasModel
 });
 ```
 
@@ -381,20 +381,25 @@ measured the same within 2%. The deposit and the walkthrough's `back` are from t
 | Return after 13 transfers, one certificate each | 3,554,807 |
 | Return after 40 transfers in 4 certificates | 7,179,054 |
 | Return after 204 transfers (the largest the preflight admitted in that run) | 36,951,383 |
+| Return after 300 transfers in 41 certificates (bft-core#1179's dev-server run; burned past the preflight, for the measurement) | 55,673,867 |
+| The same, 300 transfers consolidated to 2 certificates | 52,801,263 |
+| Return after 261 transfers to 261 distinct owner keys (burned past the preflight) | 58,506,740 |
 
 **What the user has to hold.** The redeem transaction's gas limit is the estimate plus `gasReserve` = 500,000 (spec section 12.4): other
 users' payments can make any return the sealing one (the K-th payment of a segment seals it, up to about 230,000 gas more) or the worst scan
 of the recent buffers (up to about 283,000 more). The reserve is limit, not spend: only the return that seals pays the sealing gas. The preflight before the burn uses
-a larger, conservative bound: the burn is counted at the decoder's bounds (about 4.5M gas) and 64 segments of future history are added. The
-walkthrough's 0.04 part was planned at 7,643,951 gas, sent with a limit of 1,906,818, and used 1,394,583 (8,804 bytes of calldata). The paying address must be able to
+a larger, conservative bound: the burn is counted at the decoder's bounds (about 3.0M gas) and 64 segments of future history are added. The
+walkthrough's 0.04 part was planned at 7,643,951 gas (that transcript was recorded under the earlier model, measured-nb2-05), sent with a limit of 1,906,818, and used 1,394,583 (8,804 bytes of calldata). The paying address must be able to
 fund the preflight's limit at twice the base fee plus the tip, or the preflight refuses with `InsufficientFunds` and nothing is burned.
 
-**How cost grows with the token's history.** The token verifier's gas grows with every transfer and split level in the part's lineage. The
-plug-in's measured model (`MeasuredGasModel`, from unicity-pos-contracts#82 `docs/nb2-verifier.md`) rounds each term up: 800,000 base,
-190,000 per transfer, 760,000 per split level, plus bytes and signatures beyond the measured shape. A transfer certified alone costs more
-than one certified in a batch with others, because each distinct certificate is verified. On the 204-transfer probes, the preflight's
-bound grew by about 240,000 gas per transfer (the boundary fit), while the gas actually spent was about 177,000 per transfer. That was
-(36,951,383 − 882,230) / 204, against an origin-only return. The difference is the preflight's margin.
+**How cost grows with the token's history.** The token verifier's gas grows with every transfer and split level in the part's lineage.
+The plug-in's bound (`MeasuredGasModel`, [`nb2-gas-model.md`](nb2-gas-model.md)) prices each thing the verifier does from the token
+itself: every inclusion proof, its UC and path, every distinct certificate, the CBOR items, the keys, split edges, and the verifier's
+memory. That memory grows quadratically with the token's length, so each transfer costs a little more than the last: about 180,000 gas a
+transfer at 100 transfers, about 210,000 at 300. A transfer certified alone costs more than one certified in a batch with others, because
+each distinct certificate is verified once. A token consolidated with the SDK (one or two certificates for its whole history) is credited
+for that. At redemption the bound is about 2% above the gas the chain spends on a 300-transfer return (55.7M gas paid live, 57.5M
+bounded). Before the burn, the burn itself is counted at its bounds.
 
 **How cost grows with waiting.** A burn's redemption proves that `eta` was not paid in any segment sealed since its index: one gap proof
 per segment, `65 + 32 log2 K` bytes, about 5,950 gas each at K = 64 (257 bytes; 129 bytes at the test vault's K = 4). A segment seals every K
@@ -418,11 +423,12 @@ deployment:
 | `gasReserve`, added to every redeem's gas limit | 500,000 |
 | `returnReserveSegments`, the future history the preflight provisions for | 64 segments (256 payments on the package's K = 4 test vault; 4,096 at the production K = 64) |
 
-Gas binds long before bytes: the largest return that fits `userGasLimit` carries about 300 KB of evidence. The manifest's `envelope` gives the
-model's estimate (about 280 transfers for an unsplit token, about 4 fewer per split level) and, for a reference part, how long a burn may
-wait before its history no longer fits. On live tokens the bound is lower than the model's estimate, because real tokens carry larger
-inclusion proofs and more signatures than the measured shape. In the NB2-09 run the preflight admitted 204 batch-certified transfers and
-refused 206 (204 and 205 in the dev-server run above), and both verdicts were confirmed against the chain: the admitted token was burned and paid within `userGasLimit`, and each refused token's state was
+Gas binds just before bytes: the largest unsplit return that passes the preflight carries about 465 KB of evidence, and L_max binds at
+about 310 transfers. The manifest's `envelope` gives the bound's estimate: about 290 transfers in 16 certificates for an unsplit token, and
+about 250 at one or two split levels when the whole history lies above the splits. For a reference part it also says how long a burn may
+wait before its history no longer fits. A token consolidated before its plan passes at 300 transfers (59.2M gas at the preflight). In the
+dev-server boundary run (bft-core#1179) the preflight admitted BOUNDARY_ADMITTED transfers in 16 certificates and refused BOUNDARY_REFUSED,
+and every verdict was confirmed against the chain: each admitted token was burned and paid within `userGasLimit`, and each refused token's state was
 shown unspent by a verified non-inclusion proof from the aggregator after the refusal.
 
 **The boundary drifts, so plan right before you burn.** A return's gas depends on the token's own history and on the aggregator's tree,
@@ -437,8 +443,7 @@ by about 2 transfers within that session. So:
 The lane asserts this on every boundary probe against the chain.
 
 **A history over the limit can't be returned in this release.** Splitting does not help: a part carries its parent's whole history, and
-each split level adds gas. The preflight's model charges a split level as about four transfers; the measured spend is about three
-(about 510,000 to 525,000 gas a level, against about 177,000 a transfer). Keep tokens meant for return well inside the envelope, and return them before
+each split level adds gas: about 57,000 for the edge itself, and about 15,000 more for every transfer above the split. Keep tokens meant for return well inside the envelope, and return them before
 their history gets near it. A claim that outgrows the limits after its burn (`CapacityExceeded`) has no recovery yet; continuation is
 deferred to bft-core#1108. The preflight exists to stop such a burn before it happens.
 
