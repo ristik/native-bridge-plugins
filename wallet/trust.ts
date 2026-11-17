@@ -1,7 +1,7 @@
 /**
- * The tester wallet's held trust (bridge-tester.ts): the operator's shipped bundle under its pin, or the wallet's own durable history when it has one,
+ * The reference wallet's held trust (nb2-wallet.ts): the operator's shipped bundle under its pin, or the wallet's own durable history when it has one,
  * and the one way that history is written. One process per wallet: the write is a temporary file renamed over the old one, which suits the serial
- * tester; it is not the public SDK session's concurrent-writer behaviour, nor evidence of power-loss durability.
+ * wallet; it is not the public SDK session's concurrent-writer behaviour, nor evidence of power-loss durability.
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 

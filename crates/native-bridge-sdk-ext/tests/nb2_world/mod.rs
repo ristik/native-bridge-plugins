@@ -343,6 +343,8 @@ pub struct Faults {
     pub hide_all_seals: bool,
     /// Recipient behaviour by address.
     pub recipients: HashMap<[u8; 20], RecipientBehaviour>,
+    /// Deposited events carry this domain instead of the vault's (a provider or vault of another deployment).
+    pub deposit_domain: Option<[u8; 32]>,
 }
 
 pub struct ChainState {
@@ -653,7 +655,12 @@ impl FakeChain {
                         } => logs.push(Log {
                             address: VAULT.to_vec(),
                             topics: vec![topic::deposited().to_vec(), u256_64(n).to_vec()],
-                            data: deposited_data(&self.domain(), &amount, &rho, &first_owner),
+                            data: deposited_data(
+                                &st.faults.deposit_domain.unwrap_or(self.domain()),
+                                &amount,
+                                &rho,
+                                &first_owner,
+                            ),
                         }),
                         VaultEvent::Paid {
                             eta,

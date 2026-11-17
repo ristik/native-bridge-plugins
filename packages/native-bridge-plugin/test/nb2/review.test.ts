@@ -270,3 +270,19 @@ test('options: the measured gas model is the default; k_w is not in the options;
   assert.ok(plan.warnings.some((x) => x.includes('blocks old')));
   void LocalKeySigner;
 });
+
+test('a Deposited event with another deployment\'s domain D is not this deposit (the record stays submitted)', async () => {
+  const { chain, payer, owner, w } = await deposited();
+  const real = chain.call.bind(chain);
+  chain.call = async <T>(m: string, p: any[]): Promise<T> => {
+    const r = await real<T>(m, p);
+    if (m !== 'eth_getTransactionReceipt' || r === null) return r;
+    const rc = r as unknown as { logs: { topics: string[]; data: string }[] };
+    // the same rho and amount, under another D (a vault of another configuration at the same address)
+    for (const l of rc.logs) if (l.topics[0].toLowerCase() === h(TOPIC.Deposited)) l.data = `0x${'5a'.repeat(32)}${l.data.slice(66)}`;
+    return r;
+  };
+  const plan = await w.planDeposit(7n, owner.publicKey);
+  assert.equal(await reason(w.submitDeposit(plan, payer)), 'ProviderFault');
+  assert.equal((await w.journal.deposit(plan.intent))!.status, 'submitted');
+});

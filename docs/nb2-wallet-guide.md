@@ -1,242 +1,495 @@
-# Native bridge v2: wallet integration guide (draft)
+# Native bridge v2: wallet integration guide
 
-**Draft for NB2-11 (bft-core#1107).** This draft covers the TypeScript plug-in's API (NB2-07, bft-core#1103). The reference
-command-line wallet, the command transcript and the live numbers come **after NB2-09** (bft-core#1105), and are marked that way
-below. The normative rules are in bft-core `docs/design/native-bridge-v2.md` (the spec) and `protocol/interop.md`.
+This guide is for a wallet developer. It shows how to move native UCT between the EVM chain and Unicity with the TypeScript plug-in
+(`packages/native-bridge-plugin`, entry point `./nb2`). You don't handle segments, gap proofs or receipt tries yourself: the plug-in builds and
+checks them. The guide walks through the reference command-line wallet in [`wallet/`](../wallet), which runs every step, and you can follow it
+on a test deployment.
 
-This guide is for a wallet developer. You can bridge native UCT between the EVM chain and Unicity without handling segments, gap
-proofs or receipt tries yourself.
+The rules behind each step are in bft-core
+[`docs/design/native-bridge-v2.md`](https://github.com/ristik/bft-core/blob/integration/enshrined-evm/docs/design/native-bridge-v2.md) (the
+spec; section numbers below refer to it), [`protocol/interop.md`](../protocol/interop.md) (the bytes) and [`nb2-journal.md`](nb2-journal.md)
+(the journal format).
+
+> **Fake value only.** Every deployment of this release is a test deployment. Mint admission is still open (bft-core#1039, see
+> [Limits](#limits)), and an oversized claim has no recovery path yet. Don't move real value through it.
+
+- [What a user can do](#what-a-user-can-do)
+- [Try it: the reference wallet](#try-it-the-reference-wallet)
+- [The two flows](#the-two-flows)
+- [Using the plug-in](#using-the-plug-in)
+- [What to persist, and when](#what-to-persist-and-when)
+- [What can go wrong](#what-can-go-wrong)
+- [What it costs](#what-it-costs)
+- [Limits](#limits)
+- [RPC requirements](#rpc-requirements)
 
 ## What a user can do
 
-- **Deposit.** Lock UCT in the vault contract on the EVM chain. The user receives the same amount as an ordinary Unicity token.
+- **Deposit.** Lock UCT in the vault contract on the EVM chain. The user gets the same amount as an ordinary Unicity token.
 - **Spend it on Unicity.** Transfer and split the token like any other token. Nothing touches the EVM.
-- **Return.** Burn a whole token part. The vault pays that part's amount to an EVM address the burn names.
+- **Return.** Burn a whole token part. The vault pays that part's amount to the EVM address the burn names.
 
 A part is returned whole. To return 40 of a 100 token, split it into 40 and 60 first, then return the 40.
 
-## Setup
+## Try it: the reference wallet
 
-```ts
-import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySigner, localOwner } from '@unicitylabs/native-bridge-plugin/nb2';
+The reference wallet is a small command-line program on the plug-in, with one command per bridge step. Its core
+([`wallet/core.ts`](../wallet/core.ts)) is also what the bft-core testnet lane drives, so the commands below are the ones the lane tests on
+every run.
 
-const bridge = await NativeBridgeV2.open({
-  pins,                                  // the deployment manifest: Γ, limits, code hash, deployment block (written by NB2-09)
-  trust,                                 // the network's trust-base history (TrustInput.fromBundle)
-  rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway, nothing bridge-specific
-  aggregator: new SdkAggregator(aggregatorUrl),
-  journal: store,                        // your key-value store; its putIf MUST be atomic and durable (docs/nb2-journal.md)
-  bridgeKey: deriveBridgeKey(seed),      // k_w
-  backup: async (intents) => { /* back up the intent high-water mark with the seed */ },
-  refreshTrust: async () => { /* append newer trust-base entries */ },
-  // gas: optional; the default is the measured MeasuredGasModel (NB2-05), replaceable by any GasModel
-});
+### What you need
+
+- **The deployment's public files**, from its operator (a bft-core testnet package publishes them from `GENERATION/bridge/nb2/public/`):
+  - `nb2-release.json`, the release manifest. It holds the pins the wallet checks the deployment against (Γ, the vault's runtime code hash, the
+    limits, the deployment block), the operating envelope, and the plug-in commit it was released with (`bridge.sources`).
+  - `trust-base.bundle.cbor` and `trust-base.genesis.entryid`: the network's trust-base history and its pin.
+- **The deployment's public gateway URL.** It is the ordinary JSON-RPC endpoint; the aggregator is its `/aggregator` route.
+- **A checkout of this repository** at the commit the manifest names, with Node 22:
+
+  ```sh
+  git clone https://github.com/ristik/native-bridge-plugins && cd native-bridge-plugins
+  git checkout <bridge.sources["native-bridge-plugins"] of nb2-release.json>
+  npm ci
+  ```
+
+- **Some UCT on the EVM chain** for the deposit itself and for gas (the faucet of a test deployment).
+
+Every command is `npx tsx wallet/nb2-wallet.ts [--wallet DIR] COMMAND ...`, written `nb2-wallet` below. The wallet directory defaults to
+`./nb2-wallet`. It holds an **unencrypted** secret: this is a test wallet.
+
+### A deposit and a split return
+
+The transcript below is the `walkthrough` stage of the bft-core testnet lane (`deploy/testnet/bridge/nb2/rehearse_nb2.py`). It comes from
+a full lane run on a throwaway four-validator package generation on the dev server, 2026-11-17, where every stage passed. The vault is the
+K = 4 test build (see [Limits](#limits)), and the walkthrough ran after the lane's other stages, so the vault had already sealed seven
+segments and taken 32 deposits.
+
+The lane runs the wallet inside the package's own network, so the gateway is `http://rpc:8545`, and it passes the key through the
+environment (`--key-env`). Without `--key-env`, `init` makes a new secret in the wallet directory. On a public deployment, pass the
+deployment's public gateway URL. The lane runs this stage on every run and keeps the transcript (`nb2/walkthrough.txt` in its evidence), so a
+change that breaks this flow fails the lane.
+
+```console
+$ nb2-wallet init --release /work/nb2/public/nb2-release.json --rpc http://rpc:8545 --key-env NB2_KEY_WALK
+wallet /work/nb2/walkthrough/nb2-wallet for the test vault 0x13a1eef867cdffa571dedd236320aaac4abe6d53 on chain 31337
+installation check passed: chain ID, config() = the pinned Γ, the vault's runtime code hash
+fund this EVM address with UCT for deposits and gas: 0x12a2094927c3be88f8858dead12f0bd6742156bb
+
+$ nb2-wallet address
+EVM address 0x12a2094927c3be88f8858dead12f0bd6742156bb: 5 UCT
+Unicity owner key 0x035ecdec73f548463023c6fb2bef483b0da5963a3966ccb5da0c0f551ef4553000
+
+$ nb2-wallet deposit coin 0.1
+planned deposit intent 0 of 0.1 UCT as coin; the intent high-water mark is backed up
+deposit 33 in block 906 (tx 0xb669381c743b33d1b0469ebc4be0293b6e488fa041f91f3ee8ed0082008b05b7)
+next: mint coin
+
+$ nb2-wallet mint coin
+the deposit proof: CompanionUnknown, retrying
+minted coin: 0.1 UCT from deposit 33, token 0x0d63035708ec9872.., J 2150 bytes
+
+$ nb2-wallet split coin keep=0.06 back=0.04
+split coin into keep (0.06 UCT) + back (0.04 UCT)
+
+$ nb2-wallet status
+vault 0x13a1eef867cdffa571dedd236320aaac4abe6d53: segment 7, 33 deposits, 0.111 UCT outstanding
+coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 906)
+
+$ nb2-wallet plan-return back
+the preflight passes: back (0.04 UCT) to 0x12a2094927c3be88f8858dead12f0bd6742156bb at index a = 7, vault at segment 7
+  gas limit 7643951 of userGasLimit 60000000; room for 3748 historical proofs, 3684 beyond the reserve
+nothing is burned. Run burn back to return it: the preflight runs again on fresh state first
+
+$ nb2-wallet burn back
+the preflight passes again: gas limit 7643951, index a = 7
+burned back for 0x12a2094927c3be88f8858dead12f0bd6742156bb: 0.04 UCT, redemption ID 0x6babec4a295de75b.., 8594 evidence bytes
+next: redeem back
+
+$ nb2-wallet redeem back
+the verifier answers QuorumNotMet: the seal registry has not imported the burn's root round yet (#1125); waiting
+paid 0.04 UCT to 0x12a2094927c3be88f8858dead12f0bd6742156bb in block 924 (tx 0x87d5006988a76a404fb0561f679596851a15153336e0eccf440cd7e41f248350); 1 redeem transaction sent
+
+$ nb2-wallet redeem back
+paid 0.04 UCT to 0x12a2094927c3be88f8858dead12f0bd6742156bb in block 924 (tx 0x87d5006988a76a404fb0561f679596851a15153336e0eccf440cd7e41f248350); 1 redeem transaction sent
+
+$ nb2-wallet status
+vault 0x13a1eef867cdffa571dedd236320aaac4abe6d53: segment 7, 33 deposits, 0.071 UCT outstanding
+coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 906)
+back: return 0x161ec535f33bfdfe of 40000000000000000 to 0x12a2094927c3be88f8858dead12f0bd6742156bb (a = 7): paid
+
+$ nb2-wallet tokens
+keep: 0.06 UCT
 ```
 
-`open` runs the installation check: the chain ID, the vault's `config()` against the pinned Γ, and the vault's runtime code hash.
+What each step did:
+
+1. **`init`** read the manifest and ran the installation check: the RPC serves the manifest's chain, the vault's `config()` is exactly the
+   pinned Γ, and the vault's runtime code hash is the pinned one. It printed the EVM address to fund.
+2. **`deposit coin 0.1`** derived the deposit secret from the wallet key and a fresh intent number, journaled it, handed the intent
+   high-water mark to the backup, and only then sent `deposit` to the vault. The vault numbered the deposit (`Deposited` event).
+3. **`mint coin`** waited for the deposit block's certificate. It is served once the next block exists; until then the node answers
+   `CompanionUnknown`, and the wallet retries. It then built the receipt proof `J`, checked it offline, and minted an ordinary Unicity token
+   with `J` as its reason.
+4. **`split`** made two whole parts, 0.06 and 0.04. This is the ordinary token split; the vault is not involved.
+5. **`plan-return back`** ran the capacity preflight and burned nothing.
+   - It verified the part's whole provenance.
+   - It chose the burn index from the newest verified `SegmentSealed` receipt: segment 6 was the newest sealed, so `a = 7`.
+   - It checked that the complete future redemption fits the transaction-size limit and `userGasLimit` with 64 segments of reserve. The
+     part has room for 3,748 historical proofs; the gas limit printed is the preflight's conservative bound, not the spend.
+   - It checked that the paying address can fund the worst-case gas.
+6. **`burn back`** ran the preflight again on fresh chain state, then certified the burn. The burn signs the recipient, the amount and the
+   index, and its redemption ID `eta` is fixed from here on.
+7. **`redeem back`** read one `SegmentSealed` log per segment since the index, built the gap proofs, sent the redeem transaction and waited
+   for its block's certificate. No segment had sealed since `a`, so no gap proof was needed. The deployed verifier first answered
+   `QuorumNotMet`: the EVM chain's seal registry had not imported the burn's root round yet (bft-core#1125). The wallet waited and built it
+   again (nothing is sent while the simulation refuses), and the vault paid. The second `redeem` found the payment: the same
+   transaction, and still one redeem transaction sent.
+8. **`status`** says where every deposit, transfer and return stands, and which command moves it on (`next: ...`). After a crash or a
+   timeout, run that command again: every step resumes from the journal and never repeats an irreversible action.
+9. **`tokens`** lists what the wallet holds: the split parent and the burned part are spent (`tokens --all` lists them too).
+
+The other commands:
+
+- `address` prints the EVM address, its balance and the wallet's Unicity owner key.
+- `transfer NAME NEW [--to-key KEY]` is an ordinary Unicity transfer, to another of the wallet's keys or to another wallet's key. The
+  plug-in does not journal transfers, so the wallet does: it checks the new name, writes the exact request to
+  `tokens/NEW.pending.json`, and only then submits it. Run it again after a crash and it certifies the same request.
+- `plan-return` and `burn` take `--recipient ADDR` to pay an address other than the wallet's own. A mixed-case address must carry its EIP-55
+  checksum. Without `--recipient`, `burn` keeps the recipient `plan-return` chose.
+- `deposit NAME` without an amount resumes a planned deposit. It never sends a second one, and it refuses a different amount.
+
+Every command that moves value runs the installation check again first; only `address`, `tokens` and `status` skip it. A network reset can
+keep the chain ID and the vault address while another vault sits behind them, and a stale manifest would then deposit into the wrong
+deployment. One process at a time uses a wallet directory: its `lock` file names the owner, and a stale lock from a process that no longer
+runs on the same host is taken over.
 
 ## The two flows
 
 ```mermaid
 sequenceDiagram
     autonumber
+    title EVM to Unicity: deposit, proof, mint
     participant W as Wallet (plug-in)
-    participant J as Journal
+    participant J as Journal and backup
     participant V as Vault (EVM)
     participant A as Aggregator
-    W->>J: planDeposit: intent i, rho (secret r is derived, not stored)
-    W->>W: backup(high-water mark)
-    W->>J: signed deposit transaction
-    W->>V: submitDeposit: deposit(firstOwner, rho) + value
+    W->>J: planDeposit: intent i, rho (the secret r is derived from k_w and i, never stored)
+    W->>J: backup(intent high-water mark), before any value is sent
+    W->>J: the signed deposit transaction
+    W->>V: submitDeposit: deposit(firstOwner, rho) with the value
     V-->>W: Deposited(n, D, value, rho, firstOwner)
-    Note over W: wait one block: the next block carries this block's certificate
-    W->>V: collectDepositProof: header, companion, block receipts
+    Note over W,V: one block later the child block carries this block's certificate
+    W->>V: collectDepositProof: header, certificate, block receipts
     W->>W: build the receipt proof, verify it offline
     W->>J: J = (D, n, r, receipt proof)
     W->>A: mint with reason J
     A-->>W: inclusion proof
-    W->>J: the token (verified offline)
+    W->>J: the token, verified offline
 ```
 
 ```mermaid
 sequenceDiagram
     autonumber
+    title Unicity to EVM: plan, burn, redeem
     participant W as Wallet (plug-in)
     participant J as Journal
     participant V as Vault (EVM)
     participant A as Aggregator
-    W->>V: planReturn: the newest SegmentSealed receipt
-    W->>W: verify the token and the receipt offline: a = j + 1; capacity preflight
-    W->>J: the plan
-    W->>J: burn: the exact burn request
+    W->>V: planReturn: the newest SegmentSealed receipt, state()
+    W->>W: verify the part and the receipt offline; a = j + 1; capacity preflight
+    W->>J: the plan (nothing irreversible yet)
+    W->>V: burn: the preflight again, on fresh state
+    W->>J: the exact burn request
     W->>A: certify the burn (R = D, asset, recipient, amount, a)
     A-->>W: inclusion proof
-    W->>J: the certified burn, eta
+    W->>J: the certified burn and eta
     W->>V: buildRedeem: one SegmentSealed log per segment a .. c-1
     W->>W: check every log, build the gap proofs
-    W->>J: signed redeem transaction
+    W->>J: the signed redeem transaction
     W->>V: submitRedeem: redeem(evidence, eta, a, history)
-    V-->>W: Paid(eta, recipient, amount); value to the recipient
+    V-->>W: Paid(eta, recipient, amount), the value to the recipient
 ```
 
-In code:
+## Using the plug-in
 
 ```ts
-const plan = await bridge.planDeposit(100n, ownerKey);           // no network
-await bridge.submitDeposit(plan, evmSigner);                      // EVM
-await bridge.collectDepositProof(plan.intent);                    // EVM RPC; retry CompanionUnknown after a block
-const token = await bridge.mint(plan.intent);                     // aggregator
+import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySigner, localOwner } from '@unicitylabs/native-bridge-plugin/nb2';
+
+const bridge = await NativeBridgeV2.open({
+  pins,                                  // the manifest's pins (nb2-release.json "pins"; wallet/core.ts pinsOf reads them)
+  trust,                                 // the network's trust-base history (TrustInput.fromBundle(bundle, pin))
+  rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway: nothing bridge-specific
+  aggregator: new SdkAggregator(`${gatewayUrl}/aggregator`),
+  journal: store,                        // your key-value store; its putIf MUST be atomic and durable (nb2-journal.md)
+  bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
+  backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
+  refreshTrust: async () => { /* append newer trust-base entries (wallet/trust.ts refreshAll) */ },
+  // gas: optional; the default is the measured MeasuredGasModel, replaceable by any GasModel
+});
+```
+
+`open` runs the installation check (the chain ID, `config()` against the pinned Γ, the runtime code hash) unless its second argument is
+`false`. The two flows in code:
+
+```ts
+const plan = await bridge.planDeposit(100n, ownerKey);            // reads only the block number; journals the intent and calls backup
+await bridge.submitDeposit(plan, evmSigner);                       // EVM; reconciles an earlier send instead of sending twice
+await bridge.collectDepositProof(plan.intent);                     // EVM RPC; CompanionUnknown until the next block exists: retry
+const token = await bridge.mint(plan.intent);                      // aggregator
 
 const parts = await bridge.split(token, owner, [{ ownerKey, amount: 60n }, { ownerKey, amount: 40n }]);
 
 const r = await bridge.planReturn(parts[1], evmRecipient, evmSigner.address);  // refuses before anything is burned
-await bridge.burn(r.returnId, owner);                             // aggregator
-await bridge.submitRedeem(r.returnId, evmSigner);                 // builds the witness, sends, reconciles
+await bridge.burn(r.returnId, owner);                              // repeats the preflight, then certifies the burn
+await bridge.submitRedeem(r.returnId, evmSigner);                  // builds the witness, sends, reconciles
 ```
 
-Every call can be repeated with the same identifier after a crash, and resumes where it stopped.
+`wallet/core.ts` wraps exactly these calls, one function per CLI command, with a file journal and a token store. Every journaled call
+(`submitDeposit`, `collectDepositProof`, `mint`, `split`, `planReturn`, `burn`, `submitRedeem`) can be repeated with the same identifier
+after a crash, and resumes where it stopped. `bridge.status()` describes every journaled deposit and return in words.
+
+`transfer` is the exception: the plug-in certifies it with a fresh random mask and keeps no record. A crash after certification, or a
+failure to save the result, loses the token, and a retry builds a different request that the aggregator refuses for the spent state. So a
+wallet persists the exact request before it certifies it: `transferRequest`, then a durable write, then `certifyChecked` and
+`appendTransfer`. That is what `wallet/core.ts` `transfer` does.
 
 ## What to persist, and when
 
 | What | When | Why |
 |---|---|---|
-| The intent counter, and a **backup** of its high-water mark with the seed | before any deposit is sent | the secret `r` derives from the seed and the intent number; without the mark, a restored wallet cannot find its deposits. A lost secret is a lost deposit: there is no refund. |
+| The intent counter, and a **backup** of its high-water mark with the seed | before any deposit is sent | the deposit secret `r` derives from the seed and the intent number. Without the mark, a restored wallet can't find its deposits, and a lost secret is a lost deposit: there is no refund. `submitDeposit` refuses (`JournalNotPersisted`) until the backup has been taken. |
 | Each deposit's record, then every signed deposit transaction | before broadcast | a retry reconciles the earlier send instead of depositing twice |
-| `J` (the deposit evidence) | as soon as the block is certified | later minting never depends on a provider |
+| `J`, the deposit evidence | as soon as the block is certified | minting later never depends on a provider |
 | The token | after the offline check | it is the asset |
+| A transfer's exact request (the wallet's own record) | before certification | the plug-in does not journal transfers; the request carries a random mask, so only the same bytes can be certified again |
+| The return plan | before the burn | it fixes the index `a` and the recipient |
 | The burn request, then the certified burn | before certification, and before you report success | the burn is irreversible. Its index and recipient never change; only the witness is rebuilt. |
 | Every signed redeem transaction | before broadcast | an ambiguous broadcast is resolved by that transaction's receipt |
 
-The plug-in writes all of these through `JournalStore.putIf`, a compare-and-swap that must be atomic and durable: it resolves only once
-the value survives a crash, and no other write can land between its comparison and its write. Segment logs, gap trees, proofs and fee estimates
-are rebuilt on demand. A wallet that deletes them and keeps the journal still redeems.
+The plug-in writes all of these through `JournalStore.putIf`, a compare-and-swap. It must be atomic and durable: it resolves only once the
+value survives a crash, and no other write can land between its comparison and its write. Run one writer per journal.
 
-`submitDeposit` refuses in these cases:
+What can be rebuilt: segment logs, gap trees, gap proofs, held witnesses, fee estimates and the trust-base history (refetched from the gateway
+and checked from the pinned genesis entry). A wallet that deletes them and keeps the journal and its tokens still redeems; the lane's `cold`
+stage does exactly that.
 
-- the plan's record is missing;
-- the record differs from the plan;
-- the high-water mark does not cover the intent;
-- the mark is not backed up (`JournalNotPersisted`).
+The reference wallet keeps all of this in its directory: `journal.json`, `backup.json` (the high-water mark; a real wallet stores it with
+the seed backup, off the device), `tokens.json` with `tokens/*.cbor` and any `tokens/*.pending.json`, and `trust-history.cbor`.
+
+**How the reference store meets the contract.** Every file is written durably:
+
+1. write a temporary file and `fsync` it;
+2. rename it over the old file;
+3. `fsync` the directory.
+
+The write returns only after step 3, so a power loss leaves the old content or the new, never a torn file, and a returned `putIf` survives.
+The `lock` file keeps every other process out of the directory, which is what makes the compare-and-swap atomic. The wallet's tests check
+the burn's case: after a power loss right after the burn is certified, the journal still holds the exact burn request, and `burn` resumes
+with it.
 
 ## What can go wrong
 
-Refusals carry a rule name (`Nb2Error.rule`, section 14 of the spec) or a wallet reason (`WalletError.reason`). The vault's errors
-come back from a simulation or a reverted transaction. `classifyRedeemError` maps them to the actions below, and `submitRedeem`
-applies them itself.
+Refusals carry a rule name (`Nb2Error.rule`, spec section 14) or a wallet reason (`WalletError.reason`). The vault's errors come back
+from a simulation or from a reverted transaction, and `classifyRedeemError` maps each one to an action. The plug-in applies some of those
+actions itself and throws the rest to you:
+
+- **Before anything is signed.** `buildRedeem` simulates the redeem with `eth_estimateGas`.
+  - On `StaleEndpoint` it rebuilds the witness, up to twice.
+  - It turns `AlreadyPaid` into the wallet refusal `AlreadyPaid`: reconcile.
+  - Any other vault error is thrown as an `Nb2Error` named after the vault's rule, with the revert data in `args`. Nothing was sent, and the
+    burn is intact. This covers `FutureIndex`, `BadGapProof`, `ChainMismatch`, `BadHistoryLength`, `VerifierRefused` and the rest.
+- **After a send that reverted.** `submitRedeem` simulates the same call again and then acts on the result.
+  - It reconciles on `AlreadyPaid`.
+  - It rebuilds the witness and sends again on `StaleEndpoint`, `BadGapProof`, `ChainMismatch` and `BadHistoryLength`.
+  - It sends once more with twice the gas after an out-of-gas, `PayoutFailed` or `Reentrancy`.
+  - It throws on everything else, `FutureIndex` included.
+  - After four attempts it answers `not-paid`.
+
+The table says what each error means and what your wallet does when it reaches you.
 
 | Error | Where | Meaning | What the wallet does |
 |---|---|---|---|
+| `BadDeployment` | `NativeBridgeV2.open` (the installation check) | the RPC serves another chain, the vault's `config()` is not the pinned Γ, or its runtime code hash is not the pinned one | stop: the manifest and the node are not the same deployment (a reset network, a wrong URL or a stale manifest). Send nothing. |
+| `TrustInput` | `NativeBridgeV2.open` | the trust-base history is not the one Γ names (another genesis entry) | use the bundle and pin published with the manifest |
+| `BadInput` | any call | an argument outside the API's contract (a malformed key or address, a zero amount, a split with one output, a `k_w` that is not 32 bytes) | fix the call; nothing happened |
+| `NotPending` | mint, collectDepositProof, burn, buildRedeem, planReturn | the step doesn't apply to the record's state: minting a deposit that has not landed, burning or redeeming out of order, planning a part that is already burned | run the step the journal is at (`status`); not retryable as is |
 | `JournalNotPersisted` | submitDeposit | the plan or its backup is not durable | write and back up, then retry; nothing was sent |
 | `JournalConflict` | any journaled step | another process advanced the same record | reload; the record that won is the truth. Run one writer per journal. |
 | `CompanionUnknown` | collectDepositProof, planReturn | the block's certificate is not served yet (no child block), or the node is on another chain | retry after a block |
+| `CompanionProvider` | any certificate read | the companion's witnesses are not exactly `[certificate, technical record]` | use another provider |
 | `EvidencePruned` | any evidence read | this node no longer serves the companion, block or receipts | use another provider or an archive |
-| `ProviderFault` | any evidence read | the provider served data that contradicts itself: a wrong hash or root, or an answer over the gateway cap (HTTP 413) | use another provider |
+| `ProviderFault` | any evidence read | the provider served data that contradicts itself (a wrong hash or root), or an answer over the gateway's 8 MiB cap (HTTP 413) | use another provider; for a 413 on logs the plug-in narrows the window itself |
 | `EvidenceMissing` | buildRedeem | a segment log was not served | use another provider. A missing log is never read as "not paid". |
 | `SegmentLog` | buildRedeem | a served log has the wrong length, order or chain link | use another provider |
 | `NoEntryForEpoch` (also inside `SealReceipt`) | verification | a certificate's epoch is newer than the held trust history | extend the history (`refreshTrust`) and retry; the evidence is not invalid |
 | `SealReceipt` (other inner rules) | planReturn | the newest seal receipt does not verify | use another provider; nothing is burned |
-| `CapacityPreflight` | planReturn | the return would not fit the transaction-size limit or `userGasLimit`, with the history already owed plus the reserve, or its gas cannot be bounded | **do not burn**. Choose a smaller lineage, or wait for a deployment with larger limits. |
-| `InsufficientFunds` | planReturn | the paying EVM account cannot fund the worst-case gas limit | fund it; nothing is burned |
+| `CapacityPreflight` | planReturn, burn | the return would not fit the transaction-size limit or `userGasLimit`, with the history already owed plus the reserve, or its gas can't be bounded | **don't burn**. The token stays spendable on Unicity. See [Limits](#limits). |
+| `InsufficientFunds` | planReturn, burn | the paying EVM address can't fund the worst-case gas limit | fund it; nothing is burned |
 | `RecipientRefused` | planReturn | the zero address or the vault | choose another recipient |
-| `StateReadNotAdmitted` / `ImplausibleIndex` | planReturn with `useStateRead` | a plain `state()` read is evidence only on a test deployment, and only within `maxJump` | use the seal receipt (the default) |
-| `Unconfirmed` | submitDeposit | a send has no receipt yet, or its nonce was used by a transaction seen too recently to call the send dead | call again later; it reconciles, and signs a new transaction only after the old one is dead at depth |
+| `StateReadNotAdmitted` / `ImplausibleIndex` | planReturn with `useStateRead` | a plain `state()` read is evidence only on a deployment whose manifest says `stateReadOnly`, and only within `maxJump` | use the seal receipt (the default) |
+| `Unconfirmed` | submitDeposit, the aggregator | a send has no receipt yet, or its nonce was used by a transaction seen too recently to call the send dead; or no inclusion proof yet | call again later; it reconciles, and signs a new transaction only after the old one is dead at depth |
+| `Reverted` | submitDeposit, the aggregator | the deposit transaction was mined and reverted (the vault's own error says why), or the aggregator refused the certification request | for a deposit, read the vault error below; nothing was locked. For the aggregator, check the request; a spent state is refused for good. |
 | `CapacityExceeded` | buildRedeem | the claim grew past the limits after the burn | no recovery in this release (continuation, bft-core#1108, is deferred); tell the user |
-| `AlreadyPaid` (vault) | simulation | the identifier is in a recent buffer | reconcile: look for `Paid(eta)` |
+| `AlreadyPaid` | buildRedeem | the vault reports the identifier in a recent buffer, or the wallet found `eta` in a sealed segment while building the history | reconcile: look for `Paid(eta)`; `submitRedeem` does it first |
 | `StaleEndpoint` (vault) | simulation | two seals since the witness was built | rebuild the witness (automatic); never a new burn |
-| `FutureIndex` (vault) | simulation | the vault has not reached `a` | wait; cannot arise from a verified seal receipt |
+| `FutureIndex` (vault) | simulation | the vault has not reached `a` | wait; can't arise from a verified seal receipt |
 | `BadGapProof`, `ChainMismatch`, `BadHistoryLength` (vault) | simulation | a wrong proof or start head | rebuild the witness; the burn stays |
 | `PayoutFailed`, `Reentrancy` (vault) | transaction | the recipient refused the value, or re-entered | retry once; a recipient that always refuses strands the burn |
-| `VerifierRefused(<rule>)` (vault) | simulation | the token verifier refused the evidence with `<rule>` | stop and report. Retry only if the inner rule is `NoEntryForEpoch`. |
+| `VerifierRefused` with `QuorumNotMet` inside (vault) | buildRedeem's simulation, right after a burn | usually the EVM chain's seal registry has not imported the burn's root round yet (bft-core#1125), and on chain that reads as a bad quorum. The plug-in throws it, classified `stop`. | it is not a verdict yet: see [the registry lag](#the-registry-lag-right-after-a-burn) |
+| `VerifierRefused(<other rule>)` (vault) | simulation | the token verifier refused the evidence with `<rule>` | stop and report. Retry only if the inner rule is `NoEntryForEpoch`. |
+| `VerifierBadReturn` (vault) | simulation | the verifier's answer is not a well-formed verdict | stop and report: a deployment fault |
 | `DomainMismatch`, `AssetMismatch`, `ClaimMismatch`, `BadRecipient`, `ZeroAmount`, `LiabilityUnderflow`, `SegmentCounterExhausted` (vault) | simulation | the evidence is not for this vault, or the vault is exhausted | stop and report |
 | `ZeroValue`, `BadFirstOwner`, `LiabilityCap`, `DepositCounterExhausted` (vault) | deposit | the deposit itself is refused | fix the amount or owner; nothing was locked |
-| `UnlockRecovery` | verification | an unlock in the lineage uses recovery ID 2 or 3 | the token is still valid natively but cannot be returned; refuse to accept it for return |
+| `BadConfig` (vault) | the vault's constructor | the configuration is not one this build accepts (wrong K or B) | an operator's error at deployment; a wallet never meets it from a deployed vault |
+| `UnlockRecovery` | verification | an unlock in the lineage uses recovery ID 2 or 3 | the token is still valid on Unicity but can't be returned; refuse to accept it for a return |
+| Token verification rules (spec sections 14.1 to 14.4: `Truncated`, `NonCanonical`, `Shape`, ..., `MintSalt`, `SecretOpening`, `CDMismatch`, `InclusionProof`, `SealEpoch`, `SealRoot`, `QuorumNotMet`, `SplitSum` and the rest) | verifyToken, planReturn, and the verification of any token you receive | the token or its lineage is invalid: a malformed encoding, a mint that doesn't open its deposit, a bad inclusion proof or certificate | refuse the token; don't try to return it. The plug-in's own `QuorumNotMet` here means a certificate really lacks its quorum under the held trust history. It is not the vault's registry lag. |
+| HTTP 429, or 503 "busy" | any gateway call | rate limit, or both large-body slots in use | back off and retry (the plug-in's `HttpJsonRpc` does) |
+| HTTP 400, connection closed | `eth_sendRawTransaction`, `eth_call`, `eth_estimateGas` | the body is over the gateway's large-body bound; it is refused on its declared length, unread | a transaction within `maxEncodedTxBytes` never hits this; the preflight keeps a return within it |
+| HTTP 503 "broadcast may be partial" | `eth_sendRawTransaction` | ambiguous: the transaction may still be included | poll the receipt of the locally computed hash and look for `Paid(eta)` before resending (automatic) |
+
+### The registry lag right after a burn
+
+A burn is certified by the aggregator under a root round. The EVM chain's seal registry imports that round a few blocks later. Until it
+does, the deployed verifier cannot find the round's seal, and it answers `QuorumNotMet`, the same answer it gives a certificate with a bad
+quorum (bft-core#1125). The plug-in and the Go reference accept the same bytes. In the NB2-09 runs, the vault accepted them within a few
+seconds.
+
+The plug-in reports it from `buildRedeem`'s simulation as `Nb2Error`, with `rule` set to `VerifierRefused` and the vault's revert data in
+`args[0]`, and `classifyRedeemError` calls it `stop`. Recognise it with `isRegistryLag` (in `wallet/core.ts`): it decodes `args[0]` and
+checks for `QuorumNotMet`. Retrying is safe, because the simulation refused before anything was signed: no gas is spent and nothing can be
+sent twice.
+
+The reference wallet waits and builds again for up to 2 minutes. After that, `redeem` stops and says that the burn is intact and to run
+`redeem` again later. A refusal that persists well past the registry's import may be a real bad quorum: report it. A wallet with its own
+policy should still never treat this answer as a verdict right after a burn.
 
 ## What it costs
 
-These figures are measured by the NB2-02 bake-off (unicity-pos-contracts#80 `bench/nb2/RESULTS.md`, `K = 64`, `B = 16`, Cancun). Each
-is one whole transaction with every slot cold, and includes base gas and calldata. The token verifier is excluded: NB2-05 measures it.
+Gas prices are the deployment's; on the package's test network a gas unit cost 10^6 wei. The figures are gas units.
 
-| Operation | Gas |
+**Measured live** on the K = 4 test vault. The returns are from the NB2-09 lane run (bft-core CI run 44037100193); the dev-server run above
+measured the same within 2%. The deposit and the walkthrough's `back` are from the transcript above.
+
+| Operation | Gas used |
 |---|---:|
-| Deposit, first in a fresh vault | 48,758 |
-| Deposit, steady state | 31,670 |
-| Return, typical (current segment half full), no history | 63,791 |
-| Return whose witness ends one segment back | 78,083 |
-| Each sealed segment of waiting (one gap proof, 257 bytes of calldata) | 5,950 |
-| Return with 1 / 10 / 100 segments of history | 72,852 / 126,393 / 661,926 |
-| The sealing return (the 64th payment of a segment), uniform / worst bucket | 299,630 / 342,766 |
+| Deposit (the walkthrough's `deposit`) | 31,739 |
+| Return of an origin-only token (no transfer) | 882,230 |
+| Return after one transfer | 1,056,450 |
+| Return of a part one split level down (the walkthrough's `back`) | 1,394,583 |
+| Return after one transfer and one split (`p60`) | 1,582,088 |
+| Return of a part three split levels down | 2,411,141 |
+| Return after 13 transfers, one certificate each | 3,554,807 |
+| Return after 40 transfers in 4 certificates | 7,179,054 |
+| Return after 204 transfers (the largest the preflight admitted in that run) | 36,951,383 |
 
-On top of these:
+**What the user has to hold.** The redeem transaction's gas limit is the estimate plus `gasReserve` = 500,000 (spec section 12.4): other
+users' payments can make any return the sealing one (the K-th payment of a segment seals it, up to about 230,000 gas more) or the worst scan
+of the recent buffers (up to about 283,000 more). The reserve is limit, not spend: only the return that seals pays the sealing gas. The preflight before the burn uses
+a larger, conservative bound: the burn is counted at the decoder's bounds (about 4.5M gas) and 64 segments of future history are added. The
+walkthrough's 0.04 part was planned at 7,643,951 gas, sent with a limit of 1,906,818, and used 1,394,583 (8,804 bytes of calldata). The paying address must be able to
+fund the preflight's limit at twice the base fee plus the tip, or the preflight refuses with `InsufficientFunds` and nothing is burned.
 
-- **Reserve.** Every return's gas limit is the expected cost plus `gasReserve = 500,000`. Other users' payments can make any return the
-  sealing one, or the worst scan. The reserve is limit, not spend, but the paying account must hold it (`InsufficientFunds`).
-- **Token verification** (measured by NB2-05, unicity-pos-contracts#82 `docs/nb2-verifier.md`, calldata included). It grows with the
-  token's history:
+**How cost grows with the token's history.** The token verifier's gas grows with every transfer and split level in the part's lineage. The
+plug-in's measured model (`MeasuredGasModel`, from unicity-pos-contracts#82 `docs/nb2-verifier.md`) rounds each term up: 800,000 base,
+190,000 per transfer, 760,000 per split level, plus bytes and signatures beyond the measured shape. A transfer certified alone costs more
+than one certified in a batch with others, because each distinct certificate is verified. On the 204-transfer probes, the preflight's
+bound grew by about 240,000 gas per transfer (the boundary fit), while the gas actually spent was about 177,000 per transfer. That was
+(36,951,383 − 882,230) / 204, against an origin-only return. The difference is the preflight's margin.
 
-  | Token | Evidence | Verifier gas |
-  |---|---:|---:|
-  | mint + burn | 4.2 KB | 748,672 |
-  | mint + transfer + burn | 5.2 KB | 916,429 |
-  | reference part after two splits | 9.8 KB | 1,851,544 |
-  | 20 transfers | 24.6 KB | 4,316,495 |
-
-  That is about 182,000 gas per further transfer and about 739,000 per nested split level. The plug-in's `MeasuredGasModel` rounds
-  each term up (800,000 base, 190,000 per transfer, 760,000 per split level, plus bytes and signatures beyond the measured shape), adds
-  the worst vault call (487,339) and the reserve, and refuses what it cannot bound. With a 30M `userGasLimit`, about 155 transfers or
-  40 nested split levels fit. Live figures come **after NB2-09**.
-- **Waiting.** A burn's history grows by one gap proof per 64 payments to the vault after the burn's index. At 1 payment per second, that
-  is about 5,950 gas and 257 bytes per minute.
+**How cost grows with waiting.** A burn's redemption proves that `eta` was not paid in any segment sealed since its index: one gap proof
+per segment, `65 + 32 log2 K` bytes, about 5,950 gas each at K = 64 (257 bytes; 129 bytes at the test vault's K = 4). A segment seals every K
+payments to the vault, so at K = 64 and one payment a second the history grows by about one proof a minute. The NB2-02 bake-off
+(unicity-pos-contracts#80 `bench/nb2/RESULTS.md`, K = 64, the vault alone, without the token verifier) measured a return with 1 / 10 / 100
+segments of history at 72,852 / 126,393 / 661,926 gas, and the sealing return (the 64th payment of a segment) at up to 342,766.
 
 ## Limits
 
-- **Freshness of the index (an availability assumption).** The burn index comes from the newest seal receipt that the provider
-  serves, and `c_obs` from its `state()` view. A provider that hides newer seals cannot push the index into the future; it can only
-  anchor it lower, which means more history to prove. `planReturn` warns when the newest receipt is older than `maxSealAgeBlocks`
-  (7,200 by default). `burn` repeats the preflight against a fresh state before it signs. Neither check guarantees redemption against
-  an indefinitely stale view or arbitrary later traffic.
-- **A reused deposit secret** (two devices restored from one backup, or a faulty wallet) yields two deposits with one `rho`. Each is
-  its own root token: `recoverDeposits` journals both, and `mintExtraDeposit` mints the second.
+**The test vault.** The package deploys two vaults: the test build (K = 4, B = 2), whose manifest the lanes and the walkthrough use, and
+the production build (K = 64, B = 16) beside it. A segment seals every K payments, so at K = 4 the lane can rotate segments in a few
+returns. Wallets read K from Γ; nothing in a wallet depends on which build it is.
 
-- **Operating envelope.** The deployment manifest pins:
-  - the encoded-transaction limit (`L_max`, 512 KiB by default);
-  - `userGasLimit`;
-  - `returnReserveSegments` (64 by default).
+**The operating envelope.** The manifest pins the limits a wallet plans against (`pins`, with their sources under `limits`). On the package
+deployment:
 
-  Before burning, `planReturn` adds the history already owed since the index to the reserve, and requires the whole prospective return
-  to fit both limits. The published envelope (the largest token, and the return delay at stated traffic) comes **after NB2-09**.
-- **Oversized claims.** A claim that outgrows the limits after its burn cannot be redeemed in this release. There is no recovery path
-  yet: continuation is deferred to bft-core#1108. The preflight exists to stop such a burn before it happens.
-- **Recipient.** The burn signs one EVM address, and only it is paid. Use an address you control that accepts plain value transfers. A
-  contract recipient produces a warning: if it ever refuses the payment, the burn is stuck.
-- **Mint admission (#1039).** A chain observer cannot compute a deposit's token ID, so it cannot block the mint in advance. But anyone
-  who sees the mint request, or a hostile aggregator, can still race it. Until that issue is fixed, the network treats a working mint
-  admission as a prerequisite for real value. Do not move real value through this release.
-- **Unlock recovery IDs.** Every unlock in a returnable token's lineage uses recovery ID 0 or 1. The plug-in's own signatures always do.
+| Limit | Value |
+|---|---|
+| `maxEncodedTxBytes` (L_max), the largest redeem transaction a wallet may build | 512 KiB (524,288 bytes) |
+| `userGasLimit`, the gas of one transaction | 60,000,000 |
+| `gasReserve`, added to every redeem's gas limit | 500,000 |
+| `returnReserveSegments`, the future history the preflight provisions for | 64 segments (256 payments on the package's K = 4 test vault; 4,096 at the production K = 64) |
+
+Gas binds long before bytes: the largest return that fits `userGasLimit` carries about 300 KB of evidence. The manifest's `envelope` gives the
+model's estimate (about 280 transfers for an unsplit token, about 4 fewer per split level) and, for a reference part, how long a burn may
+wait before its history no longer fits. On live tokens the bound is lower than the model's estimate, because real tokens carry larger
+inclusion proofs and more signatures than the measured shape. In the NB2-09 run the preflight admitted 204 batch-certified transfers and
+refused 206 (204 and 205 in the dev-server run above), and both verdicts were confirmed against the chain: the admitted token was burned and paid within `userGasLimit`, and each refused token's state was
+shown unspent by a verified non-inclusion proof from the aggregator after the refusal.
+
+**The boundary drifts, so plan right before you burn.** A return's gas depends on the token's own history and on the aggregator's tree,
+which keeps growing: in one live session, fresh probes of the same length carried about 991 more evidence bytes each, and the boundary moved
+by about 2 transfers within that session. So:
+
+- run `planReturn` right before `burn` (the reference wallet's `burn` does, and the plug-in repeats the preflight once more before it signs);
+- never reuse a limit measured earlier, by you or by anyone else;
+- treat the envelope as guidance, not admission.
+
+**The preflight is the safety gate.** It refuses before the burn: a refused return never burns, and the token stays spendable on Unicity.
+The lane asserts this on every boundary probe against the chain.
+
+**A history over the limit can't be returned in this release.** Splitting does not help: a part carries its parent's whole history, and
+each split level adds gas. The preflight's model charges a split level as about four transfers; the measured spend is about three
+(about 510,000 to 525,000 gas a level, against about 177,000 a transfer). Keep tokens meant for return well inside the envelope, and return them before
+their history gets near it. A claim that outgrows the limits after its burn (`CapacityExceeded`) has no recovery yet; continuation is
+deferred to bft-core#1108. The preflight exists to stop such a burn before it happens.
+
+**Freshness of the index.** The burn index comes from the newest seal receipt the provider serves, and the endpoint estimate from its
+`state()` view. A provider that hides newer seals can't push the index into the future; it can only anchor it lower, which means more history
+to prove. `planReturn` warns when the newest receipt is older than `maxSealAgeBlocks` (7,200 by default). Neither check guarantees redemption
+against an indefinitely stale view or arbitrary later traffic.
+
+**The recipient.** The burn signs one EVM address, and only that address is paid. Use an address you control that accepts plain value
+transfers. A contract recipient gets a warning: if it ever refuses the payment, the burn is stuck.
+
+**A reused deposit secret** (two devices restored from one backup, or a faulty wallet) gives two deposits with one `rho`. Each is its own
+root token: `recoverDeposits` journals both, and `mintExtraDeposit` mints the second.
+
+**Unlock recovery IDs.** Every unlock in a returnable token's lineage must use recovery ID 0 or 1. The plug-in's own signatures always do.
+
+**Mint admission is still open (bft-core#1039).** A token's first state is registered with the aggregator under an ID that anyone who knows
+the token ID can sign for (the SDK's mint key is public by design), and the aggregator keeps the first registration of an ID for good. In
+this bridge the token ID depends on the deposit secret, so watching the EVM chain is not enough to work it out in advance. But once the mint
+request is visible, on its way to the aggregator or to a dishonest aggregator, someone can register a competing first state for the same ID
+ahead of it. The honest mint can then never be certified, and the deposit is stranded: the vault has no refund. Until that issue is fixed,
+the bridge is a test system. Don't move real value through it.
 
 ## RPC requirements
 
-Any node that meets the wallet RPC contract (spec section 12.7) works. No bridge-specific service exists.
+Any node that meets the wallet RPC contract (spec section 12.7, NB2-06, bft-core#1102) works. There is no bridge-specific service, and
+nothing read is trusted: every item is verified offline, so a provider that withholds data can only delay the wallet.
 
 | Need | Method |
 |---|---|
-| The certificate of block N | `eth_getBlockByNumber(N+1, false)`, then `unicity_getSealCompanionV1(hash(N+1))`, witness 0 |
+| The certificate of block N | `eth_getBlockByNumber(N+1, false)`, then `unicity_getSealCompanionV1(hash(N+1))`: `{"status":"found"}`, witness 0 |
 | The header of block N | `eth_getBlockByHash(hash, false)` |
 | The receipt-trie path | `eth_getTransactionReceipt`, `eth_getBlockReceipts(hash)` |
-| Segment logs, the newest seal, `Paid(eta)` | `eth_getLogs` with one address and windows of at most 10,000 blocks |
-| Vault views | `eth_call` of `config()`, `state()` |
-| Submission | `eth_estimateGas`, `eth_sendRawTransaction` |
+| Segment logs, the newest seal, `Paid(eta)` | `eth_getLogs` with exactly one address and explicit windows of at most 10,000 blocks |
+| Vault views | `eth_call` of `config()`, `state()`, `domain()` |
+| Simulation and submission | `eth_call`, `eth_estimateGas`, `eth_sendRawTransaction` |
+| Retention | `unicity_sealCompanionHorizonV1` answers `null`: nothing is pruned |
+| Trust-base history | `GET /api/v1/trustbases` on the same host (the SDK's trust-base path) |
 
-Gateway behaviour the plug-in handles:
+What the package's public gateway enforces, and what the plug-in does about it:
 
-- it backs off on HTTP 429 and on a busy 503;
-- it halves a log window on a result-count error or on HTTP 413 (the 8 MiB answer cap);
-- it treats HTTP 503 from `eth_sendRawTransaction` as ambiguous (the transaction may still land): it polls the receipt of the
-  transaction hash it computed itself, and checks `Paid(eta)`, before it resends anything.
+- Bodies are at most 16 KiB, except `eth_call`, `eth_estimateGas` and `eth_sendRawTransaction`, which take up to 4.5 MiB (room for a
+  512 KiB transaction hex-encoded). A body declared larger is refused with HTTP 400 and the connection is closed, unread. At most two large
+  bodies are read at once (503 "busy": retry).
+- Rate limits answer HTTP 429; the plug-in backs off.
+- One answer is at most 8 MiB (HTTP 413 above it). The plug-in halves a log window on a 413 or on the node's result-count error.
+- `eth_sendRawTransaction` is relayed to every validator. Its HTTP 503 ("broadcast may be partial") is ambiguous: the plug-in polls the
+  receipt of the hash it computed itself, and checks `Paid(eta)`, before it sends anything again.
+- Retention: the nodes behind the gateway are proof sources, so companions, receipts and logs are served for the life of the deployment.
+  Deposit evidence can be fetched at any time after the deposit's child block exists, and segment logs from the deployment block on. The
+  wallet still builds `J` right away and keeps it with the token, so minting never depends on a provider.
 
-Retention: nodes behind the public gateway serve companions, receipts and logs for the life of the deployment.
-
-## Reference wallet
-
-The command-line wallet (`deploy/testnet/bridge/tester`, rewritten on this API, with one command per step and a `status` command)
-comes **after NB2-09**, together with the transcript of a testnet deposit and split return. `bridge.status()` already gives the
-wording that `status` will print for each journaled deposit and return.
+Another node meets the contract if it serves these methods with the same answers: an execution client of the deployment's chain that
+serves the `unicity_` methods (ureth) and runs as a proof source, its default.
