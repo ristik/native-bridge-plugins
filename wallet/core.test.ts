@@ -176,3 +176,32 @@ test('init: a refused installation check leaves no wallet; a passed one writes t
   await assert.rejects(Wallet.create(good.dir, good.config, () => good.secret, { lock: false, rpc: good.chain, aggregator: good.agg }), /already a wallet/);
   assert.ok(!readdirSync(good.dir).some((f) => f.endsWith('.tmp')));
 });
+
+test('split: a crashed split reserves its part names until it is resumed', async () => {
+  const x = await withCoin();
+  x.agg.crashNext = true; // the parent's burn is certified, then the process dies
+  await assert.rejects(split(x.w, 'coin', 0, [{ label: 'a', amount: 4n }, { label: 'b', amount: 6n }]), /power lost/);
+  const again = await x.openAt();
+  await assert.rejects(planDeposit(again, 'a', 1n), /a is reserved by the unfinished split of coin/);
+  await assert.rejects(transfer(again, 'coin', 'b', 1), /b is reserved by the unfinished split of coin/);
+  const [a, b] = await split(again, 'coin', 0, [{ label: 'a', amount: 4n }, { label: 'b', amount: 6n }]);
+  assert.equal((await again.bridge.verifyToken(a)).amount, 4n);
+  assert.equal((await again.bridge.verifyToken(b)).amount, 6n);
+  assert.equal(again.entry('coin').spent, 'split into a, b');
+  await planDeposit(again, 'c', 1n); // other names were never reserved
+});
+
+test('burn: the token is marked spent before its request is journaled, so a crash leaves nothing that can spend it twice', async () => {
+  const x = await withCoin();
+  await planReturn(x.w, 'coin');
+  x.agg.crashNext = true;
+  await assert.rejects(burn(x.w, 'coin'), /power lost/);
+  const again = await x.openAt();
+  assert.equal((await again.returnRecord('coin')).status, 'burn-requested');
+  const before = x.agg.submitted;
+  await assert.rejects(transfer(again, 'coin', 'x', 1), /coin is spent \(burn in progress\)/);
+  assert.equal(x.agg.submitted, before, 'the transfer submitted nothing');
+  const b = await burn(again, 'coin');
+  assert.equal(b.plan, null);
+  assert.equal(again.entry('coin').spent, 'burned for its return');
+});

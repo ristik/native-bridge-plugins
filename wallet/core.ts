@@ -230,6 +230,9 @@ interface PendingTransfer { from: string; to: string; owner: number; toKey?: str
 const NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 const PENDING = 'transfer pending as ';
 const BURNED = 'burned for its return';
+const BURNING = 'burn in progress';
+/** A spent mark a return's own steps may pass: the token is being, or has been, burned for it. */
+const burnMark = (sp: string | undefined): boolean => sp === BURNED || sp === BURNING;
 
 // ---- the aggregator ------------------------------------------------------------------------------------------------------------------------
 
@@ -416,6 +419,11 @@ export class Wallet {
     if (!NAME.test(label)) throw new Error(`a token name is 1 to 64 letters, digits, '.', '_' or '-': ${JSON.stringify(label)}`);
     if (this.has(label)) throw new Error(`the wallet already has a token named ${label}`);
     if (existsSync(this.pendingFile(label))) throw new Error(`a transfer to ${label} is pending: finish it first (status)`);
+    // the parts of an unfinished split are reserved: its resume saves them under these names
+    for (const l of this.labels()) {
+      const e = this.entry(l);
+      if (e.splitInto?.includes(label) && e.spent?.endsWith('(in progress)')) throw new Error(`${label} is reserved by the unfinished split of ${l}: finish it first (status)`);
+    }
   }
   /** LABEL as a token that can be spent: held, minted, and not spent already. */
   public spendable(label: string): TokenEntry {
@@ -582,7 +590,7 @@ export async function split(w: Wallet, from: string, owner: number, parts: { lab
  */
 export async function planReturn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void): Promise<ReturnPlan> {
   const e = w.entry(label);
-  if (e.spent && e.spent !== BURNED) throw new Error(`${label} is spent (${e.spent})`);
+  if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
   const plan = await retry(() => w.bridge.planReturn(w.token(label), recipient ?? w.signer.address, w.signer.address), note, 30, 2_000, NOT_YET);
   w.update(label, { returnId: hx(plan.returnId) });
   return plan;
@@ -595,11 +603,22 @@ export async function planReturn(w: Wallet, label: string, recipient?: Uint8Arra
  */
 export async function burn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void): Promise<{ plan: ReturnPlan | null; burned: Uint8Array; eta: Uint8Array; evidenceBytes: number }> {
   const e = w.entry(label);
-  if (e.spent && e.spent !== BURNED) throw new Error(`${label} is spent (${e.spent})`);
+  if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
   let plan: ReturnPlan | null = null;
   const rec = e.returnId ? await w.bridge.journal.ret(e.returnId) : null;
   if (rec === null || rec.status === 'planned') plan = await planReturn(w, label, recipient ?? (rec ? unhex(rec.recipient) : undefined), note);
-  const b = await retry(() => w.bridge.burn(unhex(w.entry(label).returnId!), w.owner(e.owner)), note);
+  // the token is marked before its burn request is journaled, so nothing else can spend the state the burn spends; a burn that never got
+  // that far (a refused last preflight) takes the mark back
+  const id = w.entry(label).returnId!;
+  w.update(label, { spent: BURNING });
+  let b: Awaited<ReturnType<typeof w.bridge.burn>>;
+  try {
+    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner)), note);
+  } catch (err) {
+    const r = await w.bridge.journal.ret(id);
+    if (r === null || r.status === 'planned') w.update(label, { spent: undefined });
+    throw err;
+  }
   w.update(label, { note: 'burned', spent: BURNED });
   return { plan, burned: b.burned, eta: b.eta, evidenceBytes: evidenceOf(b.burned).length };
 }
@@ -691,7 +710,7 @@ export async function status(w: Wallet): Promise<string[]> {
   }
   returns.forEach((r, i) => {
     const l = byReturn.get(r.returnId.toLowerCase());
-    const abandoned = r.status === 'planned' && l !== undefined && w.entry(l).spent !== undefined && w.entry(l).spent !== BURNED;
+    const abandoned = r.status === 'planned' && l !== undefined && w.entry(l).spent !== undefined && !burnMark(w.entry(l).spent);
     const next = abandoned ? undefined : NEXT_RETURN[r.status];
     const owed = r.status === 'burned' || r.status === 'submitted' ? `; the witness proves ${st.segment - BigInt(r.a)} sealed segments` : '';
     lines.push(`${l ?? '?'}: ${words[deposits.length + i]}${owed}${next && l ? `; next: ${next} ${l}` : ''}`);
