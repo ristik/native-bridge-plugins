@@ -9,7 +9,7 @@ import { test } from 'node:test';
 
 import { fromHex } from '../../src/bytes.js';
 import { lineageOf } from '../../src/nb2/bridge.js';
-import { batchGas, cborItems, memoryGas, MeasuredGasModel, priceFeatures, redeemFeatures, redeemGasTerms, REDEEM_GAS, type RedeemShape } from '../../src/nb2/gas.js';
+import { batchGas, calibratedVerifier, cborItems, memoryGas, MeasuredGasModel, priceFeatures, redeemFeatures, redeemGasTerms, REDEEM_GAS, type RedeemShape } from '../../src/nb2/gas.js';
 import { type Token } from '../../src/nb2/token.js';
 import { decodeEvidence } from '../../src/nb2/verify.js';
 
@@ -31,7 +31,7 @@ const shapes = (v: { evidence: string; cases: Case[] }): [Case, RedeemShape][] =
 
 test('the shared vectors: every feature and term, exactly (a null bound where the vector fails closed)', () => {
   assert.equal(file.model, new MeasuredGasModel().name);
-  assert.ok(file.vectors.length >= 11);
+  assert.ok(file.vectors.length >= 13);
   let nulls = 0;
   for (const v of file.vectors) {
     for (const [c, s] of shapes(v)) {
@@ -124,4 +124,25 @@ test('fail closed: no lineage, a UC that does not parse, more than one pending t
   const t = s.lineage[s.lineage.length - 1];
   const bad: Token = { ...t, proofs: t.proofs.map((p, i) => (i === 0 ? { ...p, uc: p.uc.subarray(0, p.uc.length - 1) } : p)) };
   assert.equal(redeemGasTerms({ ...s, lineage: [...s.lineage.slice(0, -1), bad] }), null);
+});
+
+test('the default bound applies to the calibrated verifier build only: its runtime code with the immutables zeroed, pinning the calibrated helper', () => {
+  const code = fromHex(readFileSync(new URL('../../../../tests/nb2-gas/verifier-runtime.hex', import.meta.url), 'utf8').trim())!;
+  const m = new MeasuredGasModel();
+  assert.equal(calibratedVerifier(code), true);
+  assert.equal(m.supportsVerifier(code), true);
+  // another deployment of the same build: other immutables (the helper's address, admitsTestSet)
+  const other = Uint8Array.from(code);
+  other[325 + 31] ^= 1;
+  other[12_187 + 31] ^= 1;
+  assert.equal(calibratedVerifier(other), true);
+  // another build: one code byte, a helper with other code, another length
+  const byte = Uint8Array.from(code);
+  byte[1_000] ^= 1;
+  assert.equal(calibratedVerifier(byte), false);
+  const helper = Uint8Array.from(code);
+  helper[368] ^= 1;
+  assert.equal(calibratedVerifier(helper), false);
+  assert.equal(calibratedVerifier(code.subarray(1)), false);
+  assert.equal(calibratedVerifier(new Uint8Array()), false);
 });

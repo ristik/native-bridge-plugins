@@ -224,7 +224,8 @@ const bridge = await NativeBridgeV2.open({
   bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
   backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
   refreshTrust: async () => { /* append newer trust-base entries (wallet/trust.ts refreshAll) */ },
-  // gas: optional; the default is MeasuredGasModel (the redeem gas bound, docs/nb2-gas-model.md), replaceable by any GasModel
+  // gas: optional; the default is MeasuredGasModel (the redeem gas bound, docs/nb2-gas-model.md), applied only to the verifier build it is
+  // calibrated for (any other deployment refuses the burn until you supply a GasModel)
 });
 ```
 

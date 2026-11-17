@@ -26,7 +26,7 @@ limit = transaction + vault + batch + membership + sha256 + execution + memory +
 | Term | What it charges | How |
 |---|---|---|
 | transaction | 21,000 + every calldata byte | 16 per byte, every byte priced as nonzero |
-| vault | the vault's replay, checks and payout | its worst measured call (unicity-pos-contracts#80 `bench/nb2/RESULTS.md`, K = 64: previous endpoint, one bucket, sealing: 487,339), 6,000 per historical segment, and its copy of the evidence into the verifier call (3 a word and the vault frame's memory expansion) |
+| vault | the vault's replay, checks and payout | its worst measured call over every phase (unicity-pos-contracts#80 `bench/nb2/RESULTS.md`, K = 64, B = 16: the first-generation segment 1's previous endpoint, one bucket, sealing: 507,215), 6,000 per historical segment, and its copy of the evidence into the verifier call (3 a word and the vault frame's memory expansion) |
 | batch | CERT_BATCH_V2 (`0x0100`) | the ureth schedule exactly, `60,000 + 16C + 500k(k-1) + 1,100 + 29,900E + 7,200Q + 2,000A + 250P`, over the distinct claims in the verifier's own batching (`_flush`: balanced calls of at most 16 claims and 256 KiB) |
 | membership | the RSMT membership (`0x0102`) | the schedule exactly, `2,000 + 16 x request bytes + 250 (1 + siblings)`, per inclusion proof |
 | sha256 | SHA-256 (`0x02`) of every hashed transaction | `60 + 12` a word, exactly. A child's mint contains its parent token, so nesting is counted where it costs |
@@ -64,18 +64,31 @@ steps; CBOR items, from the bytes; the root's J. Two cases are bounded instead o
 | a byte of the UC's input record | 27 | measured on real UCs |
 | a seal signature; a shard tree sibling; a unicity tree step | 1,784; 1,798; 2,146 | measured on synthetic UCs; a sibling adds the verifier's `_inShard` at 250 a shard bit (measured 170 on 64- and 200-bit shards) |
 | a byte of a node ID with a non-ASCII byte (the helper's byte-wise UTF-8 check) | 315 | measured |
-| a byte of J | 10 | code (its RLP walks and Keccak) |
+| a byte of J | 10 | code (its copies and the trie nodes' and header's Keccak: at most 20 gas a word) |
+| an RLP item of the header, a trie node or the receipt (`check()`) | 450 | measured at most 408 (lists of up to 5,000 items) |
+| a `head()` with its Item: each log up to the selected one, its topics, every child a `kids()` call walks | 1,100 | measured at most 1,040 (receipts with up to 2,000 preceding logs) |
+| a `kids()` call (its array of Items) | 2,000 | code (an array of up to 20 four-word Items, zeroed) |
 | cold accesses: the helper's code hash and code | 5,200 | the schedule (2 x 2,600; the lab runs warm) |
 
-Each helper call's own memory expansion is added per UC (`C_mem` of three UC lengths).
+Each helper call's own memory expansion is added per UC (`C_mem` of three UC lengths). The receipt helper's frame adds the receipt walk's
+allocations to its UC parse: 4 words an Item (`head()`), 1 + 5 max words a `kids()` array, the log's data and topics, the nodes'
+positions, the key nibbles and header widths, and the largest node or header copied for its Keccak. The receipt is read from J for these
+counts: every RLP item of the header, the trie nodes and the receipt, the log index and the selected log's topics. A deposit after 2,000
+logs (the review's receipt) is a shared vector.
 
-**The memory bound.** `M` adds four parts:
+**The memory bound.** `M` follows the verifier's allocations. Solidity's allocator only grows, so the frame's high-water is its final free
+pointer plus any scratch use beyond it. Every allocation is either fixed in size per proof, per token, per claim or per split edge, or
+proportional to one of four byte counts. The four are UC bytes, path bytes, claim bytes and J's bytes. Per proof, a UC is copied three
+times: the verifier's slice, the ABI answer and the claim decoded from it. The path is copied once, into the membership request. Each
+distinct claim is copied once, into the batch. J's nodes, UC and header are sliced, then encoded into the helper call. Each allocation
+step of a split edge encodes 130 bytes. So `M` adds:
 
 - the verifier's hash tables, exactly: `pow2(2(n+1)) + pow2(2n) + (n+1) + 256` words for `n` proofs;
 - 320 words;
-- per unit: 67.44 words a proof, 1.03 a claim word (each distinct claim plus one), 3.06 a UC word (the code's three copies: the verifier's
-  slice, the returned claim, the decoded answer), 1.23 a path word and 285.23 a token, all measured; 6 an allocation step (`_sumVerify`'s
-  130-byte encoding) and 2 a word of J (its receipt nodes, sliced and passed to the helper), from the code;
+- the byte-count parts, at the code's copy counts plus 2%: 3.06 a UC word, 1.23 a path word (the copy and the request's heads), 1.03 a
+  claim word (each distinct claim plus one), and 2 a word of J;
+- the fixed parts, measured, because their sizes do not depend on the data: 67.44 words a proof (its Step, Pred and encodings), 285.23 a
+  token, and 6 an allocation step (`_sumVerify`'s 130-byte encoding, from the code);
 - the largest scratch use that the allocations after it do not cover. A transaction is hashed from a copy at the free pointer, and every
   later proof allocates at least two copies of its UC over that copy.
 
@@ -101,7 +114,9 @@ calls. Each part is bounded separately:
      same start.
 3. **Execution is linear in the loop counts, priced at or above each unit's measured cost.**
    - We read the verifier, its helper and the vault for loops. Every loop iterates over an input structure: proofs, items, siblings,
-     signatures, steps, node-ID bytes, allocation steps, claims, tables.
+     signatures, steps, node-ID bytes, allocation steps, claims, tables, and in the receipt helper RLP items, logs, topics and `kids()`
+     children. The receipt's are counted from J itself, not from its byte length: a receipt of many small logs costs per item, not per
+     byte.
    - The only superlinear effects are three:
      - memory, priced explicitly (2);
      - the open-addressing tables, whose probes are replayed exactly on the token's own keys, state IDs and claims (only the pending
@@ -110,11 +125,19 @@ calls. Each part is bounded separately:
    - Every coefficient is the measured marginal cost of its unit, raised (below), and each intercept is raised to the largest residual.
      So the bound is at or above the lab's gas for every measured file.
    - The two accesses that the lab runs warm (the helper's code hash and its code) are charged cold, 2,600 each.
-4. **The vault** is its worst measured call over the bucket and sealing states (K = 64). The K = 4 lane's vault is cheaper. To that we
-   add the per-segment replay and the copy of the evidence.
-5. **Forwarding.** EIP-150 withholds 1/64 at each call. The bound adds 1/63 of the verifier's charge, and 1/63 of the verifier's largest
+4. **The vault** is its worst measured call over the bucket, sealing and generation states (K = 64, B = 16: 507,215, the first-generation
+   segment 1). It includes the transaction's intrinsic gas and its call to a stub verifier, which the transaction term and the verifier
+   terms charge again. The K = 4 lane's vault is cheaper. To that we add the per-segment replay and the copy of the evidence. The payout
+   is to the recipient the benchmark used, an account without code: a contract recipient's own execution is not bounded (the wallet
+   warns about a contract recipient).
+5. **The build.** The constants are those of one verifier build. The bound is applied only to that build. The bridge reads the
+   verifier's runtime code once, checks its hash against Γ, and compares it with the calibrated build: the code with its immutables
+   zeroed (`CALIBRATED_VERIFIER`, the same for the test and production builds and every deployment), and the receipt helper's code hash
+   it pins. For any other verifier the default bound is refused before the burn (`CapacityPreflight`). A wallet that supplies its own
+   model is responsible for it.
+6. **Forwarding.** EIP-150 withholds 1/64 at each call. The bound adds 1/63 of the verifier's charge, and 1/63 of the verifier's largest
    inner call: the largest of its batch calls, its helper `certificate()` calls (at the bound of each distinct UC, the pending burn's
-   at the decoder bounds included) and its `receiptLog()` call (J's EVM UC, J's bytes and that frame's memory).
+   at the decoder bounds included) and its `receiptLog()` call (J's EVM UC, its receipt walk, J's bytes and that frame's memory).
 
 ## Calibration
 
@@ -147,12 +170,13 @@ it.
 - The unsplit execution's residual is within 19,000 gas over 129 files, from 1 to 317 proofs.
 - The split terms are the least pair (per parent step, per edge) that covers every split file over the unsplit bound, raised by 5%.
 
-On all 146 files, the bound's execution, memory and SHA-256 are 0.9% to 15% above the lab's measured gas. The 15% is a 24 KiB seal,
+On all 146 files, the bound's execution, memory and SHA-256 are 1.1% to 15% above the lab's measured gas. The 15% is a 24 KiB seal,
 whose signature bytes are priced as UC bytes.
 
-**Shared vectors.** `tests/nb2-gas/gas-vectors.json` holds 12 evidence files, and both plug-ins check every feature and term of each.
-Six are real: 1 and 10 transfers, 3 and 10 split levels, 151 fresh keys, trimmed seals. Six are synthetic: a 200-bit shard; 16
-signatures with non-ASCII IDs; 16 signatures; 24 KiB seals over the batch's byte cap; and two that must fail closed (17 signatures, and a
+**Shared vectors.** `tests/nb2-gas/gas-vectors.json` holds 13 evidence files, and both plug-ins check every feature and term of each.
+Six are real: 1 and 10 transfers, 3 and 10 split levels, 151 fresh keys, trimmed seals. Seven are synthetic: a 200-bit shard; 16
+signatures with non-ASCII IDs; 16 signatures; 24 KiB seals over the batch's byte cap; a deposit after 2,000 logs (the review's
+receipt); and two that must fail closed (17 signatures, and a
 non-text signature key). Each file is checked at redemption (P 0 and 17 at K = 4, P 17 at K = 64) and at the preflight (K = 4 and 64).
 
 The scripts and the raw data are in `~/evidence/nb2-gas-refit/` on the dev server (`lab/`, `fit3.py`, `features.jsonl`, `validate.jsonl`).
@@ -165,27 +189,27 @@ against `userGasLimit` = 60M.
 
 | Part | Transfers | Split levels | Certificates | P | Real | Bound | Bound / real | Preflight | Paid gasUsed |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| a50, raw | 51 | 0 | 18 | 0 | 9,585,385 | 10,133,510 | 1.057 | 14,329,794 | |
-| a100, raw | 101 | 0 | 26 | 0 | 18,351,112 | 19,014,705 | 1.036 | 23,336,845 | 18,082,571 (P 17) |
-| a200, raw | 201 | 0 | 35 | 0 | 36,627,443 | 37,550,658 | 1.025 | 42,128,517 | |
-| a280, raw | 281 | 0 | 39 | 0 | 52,358,159 | 53,537,157 | 1.023 | 58,324,370 (admitted) | |
-| a300, raw | 301 | 0 | 41 | 0 | 56,521,474 | 57,795,738 | 1.023 | 62,636,998 (refused) | 55,673,867 |
-| a300, raw | 301 | 0 | 41 | 16 | 56,559,915 | 57,925,530 | 1.024 | 62,766,278 | |
-| b150k, consolidated | 151 | 0 | 2 | 0 | 25,811,210 | 26,579,004 | 1.030 | 31,017,862 | |
-| b300k, consolidated | 301 | 0 | 2 | 0 | 53,605,886 | 54,829,204 | 1.023 | 59,641,261 (admitted) | 52,801,263 |
-| g250kt, consolidated and trimmed | 251 | 0 | 2 | 0 | 42,094,024 | 43,094,932 | 1.024 | 47,733,191 | 41,474,902 |
-| k260, fresh keys | 261 | 0 | 39 | 0 | 59,401,954 | 60,807,622 | 1.024 | 65,552,853 (refused) | 58,506,740 |
-| e1n | 152 | 1 | 21 | 0 | 28,892,312 | 29,553,884 | 1.023 | 34,013,606 | |
-| e2n | 282 | 1 | 34 | 0 | 55,086,126 | 55,952,093 | 1.016 | 60,745,834 (refused) | |
-| e3n | 153 | 2 | 24 | 0 | 30,631,535 | 31,457,731 | 1.027 | 35,748,413 | |
-| e4n | 283 | 2 | 36 | 16 | 57,530,188 | 59,082,172 | 1.027 | 63,582,098 (refused) | 56,628,979 |
-| e7n | 21 | 10 | 32 | 0 | 9,039,639 | 9,678,256 | 1.071 | 13,802,149 | 8,914,393 |
+| a50, raw | 51 | 0 | 18 | 0 | 9,585,385 | 10,195,994 | 1.064 | 14,392,278 | |
+| a100, raw | 101 | 0 | 26 | 0 | 18,351,112 | 19,077,189 | 1.040 | 23,399,330 | 18,082,571 (P 17) |
+| a200, raw | 201 | 0 | 35 | 0 | 36,627,443 | 37,613,142 | 1.027 | 42,191,002 | |
+| a280, raw | 281 | 0 | 39 | 0 | 52,358,159 | 53,599,641 | 1.024 | 58,386,854 (admitted) | |
+| a300, raw | 301 | 0 | 41 | 0 | 56,521,474 | 57,858,222 | 1.024 | 62,699,483 (refused) | 55,673,867 |
+| a300, raw | 301 | 0 | 41 | 16 | 56,559,915 | 57,988,014 | 1.025 | 62,828,763 | |
+| b150k, consolidated | 151 | 0 | 2 | 0 | 25,811,210 | 26,641,489 | 1.032 | 31,080,347 | |
+| b300k, consolidated | 301 | 0 | 2 | 0 | 53,605,886 | 54,891,689 | 1.024 | 59,703,745 (admitted) | 52,801,263 |
+| g250kt, consolidated and trimmed | 251 | 0 | 2 | 0 | 42,094,024 | 43,157,416 | 1.025 | 47,795,675 | 41,474,902 |
+| k260, fresh keys | 261 | 0 | 39 | 0 | 59,401,954 | 60,870,106 | 1.025 | 65,615,337 (refused) | 58,506,740 |
+| e1n | 152 | 1 | 21 | 0 | 28,892,312 | 29,616,368 | 1.025 | 34,076,090 | |
+| e2n | 282 | 1 | 34 | 0 | 55,086,126 | 56,014,577 | 1.017 | 60,808,318 (refused) | |
+| e3n | 153 | 2 | 24 | 0 | 30,631,535 | 31,520,216 | 1.029 | 35,810,897 | |
+| e4n | 283 | 2 | 36 | 16 | 57,530,188 | 59,144,656 | 1.028 | 63,644,583 (refused) | 56,628,979 |
+| e7n | 21 | 10 | 32 | 0 | 9,039,639 | 9,740,740 | 1.078 | 13,864,634 | 8,914,393 |
 
 Over all 87 measurements (21 burns at P = 0 to 17, `validate.jsonl`):
 
-- the bound at redemption is 1.016 to 1.51 times the real gas: about 1.02 at 250 to 300 transfers, and more for small tokens, where the
+- the bound at redemption is 1.017 to 1.57 times the real gas: about 1.02 at 250 to 300 transfers, and more for small tokens, where the
   vault's K = 64 worst call dominates;
-- the preflight is 1.094 to 4.8 times the real gas;
+- the preflight is 1.095 to 4.9 times the real gas;
 - no measurement lies above its bound.
 
 **The live boundary** (the lane's `boundary` stage on this generation, bft-core#1179). It used fresh tokens in 16 certificate groups at the
@@ -229,8 +253,8 @@ The margin has three parts:
 
 ## Limits of the argument
 
-- **The constants are those of the deployed verifier build** (contracts `884c4829`, solc 0.8.37, via-IR, `optimizer_runs = 1`). A new
-  verifier build needs a new calibration. Γ pins the verifier's code hash, so a new build is also a new deployment.
+- **The constants are those of the deployed verifier build** (contracts `884c4829`, solc 0.8.37, via-IR, `optimizer_runs = 1`). The
+  bridge enforces it (above). A new build needs a new calibration and a new `CALIBRATED_VERIFIER`.
 - **Shapes the lane cannot produce** are covered by the per-unit coefficients, which are measured on synthetic UCs. That means shard tree
   siblings, more unicity tree steps, more signatures, long or non-ASCII node IDs and long summaries. J's per-byte cost is from the code,
   not measured: J's shape is fixed on the lane.

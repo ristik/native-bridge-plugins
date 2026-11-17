@@ -64,6 +64,13 @@ test('preflight: an oversized token, unfundable gas and an unboundable gas cost 
   assert.ok(new ProvisionalGasModel().name.length > 0);
 });
 
+test('the default gas bound is refused for a verifier it is not calibrated for: the stand-in verifier code is not Γ\'s', async () => {
+  const s = await minted({ gas: undefined });
+  assert.equal(s.w.gas.name, 'bound-nb2-1179');
+  assert.equal(await outcome(s.w.planReturn(s.token, r, s.payer.address)), 'BadDeployment');
+  // the world's own tests supply the model as a wallet supplies its own (world.ts WORLD_GAS): no build check, the bound as computed
+});
+
 test('recipient rule: zero and vault refused, a contract warned', async () => {
   const s = await minted();
   assert.equal(await outcome(s.w.planReturn(s.token, new Uint8Array(20), s.payer.address)), 'RecipientRefused');

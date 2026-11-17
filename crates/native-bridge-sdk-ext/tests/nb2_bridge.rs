@@ -546,7 +546,9 @@ fn minted_world(
     let payer = w.evm_account("p");
     let owner = local_owner(&key("o"));
     let mut o = w.options("w", World::store());
-    o.gas = gas;
+    if gas.is_some() {
+        o.gas = gas;
+    }
     let b = NativeBridgeV2::open(o).unwrap();
     let t = minted(&b, &payer, &owner, 3);
     (w, b, payer, owner, t)
@@ -595,6 +597,23 @@ fn preflight_an_oversized_token_unfundable_gas_and_an_unboundable_gas_cost_refus
     assert_eq!(ok.journal.returns().unwrap().len(), 0);
     let plan = ok.plan_return(&t, &r, &payer.address(), None).unwrap();
     assert!(plan.gas_limit > 500_000 && plan.gas_limit < 60_000_000);
+}
+
+#[test]
+fn the_default_gas_bound_is_refused_for_a_verifier_it_is_not_calibrated_for() {
+    // the world's verifier is a stand-in whose code is not Γ's: the default model is never applied to it
+    let w = setup();
+    let payer = w.evm_account("p");
+    let owner = local_owner(&key("o"));
+    let mut o = w.options("w", World::store());
+    o.gas = None;
+    let b = NativeBridgeV2::open(o).unwrap();
+    assert_eq!(b.gas.name(), "bound-nb2-1179");
+    let t = minted(&b, &payer, &owner, 3);
+    assert_eq!(
+        reason(b.plan_return(&t, &recipient("recipient"), &payer.address(), None)),
+        "BadDeployment"
+    );
 }
 
 #[test]

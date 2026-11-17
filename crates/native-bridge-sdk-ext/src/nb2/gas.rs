@@ -21,6 +21,7 @@ use super::token::{
     concat, encode_token, mint_source_hash, result_state, state_id, token_id_of, Predicate, Token,
     PRED_SIGNATURE,
 };
+use super::util::to_hex;
 
 /// What the gas model sees of a prospective redemption.
 pub struct RedeemShape<'a> {
@@ -41,6 +42,11 @@ pub trait GasModel: Send + Sync {
     fn redeem_gas_limit(&self, s: &RedeemShape<'_>) -> Option<u64>;
     /// The gas limit of a deposit call.
     fn deposit_gas_limit(&self) -> u64;
+    /// Whether the model is calibrated for the deployment's verifier, given its runtime code (whose hash the bridge has checked against
+    /// Γ); None for a model that does not say, which is the wallet's own choice and is used as supplied.
+    fn supports_verifier(&self, _code: &[u8]) -> Option<bool> {
+        None
+    }
 }
 
 /// Measured by #1098 (K = 64, B = 16, optimizer runs 200): replay and settlement only.
@@ -133,7 +139,7 @@ impl GasModel for ProvisionalGasModel {
 pub mod redeem_gas {
     pub const TX_BASE: u64 = 21_000;
     pub const CALLDATA_BYTE: u64 = 16;
-    pub const VAULT_WORST_CALL: u64 = 487_339;
+    pub const VAULT_WORST_CALL: u64 = 507_215;
     pub const PER_SEGMENT: u64 = 6_000;
     pub const COPY_WORD: u64 = 3;
     pub const BATCH_CALL: u64 = 61_100;
@@ -171,6 +177,9 @@ pub mod redeem_gas {
     pub const PER_PROBE: u64 = 271;
     pub const PER_CLAIM: u64 = 1_039;
     pub const J_BYTE: u64 = 10;
+    pub const PER_RLP_ITEM: u64 = 450;
+    pub const PER_RLP_HEAD: u64 = 1_100;
+    pub const PER_RLP_KIDS: u64 = 2_000;
     pub const COLD_ACCESS: u64 = 5_200;
     pub const MEM_BASE: usize = 320;
     pub const MEM_PER_STEP_100: usize = 6_744;
@@ -265,6 +274,10 @@ pub struct RedeemFeatures {
     pub uc_slow: usize,
     pub helper_memory: u64,
     pub evm_uc: UcCost,
+    pub rcpt_items: usize,
+    pub rcpt_heads: usize,
+    pub rcpt_kids: usize,
+    pub rcpt_words: usize,
     pub uc_costs: Vec<UcCost>,
     pub path_words: usize,
     pub max_uc: usize,
@@ -361,6 +374,186 @@ fn uc_shape(uc: &[u8]) -> Option<UcShape> {
         claim_bytes: claim.len(),
         claim_key: Some(he(&[&claim])),
     })
+}
+
+/// An RLP item as Nb2Evm.head reads it.
+#[derive(Clone, Copy)]
+struct Rlp {
+    list: bool,
+    pos: usize,
+    len: usize,
+    end: usize,
+}
+
+fn rlp_head(b: &[u8], p: usize, end: usize) -> Option<Rlp> {
+    if p >= end {
+        return None;
+    }
+    let x = b[p];
+    let be = |q: usize, n: usize| -> Option<usize> {
+        if n > 4 || q + n > end || b[q] == 0 {
+            return None;
+        }
+        Some(
+            b[q..q + n]
+                .iter()
+                .fold(0usize, |v, &d| v * 256 + d as usize),
+        )
+    };
+    let (list, hdr, len) = if x < 0x80 {
+        return Some(Rlp {
+            list: false,
+            pos: p,
+            len: 1,
+            end: p + 1,
+        });
+    } else if x <= 0xb7 {
+        (false, 1, (x - 0x80) as usize)
+    } else if x <= 0xbf {
+        let ll = (x - 0xb7) as usize;
+        (false, 1 + ll, be(p + 1, ll)?)
+    } else if x <= 0xf7 {
+        (true, 1, (x - 0xc0) as usize)
+    } else {
+        let ll = (x - 0xf7) as usize;
+        (true, 1 + ll, be(p + 1, ll)?)
+    };
+    if p + hdr + len > end {
+        return None;
+    }
+    Some(Rlp {
+        list,
+        pos: p + hdr,
+        len,
+        end: p + hdr + len,
+    })
+}
+
+/// Every RLP item in [p, end) (check()'s visits), or None when it is not RLP.
+fn rlp_items(b: &[u8], mut p: usize, end: usize, depth: usize) -> Option<usize> {
+    let mut n = 0;
+    while p < end {
+        let it = rlp_head(b, p, end)?;
+        if depth > 16 {
+            return None;
+        }
+        n += 1;
+        if it.list {
+            n += rlp_items(b, it.pos, it.end, depth + 1)?;
+        }
+        p = it.end;
+    }
+    Some(n)
+}
+
+fn rlp_kids(b: &[u8], it: &Rlp) -> Option<Vec<Rlp>> {
+    let mut out = Vec::new();
+    let mut q = it.pos;
+    while q < it.end {
+        let k = rlp_head(b, q, it.end)?;
+        q = k.end;
+        out.push(k);
+    }
+    Some(out)
+}
+
+struct ReceiptShape {
+    items: usize,
+    heads: usize,
+    kids: usize,
+    words: usize,
+}
+
+/// The receipt helper's walk of J's deposit proof (`gas.ts` receiptShape): check() of the header, every trie node and the receipt;
+/// kids() of the header (20), each node (17), the receipt (4) and the log (3); head() of every log up to the selected one and of its
+/// topics; those calls' allocations and the log's data.
+fn receipt_shape(header: &[u8], nodes: &[Vec<u8>], log_index: u64) -> Option<ReceiptShape> {
+    let mut sh = ReceiptShape {
+        items: 0,
+        heads: 0,
+        kids: 0,
+        words: 0,
+    };
+    let largest = nodes
+        .iter()
+        .map(|x| x.len())
+        .chain(core::iter::once(header.len()))
+        .max()
+        .unwrap_or(0);
+    sh.words = 128 + 2 * nodes.len() + 18 + 20 + ceil32(largest);
+    fn kids_of(sh: &mut ReceiptShape, b: &[u8], it: &Rlp, max: usize) -> Option<Vec<Rlp>> {
+        let k = rlp_kids(b, it)?;
+        sh.kids += 1;
+        sh.heads += k.len();
+        sh.words += 1 + 5 * max + 4 * k.len();
+        Some(k)
+    }
+    fn top(sh: &mut ReceiptShape, b: &[u8]) -> Option<Rlp> {
+        let n = rlp_items(b, 0, b.len(), 0)?;
+        let it = rlp_head(b, 0, b.len())?;
+        if it.end != b.len() {
+            return None;
+        }
+        sh.items += n;
+        Some(it)
+    }
+    let h = top(&mut sh, header)?;
+    if !h.list {
+        return None;
+    }
+    kids_of(&mut sh, header, &h, 20)?;
+    let mut value: Option<&[u8]> = None;
+    for (i, node) in nodes.iter().enumerate() {
+        let it = top(&mut sh, node)?;
+        if !it.list {
+            return None;
+        }
+        let k = kids_of(&mut sh, node, &it, 17)?;
+        if i == nodes.len() - 1 {
+            let v = match k.len() {
+                17 => k[16],
+                2 => k[1],
+                _ => return None,
+            };
+            if v.list {
+                return None;
+            }
+            value = Some(&node[v.pos..v.end]);
+        }
+    }
+    let value = value.filter(|v| !v.is_empty())?;
+    let r = if value[0] < 0xc0 { &value[1..] } else { value };
+    let rt = top(&mut sh, r)?;
+    if !rt.list {
+        return None;
+    }
+    let f = kids_of(&mut sh, r, &rt, 4)?;
+    if f.len() != 4 || !f[3].list {
+        return None;
+    }
+    let mut q = f[3].pos;
+    let mut sel = None;
+    let mut i = 0u64;
+    while q < f[3].end {
+        let it = rlp_head(r, q, f[3].end)?;
+        sh.heads += 1;
+        sh.words += 4;
+        if i == log_index {
+            sel = Some(it);
+            break;
+        }
+        i += 1;
+        q = it.end;
+    }
+    let sel = sel.filter(|s| s.list)?;
+    let lk = kids_of(&mut sh, r, &sel, 3)?;
+    if lk.len() != 3 || !lk[1].list {
+        return None;
+    }
+    let topics = rlp_kids(r, &lk[1])?;
+    sh.heads += topics.len();
+    sh.words += 4 * topics.len() + 1 + topics.len() + 1 + ceil32(lk[2].len);
+    Some(sh)
 }
 
 /// One open-addressing table of the verifier (linear probing from the key's low bits), counting its probes and its misses.
@@ -498,7 +691,9 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
         .justification
         .as_deref()
         .filter(|j| head_tag(j) == Some(tag::RECEIPT_BACKING))?;
-    let evm = shape_of(&decode_receipt_backing(j).ok()?.proof.uc)?;
+    let dp = decode_receipt_backing(j).ok()?.proof;
+    let evm = shape_of(&dp.uc)?;
+    let rcpt = receipt_shape(&dp.header, &dp.nodes, dp.log_index)?;
     let mut items = 2 + cbor_items(&encode_token(part)) + cbor_items(j);
     if pending {
         items += g::PENDING_PAIR_ITEMS + g::PENDING_UC_ITEMS;
@@ -576,7 +771,7 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
         uc_stc: evm.stc,
         uc_utc: evm.utc,
         uc_slow: evm.slow,
-        helper_memory: helper_memory(evm.bytes),
+        helper_memory: memory_gas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
         evm_uc: UcCost {
             bytes: evm.bytes,
             ir: evm.ir,
@@ -586,6 +781,10 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
             slow: evm.slow,
         },
         uc_costs: Vec::new(),
+        rcpt_items: rcpt.items,
+        rcpt_heads: rcpt.heads,
+        rcpt_kids: rcpt.kids,
+        rcpt_words: rcpt.words,
         path_words: 0,
         max_uc: evm.bytes,
         scratch: 24,
@@ -750,6 +949,9 @@ pub fn price_features(f: &RedeemFeatures, evidence_bytes: usize, proofs: u64, k:
         + g::PER_PROBE * u(f.probes)
         + g::PER_CLAIM * u(f.claims.len())
         + g::J_BYTE * u(f.j_bytes)
+        + g::PER_RLP_ITEM * u(f.rcpt_items)
+        + g::PER_RLP_HEAD * u(f.rcpt_heads)
+        + g::PER_RLP_KIDS * u(f.rcpt_kids)
         + g::COLD_ACCESS;
     let memory_words = verifier_memory_words(f);
     let memory = memory_gas(memory_words);
@@ -760,7 +962,12 @@ pub fn price_features(f: &RedeemFeatures, evidence_bytes: usize, proofs: u64, k:
         largest = largest.max(helper_gas(c));
     }
     largest = largest.max(
-        helper_gas(&f.evm_uc) + g::J_BYTE * u(f.j_bytes) + memory_gas(3 * ceil32(f.j_bytes) + 64),
+        helper_gas(&f.evm_uc) - helper_memory(f.evm_uc.bytes)
+            + memory_gas(3 * ceil32(f.evm_uc.bytes) + 64 + f.rcpt_words)
+            + g::J_BYTE * u(f.j_bytes)
+            + g::PER_RLP_ITEM * u(f.rcpt_items)
+            + g::PER_RLP_HEAD * u(f.rcpt_heads)
+            + g::PER_RLP_KIDS * u(f.rcpt_kids),
     );
     let inner = largest / 63 + 1;
     let forwarding = (verifier + inner) / 63 + 1 + inner;
@@ -786,7 +993,47 @@ pub fn redeem_gas_terms(s: &RedeemShape<'_>) -> Option<GasTerms> {
     redeem_features(s).map(|f| price_features(&f, s.evidence_bytes, s.proofs, s.k))
 }
 
-/// The default model: [`redeem_gas`].
+/// The verifier build [`redeem_gas`] is calibrated for (`gas.ts` CALIBRATED_VERIFIER): unicity-pos-contracts 884c4829
+/// `src/nb2/verifier` (solc 0.8.37, via-IR, optimizer runs 1), compared with its immutables zeroed, pinning the calibrated helper.
+pub mod calibrated_verifier {
+    pub const CODE_LENGTH: usize = 19_574;
+    pub const MASKED_CODE_HASH: &str =
+        "65fbc862ae2ea16729506cd9e6a62458785751b690103ce25d9515495029f201";
+    pub const IMMUTABLES: [(usize, usize); 8] = [
+        (325, 32),
+        (368, 32),
+        (3_071, 32),
+        (8_417, 32),
+        (8_473, 32),
+        (8_541, 32),
+        (12_187, 32),
+        (15_504, 32),
+    ];
+    pub const HELPER_CODE_HASH_AT: [usize; 2] = [368, 8_417];
+    pub const HELPER_CODE_HASH: &str =
+        "16f1381ed6c1d9cd1c14b467fcfb2ec84ab8903f65da506048fbb2e2c10ffe23";
+}
+
+/// Whether CODE is the calibrated verifier build (immutables zeroed) pinning the calibrated helper.
+pub fn calibrated_verifier(code: &[u8]) -> bool {
+    use calibrated_verifier as c;
+    if code.len() != c::CODE_LENGTH {
+        return false;
+    }
+    if c::HELPER_CODE_HASH_AT
+        .iter()
+        .any(|&at| to_hex(&code[at..at + 32]) != c::HELPER_CODE_HASH)
+    {
+        return false;
+    }
+    let mut m = code.to_vec();
+    for (at, n) in c::IMMUTABLES {
+        m[at..at + n].fill(0);
+    }
+    to_hex(&he(&[&m])) == c::MASKED_CODE_HASH
+}
+
+/// The default model: [`redeem_gas`], for the calibrated verifier build only (the bridge refuses it for any other).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeasuredGasModel;
 
@@ -801,6 +1048,10 @@ impl GasModel for MeasuredGasModel {
 
     fn deposit_gas_limit(&self) -> u64 {
         2 * measured::DEPOSIT_FIRST + 50_000
+    }
+
+    fn supports_verifier(&self, code: &[u8]) -> Option<bool> {
+        Some(calibrated_verifier(code))
     }
 }
 

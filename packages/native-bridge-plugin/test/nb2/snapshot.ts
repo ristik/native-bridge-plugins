@@ -14,7 +14,7 @@ import { MemoryJournalStore } from '../../src/nb2/journal.js';
 import { headerOfJson } from '../../src/nb2/rpc.js';
 import { deriveBridgeKey, type BridgeOptions } from '../../src/nb2/bridge.js';
 import { TrustInput } from '../../src/nb2/trust.js';
-import { FakeAggregator, FakeChain, key, roundAtLeast, roundNow, type Root } from './world.js';
+import { FakeAggregator, FakeChain, WORLD_GAS, key, roundAtLeast, roundNow, type Root } from './world.js';
 
 export const SNAPSHOT_FORMAT = 'unicity-nb2-offline-world';
 
@@ -30,7 +30,7 @@ export function worldOf(root: Root, chain: FakeChain, agg: FakeAggregator) {
   };
   const options = (seed: string, store = new MemoryJournalStore()): BridgeOptions => ({
     pins, trust: root.trust, rpc: chain, aggregator: agg, journal: store, bridgeKey: deriveBridgeKey(key(seed)), backup: async () => {},
-    receiptTimeoutMs: 0, pollMs: 0, sleep: async () => {},
+    receiptTimeoutMs: 0, pollMs: 0, sleep: async () => {}, gas: WORLD_GAS,
   });
   return { root, chain, agg, pins, options };
 }

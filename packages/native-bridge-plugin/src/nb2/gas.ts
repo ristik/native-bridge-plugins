@@ -35,6 +35,11 @@ export interface RedeemShape {
 export interface GasModel {
   readonly name: string;
   redeemGasLimit(s: RedeemShape): bigint | null;
+  /**
+   * Whether the model is calibrated for the deployment's verifier, given its runtime code (whose hash the bridge has checked against Γ).
+   * A model without this method is the wallet's own choice and is used as supplied.
+   */
+  supportsVerifier?(code: Uint8Array): boolean;
   /** The gas limit of a deposit call. */
   depositGasLimit(): bigint;
 }
@@ -129,7 +134,7 @@ export const REDEEM_GAS = {
   txBase: 21_000n,
   calldataByte: 16n,
   // the vault (#1098 bench/nb2 RESULTS.md "worst"; unicity-pos-contracts#80, #81)
-  vaultWorstCall: 487_339n,
+  vaultWorstCall: 507_215n, // the worst over every phase, the first-generation segment 1 included
   perSegment: 6_000n,
   copyWord: 3n,
   // CERT_BATCH_V2 (ureth crates/unicity/b1 batch.rs): 60,000 + 16 C + 500 k(k-1) + 1,100 + 29,900 E + 7,200 Q + 2,000 A + 250 P
@@ -170,7 +175,11 @@ export const REDEEM_GAS = {
   perDecompress: 2_100n,
   perProbe: 271n,
   perClaim: 1_039n,
-  jByte: 10n,
+  jByte: 10n, // J's copies and Keccak (code: at most 20 gas a word)
+  // the receipt helper's RLP walk (Nb2Evm: check, head, kids; measured on receipts of up to 2,000 logs and lists of 5,000 items)
+  perRlpItem: 450n, // check() of every item of the header, each trie node and the receipt (measured at most 408)
+  perRlpHead: 1_100n, // head() with its Item: each preceding log, the selected log's topics, every kids() child (measured at most 1,040)
+  perRlpKids: 2_000n, // a kids() call's array of max Items
   coldAccess: 5_200n, // the verifier's EXTCODEHASH of its helper and the helper's code, cold on chain (2 x 2,600)
   // the verifier frame's memory high-water beyond its hash tables: words, and hundredths of a word per unit (measured, rounded up)
   memBase: 320,
@@ -242,6 +251,10 @@ export interface RedeemFeatures {
   ucSlow: number;
   helperMemory: bigint; // the helper frames' memory expansion
   evmUc: UcCost; // J's EVM UC (the helper's receiptLog parses it)
+  rcptItems: number; // RLP items check() visits: the header, every trie node, the receipt
+  rcptHeads: number; // head() calls: every preceding log and the selected one, its topics, every child a kids() call walks
+  rcptKids: number; // kids() calls
+  rcptWords: number; // the receipt helper frame's allocations beyond its UC parse (words)
   ucCosts: UcCost[]; // the distinct UC shapes the helper parses (each a call of its own: the forwarding term takes the largest)
   pathWords: number; // the membership requests (words)
   maxUc: number;
@@ -274,6 +287,140 @@ export function cborItems(b: Uint8Array): number {
     n++;
   }
   return n;
+}
+
+/** An RLP item as Nb2Evm.head reads it. */
+interface Rlp { list: boolean; pos: number; len: number; end: number }
+
+function rlpHead(b: Uint8Array, p: number, end: number): Rlp | null {
+  if (p >= end) return null;
+  const x = b[p];
+  const be = (q: number, n: number): number | null => {
+    if (n > 4 || q + n > end || b[q] === 0) return null;
+    let v = 0;
+    for (let k = 0; k < n; k++) v = v * 256 + b[q + k];
+    return v;
+  };
+  let hdr = 1;
+  let len: number;
+  let list = false;
+  if (x < 0x80) return { list: false, pos: p, len: 1, end: p + 1 };
+  if (x <= 0xb7) len = x - 0x80;
+  else if (x <= 0xbf) {
+    const n = be(p + 1, x - 0xb7);
+    if (n === null) return null;
+    hdr += x - 0xb7;
+    len = n;
+  } else if (x <= 0xf7) {
+    list = true;
+    len = x - 0xc0;
+  } else {
+    const n = be(p + 1, x - 0xf7);
+    if (n === null) return null;
+    list = true;
+    hdr += x - 0xf7;
+    len = n;
+  }
+  if (p + hdr + len > end) return null;
+  return { list, pos: p + hdr, len, end: p + hdr + len };
+}
+
+/** Every RLP item in [p, end) (check()'s visits), or null when it is not RLP. */
+function rlpItems(b: Uint8Array, p: number, end: number, depth = 0): number | null {
+  let n = 0;
+  while (p < end) {
+    const it = rlpHead(b, p, end);
+    if (it === null || depth > 16) return null;
+    n++;
+    if (it.list) {
+      const k = rlpItems(b, it.pos, it.end, depth + 1);
+      if (k === null) return null;
+      n += k;
+    }
+    p = it.end;
+  }
+  return n;
+}
+
+function rlpKids(b: Uint8Array, it: Rlp): Rlp[] | null {
+  const out: Rlp[] = [];
+  for (let q = it.pos; q < it.end;) {
+    const k = rlpHead(b, q, it.end);
+    if (k === null) return null;
+    out.push(k);
+    q = k.end;
+  }
+  return out;
+}
+
+/**
+ * The receipt helper's walk of J's deposit proof (Nb2ReceiptVerifier.receiptLog, Nb2Evm): check() of the header, every trie node and the
+ * receipt; kids() of the header (20), each node (17), the receipt (4) and the log (3), each walking every child; head() of every log up to
+ * the selected one and of its topics; the allocations of those calls (an Item is 4 words, a kids() array 1 + 5 max) and the log's data.
+ */
+function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint): { items: number; heads: number; kids: number; words: number } | null {
+  let items = 0;
+  let heads = 0;
+  let kids = 0;
+  // fixed: the frame's own words, the nodes' position and length arrays, the key nibbles (18), the header widths (20); scratch: the largest
+  // node or header copied for its Keccak beyond the free pointer
+  let words = 128 + 2 * nodes.length + 18 + 20 + ceil32(Math.max(header.length, ...nodes.map((x) => x.length)));
+  const kidsOf = (b: Uint8Array, it: Rlp, max: number): Rlp[] | null => {
+    const k = rlpKids(b, it);
+    if (k === null) return null;
+    kids++;
+    heads += k.length;
+    words += 1 + 5 * max + 4 * k.length;
+    return k;
+  };
+  const top = (b: Uint8Array): Rlp | null => {
+    const n = rlpItems(b, 0, b.length);
+    const it = rlpHead(b, 0, b.length);
+    if (n === null || it === null || it.end !== b.length) return null;
+    items += n;
+    return it;
+  };
+  const h = top(header);
+  if (h === null || !h.list || kidsOf(header, h, 20) === null) return null;
+  let value: Uint8Array | null = null;
+  for (let i = 0; i < nodes.length; i++) {
+    const it = top(nodes[i]);
+    if (it === null || !it.list) return null;
+    const k = kidsOf(nodes[i], it, 17);
+    if (k === null) return null;
+    if (i === nodes.length - 1) {
+      const v = k.length === 17 ? k[16] : k.length === 2 ? k[1] : null;
+      if (v === null || v.list) return null;
+      value = nodes[i].subarray(v.pos, v.end);
+    }
+  }
+  if (value === null || value.length === 0) return null;
+  const r = value[0] < 0xc0 ? value.subarray(1) : value;
+  const rt = top(r);
+  if (rt === null || !rt.list) return null;
+  const f = kidsOf(r, rt, 4);
+  if (f === null || f.length !== 4 || !f[3].list) return null;
+  let q = f[3].pos;
+  let sel: Rlp | null = null;
+  for (let i = 0n; q < f[3].end; i++) {
+    const it = rlpHead(r, q, f[3].end);
+    if (it === null) return null;
+    heads++;
+    words += 4;
+    if (i === logIndex) {
+      sel = it;
+      break;
+    }
+    q = it.end;
+  }
+  if (sel === null || !sel.list) return null;
+  const lk = kidsOf(r, sel, 3);
+  if (lk === null || lk.length !== 3 || !lk[1].list) return null;
+  const topics = rlpKids(r, lk[1]);
+  if (topics === null) return null;
+  heads += topics.length;
+  words += 4 * topics.length + 1 + topics.length + 1 + ceil32(lk[2].len);
+  return { items, heads, kids, words };
 }
 
 const u32 = (v: number): Uint8Array => Uint8Array.of(v >>> 24, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
@@ -395,12 +542,15 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
   const j = L[0].mint.justification;
   if (j === null || headTag(j) !== TAG.receiptBacking) return null;
   let evm: UcShape | null;
+  let rcpt: ReturnType<typeof receiptShape>;
   try {
-    evm = shapeOf(decodeReceiptBacking(j).proof.uc);
+    const dp = decodeReceiptBacking(j).proof;
+    evm = shapeOf(dp.uc);
+    rcpt = receiptShape(dp.header, dp.nodes, dp.logIndex);
   } catch {
     return null;
   }
-  if (evm === null) return null;
+  if (evm === null || rcpt === null) return null;
   // CBOR items: the evidence once, every split justification and J once (a byte string's content is scanned by the check that opens it)
   let items = 2 + cborItems(encodeToken(part)) + cborItems(j) + (pending ? g.pendingPairItems + g.pendingUcItems : 0);
   let allocSteps = 0;
@@ -457,8 +607,9 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
   }
   const f: RedeemFeatures = {
     tokens: L.length, edges: L.length - 1, allocSteps, steps: n, parentSteps: L.slice(0, -1).reduce((m, t) => m + 1 + t.transfers.length, 0), txWords: 0, maxTx: 0, siblings: 0, ucParses: n + 1, ucBytes: evm.bytes, ucIr: evm.ir, ucSignatures: evm.signatures,
-    ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, helperMemory: helperMemory(evm.bytes),
-    evmUc: { bytes: evm.bytes, ir: evm.ir, signatures: evm.signatures, stc: evm.stc, utc: evm.utc, slow: evm.slow }, ucCosts: [], pathWords: 0, maxUc: evm.bytes, scratch: 24, items, jBytes: j.length,
+    ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, helperMemory: memoryGas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
+    evmUc: { bytes: evm.bytes, ir: evm.ir, signatures: evm.signatures, stc: evm.stc, utc: evm.utc, slow: evm.slow }, ucCosts: [],
+    rcptItems: rcpt.items, rcptHeads: rcpt.heads, rcptKids: rcpt.kids, rcptWords: rcpt.words, pathWords: 0, maxUc: evm.bytes, scratch: 24, items, jBytes: j.length,
     keyLookups, decompressions: keys.misses, probes: keys.probes + sids.probes + claimIds.probes + unknownProbes, claims,
   };
   // a transaction is hashed from a copy at the free pointer (SHA-256 of calldata); every later step allocates at least its UC's slice and its
@@ -573,14 +724,15 @@ export function priceFeatures(f: RedeemFeatures, evidenceBytes: number, proofs: 
     + g.perUcParse * B(f.ucParses) + g.perUcByte * B(f.ucBytes) + g.perUcIrByte * B(f.ucIr) + g.perUcSignature * B(f.ucSignatures) + g.perUcStc * B(f.ucStc) + g.perUcUtc * B(f.ucUtc)
     + g.perUcSlowByte * B(f.ucSlow) + f.helperMemory
     + g.perKeyLookup * B(f.keyLookups) + g.perDecompress * B(f.decompressions) + g.perProbe * B(f.probes) + g.perClaim * B(f.claims.length) + g.jByte * B(f.jBytes)
-    + g.coldAccess;
+    + g.perRlpItem * B(f.rcptItems) + g.perRlpHead * B(f.rcptHeads) + g.perRlpKids * B(f.rcptKids) + g.coldAccess;
   const memoryWords = verifierMemoryWords(f);
   const memory = memoryGas(memoryWords);
   const verifier = batch.gas + membership + sha256 + execution + memory;
   // EIP-150 at the verifier's own calls: the largest of its batch calls, its helper calls (one a UC; J's receipt with its EVM UC)
   let largest = batch.largest;
   for (const c of f.ucCosts) if (helperGas(c) > largest) largest = helperGas(c);
-  const receipt = helperGas(f.evmUc) + g.jByte * B(f.jBytes) + memoryGas(3 * ceil32(f.jBytes) + 64);
+  const receipt = helperGas(f.evmUc) - helperMemory(f.evmUc.bytes) + memoryGas(3 * ceil32(f.evmUc.bytes) + 64 + f.rcptWords) + g.jByte * B(f.jBytes)
+    + g.perRlpItem * B(f.rcptItems) + g.perRlpHead * B(f.rcptHeads) + g.perRlpKids * B(f.rcptKids);
   if (receipt > largest) largest = receipt;
   const inner = largest / 63n + 1n;
   const forwarding = (verifier + inner) / 63n + 1n + inner;
@@ -594,9 +746,37 @@ export function redeemGasTerms(s: RedeemShape): GasTerms | null {
   return f === null ? null : priceFeatures(f, s.evidenceBytes, s.proofs, s.K);
 }
 
-/** The default model: {@link REDEEM_GAS}. */
+/**
+ * The verifier build {@link REDEEM_GAS} is calibrated for: unicity-pos-contracts 884c4829 `src/nb2/verifier` (solc 0.8.37, via-IR, optimizer
+ * runs 1), the runtime code both builds deploy. Its immutables (admitsTestSet, the helper's address, the helper's code hash) differ by
+ * deployment, so the code is compared with them zeroed, and the helper code hash it pins must be the calibrated helper's. The native
+ * schedules assumed are ureth unicity/main 7f625ea (crates/unicity/b1).
+ */
+export const CALIBRATED_VERIFIER = {
+  codeLength: 19_574,
+  maskedCodeHash: '65fbc862ae2ea16729506cd9e6a62458785751b690103ce25d9515495029f201',
+  immutables: [[325, 32], [368, 32], [3_071, 32], [8_417, 32], [8_473, 32], [8_541, 32], [12_187, 32], [15_504, 32]],
+  helperCodeHashAt: [368, 8_417],
+  helperCodeHash: '16f1381ed6c1d9cd1c14b467fcfb2ec84ab8903f65da506048fbb2e2c10ffe23',
+} as const;
+
+/** Whether CODE is the calibrated verifier build (immutables zeroed) pinning the calibrated helper. */
+export function calibratedVerifier(code: Uint8Array): boolean {
+  const c = CALIBRATED_VERIFIER;
+  if (code.length !== c.codeLength) return false;
+  for (const at of c.helperCodeHashAt) if (toHex(code.subarray(at, at + 32)) !== c.helperCodeHash) return false;
+  const m = Uint8Array.from(code);
+  for (const [at, n] of c.immutables) m.fill(0, at, at + n);
+  return toHex(HE(m)) === c.maskedCodeHash;
+}
+
+/** The default model: {@link REDEEM_GAS}, for the {@link CALIBRATED_VERIFIER} build only (the bridge refuses it for any other). */
 export class MeasuredGasModel implements GasModel {
   public readonly name = 'bound-nb2-1179';
+
+  public supportsVerifier(code: Uint8Array): boolean {
+    return calibratedVerifier(code);
+  }
 
   public redeemGasLimit(s: RedeemShape): bigint | null {
     return redeemGasTerms(s)?.limit ?? null;

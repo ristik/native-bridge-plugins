@@ -133,6 +133,8 @@ export class NativeBridgeV2 {
   private readonly opts: Omit<BridgeOptions, 'bridgeKey'>;
   /** In-process serialization per journal key (with the store's compare-and-swap across processes). */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** Whether the gas model applies to this deployment's verifier (checked once, from its runtime code). */
+  private gasFits: boolean | null = null;
 
   private constructor(options: BridgeOptions) {
     const { bridgeKey, ...opts } = options;
@@ -589,10 +591,27 @@ export class NativeBridgeV2 {
   }
 
   /**
+   * Whether the gas model applies to the deployed verifier: a model that says which builds it is calibrated for (the default does) is
+   * shown the verifier's runtime code, whose hash must be Γ's; a model that does not say is the wallet's own choice.
+   */
+  private async gasApplies(): Promise<boolean> {
+    if (this.gas.supportsVerifier === undefined) return true;
+    if (this.gasFits === null) {
+      const code = await this.evm.code(this.cfg.verifier);
+      if (!eq(HE(code), this.cfg.verifierCodeHash)) refuse('BadDeployment', 'the verifier\'s runtime code is not the one Γ pins');
+      this.gasFits = this.gas.supportsVerifier(code);
+    }
+    return this.gasFits;
+  }
+
+  /**
    * The section 12.5 preflight for burning `token` at index `a` to `recipient`, with a fresh endpoint estimate (c_obs = max(c, a); the
    * state read is an availability assumption, not evidence) and the payer's funds for the worst-case gas limit.
    */
   private async preflight(token: Uint8Array, amount: bigint, recipient: Uint8Array, a: bigint, payer: Uint8Array): Promise<{ cObs: bigint; pNow: bigint; need: bigint; pMax: bigint; gas: bigint }> {
+    if (!(await this.gasApplies())) {
+      fail('CapacityPreflight', `the gas model ${this.gas.name} is not calibrated for this deployment's verifier build: supply a GasModel for it`);
+    }
     const st = await this.evm.vaultState(this.cfg.vault);
     const cObs = st.segment > a ? st.segment : a;
     const R = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient, amount, minIndex: a });
@@ -687,8 +706,10 @@ export class NativeBridgeV2 {
       const calldata = redeemCalldata(evidence, eta, a, history);
       const pins = this.opts.pins;
       const lO = BigInt(otherBytes(evidence.length));
-      let gasLimit = this.gas.redeemGasLimit({ evidenceBytes: evidence.length, lineage: lineageOf(decodeToken(unhex(rec.burned!))), pendingTransactions: 0, proofs: P, K: this.cfg.K });
-      if (gasLimit === null) fail('CapacityExceeded', 'the gas cannot be bounded');
+      // the model only where it applies; the simulation, when the RPC has one, sets the limit
+      let gasLimit = (await this.gasApplies())
+        ? this.gas.redeemGasLimit({ evidenceBytes: evidence.length, lineage: lineageOf(decodeToken(unhex(rec.burned!))), pendingTransactions: 0, proofs: P, K: this.cfg.K })
+        : null;
       const est = await this.evm.estimateGas({ from: unhex(rec.recipient), to: this.cfg.vault, data: calldata });
       if ('gas' in est) gasLimit = est.gas + pins.gasReserve;
       else {
@@ -699,6 +720,7 @@ export class NativeBridgeV2 {
         if (e !== null) throw new Nb2Error(e.rule, `simulation refused (${action})`, e.args.map((x) => (typeof x === 'bigint' ? String(x) : hexq(x))));
         // no rule: an RPC without simulation; the model's bound stands
       }
+      if (gasLimit === null) fail('CapacityExceeded', 'the gas cannot be bounded');
       capacityExceeded(pins.maxEncodedTxBytes, BigInt(evidence.length), lO, this.cfg.K, P, gasLimit!, pins.userGasLimit);
       return { returnId, calldata, gasLimit: gasLimit!, P, endpoint: st.segment, history, eta, claimedStart: a };
     }

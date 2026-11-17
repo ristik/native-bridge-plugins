@@ -5,8 +5,9 @@
 
 use native_bridge_sdk_ext::nb2::bridge::lineage_of;
 use native_bridge_sdk_ext::nb2::gas::{
-    batch_gas, cbor_items, memory_gas, price_features, redeem_features, redeem_gas_terms, Claim,
-    GasModel, GasTerms, MeasuredGasModel, RedeemFeatures, RedeemShape, UcCost,
+    batch_gas, calibrated_verifier, cbor_items, memory_gas, price_features, redeem_features,
+    redeem_gas_terms, Claim, GasModel, GasTerms, MeasuredGasModel, RedeemFeatures, RedeemShape,
+    UcCost,
 };
 use native_bridge_sdk_ext::nb2::token::Token;
 use native_bridge_sdk_ext::nb2::util::from_hex;
@@ -40,7 +41,7 @@ fn features_json(f: &RedeemFeatures) -> Value {
     json!({
         "tokens": f.tokens, "edges": f.edges, "allocSteps": f.alloc_steps, "steps": f.steps, "parentSteps": f.parent_steps, "txWords": f.tx_words, "maxTx": f.max_tx,
         "siblings": f.siblings, "ucParses": f.uc_parses, "ucBytes": f.uc_bytes, "ucIr": f.uc_ir, "ucSignatures": f.uc_signatures, "ucStc": f.uc_stc,
-        "ucUtc": f.uc_utc, "ucSlow": f.uc_slow, "helperMemory": f.helper_memory.to_string(), "evmUc": uc(&f.evm_uc), "ucCosts": f.uc_costs.iter().map(uc).collect::<Vec<_>>(),
+        "ucUtc": f.uc_utc, "ucSlow": f.uc_slow, "helperMemory": f.helper_memory.to_string(), "evmUc": uc(&f.evm_uc), "rcptItems": f.rcpt_items, "rcptHeads": f.rcpt_heads, "rcptKids": f.rcpt_kids, "rcptWords": f.rcpt_words, "ucCosts": f.uc_costs.iter().map(uc).collect::<Vec<_>>(),
         "pathWords": f.path_words, "maxUc": f.max_uc, "scratch": f.scratch, "items": f.items, "jBytes": f.j_bytes, "keyLookups": f.key_lookups,
         "decompressions": f.decompressions, "probes": f.probes, "claims": claims,
     })
@@ -97,7 +98,7 @@ fn shared_vectors_reproduce_exactly() {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(FILE).unwrap()).unwrap();
     assert_eq!(v["model"], MeasuredGasModel.name());
     let vectors = v["vectors"].as_array().unwrap();
-    assert!(vectors.len() >= 11);
+    assert!(vectors.len() >= 13);
     let mut nulls = 0;
     for vec in vectors {
         let name = vec["name"].as_str().unwrap();
@@ -273,4 +274,34 @@ fn fail_closed() {
     let uc = &mut bad[last].proofs[0].uc;
     uc.pop();
     assert!(s(&bad, 0).is_none());
+}
+
+#[test]
+fn the_default_bound_applies_to_the_calibrated_verifier_build_only() {
+    let code = from_hex(
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/nb2-gas/verifier-runtime.hex"
+        ))
+        .unwrap()
+        .trim(),
+    )
+    .unwrap();
+    assert!(calibrated_verifier(&code));
+    assert_eq!(MeasuredGasModel.supports_verifier(&code), Some(true));
+    let mut other = code.clone();
+    other[325 + 31] ^= 1;
+    other[12_187 + 31] ^= 1;
+    assert!(
+        calibrated_verifier(&other),
+        "another deployment of the build"
+    );
+    let mut byte = code.clone();
+    byte[1_000] ^= 1;
+    assert!(!calibrated_verifier(&byte));
+    let mut helper = code.clone();
+    helper[368] ^= 1;
+    assert!(!calibrated_verifier(&helper));
+    assert!(!calibrated_verifier(&code[1..]));
+    assert!(!calibrated_verifier(&[]));
 }

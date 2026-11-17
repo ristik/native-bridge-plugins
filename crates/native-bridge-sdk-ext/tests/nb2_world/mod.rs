@@ -21,6 +21,7 @@ use native_bridge_sdk_ext::nb2::crypto::{he, hu};
 use native_bridge_sdk_ext::nb2::deposit::{deposited_data, topic};
 use native_bridge_sdk_ext::nb2::errors::{Error, Result};
 use native_bridge_sdk_ext::nb2::evm::{decode_signed_tx, EvmSigner, LocalKeySigner};
+use native_bridge_sdk_ext::nb2::gas::{GasModel, MeasuredGasModel, RedeemShape};
 use native_bridge_sdk_ext::nb2::header::{
     empty_trie_root, empty_uncle_hash, encode_header, Header,
 };
@@ -1019,6 +1020,21 @@ pub fn setup() -> World {
     }
 }
 
+/// The bound without its build check (`world.ts` WORLD_GAS).
+pub struct WorldGas;
+
+impl GasModel for WorldGas {
+    fn name(&self) -> &str {
+        MeasuredGasModel.name()
+    }
+    fn redeem_gas_limit(&self, s: &RedeemShape<'_>) -> Option<u64> {
+        MeasuredGasModel.redeem_gas_limit(s)
+    }
+    fn deposit_gas_limit(&self) -> u64 {
+        MeasuredGasModel.deposit_gas_limit()
+    }
+}
+
 impl World {
     pub fn options(&self, seed: &str, store: Arc<dyn JournalStore>) -> BridgeOptions {
         let mut o = BridgeOptions::new(
@@ -1033,6 +1049,8 @@ impl World {
         o.receipt_timeout_ms = Some(0);
         o.poll_ms = Some(0);
         o.sleep = Some(Box::new(|_| {}));
+        // the world's verifier is a stand-in, not the calibrated build: its tests supply the bound as a wallet supplies its own model
+        o.gas = Some(Box::new(WorldGas));
         o
     }
 
