@@ -290,6 +290,8 @@ export class NativeBridgeV2 {
     if (l === undefined) refuse('ProviderFault', 'the deposit receipt has no Deposited log');
     const d = decodeDeposited({ address: this.cfg.vault, topics: l!.topics.map((x) => unhex(x.toLowerCase())), data: unhex(l!.data.toLowerCase()), blockNumber: 0n, blockHash: new Uint8Array(32), transactionHash: new Uint8Array(32), logIndex: 0n });
     if (d === null || !eq(d.rho, unhex(rec.rho))) refuse('ProviderFault', 'the Deposited log is not this intent\'s');
+    // the event's D is this deployment's: the same rho under another vault configuration at this address is not this deposit
+    if (!eq(d!.domain, this.domain)) refuse('ProviderFault', 'the Deposited log carries another deployment\'s domain D');
     rec.depositTx = r.transactionHash.toLowerCase();
     rec.blockNumber = dec(BigInt(r.blockNumber));
     rec.depositNumber = dec(d!.n);

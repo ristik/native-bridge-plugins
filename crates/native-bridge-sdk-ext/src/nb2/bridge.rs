@@ -648,6 +648,13 @@ impl NativeBridgeV2 {
                 "the Deposited log is not this intent's",
             );
         };
+        // the event's D is this deployment's: the same rho under another vault configuration at this address is not this deposit
+        if d.domain != self.domain {
+            return refuse(
+                WalletReason::ProviderFault,
+                "the Deposited log carries another deployment's domain D",
+            );
+        }
         let block = super::rpc::qty64(&json!(r.block_number), "blockNumber")?;
         rec.deposit_tx = Some(r.transaction_hash.to_lowercase());
         rec.block_number = Some(dec(block));

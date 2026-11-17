@@ -169,6 +169,24 @@ fn crash_between_send_and_receipt_the_retry_reconciles_and_never_deposits_twice(
 }
 
 #[test]
+fn a_deposited_event_with_another_deployments_domain_is_not_this_deposit() {
+    // the same address and rho under another vault configuration (a reset network that redeployed at the same nonce): the receipt's
+    // Deposited log names another D, and the record must not become deposited
+    let w = setup();
+    let payer = w.evm_account("p");
+    let b = open(&w, "w", World::store());
+    let plan = b
+        .plan_deposit(&big(7), &local_owner(&key("o")).public_key())
+        .unwrap();
+    w.chain.with(|s| s.faults.deposit_domain = Some([0x5a; 32]));
+    assert_eq!(reason(b.submit_deposit(&plan, &payer)), "ProviderFault");
+    assert_eq!(
+        b.journal.deposit(plan.intent).unwrap().unwrap().status,
+        "submitted"
+    );
+}
+
+#[test]
 fn crash_between_burn_request_and_certification_and_between_burn_and_redeem() {
     let w = setup();
     let payer = w.evm_account("p");
