@@ -32,7 +32,7 @@ limit = transaction + vault + batch + membership + sha256 + execution + memory +
 | sha256 | SHA-256 (`0x02`) of every hashed transaction | `60 + 12` a word, exactly. A child's mint contains its parent token, so nesting is counted where it costs |
 | execution | the verifier's and its helper's own execution | each loop priced per iteration (table below) |
 | memory | the verifier frame's memory expansion | `3M + M²/512` (the Yellow Paper's `C_mem`) over a bound `M` of its high-water, in words |
-| forwarding | EIP-150 | the vault keeps 1/64 of what it forwards to the verifier, the verifier 1/64 of its largest call |
+| forwarding | EIP-150 | the vault keeps 1/64 of what it forwards to the verifier, the verifier 1/64 of its largest call: the largest of its batch calls, its helper calls (one a UC, the pending burn's included) and J's receipt call |
 | gasReserve | the pinned reserve | 500,000 |
 
 **What it counts.** It counts everything in the token itself: every proof's UC, path and transaction; distinct claims by digest; the
@@ -62,17 +62,20 @@ steps; CBOR items, from the bytes; the root's J. Two cases are bounded instead o
 | UC parsed by the helper: base | 19,100 | measured |
 | a UC byte (all copies) | 7 | measured, plus 1 for the verifier's copies |
 | a byte of the UC's input record | 27 | measured on real UCs |
-| a seal signature; a shard tree sibling; a unicity tree step | 1,784; 1,648; 2,146 | measured on synthetic UCs, plus 100 a shard bit for the verifier's `_inShard` |
+| a seal signature; a shard tree sibling; a unicity tree step | 1,784; 1,798; 2,146 | measured on synthetic UCs; a sibling adds the verifier's `_inShard` at 250 a shard bit (measured 170 on 64- and 200-bit shards) |
 | a byte of a node ID with a non-ASCII byte (the helper's byte-wise UTF-8 check) | 315 | measured |
 | a byte of J | 10 | code (its RLP walks and Keccak) |
+| cold accesses: the helper's code hash and code | 5,200 | the schedule (2 x 2,600; the lab runs warm) |
 
 Each helper call's own memory expansion is added per UC (`C_mem` of three UC lengths).
 
 **The memory bound.** `M` adds four parts:
 
 - the verifier's hash tables, exactly: `pow2(2(n+1)) + pow2(2n) + (n+1) + 256` words for `n` proofs;
-- 350 words;
-- per unit: 78.82 words a proof, 1.03 a claim word (each distinct claim plus one), 2.63 a UC word, 1.01 a path word and 277.75 a token;
+- 320 words;
+- per unit: 67.44 words a proof, 1.03 a claim word (each distinct claim plus one), 3.06 a UC word (the code's three copies: the verifier's
+  slice, the returned claim, the decoded answer), 1.23 a path word and 285.23 a token, all measured; 6 an allocation step (`_sumVerify`'s
+  130-byte encoding) and 2 a word of J (its receipt nodes, sliced and passed to the helper), from the code;
 - the largest scratch use that the allocations after it do not cover. A transaction is hashed from a copy at the free pointer, and every
   later proof allocates at least two copies of its UC over that copy.
 
@@ -91,8 +94,9 @@ calls. Each part is bounded separately:
    `C_mem(high-water)`.
    - The verifier frame's high-water was measured on every lab file. It was read from the free pointer after a verification, and
      cross-checked by the expansion cost of a probe above it.
-   - The bound is at or above it on all 136 files (by 8 to 1,074 words). The hash tables, which jump at powers of two, are computed
-     exactly.
+   - The bound is at or above it on all 146 files. Those include ten synthetic tokens whose UCs run from 485 bytes to 24 KiB through the
+     verifier frame, so the three copies of a UC that the code makes are measured at every legal UC size (3.00 words a UC word; the bound
+     takes 3.06). The hash tables, which jump at powers of two, are computed exactly.
    - The scratch rule is sound because Solidity's allocator only grows: an allocation after the scratch use overwrites it from the
      same start.
 3. **Execution is linear in the loop counts, priced at or above each unit's measured cost.**
@@ -105,10 +109,12 @@ calls. Each part is bounded separately:
      - nested hashing, which the SHA-256 term counts byte for byte.
    - Every coefficient is the measured marginal cost of its unit, raised (below), and each intercept is raised to the largest residual.
      So the bound is at or above the lab's gas for every measured file.
+   - The two accesses that the lab runs warm (the helper's code hash and its code) are charged cold, 2,600 each.
 4. **The vault** is its worst measured call over the bucket and sealing states (K = 64). The K = 4 lane's vault is cheaper. To that we
    add the per-segment replay and the copy of the evidence.
-5. **Forwarding.** EIP-150 withholds 1/64 at each call. The bound adds 1/63 of the verifier's charge, and 1/63 of its largest batch call
-   at the verifier's level.
+5. **Forwarding.** EIP-150 withholds 1/64 at each call. The bound adds 1/63 of the verifier's charge, and 1/63 of the verifier's largest
+   inner call: the largest of its batch calls, its helper `certificate()` calls (at the bound of each distinct UC, the pending burn's
+   at the decoder bounds included) and its `receiptLog()` call (J's EVM UC, J's bytes and that frame's memory).
 
 ## Calibration
 
@@ -119,10 +125,13 @@ contracts `884c4829`, the release whose verifier is deployed. Two complementary 
   - It uses the same compiler, settings and source (`src/nb2/verifier`), with constant stubs at `0x0100` and `0x0102`. Their
     schedules are then added exactly.
   - It records the verifier's gas, its free pointer and its memory high-water.
-  - It covers 136 evidence files:
+  - It covers 146 evidence files:
     - 44 from the consolidation measurement (raw, consolidated before and after the burn, trimmed seals);
     - 92 from this run: 1 to 315 transfers in 16 certificate groups; one batch; consolidated; a certificate per transfer; 151 and 261
-      fresh owner keys (past the 128-slot key cache); trimmed; 1, 2, 3, 6 and 10 split levels; small returns.
+      fresh owner keys (past the 128-slot key cache); trimmed; 1, 2, 3, 6 and 10 split levels; small returns;
+    - 10 synthetic: this run's tokens with every UC replaced, keeping each verdict an acceptance. The replacements are 16 signatures;
+      16 signatures with 128-byte ASCII or non-ASCII node IDs; 64- and 200-bit shards (the prefix of each proof's state ID); 32 unicity
+      tree steps; 24 KiB seals, a distinct claim each, at 52 and 102 proofs; and everything at once.
   - It also measured the helper's `certificate()` on real UCs and on synthetic ones. The synthetic UCs vary one structure at a time:
     1 to 16 signatures, 0 to 255 shard tree siblings, 0 to 32 unicity tree steps, 0 to 256 summary bytes, node IDs of 8 to 128
     ASCII or non-ASCII bytes. Each has its seal hash recomputed so the folds pass.
@@ -130,14 +139,21 @@ contracts `884c4829`, the release whose verifier is deployed. Two complementary 
   `eth_estimateGas` of its redeem at 0, 1, 4 and 16 to 17 historical segments, and 7 of them were paid live.
 
 **How the constants are bounded.** Each part (the helper, the memory, the unsplit execution) is a least-squares fit on the features its
-loops run over. Every per-unit coefficient is then raised: by 5% for the helper and the split terms, by 2% for unsplit execution, and
-not at all for memory, whose intercept covers its residual. The intercept is raised to the largest residual.
+loops run over. Every per-unit coefficient is then raised: by 5% for the helper and the split terms, and by 2% for unsplit execution and
+for memory. The intercept is raised to the largest residual. Unsplit execution is fit on the lane's shapes; the synthetic tokens check
+it.
 
 - The helper's fit residual is within 3,000 gas over the real and synthetic UCs.
 - The unsplit execution's residual is within 19,000 gas over 129 files, from 1 to 317 proofs.
 - The split terms are the least pair (per parent step, per edge) that covers every split file over the unsplit bound, raised by 5%.
 
-On all 136 files, the bound's execution, memory and SHA-256 are 0.3% to 3.0% above the lab's measured gas.
+On all 146 files, the bound's execution, memory and SHA-256 are 0.9% to 15% above the lab's measured gas. The 15% is a 24 KiB seal,
+whose signature bytes are priced as UC bytes.
+
+**Shared vectors.** `tests/nb2-gas/gas-vectors.json` holds 12 evidence files, and both plug-ins check every feature and term of each.
+Six are real: 1 and 10 transfers, 3 and 10 split levels, 151 fresh keys, trimmed seals. Six are synthetic: a 200-bit shard; 16
+signatures with non-ASCII IDs; 16 signatures; 24 KiB seals over the batch's byte cap; and two that must fail closed (17 signatures, and a
+non-text signature key). Each file is checked at redemption (P 0 and 17 at K = 4, P 17 at K = 64) and at the preflight (K = 4 and 64).
 
 The scripts and the raw data are in `~/evidence/nb2-gas-refit/` on the dev server (`lab/`, `fit3.py`, `features.jsonl`, `validate.jsonl`).
 
@@ -214,3 +230,9 @@ The margin has three parts:
   siblings, more unicity tree steps, more signatures, long or non-ASCII node IDs and long summaries. J's per-byte cost is from the code,
   not measured: J's shape is fixed on the lane.
 - **The vault term is K = 64's worst call,** which is above every K = 4 call. K = 128 or larger would need its own vault measurement.
+- **The native schedules are ureth `unicity/main` at `7f625ea`** (`crates/unicity/b1` batch.rs and rsmt.rs). There, a registry word
+  read is `READ_GAS` = 100, which ureth marks as provisional until its cold-registry measurement. A repricing there changes the batch term
+  and needs a new release of the bound.
+- **The replayed probe and decompression counts** are checked against the verifier's code (the review of #82) and through the lab's
+  totals. They are not checked against the verifier's own counters.
+- **A zero state ID** (the tables' sentinel) has no known preimage. Both plug-ins handle it as the verifier does, but no vector reaches it.

@@ -163,7 +163,7 @@ export const REDEEM_GAS = {
   perUcByte: 7n,
   perUcIrByte: 27n,
   perUcSignature: 1_784n,
-  perUcStc: 1_648n,
+  perUcStc: 1_798n, // the helper's 1,548 and the verifier's _inShard, 250 a shard bit (measured 170)
   perUcUtc: 2_146n,
   perUcSlowByte: 315n,
   perKeyLookup: 0n,
@@ -171,16 +171,18 @@ export const REDEEM_GAS = {
   perProbe: 271n,
   perClaim: 1_039n,
   jByte: 10n,
+  coldAccess: 5_200n, // the verifier's EXTCODEHASH of its helper and the helper's code, cold on chain (2 x 2,600)
   // the verifier frame's memory high-water beyond its hash tables: words, and hundredths of a word per unit (measured, rounded up)
-  memBase: 350,
-  memPerStep100: 7_882,
+  memBase: 320,
+  memPerStep100: 6_744,
   memPerParentStep100: 0,
   memPerClaimWord100: 103,
-  memPerUcWord100: 263,
-  memPerPathWord100: 101,
-  memPerToken100: 27_775,
+  memPerUcWord100: 306,
+  memPerPathWord100: 123,
+  memPerToken100: 28_523,
   memPerEdge100: 0,
-  memPerAllocStep100: 0,
+  memPerAllocStep100: 600, // _sumVerify's 130-byte encoding a step
+  memPerJWord100: 200, // J's receipt nodes, sliced and passed to the helper
   // the pending burn at the decoder bounds (unicity-pos-contracts Nb2Cert, the verifier's MAX_PROOF_UC, the RSMT's 256 levels)
   pendingTxBytes: 256,
   pendingUcBytes: 24_576,
@@ -210,6 +212,17 @@ interface UcShape {
   claimKey: string | null; // keccak of the claim; null: unknown
 }
 
+/** A UC's shape as the helper's parse prices it. */
+export interface UcCost { bytes: number; ir: number; signatures: number; stc: number; utc: number; slow: number }
+
+/** The helper's certificate() on one UC, at the bound's coefficients (its execution and its frame's memory). */
+export function helperGas(c: UcCost): bigint {
+  const g = REDEEM_GAS;
+  const B = (n: number): bigint => BigInt(n);
+  return g.perUcParse + g.perUcByte * B(c.bytes) + g.perUcIrByte * B(c.ir) + g.perUcSignature * B(c.signatures) + g.perUcStc * B(c.stc) + g.perUcUtc * B(c.utc)
+    + g.perUcSlowByte * B(c.slow) + helperMemory(c.bytes);
+}
+
 /** What the bound counts, extracted from the lineage. */
 export interface RedeemFeatures {
   tokens: number;
@@ -228,6 +241,8 @@ export interface RedeemFeatures {
   ucUtc: number;
   ucSlow: number;
   helperMemory: bigint; // the helper frames' memory expansion
+  evmUc: UcCost; // J's EVM UC (the helper's receiptLog parses it)
+  ucCosts: UcCost[]; // the distinct UC shapes the helper parses (each a call of its own: the forwarding term takes the largest)
   pathWords: number; // the membership requests (words)
   maxUc: number;
   scratch: number; // the largest scratch use beyond the free pointer that the allocations after it do not cover (words)
@@ -281,7 +296,7 @@ function ucShape(uc: Uint8Array): UcShape | null {
     let slow = 0;
     for (let k = 0; k < sigs.kids.length; k += 2) {
       const id = sigs.kids[k].data;
-      if (id === undefined) return null;
+      if (sigs.kids[k].major !== 3 || id === undefined) return null;
       if (id.some((x) => x >= 0x80)) slow += id.length;
     }
     const claim = concat(u32(Number(utc[1].arg)), u16(shard.length), shard, sch, bytesN(irc[4], 32), HU(raw(uc, ir)), u32(uc.length), uc);
@@ -442,7 +457,8 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
   }
   const f: RedeemFeatures = {
     tokens: L.length, edges: L.length - 1, allocSteps, steps: n, parentSteps: L.slice(0, -1).reduce((m, t) => m + 1 + t.transfers.length, 0), txWords: 0, maxTx: 0, siblings: 0, ucParses: n + 1, ucBytes: evm.bytes, ucIr: evm.ir, ucSignatures: evm.signatures,
-    ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, helperMemory: helperMemory(evm.bytes), pathWords: 0, maxUc: evm.bytes, scratch: 24, items, jBytes: j.length,
+    ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, helperMemory: helperMemory(evm.bytes),
+    evmUc: { bytes: evm.bytes, ir: evm.ir, signatures: evm.signatures, stc: evm.stc, utc: evm.utc, slow: evm.slow }, ucCosts: [], pathWords: 0, maxUc: evm.bytes, scratch: 24, items, jBytes: j.length,
     keyLookups, decompressions: keys.misses, probes: keys.probes + sids.probes + claimIds.probes + unknownProbes, claims,
   };
   // a transaction is hashed from a copy at the free pointer (SHA-256 of calldata); every later step allocates at least its UC's slice and its
@@ -463,6 +479,10 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
     f.ucUtc += st.uc.utc;
     f.ucSlow += st.uc.slow;
     f.helperMemory += helperMemory(st.uc.bytes);
+    const c = { bytes: st.uc.bytes, ir: st.uc.ir, signatures: st.uc.signatures, stc: st.uc.stc, utc: st.uc.utc, slow: st.uc.slow };
+    if (!f.ucCosts.some((x) => x.bytes === c.bytes && x.ir === c.ir && x.signatures === c.signatures && x.stc === c.stc && x.utc === c.utc && x.slow === c.slow)) {
+      f.ucCosts.push(c);
+    }
     f.pathWords += 1 + ceil32(104 + 32 * (st.siblings + 1));
     f.maxUc = Math.max(f.maxUc, st.uc.bytes);
   }
@@ -518,7 +538,7 @@ export function verifierMemoryWords(f: RedeemFeatures): number {
   const n = f.steps;
   const tables = pow2At(2 * (n + 1)) + pow2At(2 * n) + (n + 1) + 2 * g.keyCache;
   const per = g.memPerStep100 * n + g.memPerParentStep100 * f.parentSteps + g.memPerClaimWord100 * f.claims.reduce((w, c) => w + ceil32(c.bytes) + 1, 0) + g.memPerUcWord100 * ceil32(f.ucBytes) + g.memPerPathWord100 * f.pathWords
-    + g.memPerToken100 * f.tokens + g.memPerEdge100 * f.edges + g.memPerAllocStep100 * f.allocSteps;
+    + g.memPerToken100 * f.tokens + g.memPerEdge100 * f.edges + g.memPerAllocStep100 * f.allocSteps + g.memPerJWord100 * ceil32(f.jBytes);
   return g.memBase + Math.ceil(per / 100) + tables + f.scratch;
 }
 
@@ -552,11 +572,17 @@ export function priceFeatures(f: RedeemFeatures, evidenceBytes: number, proofs: 
     + g.perTxWord * B(f.txWords) + g.perSibling * B(f.siblings) + g.perItem * B(f.items)
     + g.perUcParse * B(f.ucParses) + g.perUcByte * B(f.ucBytes) + g.perUcIrByte * B(f.ucIr) + g.perUcSignature * B(f.ucSignatures) + g.perUcStc * B(f.ucStc) + g.perUcUtc * B(f.ucUtc)
     + g.perUcSlowByte * B(f.ucSlow) + f.helperMemory
-    + g.perKeyLookup * B(f.keyLookups) + g.perDecompress * B(f.decompressions) + g.perProbe * B(f.probes) + g.perClaim * B(f.claims.length) + g.jByte * B(f.jBytes);
+    + g.perKeyLookup * B(f.keyLookups) + g.perDecompress * B(f.decompressions) + g.perProbe * B(f.probes) + g.perClaim * B(f.claims.length) + g.jByte * B(f.jBytes)
+    + g.coldAccess;
   const memoryWords = verifierMemoryWords(f);
   const memory = memoryGas(memoryWords);
   const verifier = batch.gas + membership + sha256 + execution + memory;
-  const inner = batch.largest / 63n + 1n;
+  // EIP-150 at the verifier's own calls: the largest of its batch calls, its helper calls (one a UC; J's receipt with its EVM UC)
+  let largest = batch.largest;
+  for (const c of f.ucCosts) if (helperGas(c) > largest) largest = helperGas(c);
+  const receipt = helperGas(f.evmUc) + g.jByte * B(f.jBytes) + memoryGas(3 * ceil32(f.jBytes) + 64);
+  if (receipt > largest) largest = receipt;
+  const inner = largest / 63n + 1n;
   const forwarding = (verifier + inner) / 63n + 1n + inner;
   const reserve = MEASURED.gasReserve;
   const limit = transaction + vault + verifier + forwarding + reserve;

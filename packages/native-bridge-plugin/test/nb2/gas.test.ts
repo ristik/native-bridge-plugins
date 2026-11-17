@@ -29,14 +29,41 @@ const shapes = (v: { evidence: string; cases: Case[] }): [Case, RedeemShape][] =
   }]);
 };
 
-test('the shared vectors: every feature and term, exactly', () => {
+test('the shared vectors: every feature and term, exactly (a null bound where the vector fails closed)', () => {
   assert.equal(file.model, new MeasuredGasModel().name);
-  assert.ok(file.vectors.length >= 5);
+  assert.ok(file.vectors.length >= 11);
+  let nulls = 0;
   for (const v of file.vectors) {
     for (const [c, s] of shapes(v)) {
       assert.deepEqual(json(redeemFeatures(s)), c.features, `${v.name} ${c.input} P ${c.proofs}: features`);
       assert.deepEqual(json(redeemGasTerms(s)), c.terms, `${v.name} ${c.input} P ${c.proofs}: terms`);
-      assert.equal(new MeasuredGasModel().redeemGasLimit(s), BigInt((c.terms as { limit: string }).limit));
+      const want = c.terms === null ? null : BigInt((c.terms as { limit: string }).limit);
+      assert.equal(new MeasuredGasModel().redeemGasLimit(s), want);
+      if (want === null) nulls++;
+    }
+  }
+  // the 17-signature seal and the non-text signature key, every case
+  assert.equal(nulls, 2 * 5);
+});
+
+test('every vector: the preflight is at or above the redemption at the same proofs, and so is each pending-dependent feature', () => {
+  for (const v of file.vectors) {
+    const all = shapes(v);
+    for (const K of [4n, 64n]) {
+      const red = all.find(([c]) => c.pendingTransactions === 0 && BigInt(c.K) === K && BigInt(c.proofs) === 17n);
+      const pre = all.find(([c]) => c.pendingTransactions === 1 && BigInt(c.K) === K);
+      if (!red || !pre) continue;
+      const fr = redeemFeatures(red[1]);
+      const fp = redeemFeatures(pre[1]);
+      if (fr === null || fp === null) {
+        assert.equal(fr, fp, `${v.name}: null in one input only`);
+        continue;
+      }
+      assert.ok(redeemGasTerms({ ...pre[1], proofs: 17n })!.limit >= redeemGasTerms(red[1])!.limit, `${v.name} K ${K}`);
+      for (const k of ['steps', 'items', 'txWords', 'siblings', 'ucBytes', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'keyLookups'] as const) {
+        assert.ok(fp[k] >= fr[k], `${v.name} K ${K}: ${k} ${fp[k]} < ${fr[k]}`);
+      }
+      assert.ok(fp.claims.length >= fr.claims.length);
     }
   }
 });
@@ -68,7 +95,7 @@ test('CBOR items: heads, string payloads skipped', () => {
 test('the pending burn is counted at its bounds, and more of the token never costs less', () => {
   const v = file.vectors[0];
   const [, red] = shapes(v)[0];
-  const [, pre] = shapes(v)[2];
+  const [, pre] = shapes(v)[3];
   const f = redeemFeatures(pre)!;
   assert.ok(f.ucBytes >= REDEEM_GAS.pendingUcBytes && f.ucStc >= REDEEM_GAS.pendingStc && f.siblings >= REDEEM_GAS.pendingSiblings);
   assert.equal(f.claims[f.claims.length - 1].epoch, null);
@@ -78,10 +105,14 @@ test('the pending burn is counted at its bounds, and more of the token never cos
   const g = (s: RedeemShape): bigint => redeemGasTerms(s)!.limit;
   assert.ok(g({ ...red, proofs: 1n }) > g(red));
   assert.ok(g({ ...red, evidenceBytes: red.evidenceBytes + 1_000 }) > g(red));
-  const fr = redeemFeatures(red)!;
-  for (const k of ['steps', 'items', 'siblings', 'ucBytes', 'ucSignatures', 'probes', 'decompressions', 'txWords'] as const) {
-    const more = { ...fr, [k]: fr[k] + 1 };
-    assert.ok(priceFeatures(more, red.evidenceBytes, 0n, 4n).limit > priceFeatures(fr, red.evidenceBytes, 0n, 4n).limit, k);
+  for (const w of file.vectors) {
+    const [, r] = shapes(w)[0];
+    const fr = redeemFeatures(r);
+    if (fr === null) continue;
+    for (const k of ['steps', 'parentSteps', 'items', 'siblings', 'ucBytes', 'ucIr', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'decompressions', 'txWords', 'edges', 'allocSteps', 'jBytes'] as const) {
+      const more = { ...fr, [k]: fr[k] + 1 };
+      assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > priceFeatures(fr, r.evidenceBytes, 0n, 4n).limit, `${w.name}: ${k}`);
+    }
   }
 });
 

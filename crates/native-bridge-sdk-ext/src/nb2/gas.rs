@@ -163,7 +163,7 @@ pub mod redeem_gas {
     pub const PER_UC_BYTE: u64 = 7;
     pub const PER_UC_IR_BYTE: u64 = 27;
     pub const PER_UC_SIGNATURE: u64 = 1_784;
-    pub const PER_UC_STC: u64 = 1_648;
+    pub const PER_UC_STC: u64 = 1_798;
     pub const PER_UC_UTC: u64 = 2_146;
     pub const PER_UC_SLOW_BYTE: u64 = 315;
     pub const PER_KEY_LOOKUP: u64 = 0;
@@ -171,15 +171,17 @@ pub mod redeem_gas {
     pub const PER_PROBE: u64 = 271;
     pub const PER_CLAIM: u64 = 1_039;
     pub const J_BYTE: u64 = 10;
-    pub const MEM_BASE: usize = 350;
-    pub const MEM_PER_STEP_100: usize = 7_882;
+    pub const COLD_ACCESS: u64 = 5_200;
+    pub const MEM_BASE: usize = 320;
+    pub const MEM_PER_STEP_100: usize = 6_744;
     pub const MEM_PER_PARENT_STEP_100: usize = 0;
     pub const MEM_PER_CLAIM_WORD_100: usize = 103;
-    pub const MEM_PER_UC_WORD_100: usize = 263;
-    pub const MEM_PER_PATH_WORD_100: usize = 101;
-    pub const MEM_PER_TOKEN_100: usize = 27_775;
+    pub const MEM_PER_UC_WORD_100: usize = 306;
+    pub const MEM_PER_PATH_WORD_100: usize = 123;
+    pub const MEM_PER_TOKEN_100: usize = 28_523;
     pub const MEM_PER_EDGE_100: usize = 0;
-    pub const MEM_PER_ALLOC_STEP_100: usize = 0;
+    pub const MEM_PER_ALLOC_STEP_100: usize = 600;
+    pub const MEM_PER_J_WORD_100: usize = 200;
     pub const PENDING_TX_BYTES: usize = 256;
     pub const PENDING_UC_BYTES: usize = 24_576;
     pub const PENDING_SIGNATURES: usize = 16;
@@ -218,6 +220,31 @@ pub struct Claim {
     pub epoch: Option<u64>,
 }
 
+/// A UC's shape as the helper's parse prices it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UcCost {
+    pub bytes: usize,
+    pub ir: usize,
+    pub signatures: usize,
+    pub stc: usize,
+    pub utc: usize,
+    pub slow: usize,
+}
+
+/// The helper's certificate() on one UC, at the bound's coefficients (its execution and its frame's memory).
+pub fn helper_gas(c: &UcCost) -> u64 {
+    use redeem_gas as g;
+    let u = |n: usize| n as u64;
+    g::PER_UC_PARSE
+        + g::PER_UC_BYTE * u(c.bytes)
+        + g::PER_UC_IR_BYTE * u(c.ir)
+        + g::PER_UC_SIGNATURE * u(c.signatures)
+        + g::PER_UC_STC * u(c.stc)
+        + g::PER_UC_UTC * u(c.utc)
+        + g::PER_UC_SLOW_BYTE * u(c.slow)
+        + helper_memory(c.bytes)
+}
+
 /// What the bound counts, extracted from the lineage (`gas.ts` RedeemFeatures).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedeemFeatures {
@@ -237,6 +264,8 @@ pub struct RedeemFeatures {
     pub uc_utc: usize,
     pub uc_slow: usize,
     pub helper_memory: u64,
+    pub evm_uc: UcCost,
+    pub uc_costs: Vec<UcCost>,
     pub path_words: usize,
     pub max_uc: usize,
     pub scratch: usize,
@@ -298,6 +327,9 @@ fn uc_shape(uc: &[u8]) -> Option<UcShape> {
     }
     let mut slow = 0;
     for k in (0..sigs.kids.len()).step_by(2) {
+        if sigs.kids[k].major != 3 {
+            return None;
+        }
         let id = sigs.kids[k].data;
         if id.iter().any(|&x| x >= 0x80) {
             slow += id.len();
@@ -545,6 +577,15 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
         uc_utc: evm.utc,
         uc_slow: evm.slow,
         helper_memory: helper_memory(evm.bytes),
+        evm_uc: UcCost {
+            bytes: evm.bytes,
+            ir: evm.ir,
+            signatures: evm.signatures,
+            stc: evm.stc,
+            utc: evm.utc,
+            slow: evm.slow,
+        },
+        uc_costs: Vec::new(),
         path_words: 0,
         max_uc: evm.bytes,
         scratch: 24,
@@ -572,6 +613,17 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
         f.uc_utc += st.uc.utc;
         f.uc_slow += st.uc.slow;
         f.helper_memory += helper_memory(st.uc.bytes);
+        let c = UcCost {
+            bytes: st.uc.bytes,
+            ir: st.uc.ir,
+            signatures: st.uc.signatures,
+            stc: st.uc.stc,
+            utc: st.uc.utc,
+            slow: st.uc.slow,
+        };
+        if !f.uc_costs.contains(&c) {
+            f.uc_costs.push(c);
+        }
         f.path_words += 1 + ceil32(104 + 32 * (st.siblings + 1));
         f.max_uc = f.max_uc.max(st.uc.bytes);
     }
@@ -637,7 +689,8 @@ pub fn verifier_memory_words(f: &RedeemFeatures) -> usize {
         + g::MEM_PER_PATH_WORD_100 * f.path_words
         + g::MEM_PER_TOKEN_100 * f.tokens
         + g::MEM_PER_EDGE_100 * f.edges
-        + g::MEM_PER_ALLOC_STEP_100 * f.alloc_steps;
+        + g::MEM_PER_ALLOC_STEP_100 * f.alloc_steps
+        + g::MEM_PER_J_WORD_100 * ceil32(f.j_bytes);
     g::MEM_BASE + per.div_ceil(100) + tables + f.scratch
 }
 
@@ -696,10 +749,19 @@ pub fn price_features(f: &RedeemFeatures, evidence_bytes: usize, proofs: u64, k:
         + g::PER_DECOMPRESS * u(f.decompressions)
         + g::PER_PROBE * u(f.probes)
         + g::PER_CLAIM * u(f.claims.len())
-        + g::J_BYTE * u(f.j_bytes);
+        + g::J_BYTE * u(f.j_bytes)
+        + g::COLD_ACCESS;
     let memory_words = verifier_memory_words(f);
     let memory = memory_gas(memory_words);
     let verifier = batch + membership + sha256 + execution + memory;
+    // EIP-150 at the verifier's own calls: the largest of its batch calls, its helper calls (one a UC; J's receipt with its EVM UC)
+    let mut largest = largest;
+    for c in &f.uc_costs {
+        largest = largest.max(helper_gas(c));
+    }
+    largest = largest.max(
+        helper_gas(&f.evm_uc) + g::J_BYTE * u(f.j_bytes) + memory_gas(3 * ceil32(f.j_bytes) + 64),
+    );
     let inner = largest / 63 + 1;
     let forwarding = (verifier + inner) / 63 + 1 + inner;
     let reserve = measured::GAS_RESERVE;
