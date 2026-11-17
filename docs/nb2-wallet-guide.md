@@ -423,11 +423,12 @@ deployment:
 | `gasReserve`, added to every redeem's gas limit | 500,000 |
 | `returnReserveSegments`, the future history the preflight provisions for | 64 segments (256 payments on the package's K = 4 test vault; 4,096 at the production K = 64) |
 
-Gas binds just before bytes: the largest unsplit return that passes the preflight carries about 465 KB of evidence, and L_max binds at
+Gas binds just before bytes: the largest unsplit return that passes the preflight carries about 450 KB of evidence, and L_max binds at
 about 310 transfers. The manifest's `envelope` gives the bound's estimate: about 290 transfers in 16 certificates for an unsplit token, and
 about 250 at one or two split levels when the whole history lies above the splits. For a reference part it also says how long a burn may
 wait before its history no longer fits. A token consolidated before its plan passes at 300 transfers (59.2M gas at the preflight). In the
-dev-server boundary run (bft-core#1179) the preflight admitted 282 transfers in 16 certificate groups (36 certificates) and refused 284,
+dev-server boundary runs (bft-core#1179) the preflight admitted 282 transfers in 16 certificate groups and refused 284 on a tree grown by
+several thousand earlier transfers, and after the review fixes admitted 294 and refused 295 on a fresh generation's tree,
 and every verdict was confirmed against the chain: each admitted token was burned and paid within `userGasLimit`, and each refused token's state was
 shown unspent by a verified non-inclusion proof from the aggregator after the refusal.
 

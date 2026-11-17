@@ -165,27 +165,27 @@ against `userGasLimit` = 60M.
 
 | Part | Transfers | Split levels | Certificates | P | Real | Bound | Bound / real | Preflight | Paid gasUsed |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| a50, raw | 51 | 0 | 18 | 0 | 9,585,385 | 10,116,737 | 1.055 | 14,244,565 | |
-| a100, raw | 101 | 0 | 26 | 0 | 18,351,112 | 18,975,140 | 1.034 | 23,217,207 | 18,082,571 (P 17) |
-| a200, raw | 201 | 0 | 35 | 0 | 36,627,443 | 37,425,125 | 1.022 | 41,891,447 | |
-| a280, raw | 281 | 0 | 39 | 0 | 52,358,159 | 53,293,847 | 1.018 | 57,943,410 (admitted) | |
-| a300, raw | 301 | 0 | 41 | 0 | 56,521,474 | 57,515,325 | 1.018 | 62,214,212 (refused) | 55,673,867 |
-| a300, raw | 301 | 0 | 41 | 16 | 56,559,915 | 57,645,117 | 1.019 | 62,343,492 | |
-| b150k, consolidated | 151 | 0 | 2 | 0 | 25,811,210 | 26,502,423 | 1.027 | 30,838,044 | |
-| b300k, consolidated | 301 | 0 | 2 | 0 | 53,605,886 | 54,574,332 | 1.018 | 59,238,223 (admitted) | 52,801,263 |
-| g250kt, consolidated and trimmed | 251 | 0 | 2 | 0 | 42,094,024 | 42,987,324 | 1.021 | 47,501,726 | 41,474,902 |
-| k260, fresh keys | 261 | 0 | 39 | 0 | 59,401,954 | 60,574,359 | 1.020 | 65,186,040 (refused) | 58,506,740 |
-| e1n | 152 | 1 | 21 | 0 | 28,892,312 | 29,461,716 | 1.020 | 33,821,220 | |
-| e2n | 282 | 1 | 34 | 0 | 55,086,126 | 55,689,439 | 1.011 | 60,342,620 (refused) | |
-| e3n | 153 | 2 | 24 | 0 | 30,631,535 | 31,351,932 | 1.024 | 35,544,963 | |
-| e4n | 283 | 2 | 36 | 16 | 57,530,188 | 58,789,777 | 1.022 | 63,151,728 (refused) | 56,628,979 |
-| e7n | 21 | 10 | 32 | 0 | 9,039,639 | 9,653,164 | 1.068 | 13,710,717 | 8,914,393 |
+| a50, raw | 51 | 0 | 18 | 0 | 9,585,385 | 10,133,510 | 1.057 | 14,329,794 | |
+| a100, raw | 101 | 0 | 26 | 0 | 18,351,112 | 19,014,705 | 1.036 | 23,336,845 | 18,082,571 (P 17) |
+| a200, raw | 201 | 0 | 35 | 0 | 36,627,443 | 37,550,658 | 1.025 | 42,128,517 | |
+| a280, raw | 281 | 0 | 39 | 0 | 52,358,159 | 53,537,157 | 1.023 | 58,324,370 (admitted) | |
+| a300, raw | 301 | 0 | 41 | 0 | 56,521,474 | 57,795,738 | 1.023 | 62,636,998 (refused) | 55,673,867 |
+| a300, raw | 301 | 0 | 41 | 16 | 56,559,915 | 57,925,530 | 1.024 | 62,766,278 | |
+| b150k, consolidated | 151 | 0 | 2 | 0 | 25,811,210 | 26,579,004 | 1.030 | 31,017,862 | |
+| b300k, consolidated | 301 | 0 | 2 | 0 | 53,605,886 | 54,829,204 | 1.023 | 59,641,261 (admitted) | 52,801,263 |
+| g250kt, consolidated and trimmed | 251 | 0 | 2 | 0 | 42,094,024 | 43,094,932 | 1.024 | 47,733,191 | 41,474,902 |
+| k260, fresh keys | 261 | 0 | 39 | 0 | 59,401,954 | 60,807,622 | 1.024 | 65,552,853 (refused) | 58,506,740 |
+| e1n | 152 | 1 | 21 | 0 | 28,892,312 | 29,553,884 | 1.023 | 34,013,606 | |
+| e2n | 282 | 1 | 34 | 0 | 55,086,126 | 55,952,093 | 1.016 | 60,745,834 (refused) | |
+| e3n | 153 | 2 | 24 | 0 | 30,631,535 | 31,457,731 | 1.027 | 35,748,413 | |
+| e4n | 283 | 2 | 36 | 16 | 57,530,188 | 59,082,172 | 1.027 | 63,582,098 (refused) | 56,628,979 |
+| e7n | 21 | 10 | 32 | 0 | 9,039,639 | 9,678,256 | 1.071 | 13,802,149 | 8,914,393 |
 
 Over all 87 measurements (21 burns at P = 0 to 17, `validate.jsonl`):
 
-- the bound at redemption is 1.011 to 1.51 times the real gas: about 1.02 at 250 to 300 transfers, and more for small tokens, where the
+- the bound at redemption is 1.016 to 1.51 times the real gas: about 1.02 at 250 to 300 transfers, and more for small tokens, where the
   vault's K = 64 worst call dominates;
-- the preflight is 1.086 to 4.7 times the real gas;
+- the preflight is 1.094 to 4.8 times the real gas;
 - no measurement lies above its bound.
 
 **The live boundary** (the lane's `boundary` stage on this generation, bft-core#1179). It used fresh tokens in 16 certificate groups at the
@@ -194,6 +194,11 @@ pinned limits:
 - the preflight admitted 282 transfers and refused 284;
 - every probe was executed as it was judged. The admitted ones at 279 and 282 transfers were burned and paid at 52,172,044 and 52,947,159
   gas used. The refused ones at 284, 285 and 289 were refused again, and the ledger showed each still unspent.
+
+After the review of #82 (the forwarding, memory, shard-bit and cold-access fixes), the stage ran again on a fresh generation, with
+this release in its image. The preflight admitted 294 transfers and refused 295. The admitted one was burned and paid at 53,041,966 gas
+used. The refused ones at 295 and 297 were refused again and shown unspent. That tree was younger: fewer RSMT siblings a proof than the
+first run's, which came after several thousand measurement transfers.
 
 The old model admitted about 205.
 
