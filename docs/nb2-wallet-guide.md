@@ -71,54 +71,53 @@ change that breaks this flow fails the lane.
 
 ```console
 $ nb2-wallet init --release /work/nb2/public/nb2-release.json --rpc http://rpc:8545 --key-env NB2_KEY_WALK
-wallet /work/nb2/walkthrough/nb2-wallet for the test vault 0x9c48c45dae0e0f7706964ef9c87813e04d5d2a27 on chain 31337
+wallet /work/nb2/walkthrough/nb2-wallet for the test vault 0x13a1eef867cdffa571dedd236320aaac4abe6d53 on chain 31337
 installation check passed: chain ID, config() = the pinned Γ, the vault's runtime code hash
-fund this EVM address with UCT for deposits and gas: 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa
+fund this EVM address with UCT for deposits and gas: 0x12a2094927c3be88f8858dead12f0bd6742156bb
 
 $ nb2-wallet address
-EVM address 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa: 5 UCT
-Unicity owner key 0x029301998d3375a6398c3fdfbc01e58a2b6d46a54cea73c5d8acdfaec04ab37f38
+EVM address 0x12a2094927c3be88f8858dead12f0bd6742156bb: 5 UCT
+Unicity owner key 0x035ecdec73f548463023c6fb2bef483b0da5963a3966ccb5da0c0f551ef4553000
 
 $ nb2-wallet deposit coin 0.1
 planned deposit intent 0 of 0.1 UCT as coin; the intent high-water mark is backed up
-deposit 33 in block 885 (tx 0x7646eafa34bb598933a58a9c1cb8ac7d402d3bb4e2f9a6cfd272239b5453772a)
+deposit 33 in block 906 (tx 0xb669381c743b33d1b0469ebc4be0293b6e488fa041f91f3ee8ed0082008b05b7)
 next: mint coin
 
 $ nb2-wallet mint coin
-minted coin: 0.1 UCT from deposit 33, token 0x3023103f7d33ab62.., J 2150 bytes
+the deposit proof: CompanionUnknown, retrying
+minted coin: 0.1 UCT from deposit 33, token 0x0d63035708ec9872.., J 2150 bytes
 
 $ nb2-wallet split coin keep=0.06 back=0.04
 split coin into keep (0.06 UCT) + back (0.04 UCT)
 
 $ nb2-wallet status
-vault 0x9c48c45dae0e0f7706964ef9c87813e04d5d2a27: segment 7, 33 deposits, 111000000000000000 wei outstanding
-coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 885)
+vault 0x13a1eef867cdffa571dedd236320aaac4abe6d53: segment 7, 33 deposits, 0.111 UCT outstanding
+coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 906)
 
 $ nb2-wallet plan-return back
-the preflight passes: back (0.04 UCT) to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa at index a = 7, vault at segment 7
-  gas limit 7639599 of userGasLimit 60000000; room for 3748 historical proofs, 3684 beyond the reserve
+the preflight passes: back (0.04 UCT) to 0x12a2094927c3be88f8858dead12f0bd6742156bb at index a = 7, vault at segment 7
+  gas limit 7643951 of userGasLimit 60000000; room for 3748 historical proofs, 3684 beyond the reserve
 nothing is burned. Run burn back to return it: the preflight runs again on fresh state first
 
 $ nb2-wallet burn back
-the preflight passes again: gas limit 7639599, index a = 7
-burned back for 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa: 0.04 UCT, redemption ID 0xa5200bc365429d29.., 8594 evidence bytes
+the preflight passes again: gas limit 7643951, index a = 7
+burned back for 0x12a2094927c3be88f8858dead12f0bd6742156bb: 0.04 UCT, redemption ID 0x6babec4a295de75b.., 8594 evidence bytes
 next: redeem back
 
 $ nb2-wallet redeem back
 the verifier answers QuorumNotMet: the seal registry has not imported the burn's root round yet (#1125); waiting
-paid 0.04 UCT to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa in block 902 (tx 0x9a9b5bd08e2458a0866e8c42741ba337232efefbde248a6b92cad317b3e4bd5c)
+paid 0.04 UCT to 0x12a2094927c3be88f8858dead12f0bd6742156bb in block 924 (tx 0x87d5006988a76a404fb0561f679596851a15153336e0eccf440cd7e41f248350); 1 redeem transaction sent
 
 $ nb2-wallet redeem back
-paid 0.04 UCT to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa in block 902 (tx 0x9a9b5bd08e2458a0866e8c42741ba337232efefbde248a6b92cad317b3e4bd5c)
+paid 0.04 UCT to 0x12a2094927c3be88f8858dead12f0bd6742156bb in block 924 (tx 0x87d5006988a76a404fb0561f679596851a15153336e0eccf440cd7e41f248350); 1 redeem transaction sent
 
 $ nb2-wallet status
-vault 0x9c48c45dae0e0f7706964ef9c87813e04d5d2a27: segment 7, 33 deposits, 71000000000000000 wei outstanding
-coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 885)
-back: return 0x8c320ff3d366ae2b of 40000000000000000 to 0x2d77dc7dadefa83dedc70492439f5eead2cefbfa (a = 7): paid
+vault 0x13a1eef867cdffa571dedd236320aaac4abe6d53: segment 7, 33 deposits, 0.071 UCT outstanding
+coin: deposit intent 0 of 100000000000000000: minted (deposit 33, block 906)
+back: return 0x161ec535f33bfdfe of 40000000000000000 to 0x12a2094927c3be88f8858dead12f0bd6742156bb (a = 7): paid
 
 $ nb2-wallet tokens
-back: 0.04 UCT (paid)
-coin: 0.1 UCT (split into keep, back)
 keep: 0.06 UCT
 ```
 
@@ -128,8 +127,9 @@ What each step did:
    pinned Γ, and the vault's runtime code hash is the pinned one. It printed the EVM address to fund.
 2. **`deposit coin 0.1`** derived the deposit secret from the wallet key and a fresh intent number, journaled it, handed the intent
    high-water mark to the backup, and only then sent `deposit` to the vault. The vault numbered the deposit (`Deposited` event).
-3. **`mint coin`** waited for the deposit block's certificate (it is served once the next block exists), built the receipt proof `J`, checked
-   it offline, and minted an ordinary Unicity token with `J` as its reason.
+3. **`mint coin`** waited for the deposit block's certificate. It is served once the next block exists; until then the node answers
+   `CompanionUnknown`, and the wallet retries. It then built the receipt proof `J`, checked it offline, and minted an ordinary Unicity token
+   with `J` as its reason.
 4. **`split`** made two whole parts, 0.06 and 0.04. This is the ordinary token split; the vault is not involved.
 5. **`plan-return back`** ran the capacity preflight and burned nothing.
    - It verified the part's whole provenance.
@@ -142,7 +142,8 @@ What each step did:
 7. **`redeem back`** read one `SegmentSealed` log per segment since the index, built the gap proofs, sent the redeem transaction and waited
    for its block's certificate. No segment had sealed since `a`, so no gap proof was needed. The deployed verifier first answered
    `QuorumNotMet`: the EVM chain's seal registry had not imported the burn's root round yet (bft-core#1125). The wallet waited and built it
-   again, and the vault paid. The second `redeem` found the payment and sent nothing.
+   again (nothing is sent while the simulation refuses), and the vault paid. The second `redeem` found the payment: the same
+   transaction, and still one redeem transaction sent.
 8. **`status`** says where every deposit, transfer and return stands, and which command moves it on (`next: ...`). After a crash or a
    timeout, run that command again: every step resumes from the journal and never repeats an irreversible action.
 9. **`tokens`** lists what the wallet holds: the split parent and the burned part are spent (`tokens --all` lists them too).
@@ -371,10 +372,10 @@ measured the same within 2%. The deposit and the walkthrough's `back` are from t
 
 | Operation | Gas used |
 |---|---:|
-| Deposit (the walkthrough's `deposit`) | 31,751 |
+| Deposit (the walkthrough's `deposit`) | 31,739 |
 | Return of an origin-only token (no transfer) | 882,230 |
 | Return after one transfer | 1,056,450 |
-| Return of a part one split level down (the walkthrough's `back`) | 1,389,672 |
+| Return of a part one split level down (the walkthrough's `back`) | 1,394,583 |
 | Return after one transfer and one split (`p60`) | 1,582,088 |
 | Return of a part three split levels down | 2,411,141 |
 | Return after 13 transfers, one certificate each | 3,554,807 |
@@ -385,7 +386,7 @@ measured the same within 2%. The deposit and the walkthrough's `back` are from t
 users' payments can make any return the sealing one (the K-th payment of a segment seals it, up to about 230,000 gas more) or the worst scan
 of the recent buffers (up to about 283,000 more). The reserve is limit, not spend: only the return that seals pays the sealing gas. The preflight before the burn uses
 a larger, conservative bound: the burn is counted at the decoder's bounds (about 4.5M gas) and 64 segments of future history are added. The
-walkthrough's 0.04 part was planned at 7,639,599 gas, sent with a limit of 1,901,868, and used 1,389,672 (8,804 bytes of calldata). The paying address must be able to
+walkthrough's 0.04 part was planned at 7,643,951 gas, sent with a limit of 1,906,818, and used 1,394,583 (8,804 bytes of calldata). The paying address must be able to
 fund the preflight's limit at twice the base fee plus the tip, or the preflight refuses with `InsufficientFunds` and nothing is burned.
 
 **How cost grows with the token's history.** The token verifier's gas grows with every transfer and split level in the part's lineage. The
