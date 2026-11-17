@@ -33,7 +33,7 @@ function sourceOf(entries: Uint8Array[]): ITrustBaseSource {
 
 /** A wallet directory with the operator's shipped bundle and pin. */
 function wallet(shipped: Root) {
-  const dir = mkdtempSync(join(tmpdir(), 'tester-trust-'));
+  const dir = mkdtempSync(join(tmpdir(), 'wallet-trust-'));
   writeFileSync(join(dir, 'bundle.cbor'), shipped.bundle);
   writeFileSync(join(dir, 'pin'), `${Buffer.from(shipped.pin).toString('hex')}\n`);
   const load = () => loadHeldTrust(join(dir, 'bundle.cbor'), join(dir, 'pin'), join(dir, 'trust-history.cbor'));

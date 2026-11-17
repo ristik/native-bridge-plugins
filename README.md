@@ -15,7 +15,7 @@ bft-core#1106.
 | `protocol/vectors/nb2/` | The shared v2 vector file (bft-core `nb2ref`) |
 | `packages/native-bridge-plugin/` | TypeScript wallet plug-in (`./nb2`) and the shared trust input, version 0.1.0 |
 | `crates/native-bridge-sdk-ext/` | alloc-compatible Rust port (`nb2`), version 0.1.0 |
-| `tester/trust.ts` | The trust-base refresh helper the bft-core testnet driver uses |
+| `wallet/` | The reference command-line wallet (`nb2-wallet.ts`) on the TypeScript plug-in, and its core (`core.ts`) that the bft-core testnet lane drives |
 | `tests/interop/`, `tools/` | Profile, ABI, dependency-pin and vector checks |
 
 Native custody stays in unicity-pos-contracts; execution in ureth; the
@@ -28,7 +28,7 @@ genesis EntryID pin, with weighted quorum under each epoch's own committee. The
 wallet appends newer entries through the SDK's trust-base fetch; receipt
 verification itself fetches nothing. See
 [the trust-base history and UC contract](protocol/trust-base.md), the
-[wallet guide](docs/nb2-wallet-guide.md) and the [journal format](docs/nb2-journal.md).
+[wallet integration guide](docs/nb2-wallet-guide.md) (with the reference wallet) and the [journal format](docs/nb2-journal.md).
 
 ```sh
 npm ci
