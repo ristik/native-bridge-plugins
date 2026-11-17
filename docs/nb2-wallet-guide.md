@@ -196,7 +196,7 @@ sequenceDiagram
     participant V as Vault (EVM)
     participant A as Aggregator
     W->>V: planReturn: the newest SegmentSealed receipt, state()
-    W->>W: verify the part and the receipt offline; a = j + 1; capacity preflight
+    W->>W: verify the part and the receipt offline, a = j + 1, capacity preflight
     W->>J: the plan (nothing irreversible yet)
     W->>V: burn: the preflight again, on fresh state
     W->>J: the exact burn request
