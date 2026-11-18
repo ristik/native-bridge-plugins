@@ -42,6 +42,7 @@ import { VaultModel, type RecipientBehaviour, type VaultEvent } from '../../src/
 import { verdictAbi, verifyReturn } from '../../src/nb2/verify.js';
 import type { Aggregator } from '../../src/nb2/tokenops.js';
 import { deriveBridgeKey, type BridgeOptions } from '../../src/nb2/bridge.js';
+import { MeasuredGasModel, type GasModel } from '../../src/nb2/gas.js';
 import { LocalKeySigner } from '../../src/nb2/evm.js';
 import { MemoryJournalStore } from '../../src/nb2/journal.js';
 
@@ -415,6 +416,13 @@ export class FakeChain implements JsonRpc {
 
 // ---- a whole simulated deployment --------------------------------------------------------------------
 
+/**
+ * The bound without its build check: the world's verifier is a stand-in, not the calibrated build, so its tests supply the model as a
+ * wallet supplies its own (gas.test.ts and preflight.test.ts check the default's refusal of another build).
+ */
+const BOUND = new MeasuredGasModel();
+export const WORLD_GAS: GasModel = { name: BOUND.name, redeemGasLimit: (s) => BOUND.redeemGasLimit(s), depositGasLimit: () => BOUND.depositGasLimit() };
+
 export async function setup() {
   const root = await makeRoot();
   const cfg = makeConfig(root);
@@ -426,7 +434,7 @@ export async function setup() {
   };
   const options = (seed: string, store = new MemoryJournalStore()): BridgeOptions => ({
     pins, trust: root.trust, rpc: chain, aggregator: agg, journal: store, bridgeKey: deriveBridgeKey(key(seed)), backup: async () => {},
-    receiptTimeoutMs: 0, pollMs: 0, sleep: async () => {},
+    receiptTimeoutMs: 0, pollMs: 0, sleep: async () => {}, gas: WORLD_GAS,
   });
   return { root, cfg, chain, agg, pins, options };
 }

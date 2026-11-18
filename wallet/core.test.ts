@@ -10,7 +10,7 @@ import { after, test } from 'node:test';
 
 import { toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
-import { key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
+import { WORLD_GAS, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, sendDeposit, split, transfer, type WalletConfig } from './core.js';
 
 const dirs: string[] = [];
@@ -55,7 +55,7 @@ async function world(opts: { badCodeHash?: boolean } = {}) {
   const agg = new Flaky(s.agg);
   const dir = join(tmp(), 'w');
   const secret = key('wallet secret');
-  const openAt = (d = dir): Promise<Wallet> => new Wallet(d, secret, config).open({ check: false, lock: false, rpc: s.chain, aggregator: agg });
+  const openAt = (d = dir): Promise<Wallet> => new Wallet(d, secret, config).open({ check: false, lock: false, rpc: s.chain, aggregator: agg, gas: WORLD_GAS });
   return { ...s, config, agg, dir, secret, openAt };
 }
 
@@ -169,11 +169,11 @@ test('init: a refused installation check leaves no wallet; a passed one writes t
   await assert.rejects(Wallet.create(bad.dir, bad.config, () => bad.secret, { lock: false, rpc: bad.chain, aggregator: bad.agg }), /BadDeployment/);
   assert.ok(!existsSync(join(bad.dir, 'config.json')) && !existsSync(join(bad.dir, 'secret.hex')));
   const good = await world();
-  const w = await Wallet.create(good.dir, good.config, () => good.secret, { lock: false, rpc: good.chain, aggregator: good.agg });
+  const w = await Wallet.create(good.dir, good.config, () => good.secret, { lock: false, rpc: good.chain, aggregator: good.agg, gas: WORLD_GAS });
   assert.equal(statSync(join(good.dir, 'secret.hex')).mode & 0o777, 0o600);
   assert.ok(existsSync(join(good.dir, 'config.json')));
   assert.deepEqual(w.signer.address, Wallet.load(good.dir).signer.address);
-  await assert.rejects(Wallet.create(good.dir, good.config, () => good.secret, { lock: false, rpc: good.chain, aggregator: good.agg }), /already a wallet/);
+  await assert.rejects(Wallet.create(good.dir, good.config, () => good.secret, { lock: false, rpc: good.chain, aggregator: good.agg, gas: WORLD_GAS }), /already a wallet/);
   assert.ok(!readdirSync(good.dir).some((f) => f.endsWith('.tmp')));
 });
 

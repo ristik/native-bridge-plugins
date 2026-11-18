@@ -1,17 +1,28 @@
 //! Size and gas bounds of a redemption (sections 12.4 and 12.5; `gas.ts`). The preflight needs a CONSERVATIVE bound of the
 //! complete redeem transaction before the burn exists: its encoded size and its gas limit (expected cost plus `gasReserve`).
-//! The verifier part is a named, replaceable component: [`GasModel`]. The default [`ProvisionalGasModel`] over-estimates by
-//! construction and fails closed (returns None, which the preflight reports as `CapacityPreflight`) for anything it cannot bound.
+//! The gas part is a named, replaceable component: [`GasModel`]. The default [`MeasuredGasModel`] (estimate-nb2-1179,
+//! `docs/nb2-gas-model.md`) is a measured conservative estimate of the redeem, term by term from the deployed verifier's cost
+//! structure with an explicit safety margin, with the TypeScript plug-in's results exactly (`tests/nb2-gas`); it fails closed (None,
+//! which the preflight reports as `CapacityPreflight`) for anything it cannot estimate.
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
 
 use unicity_token::api::bft::UnicityCertificate;
 use unicity_token::cbor::{DecodeLimits, Decoder};
 
 use super::abi::redeem_calldata_length;
-use super::cbor::head_tag;
+use super::cbor::{array, bstr, bytes_n, head_tag, is_uint, raw, scan_native, tag_content};
 use super::config::tag;
+use super::crypto::{he, hu};
 use super::deposit::decode_receipt_backing;
 use super::segment::gap_proof_len;
-use super::token::Token;
+use super::split::decode_split_justification;
+use super::token::{
+    concat, encode_proof, encode_token, mint_source_hash, result_state, state_id, token_id_of,
+    Predicate, Token, PRED_SIGNATURE,
+};
+use super::util::{from_hex, to_hex};
 
 /// What the gas model sees of a prospective redemption.
 pub struct RedeemShape<'a> {
@@ -32,6 +43,12 @@ pub trait GasModel: Send + Sync {
     fn redeem_gas_limit(&self, s: &RedeemShape<'_>) -> Option<u64>;
     /// The gas limit of a deposit call.
     fn deposit_gas_limit(&self) -> u64;
+    /// Whether the model is calibrated for the deployment, given its runtime codes (the verifier's hash checked against Γ, the
+    /// vault's against the manifest) and the manifest's native gas schedule; None for a model that does not say, which is the
+    /// wallet's own choice and is used as supplied.
+    fn supports_deployment(&self, _d: &DeploymentCode<'_>) -> Option<bool> {
+        None
+    }
 }
 
 /// Measured by #1098 (K = 64, B = 16, optimizer runs 200): replay and settlement only.
@@ -112,107 +129,1231 @@ impl GasModel for ProvisionalGasModel {
     }
 }
 
-/// The measured schedule: NB2-05's verifier (unicity-pos-contracts#82 `docs/nb2-verifier.md`: solc 0.8.37, via-IR, Cancun,
-/// native 0x0100/0x0102 schedules, calldata included) and the vault's replay and settlement (#1098 bake-off and #81 snapshots),
-/// each term rounded up so the model stays above every measured token:
+/// The redeem gas estimate (bft-core#1179, `docs/nb2-gas-model.md`; `gas.ts` `REDEEM_GAS`, with identical results): a measured
+/// conservative estimate of the vault redeem's gas limit, term by term from the deployed verifier's cost structure:
 ///
 /// ```text
-///   verifier = 800,000 + 190,000 per further transfer + 760,000 per nested split level
-///              + 136 per evidence byte beyond the measured shape (4,242 + 1,026 per transfer + 3,238 per level)
-///              + 7,500 per seal signature beyond the measured 3
-///   vault    = 487,339 (the worst measured call: previous endpoint, one bucket, sealing) + 6,000 per historical segment
-///   limit    = verifier + vault + history calldata + gasReserve (500,000)
+///   limit = transaction + vault + batch + membership + sha256 + execution + memory + forwarding + safety + gasReserve
 /// ```
 ///
-/// It fails closed: a certificate whose signatures cannot be counted, or more than 16 of them, gives None (`CapacityPreflight`).
-pub mod measured_verifier {
-    pub const BASE: u64 = 800_000;
-    pub const PER_TRANSFER: u64 = 190_000;
-    pub const PER_SPLIT_LEVEL: u64 = 760_000;
-    pub const BASE_BYTES: u64 = 4_242;
-    pub const BYTES_PER_TRANSFER: u64 = 1_026;
-    pub const BYTES_PER_SPLIT_LEVEL: u64 = 3_238;
-    pub const PER_EXCESS_BYTE: u64 = 136;
-    pub const MEASURED_SIGNATURES: usize = 3;
-    pub const PER_EXTRA_SIGNATURE: u64 = 7_500;
-    pub const MAX_SIGNATURES: usize = 16;
-    pub const VAULT_WORST_CALL: u64 = 487_339;
+/// The token's own proofs are counted exactly; the pending burn of a preflight at the decoder bounds. A UC that does not parse, or
+/// has more than 16 signatures, gives None (`CapacityPreflight`). See `gas.ts` for each term.
+pub mod redeem_gas {
+    pub const TX_BASE: u64 = 21_000;
+    pub const CALLDATA_BYTE: u64 = 16;
+    pub const VAULT_WORST_CALL: u64 = 530_000;
     pub const PER_SEGMENT: u64 = 6_000;
+    pub const COPY_WORD: u64 = 3;
+    pub const BATCH_CALL: u64 = 61_100;
+    pub const BATCH_BYTE: u64 = 16;
+    pub const BATCH_PAIR: u64 = 500;
+    pub const BATCH_EPOCH: u64 = 29_900;
+    pub const BATCH_SIGNATURE: u64 = 7_200;
+    pub const BATCH_CLAIM: u64 = 2_000;
+    pub const BATCH_PATH: u64 = 250;
+    pub const BATCH_CLAIMS: usize = 16;
+    pub const BATCH_BYTES: usize = 262_144;
+    pub const MEMBER_CALL: u64 = 2_000;
+    pub const MEMBER_BYTE: u64 = 16;
+    pub const MEMBER_STEP: u64 = 250;
+    pub const SHA256_CALL: u64 = 60;
+    pub const SHA256_WORD: u64 = 12;
+    pub const VERIFIER_BASE: u64 = 159_000;
+    pub const PER_TOKEN: u64 = 0;
+    pub const PER_EDGE: u64 = 16_407;
+    pub const PER_ALLOC_STEP: u64 = 2_000;
+    pub const PER_STEP: u64 = 21_226;
+    pub const PER_PARENT_STEP: u64 = 0;
+    pub const PER_TX_WORD: u64 = 3;
+    pub const PER_SIBLING: u64 = 3;
+    pub const SCAN_ITEM: u64 = 410;
+    pub const SCAN_LONG: u64 = 230;
+    pub const SCAN_NODE: u64 = 185;
+    pub const SKIP_ITEM: u64 = 260;
+    pub const SKIP_LONG: u64 = 90;
+    pub const PER_UC_PARSE: u64 = 19_100;
+    pub const PER_UC_BYTE: u64 = 7;
+    pub const PER_UC_IR_BYTE: u64 = 27;
+    pub const PER_UC_SIGNATURE: u64 = 1_784;
+    pub const PER_UC_STC: u64 = 1_798;
+    pub const PER_UC_UTC: u64 = 2_146;
+    pub const PER_UC_SLOW_BYTE: u64 = 367;
+    pub const PER_UC_KEY_WORD: u64 = 320;
+    pub const PER_KEY_LOOKUP: u64 = 0;
+    pub const PER_DECOMPRESS: u64 = 2_100;
+    pub const PER_PROBE: u64 = 270;
+    pub const PER_CLAIM: u64 = 0;
+    pub const J_BYTE: u64 = 10;
+    pub const PER_RLP_ITEM: u64 = 320;
+    pub const PER_RLP_LONG: u64 = 190;
+    pub const PER_RLP_LIST: u64 = 250;
+    pub const PER_RLP_HEAD: u64 = 1_070;
+    pub const PER_RLP_LONG_HEAD: u64 = 450;
+    pub const PER_RLP_KIDS: u64 = 2_000;
+    pub const COLD_ACCESS: u64 = 5_200;
+    pub const MEM_BASE: usize = 320;
+    pub const MEM_PER_STEP_100: usize = 6_744;
+    pub const MEM_PER_PARENT_STEP_100: usize = 0;
+    pub const MEM_PER_CLAIM_WORD_100: usize = 103;
+    pub const MEM_PER_UC_WORD_100: usize = 306;
+    pub const MEM_PER_PATH_WORD_100: usize = 123;
+    pub const MEM_PER_TOKEN_100: usize = 28_523;
+    pub const MEM_PER_EDGE_100: usize = 0;
+    pub const MEM_PER_ALLOC_STEP_100: usize = 600;
+    pub const MEM_PER_J_WORD_100: usize = 200;
+    pub const PENDING_TX_BYTES: usize = 256;
+    pub const PENDING_UC_BYTES: usize = 24_576;
+    pub const PENDING_SIGNATURES: usize = 16;
+    pub const PENDING_ID_BYTES: usize = 128;
+    pub const PENDING_IR_BYTES: usize = 448;
+    pub const PENDING_STC: usize = 256;
+    pub const PENDING_UTC: usize = 32;
+    pub const PENDING_SHARD_BYTES: usize = 33;
+    pub const PENDING_SIBLINGS: usize = 256;
+    pub const PENDING_UC_ITEMS: usize = 40 + 256 + 3 * 32 + 2 * 16;
+    pub const PENDING_PAIR_ITEMS: usize = 32;
+    pub const PENDING_DATA_ITEMS: usize = 16;
+    pub const MAX_SIGNATURES: usize = 16;
+    pub const KEY_CACHE: usize = 128;
+    pub const SAFETY_DIVISOR: u64 = 32;
 }
 
-/// The default model: [`measured_verifier`].
+/// One UC as the verifier, its helper and the batch see it.
+#[derive(Clone)]
+struct UcShape {
+    bytes: usize,
+    ir: usize,
+    signatures: usize,
+    stc: usize,
+    utc: usize,
+    slow: usize,
+    key_words: usize,
+    epoch: Option<u64>,
+    claim_bytes: usize,
+    claim_key: Option<[u8; 32]>,
+}
+
+/// One distinct claim of the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub bytes: usize,
+    pub signatures: usize,
+    pub path: usize,
+    pub epoch: Option<u64>,
+}
+
+/// A UC's shape as the helper's parse prices it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UcCost {
+    pub bytes: usize,
+    pub ir: usize,
+    pub signatures: usize,
+    pub stc: usize,
+    pub utc: usize,
+    pub slow: usize,
+    pub key_words: usize,
+}
+
+/// The helper's certificate() on one UC, at the bound's coefficients (its execution and its frame's memory).
+pub fn helper_gas(c: &UcCost) -> u64 {
+    use redeem_gas as g;
+    let u = |n: usize| n as u64;
+    g::PER_UC_PARSE
+        + g::PER_UC_BYTE * u(c.bytes)
+        + g::PER_UC_IR_BYTE * u(c.ir)
+        + g::PER_UC_SIGNATURE * u(c.signatures)
+        + g::PER_UC_STC * u(c.stc)
+        + g::PER_UC_UTC * u(c.utc)
+        + g::PER_UC_SLOW_BYTE * u(c.slow)
+        + g::PER_UC_KEY_WORD * u(c.key_words)
+        + helper_memory(c.bytes)
+}
+
+/// What the bound counts, extracted from the lineage (`gas.ts` RedeemFeatures).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemFeatures {
+    pub tokens: usize,
+    pub edges: usize,
+    pub alloc_steps: usize,
+    pub steps: usize,
+    pub parent_steps: usize,
+    pub tx_words: usize,
+    pub max_tx: usize,
+    pub siblings: usize,
+    pub uc_parses: usize,
+    pub uc_bytes: usize,
+    pub uc_ir: usize,
+    pub uc_signatures: usize,
+    pub uc_stc: usize,
+    pub uc_utc: usize,
+    pub uc_slow: usize,
+    pub uc_key_words: usize,
+    pub helper_memory: u64,
+    pub evm_uc: UcCost,
+    pub rcpt_items: usize,
+    pub rcpt_long: usize,
+    pub rcpt_lists: usize,
+    pub rcpt_heads: usize,
+    pub rcpt_long_heads: usize,
+    pub rcpt_kids: usize,
+    pub rcpt_words: usize,
+    pub uc_costs: Vec<UcCost>,
+    pub path_words: usize,
+    pub max_uc: usize,
+    pub scratch: usize,
+    pub scan: CborCount,
+    pub skip: CborCount,
+    pub j_bytes: usize,
+    pub key_lookups: usize,
+    pub decompressions: usize,
+    pub probes: usize,
+    pub claims: Vec<Claim>,
+}
+
+/// What a walk of the verifier's CBOR reader visits (`gas.ts` CborCount): items, heads with argument bytes, and nested items (a
+/// non-empty array or map, a tag).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CborCount {
+    pub items: usize,
+    pub long: usize,
+    pub nodes: usize,
+}
+
+impl CborCount {
+    fn add(&mut self, b: CborCount) {
+        self.items += b.items;
+        self.long += b.long;
+        self.nodes += b.nodes;
+    }
+}
+
+/// The heads of a CBOR item sequence (definite lengths, string payloads skipped): the items the verifier's scanner visits.
+pub fn cbor_items(b: &[u8]) -> usize {
+    cbor_count(b).items
+}
+
+/// The items of a CBOR item sequence as Nb2Cbor's scan and skip visit them.
+pub fn cbor_count(b: &[u8]) -> CborCount {
+    let mut c = CborCount::default();
+    let mut p = 0usize;
+    while p < b.len() {
+        let ib = b[p];
+        p += 1;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        let mut arg = ai as usize;
+        if (24..=27).contains(&ai) {
+            let w = 1usize << (ai - 24);
+            arg = 0;
+            for k in 0..w {
+                arg = arg
+                    .wrapping_mul(256)
+                    .wrapping_add(*b.get(p + k).unwrap_or(&0) as usize);
+            }
+            p += w;
+            c.long += 1;
+        }
+        if major == 2 || major == 3 {
+            p = p.saturating_add(arg);
+        }
+        if major == 6 || ((major == 4 || major == 5) && arg > 0) {
+            c.nodes += 1;
+        }
+        c.items += 1;
+    }
+    c
+}
+
+/// The words Nb2Cert._less reads comparing encoded keys A and B (`gas.ts` compareWords).
+fn compare_words(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    match (0..n).find(|&i| a[i] != b[i]) {
+        Some(i) => i / 32 + 1,
+        None => ceil32(n).max(1),
+    }
+}
+
+/// A UC in Nb2Cert.parse's shape: tag 39001 [1, IR, trHash, scHash, STC, UTC, seal]; None when it is not that shape.
+fn uc_shape(uc: &[u8]) -> Option<UcShape> {
+    let it = scan_native(uc).ok()?;
+    let c = array(tag_content(&it, 39001).ok()?, 7).ok()?;
+    let ir = &c[1];
+    let irc = array(tag_content(ir, 39002).ok()?, 10).ok()?;
+    let sch = bytes_n(&c[3], 32).ok()?;
+    let stc = array(tag_content(&c[4], 39003).ok()?, 3).ok()?;
+    let shard = bstr(&stc[1]).ok()?;
+    let utc = array(tag_content(&c[5], 39004).ok()?, 3).ok()?;
+    let seal = array(tag_content(&c[6], 39005).ok()?, 8).ok()?;
+    let sigs = &seal[7];
+    if stc[2].major != 4
+        || !is_uint(&utc[1])
+        || utc[2].major != 4
+        || !is_uint(&seal[3])
+        || sigs.major != 5
+    {
+        return None;
+    }
+    let mut slow = 0;
+    let mut key_words = 0;
+    for k in (0..sigs.kids.len()).step_by(2) {
+        if sigs.kids[k].major != 3 {
+            return None;
+        }
+        let id = sigs.kids[k].data;
+        if id.iter().any(|&x| x >= 0x80) {
+            slow += id.len();
+        }
+        if k > 0 {
+            key_words += compare_words(raw(uc, &sigs.kids[k - 2]), raw(uc, &sigs.kids[k])) - 1;
+        }
+    }
+    let state_hash = bytes_n(&irc[4], 32).ok()?;
+    let partition = u32::try_from(utc[1].arg).ok()?;
+    let shard_len = u16::try_from(shard.len()).ok()?;
+    let uc_len = u32::try_from(uc.len()).ok()?;
+    let ir_hash = hu(&[raw(uc, ir)]);
+    let claim = concat(&[
+        &partition.to_be_bytes(),
+        &shard_len.to_be_bytes(),
+        shard,
+        sch,
+        state_hash,
+        &ir_hash,
+        &uc_len.to_be_bytes(),
+        uc,
+    ]);
+    Some(UcShape {
+        bytes: uc.len(),
+        ir: ir.end - ir.start,
+        signatures: sigs.kids.len() / 2,
+        stc: stc[2].kids.len(),
+        utc: utc[2].kids.len(),
+        slow,
+        key_words,
+        epoch: Some(seal[3].arg),
+        claim_bytes: claim.len(),
+        claim_key: Some(he(&[&claim])),
+    })
+}
+
+/// An RLP item as Nb2Evm.head reads it.
+#[derive(Clone, Copy)]
+struct Rlp {
+    list: bool,
+    at: usize,
+    pos: usize,
+    len: usize,
+    end: usize,
+}
+
+fn rlp_head(b: &[u8], p: usize, end: usize) -> Option<Rlp> {
+    if p >= end {
+        return None;
+    }
+    let x = b[p];
+    let be = |q: usize, n: usize| -> Option<usize> {
+        if n > 4 || q + n > end || b[q] == 0 {
+            return None;
+        }
+        Some(
+            b[q..q + n]
+                .iter()
+                .fold(0usize, |v, &d| v * 256 + d as usize),
+        )
+    };
+    let (list, hdr, len) = if x < 0x80 {
+        return Some(Rlp {
+            list: false,
+            at: p,
+            pos: p,
+            len: 1,
+            end: p + 1,
+        });
+    } else if x <= 0xb7 {
+        (false, 1, (x - 0x80) as usize)
+    } else if x <= 0xbf {
+        let ll = (x - 0xb7) as usize;
+        (false, 1 + ll, be(p + 1, ll)?)
+    } else if x <= 0xf7 {
+        (true, 1, (x - 0xc0) as usize)
+    } else {
+        let ll = (x - 0xf7) as usize;
+        (true, 1 + ll, be(p + 1, ll)?)
+    };
+    if p + hdr + len > end {
+        return None;
+    }
+    Some(Rlp {
+        list,
+        at: p,
+        pos: p + hdr,
+        len,
+        end: p + hdr + len,
+    })
+}
+
+/// Whether the item at P is in long form (a length of length: 0xb8 to 0xbf, 0xf8 to 0xff).
+fn rlp_long_at(b: &[u8], p: usize) -> bool {
+    (0xb8..=0xbf).contains(&b[p]) || b[p] >= 0xf8
+}
+
+/// Every RLP item in [p, end) (check()'s visits) into SH, or None when it is not RLP.
+fn rlp_items(
+    b: &[u8],
+    mut p: usize,
+    end: usize,
+    depth: usize,
+    sh: &mut ReceiptShape,
+) -> Option<()> {
+    while p < end {
+        let it = rlp_head(b, p, end)?;
+        if depth > 16 {
+            return None;
+        }
+        sh.items += 1;
+        if rlp_long_at(b, p) {
+            sh.long += 1;
+        }
+        if it.list {
+            sh.lists += 1;
+            rlp_items(b, it.pos, it.end, depth + 1, sh)?;
+        }
+        p = it.end;
+    }
+    Some(())
+}
+
+fn rlp_kids(b: &[u8], it: &Rlp) -> Option<Vec<Rlp>> {
+    let mut out = Vec::new();
+    let mut q = it.pos;
+    while q < it.end {
+        let k = rlp_head(b, q, it.end)?;
+        q = k.end;
+        out.push(k);
+    }
+    Some(out)
+}
+
+struct ReceiptShape {
+    items: usize,
+    long: usize,
+    lists: usize,
+    heads: usize,
+    long_heads: usize,
+    kids: usize,
+    words: usize,
+}
+
+/// The receipt helper's walk of J's deposit proof (`gas.ts` receiptShape): check() of the header, every trie node and the receipt;
+/// kids() of the header (20), each node (17), the receipt (4) and the log (3); head() of every log up to the selected one and of its
+/// topics; those calls' allocations and the log's data.
+fn receipt_shape(header: &[u8], nodes: &[Vec<u8>], log_index: u64) -> Option<ReceiptShape> {
+    let mut sh = ReceiptShape {
+        items: 0,
+        long: 0,
+        lists: 0,
+        heads: 0,
+        long_heads: 0,
+        kids: 0,
+        words: 0,
+    };
+    let largest = nodes
+        .iter()
+        .map(|x| x.len())
+        .chain(core::iter::once(header.len()))
+        .max()
+        .unwrap_or(0);
+    sh.words = 128 + 2 * nodes.len() + 18 + 20 + ceil32(largest);
+    fn kids_of(sh: &mut ReceiptShape, b: &[u8], it: &Rlp, max: usize) -> Option<Vec<Rlp>> {
+        let k = rlp_kids(b, it)?;
+        sh.kids += 1;
+        sh.heads += k.len();
+        sh.long_heads += k.iter().filter(|x| rlp_long_at(b, x.at)).count();
+        sh.words += 1 + 5 * max + 4 * k.len();
+        Some(k)
+    }
+    fn top(sh: &mut ReceiptShape, b: &[u8]) -> Option<Rlp> {
+        rlp_items(b, 0, b.len(), 0, sh)?;
+        let it = rlp_head(b, 0, b.len())?;
+        if it.end != b.len() {
+            return None;
+        }
+        Some(it)
+    }
+    let h = top(&mut sh, header)?;
+    if !h.list {
+        return None;
+    }
+    kids_of(&mut sh, header, &h, 20)?;
+    let mut value: Option<&[u8]> = None;
+    for (i, node) in nodes.iter().enumerate() {
+        let it = top(&mut sh, node)?;
+        if !it.list {
+            return None;
+        }
+        let k = kids_of(&mut sh, node, &it, 17)?;
+        if i == nodes.len() - 1 {
+            let v = match k.len() {
+                17 => k[16],
+                2 => k[1],
+                _ => return None,
+            };
+            if v.list {
+                return None;
+            }
+            value = Some(&node[v.pos..v.end]);
+        }
+    }
+    let value = value.filter(|v| !v.is_empty())?;
+    let r = if value[0] < 0xc0 { &value[1..] } else { value };
+    let rt = top(&mut sh, r)?;
+    if !rt.list {
+        return None;
+    }
+    let f = kids_of(&mut sh, r, &rt, 4)?;
+    if f.len() != 4 || !f[3].list {
+        return None;
+    }
+    let mut q = f[3].pos;
+    let mut sel = None;
+    let mut i = 0u64;
+    while q < f[3].end {
+        let it = rlp_head(r, q, f[3].end)?;
+        sh.heads += 1;
+        if rlp_long_at(r, q) {
+            sh.long_heads += 1;
+        }
+        sh.words += 4;
+        if i == log_index {
+            sel = Some(it);
+            break;
+        }
+        i += 1;
+        q = it.end;
+    }
+    let sel = sel.filter(|s| s.list)?;
+    let lk = kids_of(&mut sh, r, &sel, 3)?;
+    if lk.len() != 3 || !lk[1].list {
+        return None;
+    }
+    let topics = rlp_kids(r, &lk[1])?;
+    sh.heads += topics.len();
+    sh.long_heads += topics.iter().filter(|x| rlp_long_at(r, x.at)).count();
+    sh.words += 4 * topics.len() + 1 + topics.len() + 1 + ceil32(lk[2].len);
+    Some(sh)
+}
+
+/// One open-addressing table of the verifier (linear probing from the key's low bits), counting its probes and its misses.
+struct ProbeTable {
+    slots: Vec<Option<[u8; 32]>>,
+    probes: usize,
+    misses: usize,
+}
+
+impl ProbeTable {
+    fn new(size: usize) -> Self {
+        Self {
+            slots: alloc::vec![None; size],
+            probes: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up or insert KEY; a full table answers a miss without storing (the key cache).
+    fn lookup(&mut self, key: &[u8; 32]) {
+        let mask = self.slots.len() - 1;
+        let low = u32::from_be_bytes([key[28], key[29], key[30], key[31]]) as usize;
+        let mut i = low & mask;
+        for _ in 0..=mask {
+            self.probes += 1;
+            match &self.slots[i] {
+                Some(s) if s == key => return,
+                None => {
+                    self.slots[i] = Some(*key);
+                    self.misses += 1;
+                    return;
+                }
+                _ => i = (i + 1) & mask,
+            }
+        }
+        self.misses += 1;
+    }
+}
+
+/// The part's current owner and state (`tokenops` head, repeated here to keep this module free of the signing code).
+fn head_of(t: &Token) -> (Predicate, [u8; 32]) {
+    let id = token_id_of(&t.mint.salt, t.mint.network);
+    let mut state = result_state(&mint_source_hash(&id), &id);
+    let mut owner = t.mint.recipient.clone();
+    for tr in &t.transfers {
+        state = result_state(&state, &tr.mask);
+        owner = tr.recipient.clone();
+    }
+    (owner, state)
+}
+
+/// The verifier's table size for N entries (_pow2: at least 16).
+fn pow2_at(n: usize) -> usize {
+    let mut p = 16;
+    while p < n {
+        p <<= 1;
+    }
+    p
+}
+
+const fn ceil32(n: usize) -> usize {
+    n.div_ceil(32)
+}
+
+/// The memory expansion of WORDS words (the Yellow Paper's C_mem).
+pub fn memory_gas(words: usize) -> u64 {
+    let w = words as u64;
+    3 * w + w * w / 512
+}
+
+/// One helper call's frame: the UC copied for the claim, the claim and the ABI answer (about three UCs of memory).
+fn helper_memory(uc_bytes: usize) -> u64 {
+    memory_gas(3 * ceil32(uc_bytes) + 64)
+}
+
+struct StepShape {
+    tx: usize,
+    siblings: usize,
+    uc: UcShape,
+    sid: [u8; 32],
+}
+
+/// The features of a prospective redemption; None when a UC does not parse or has more signatures than the bound.
+pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
+    use redeem_gas as g;
+    let l = s.lineage;
+    if l.is_empty() || s.pending_transactions > 1 {
+        return None;
+    }
+    let pending = s.pending_transactions == 1;
+    let mut cache: BTreeMap<[u8; 32], Option<UcShape>> = BTreeMap::new();
+    let mut shape_of = |uc: &[u8]| -> Option<UcShape> {
+        let k = hu(&[uc]);
+        let u = cache.entry(k).or_insert_with(|| uc_shape(uc)).clone()?;
+        (u.signatures <= g::MAX_SIGNATURES).then_some(u)
+    };
+    let mut steps: Vec<StepShape> = Vec::new();
+    for t in l {
+        let proofs = core::iter::once(&t.mint_proof).chain(t.proofs.iter());
+        let raws = core::iter::once(&t.mint_raw).chain(t.transfers_raw.iter());
+        for (p, r) in proofs.zip(raws) {
+            let uc = shape_of(&p.uc)?;
+            steps.push(StepShape {
+                tx: r.len(),
+                siblings: p.siblings.len(),
+                uc,
+                sid: state_id(&p.cd.source, &p.cd.source_hash),
+            });
+        }
+    }
+    let part = &l[l.len() - 1];
+    let (owner, state) = head_of(part);
+    if pending {
+        let uc = UcShape {
+            bytes: g::PENDING_UC_BYTES,
+            ir: g::PENDING_IR_BYTES,
+            signatures: g::PENDING_SIGNATURES,
+            stc: g::PENDING_STC,
+            utc: g::PENDING_UTC,
+            slow: g::PENDING_SIGNATURES * g::PENDING_ID_BYTES,
+            key_words: (g::PENDING_SIGNATURES - 1) * (ceil32(g::PENDING_ID_BYTES + 2) - 1),
+            epoch: None,
+            claim_bytes: 4 + 2 + g::PENDING_SHARD_BYTES + 96 + 4 + g::PENDING_UC_BYTES,
+            claim_key: None,
+        };
+        steps.push(StepShape {
+            tx: g::PENDING_TX_BYTES,
+            siblings: g::PENDING_SIBLINGS,
+            uc,
+            sid: state_id(&owner, &state),
+        });
+    }
+    let n = steps.len();
+    let j = l[0]
+        .mint
+        .justification
+        .as_deref()
+        .filter(|j| head_tag(j) == Some(tag::RECEIPT_BACKING))?;
+    let dp = decode_receipt_backing(j).ok()?.proof;
+    let evm = shape_of(&dp.uc)?;
+    let rcpt = receipt_shape(&dp.header, &dp.nodes, dp.log_index)?;
+    // the CBOR walks (`gas.ts` redeemFeatures): scan of the evidence, every split justification, J and every transaction's data;
+    // skip of every parent token, every genesis, every proof's UC and every predicate's three fields
+    let mut scan = CborCount {
+        items: 2,
+        long: 0,
+        nodes: 1,
+    };
+    let mut skip = CborCount::default();
+    scan.add(cbor_count(&encode_token(part)));
+    scan.add(cbor_count(j));
+    let mut alloc_steps = 0;
+    for (i, t) in l.iter().enumerate() {
+        if i > 0 {
+            let sj = t.mint.justification.as_deref()?;
+            scan.add(cbor_count(sj));
+            alloc_steps += decode_split_justification(sj).ok()?.proof.len();
+        }
+        if i < l.len() - 1 {
+            skip.add(cbor_count(&encode_token(t)));
+        }
+        skip.items += 1;
+        skip.nodes += 1;
+        skip.add(cbor_count(&t.mint_raw));
+        skip.add(cbor_count(&encode_proof(&t.mint_proof)));
+        for pr in core::iter::once(&t.mint_proof).chain(t.proofs.iter()) {
+            skip.add(cbor_count(&pr.uc));
+        }
+        for d in core::iter::once(&t.mint.data)
+            .chain(t.transfers.iter().map(|tr| &tr.data))
+            .flatten()
+        {
+            scan.add(cbor_count(d));
+        }
+        let predicates = 2 * (1 + t.transfers.len());
+        skip.items += 3 * predicates;
+        skip.long += predicates;
+    }
+    if pending {
+        let n = g::PENDING_PAIR_ITEMS + g::PENDING_UC_ITEMS;
+        scan.add(CborCount {
+            items: n,
+            long: n,
+            nodes: n,
+        });
+        skip.add(CborCount {
+            items: g::PENDING_UC_ITEMS,
+            long: g::PENDING_UC_ITEMS,
+            nodes: g::PENDING_UC_ITEMS,
+        });
+        skip.items += 6;
+        skip.long += 2;
+        scan.add(CborCount {
+            items: g::PENDING_DATA_ITEMS,
+            long: g::PENDING_DATA_ITEMS,
+            nodes: g::PENDING_DATA_ITEMS,
+        });
+    }
+    let mut keys = ProbeTable::new(g::KEY_CACHE);
+    let mut key_lookups = 0;
+    let mut key = |p: &Predicate, keys: &mut ProbeTable| {
+        if p.ty == PRED_SIGNATURE {
+            key_lookups += 1;
+            keys.lookup(&he(&[&p.params]));
+        }
+    };
+    for (i, t) in l.iter().enumerate().rev() {
+        key(&t.mint.recipient, &mut keys);
+        key(&t.mint_proof.cd.source, &mut keys);
+        for (tr, pr) in t.transfers.iter().zip(t.proofs.iter()) {
+            key(&tr.recipient, &mut keys);
+            key(&pr.cd.source, &mut keys);
+        }
+        if i == l.len() - 1 && pending {
+            key(&owner, &mut keys);
+        }
+    }
+    let mut sids = ProbeTable::new(pow2_at(2 * n));
+    for st in &steps {
+        let mut k = st.sid;
+        if k == [0u8; 32] {
+            k[31] = 1;
+        }
+        sids.lookup(&k);
+    }
+    let mut claim_ids = ProbeTable::new(pow2_at(2 * (n + 1)));
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut claims = Vec::new();
+    let mut unknown_probes = 0;
+    for u in core::iter::once(&evm).chain(steps.iter().map(|st| &st.uc)) {
+        let c = Claim {
+            bytes: u.claim_bytes,
+            signatures: u.signatures,
+            path: u.stc + u.utc,
+            epoch: u.epoch,
+        };
+        match u.claim_key {
+            None => {
+                unknown_probes += seen.len() + 1;
+                claims.push(c);
+            }
+            Some(k) => {
+                claim_ids.lookup(&k);
+                if seen.insert(k) {
+                    claims.push(c);
+                }
+            }
+        }
+    }
+    let mut f = RedeemFeatures {
+        tokens: l.len(),
+        edges: l.len() - 1,
+        alloc_steps,
+        steps: n,
+        parent_steps: l[..l.len() - 1].iter().map(|t| 1 + t.transfers.len()).sum(),
+        tx_words: 0,
+        max_tx: 0,
+        siblings: 0,
+        uc_parses: n + 1,
+        uc_bytes: evm.bytes,
+        uc_ir: evm.ir,
+        uc_signatures: evm.signatures,
+        uc_stc: evm.stc,
+        uc_utc: evm.utc,
+        uc_slow: evm.slow,
+        uc_key_words: evm.key_words,
+        helper_memory: memory_gas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
+        evm_uc: UcCost {
+            bytes: evm.bytes,
+            ir: evm.ir,
+            signatures: evm.signatures,
+            stc: evm.stc,
+            utc: evm.utc,
+            slow: evm.slow,
+            key_words: evm.key_words,
+        },
+        uc_costs: Vec::new(),
+        rcpt_items: rcpt.items,
+        rcpt_long: rcpt.long,
+        rcpt_lists: rcpt.lists,
+        rcpt_heads: rcpt.heads,
+        rcpt_long_heads: rcpt.long_heads,
+        rcpt_kids: rcpt.kids,
+        rcpt_words: rcpt.words,
+        path_words: 0,
+        max_uc: evm.bytes,
+        scratch: 24,
+        scan,
+        skip,
+        j_bytes: j.len(),
+        key_lookups,
+        decompressions: keys.misses,
+        probes: keys.probes + sids.probes + claim_ids.probes + unknown_probes,
+        claims,
+    };
+    // a transaction is hashed from a copy at the free pointer; every later step allocates at least two copies of its UC over that scratch
+    let mut after = 0usize;
+    for st in steps.iter().rev() {
+        f.scratch = f.scratch.max((ceil32(st.tx) + 1).saturating_sub(after));
+        after += 2 * ceil32(st.uc.bytes);
+    }
+    for st in &steps {
+        f.tx_words += ceil32(st.tx);
+        f.max_tx = f.max_tx.max(st.tx);
+        f.siblings += st.siblings;
+        f.uc_bytes += st.uc.bytes;
+        f.uc_ir += st.uc.ir;
+        f.uc_signatures += st.uc.signatures;
+        f.uc_stc += st.uc.stc;
+        f.uc_utc += st.uc.utc;
+        f.uc_slow += st.uc.slow;
+        f.uc_key_words += st.uc.key_words;
+        f.helper_memory += helper_memory(st.uc.bytes);
+        let c = UcCost {
+            bytes: st.uc.bytes,
+            ir: st.uc.ir,
+            signatures: st.uc.signatures,
+            stc: st.uc.stc,
+            utc: st.uc.utc,
+            slow: st.uc.slow,
+            key_words: st.uc.key_words,
+        };
+        if !f.uc_costs.contains(&c) {
+            f.uc_costs.push(c);
+        }
+        f.path_words += 1 + ceil32(104 + 32 * (st.siblings + 1));
+        f.max_uc = f.max_uc.max(st.uc.bytes);
+    }
+    Some(f)
+}
+
+/// CERT_BATCH_V2 over the distinct claims in the verifier's batching (_flush): (gas, calls, the largest call's gas).
+pub fn batch_gas(claims: &[Claim]) -> (u64, usize, u64) {
+    use redeem_gas as g;
+    let m = claims.len();
+    if m == 0 {
+        return (0, 0, 0);
+    }
+    let per = m.div_ceil(m.div_ceil(g::BATCH_CLAIMS));
+    let (mut gas, mut largest, mut calls) = (0u64, 0u64, 0usize);
+    let mut s = 0;
+    while s < m {
+        let mut e = s;
+        let mut bytes = 4;
+        while e < m && e - s < per && bytes + claims[e].bytes <= g::BATCH_BYTES {
+            bytes += claims[e].bytes;
+            e += 1;
+        }
+        if e == s {
+            bytes += claims[e].bytes;
+            e += 1;
+        }
+        let k = (e - s) as u64;
+        let mut epochs: BTreeSet<(bool, u64)> = BTreeSet::new();
+        let (mut q, mut p) = (0u64, 0u64);
+        for (i, c) in claims.iter().enumerate().take(e).skip(s) {
+            epochs.insert(match c.epoch {
+                Some(ep) => (true, ep),
+                None => (false, i as u64),
+            });
+            q += c.signatures as u64;
+            p += c.path as u64;
+        }
+        let c = g::BATCH_CALL
+            + g::BATCH_BYTE * bytes as u64
+            + g::BATCH_PAIR * k * (k - 1)
+            + g::BATCH_EPOCH * epochs.len() as u64
+            + g::BATCH_SIGNATURE * q
+            + g::BATCH_CLAIM * k
+            + g::BATCH_PATH * p;
+        gas += c;
+        largest = largest.max(c);
+        calls += 1;
+        s = e;
+    }
+    (gas, calls, largest)
+}
+
+/// The verifier frame's memory high-water bound (words): its hash tables exactly, what else it allocates, its largest scratch use.
+pub fn verifier_memory_words(f: &RedeemFeatures) -> usize {
+    use redeem_gas as g;
+    let n = f.steps;
+    let tables = pow2_at(2 * (n + 1)) + pow2_at(2 * n) + (n + 1) + 2 * g::KEY_CACHE;
+    let per = g::MEM_PER_STEP_100 * n
+        + g::MEM_PER_PARENT_STEP_100 * f.parent_steps
+        + g::MEM_PER_CLAIM_WORD_100 * f.claims.iter().map(|c| ceil32(c.bytes) + 1).sum::<usize>()
+        + g::MEM_PER_UC_WORD_100 * ceil32(f.uc_bytes)
+        + g::MEM_PER_PATH_WORD_100 * f.path_words
+        + g::MEM_PER_TOKEN_100 * f.tokens
+        + g::MEM_PER_EDGE_100 * f.edges
+        + g::MEM_PER_ALLOC_STEP_100 * f.alloc_steps
+        + g::MEM_PER_J_WORD_100 * ceil32(f.j_bytes);
+    g::MEM_BASE + per.div_ceil(100) + tables + f.scratch
+}
+
+/// The verifier's CBOR walks at the estimate's prices.
+pub fn walk_gas(f: &RedeemFeatures) -> u64 {
+    use redeem_gas as g;
+    let u = |n: usize| n as u64;
+    g::SCAN_ITEM * u(f.scan.items)
+        + g::SCAN_LONG * u(f.scan.long)
+        + g::SCAN_NODE * u(f.scan.nodes)
+        + g::SKIP_ITEM * u(f.skip.items)
+        + g::SKIP_LONG * u(f.skip.long)
+}
+
+/// The receipt helper's RLP walk at the estimate's prices.
+pub fn receipt_walk_gas(f: &RedeemFeatures) -> u64 {
+    use redeem_gas as g;
+    let u = |n: usize| n as u64;
+    g::PER_RLP_ITEM * u(f.rcpt_items)
+        + g::PER_RLP_LONG * u(f.rcpt_long)
+        + g::PER_RLP_LIST * u(f.rcpt_lists)
+        + g::PER_RLP_HEAD * u(f.rcpt_heads)
+        + g::PER_RLP_LONG_HEAD * u(f.rcpt_long_heads)
+        + g::PER_RLP_KIDS * u(f.rcpt_kids)
+}
+
+/// The estimate's terms: each derived from the code or measured (`docs/nb2-gas-model.md` lists which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GasTerms {
+    pub transaction: u64,
+    pub vault: u64,
+    pub batch: u64,
+    pub membership: u64,
+    pub sha256: u64,
+    pub execution: u64,
+    pub memory: u64,
+    pub forwarding: u64,
+    pub safety: u64,
+    pub reserve: u64,
+    pub limit: u64,
+    pub memory_words: usize,
+}
+
+/// The terms of a redemption with FEATURES, EVIDENCE_BYTES of evidence and PROOFS historical gap proofs at K.
+pub fn price_features(f: &RedeemFeatures, evidence_bytes: usize, proofs: u64, k: u64) -> GasTerms {
+    use redeem_gas as g;
+    let u = |n: usize| n as u64;
+    let history_bytes = if proofs == 0 {
+        0
+    } else {
+        32 + proofs as usize * gap_proof_len(k)
+    };
+    let transaction =
+        g::TX_BASE + g::CALLDATA_BYTE * u(redeem_calldata_length(evidence_bytes, history_bytes));
+    let vw = ceil32(evidence_bytes) + 64;
+    let vault =
+        g::VAULT_WORST_CALL + g::PER_SEGMENT * proofs + g::COPY_WORD * u(vw) + memory_gas(vw);
+    let (batch, _, largest) = batch_gas(&f.claims);
+    let membership = u(f.steps) * (g::MEMBER_CALL + g::MEMBER_BYTE * 136 + g::MEMBER_STEP)
+        + u(f.siblings) * (32 * g::MEMBER_BYTE + g::MEMBER_STEP);
+    let sha256 = u(f.steps) * g::SHA256_CALL + u(f.tx_words) * g::SHA256_WORD;
+    let execution = g::VERIFIER_BASE
+        + g::PER_TOKEN * u(f.tokens)
+        + g::PER_EDGE * u(f.edges)
+        + g::PER_ALLOC_STEP * u(f.alloc_steps)
+        + g::PER_STEP * u(f.steps)
+        + g::PER_PARENT_STEP * u(f.parent_steps)
+        + g::PER_TX_WORD * u(f.tx_words)
+        + g::PER_SIBLING * u(f.siblings)
+        + walk_gas(f)
+        + g::PER_UC_PARSE * u(f.uc_parses)
+        + g::PER_UC_BYTE * u(f.uc_bytes)
+        + g::PER_UC_IR_BYTE * u(f.uc_ir)
+        + g::PER_UC_SIGNATURE * u(f.uc_signatures)
+        + g::PER_UC_STC * u(f.uc_stc)
+        + g::PER_UC_UTC * u(f.uc_utc)
+        + g::PER_UC_SLOW_BYTE * u(f.uc_slow)
+        + g::PER_UC_KEY_WORD * u(f.uc_key_words)
+        + f.helper_memory
+        + g::PER_KEY_LOOKUP * u(f.key_lookups)
+        + g::PER_DECOMPRESS * u(f.decompressions)
+        + g::PER_PROBE * u(f.probes)
+        + g::PER_CLAIM * u(f.claims.len())
+        + g::J_BYTE * u(f.j_bytes)
+        + receipt_walk_gas(f)
+        + g::COLD_ACCESS;
+    let memory_words = verifier_memory_words(f);
+    let memory = memory_gas(memory_words);
+    let safety = (execution + memory + vault) / g::SAFETY_DIVISOR + 1;
+    let verifier = batch + membership + sha256 + execution + memory;
+    // EIP-150 at the verifier's own calls: the largest of its batch calls, its helper calls (one a UC; J's receipt with its EVM UC)
+    let mut largest = largest;
+    for c in &f.uc_costs {
+        largest = largest.max(helper_gas(c));
+    }
+    largest = largest.max(
+        helper_gas(&f.evm_uc) - helper_memory(f.evm_uc.bytes)
+            + memory_gas(3 * ceil32(f.evm_uc.bytes) + 64 + f.rcpt_words)
+            + g::J_BYTE * u(f.j_bytes)
+            + receipt_walk_gas(f),
+    );
+    let inner = largest / 63 + 1;
+    let forwarding = (verifier + inner) / 63 + 1 + inner;
+    let reserve = measured::GAS_RESERVE;
+    let limit = transaction + vault + verifier + forwarding + safety + reserve;
+    GasTerms {
+        transaction,
+        vault,
+        batch,
+        membership,
+        sha256,
+        execution,
+        memory,
+        forwarding,
+        safety,
+        reserve,
+        limit,
+        memory_words,
+    }
+}
+
+/// The terms of a prospective redemption, or None when it cannot be bounded.
+pub fn redeem_gas_terms(s: &RedeemShape<'_>) -> Option<GasTerms> {
+    redeem_features(s).map(|f| price_features(&f, s.evidence_bytes, s.proofs, s.k))
+}
+
+/// The native gas schedules [`redeem_gas`] assumes (`gas.ts` NATIVE_GAS_SCHEDULE).
+pub const NATIVE_GAS_SCHEDULE: &str =
+    "CERT_BATCH_V2 61100+16C+500K(K-1)+29900E+7200Q+2000A+250P; RSMT 2000+16L+250(1+S); SHA256 60+12W";
+
+/// The deployment [`redeem_gas`] is calibrated for (`gas.ts` CALIBRATED_DEPLOYMENT): unicity-pos-contracts 884c4829 `src/nb2` as
+/// deploy_nb2.py creates it, its helper and [`NATIVE_GAS_SCHEDULE`]; each runtime is rebuilt from the artifact and the deployment's
+/// own immutable values and compared in full.
+pub mod calibrated_deployment {
+    pub const VERIFIER_CODE_LENGTH: usize = 19_574;
+    pub const VERIFIER_MASKED_CODE_HASH: &str =
+        "65fbc862ae2ea16729506cd9e6a62458785751b690103ce25d9515495029f201";
+    pub const ADMITS_TEST_SET: &[usize] = &[8_541, 12_187];
+    pub const RECEIPTS: &[usize] = &[325, 3_071, 8_473, 15_504];
+    pub const RECEIPTS_CODE_HASH: &[usize] = &[368, 8_417];
+    pub const HELPER_CODE_HASH: &str =
+        "16f1381ed6c1d9cd1c14b467fcfb2ec84ab8903f65da506048fbb2e2c10ffe23";
+    pub const VAULT_CODE_LENGTH: usize = 6_363;
+    pub const VAULT_MASKED_CODE_HASH: &str =
+        "9bc8cce34b22e45345a9a49c28a4041229f748c8d13964e69fbf2020b90545e4";
+    /// D, VERIFIER, QMAX, K, LOGK, LOGB, GLEN, G0 to G11 (NB2VaultBase's immutables in declaration order).
+    pub const VAULT_IMMUTABLES: [&[usize]; 19] = [
+        &[103, 1_318, 2_642, 4_362, 5_801],
+        &[1_218],
+        &[5_648],
+        &[
+            1_460, 1_792, 1_924, 1_986, 2_090, 2_181, 2_222, 2_391, 2_455, 2_500, 4_057, 6_226,
+        ],
+        &[375, 4_228, 4_291, 4_415, 4_531, 4_761],
+        &[
+            519, 576, 1_529, 1_567, 1_607, 1_642, 2_031, 2_139, 2_266, 2_344, 3_419, 3_468, 3_543,
+            3_639, 3_688, 4_019, 6_189,
+        ],
+        &[1_097, 4_929],
+        &[641, 5_044],
+        &[676, 5_079],
+        &[713, 5_117],
+        &[751, 5_155],
+        &[789, 5_193],
+        &[827, 5_231],
+        &[865, 5_269],
+        &[903, 5_307],
+        &[941, 5_345],
+        &[980, 5_384],
+        &[1_019, 5_423],
+        &[1_058, 5_462],
+    ];
+}
+
+/// What the bridge shows a gas model of the deployment (`gas.ts` DeploymentCode).
+pub struct DeploymentCode<'a> {
+    pub gamma: &'a [u8],
+    /// The verifier's address.
+    pub verifier: &'a [u8],
+    pub k: u64,
+    pub b: u64,
+    /// Qmax, big-endian.
+    pub qmax: &'a [u8],
+    pub verifier_code: &'a [u8],
+    /// The code at the verifier's first CREATE address ([`create_address`](verifier, 1)), where its constructor deploys the helper.
+    pub helper_code: &'a [u8],
+    pub vault_code: &'a [u8],
+    /// The deployment manifest's `nativeGasSchedule` pin, when it has one.
+    pub native_gas_schedule: Option<&'a str>,
+}
+
+/// The address of the contract ADDRESS creates with nonce NONCE (keccak256(RLP([address, nonce]))[12:]).
+pub fn create_address(address: &[u8], nonce: u64) -> [u8; 20] {
+    let n: Vec<u8> = nonce
+        .to_be_bytes()
+        .iter()
+        .copied()
+        .skip_while(|&x| x == 0)
+        .collect();
+    let item = if n.len() == 1 && n[0] < 0x80 {
+        n
+    } else {
+        concat(&[&[0x80 + n.len() as u8], &n])
+    };
+    let body = concat(&[&[0x80 + address.len() as u8], address, &item]);
+    let h = he(&[&[0xc0 + body.len() as u8], &body]);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&h[12..]);
+    out
+}
+
+fn word(b: &[u8]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[32 - b.len()..].copy_from_slice(b);
+    w
+}
+
+fn log2_ceil(v: u64) -> u64 {
+    let mut n = 0;
+    while (1u64 << n) < v {
+        n += 1;
+    }
+    n
+}
+
+/// Whether CODE is the template of length N with hash MASKED once POSITIONS are zeroed and every occurrence holds its expected word.
+fn rebuilt(
+    code: &[u8],
+    length: usize,
+    masked: &str,
+    positions: &[&[usize]],
+    values: &[[u8; 32]],
+) -> bool {
+    if code.len() != length {
+        return false;
+    }
+    let mut m = code.to_vec();
+    for (ps, v) in positions.iter().zip(values) {
+        for &at in ps.iter() {
+            if &code[at..at + 32] != v {
+                return false;
+            }
+            m[at..at + 32].fill(0);
+        }
+    }
+    to_hex(&he(&[&m])) == masked
+}
+
+/// Whether D is the calibrated deployment (`gas.ts` calibratedDeployment): the verifier's, the helper's and the vault's runtimes are
+/// exactly the calibrated artifacts with the immutables this deployment must have, and the manifest pins [`NATIVE_GAS_SCHEDULE`].
+pub fn calibrated_deployment(d: &DeploymentCode<'_>) -> bool {
+    use calibrated_deployment as c;
+    if d.native_gas_schedule != Some(NATIVE_GAS_SCHEDULE) {
+        return false;
+    }
+    if to_hex(&he(&[d.helper_code])) != c::HELPER_CODE_HASH || d.verifier.len() != 20 {
+        return false;
+    }
+    let production = d.k == 64 && d.b == 16;
+    let helper = create_address(d.verifier, 1);
+    let helper_hash = from_hex(c::HELPER_CODE_HASH).unwrap_or_default();
+    if !rebuilt(
+        d.verifier_code,
+        c::VERIFIER_CODE_LENGTH,
+        c::VERIFIER_MASKED_CODE_HASH,
+        &[c::ADMITS_TEST_SET, c::RECEIPTS, c::RECEIPTS_CODE_HASH],
+        &[
+            word(&[u8::from(!production)]),
+            word(&helper),
+            word(&helper_hash),
+        ],
+    ) {
+        return false;
+    }
+    if d.gamma.len() > 384 || d.qmax.len() > 32 {
+        return false;
+    }
+    let mut padded = [0u8; 384];
+    padded[..d.gamma.len()].copy_from_slice(d.gamma);
+    let mut values = alloc::vec![
+        hu(&[d.gamma]),
+        word(d.verifier),
+        word(d.qmax),
+        word(&d.k.to_be_bytes()),
+        word(&log2_ceil(d.k).to_be_bytes()),
+        word(&log2_ceil(d.b).to_be_bytes()),
+        word(&(d.gamma.len() as u64).to_be_bytes()),
+    ];
+    for i in 0..12 {
+        let mut w = [0u8; 32];
+        w.copy_from_slice(&padded[32 * i..32 * i + 32]);
+        values.push(w);
+    }
+    rebuilt(
+        d.vault_code,
+        c::VAULT_CODE_LENGTH,
+        c::VAULT_MASKED_CODE_HASH,
+        &c::VAULT_IMMUTABLES,
+        &values,
+    )
+}
+
+/// The default model: [`redeem_gas`], for the calibrated deployment only (the bridge refuses it for any other).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeasuredGasModel;
 
 impl GasModel for MeasuredGasModel {
     fn name(&self) -> &str {
-        "measured-nb2-05"
+        "estimate-nb2-1179"
     }
 
     fn redeem_gas_limit(&self, s: &RedeemShape<'_>) -> Option<u64> {
-        use measured_verifier as m;
-        let levels = s.lineage.len().saturating_sub(1) as u64;
-        // every token of the walk ends in a burn (its split burn, or the return burn, pending or not); further transfers are hops
-        let transfers =
-            s.lineage.iter().map(|t| t.transfers.len()).sum::<usize>() + s.pending_transactions;
-        let hops = transfers.saturating_sub(s.lineage.len()) as u64;
-        let mut extra_sigs = 0u64;
-        let count = |uc: &[u8], extra: &mut u64| -> Option<()> {
-            let n = count_signatures(uc)?;
-            if n > m::MAX_SIGNATURES {
-                return None;
-            }
-            *extra += n.saturating_sub(m::MEASURED_SIGNATURES) as u64;
-            Some(())
-        };
-        for (i, tok) in s.lineage.iter().enumerate() {
-            for pr in core::iter::once(&tok.mint_proof).chain(tok.proofs.iter()) {
-                count(&pr.uc, &mut extra_sigs)?;
-            }
-            // the root's EVM UC inside J
-            if i == 0 {
-                if let Some(evm) = evm_uc_of(tok)? {
-                    count(&evm, &mut extra_sigs)?;
-                }
-            }
-        }
-        // a future certificate at the signature bound
-        extra_sigs +=
-            (s.pending_transactions * (m::MAX_SIGNATURES - m::MEASURED_SIGNATURES)) as u64;
-        let shaped =
-            m::BASE_BYTES + m::BYTES_PER_TRANSFER * hops + m::BYTES_PER_SPLIT_LEVEL * levels;
-        let excess = (s.evidence_bytes as u64).saturating_sub(shaped);
-        let verifier = m::BASE
-            + m::PER_TRANSFER * hops
-            + m::PER_SPLIT_LEVEL * levels
-            + m::PER_EXCESS_BYTE * excess
-            + m::PER_EXTRA_SIGNATURE * extra_sigs;
-        let history_calldata = if s.proofs == 0 {
-            0
-        } else {
-            CALLDATA_NONZERO * (32 + s.proofs * gap_proof_len(s.k) as u64)
-        };
-        Some(
-            verifier
-                + m::VAULT_WORST_CALL
-                + m::PER_SEGMENT * s.proofs
-                + history_calldata
-                + measured::GAS_RESERVE,
-        )
+        redeem_gas_terms(s).map(|t| t.limit)
     }
 
     fn deposit_gas_limit(&self) -> u64 {
         2 * measured::DEPOSIT_FIRST + 50_000
     }
-}
 
-/// The EVM UC inside a root token's J: Some(None) for a token whose reason is not J (not a root), None when J does not decode.
-fn evm_uc_of(t: &Token) -> Option<Option<alloc::vec::Vec<u8>>> {
-    match t.mint.justification.as_deref() {
-        Some(j) if head_tag(j) == Some(tag::RECEIPT_BACKING) => {
-            decode_receipt_backing(j).ok().map(|b| Some(b.proof.uc))
-        }
-        _ => Some(None),
+    fn supports_deployment(&self, d: &DeploymentCode<'_>) -> Option<bool> {
+        Some(calibrated_deployment(d))
     }
 }
 

@@ -33,7 +33,8 @@ import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js
 import {
   HttpJsonRpc, LocalKeySigner, NativeBridgeV2, Nb2Error, WalletError, appendTransfer, certifyChecked, decodeRevert, deriveBridgeKey, evidenceOf,
   freshMask, localOwner, transferRequest,
-  type Aggregator, type DepositPlan, type DeploymentPins, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan, type ReturnRecord,
+  type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
+  type ReturnRecord,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
@@ -74,6 +75,7 @@ export function pinsOf(release: { pins: Record<string, unknown> }): DeploymentPi
     gamma: unhex(p.gamma as string), build: p.build as 'test' | 'production', vaultRuntimeCodeHash: unhex(p.vaultRuntimeCodeHash as string),
     maxEncodedTxBytes: BigInt(p.maxEncodedTxBytes as number), userGasLimit: BigInt(p.userGasLimit as string), gasReserve: BigInt(p.gasReserve as string),
     returnReserveSegments: BigInt(p.returnReserveSegments as number), deploymentBlock: BigInt(p.deploymentBlock as number), stateReadOnly: p.stateReadOnly as boolean,
+    ...(typeof p.nativeGasSchedule === 'string' ? { nativeGasSchedule: p.nativeGasSchedule } : {}),
   };
 }
 
@@ -290,9 +292,10 @@ export interface OpenOptions {
   lock?: boolean;
   /** wrap the gateway RPC (the lane counts and injects broadcasts through it) */
   wrapRpc?: (rpc: HttpJsonRpc) => JsonRpc;
-  /** test seams: another RPC and aggregator than the connection's */
+  /** test seams: another RPC and aggregator than the connection's, and a gas model in place of the plug-in's default */
   rpc?: JsonRpc;
   aggregator?: Aggregator;
+  gas?: GasModel;
 }
 
 export class Wallet {
@@ -388,7 +391,7 @@ export class Wallet {
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
       backup: async (intents) => writeDurable(join(this.dir, 'backup.json'), JSON.stringify(intents)),
       refreshTrust: async () => { await refreshAll(this.trust, source, 64, (b) => writeDurable(this.historyFile, b)); },
-      receiptTimeoutMs: 180_000, pollMs: 1_000,
+      receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
     }, opts.check ?? true);
     return this;
   }
