@@ -1,9 +1,9 @@
 /**
  * Size and gas bounds of a redemption (sections 12.4 and 12.5). The preflight needs a CONSERVATIVE bound of the complete redeem
  * transaction before the burn exists: its encoded size and its gas limit (expected cost plus `gasReserve`). The gas part is a named,
- * replaceable component: {@link GasModel}. The default {@link MeasuredGasModel} (bound-nb2-1179, docs/nb2-gas-model.md) bounds the redeem
- * term by term from the deployed verifier's cost structure and fails closed (null, which the preflight reports as `CapacityPreflight`) for
- * anything it cannot bound. {@link ProvisionalGasModel} is NB2-07's earlier over-estimate, kept for comparison.
+ * replaceable component: {@link GasModel}. The default {@link MeasuredGasModel} (estimate-nb2-1179, docs/nb2-gas-model.md) is a measured
+ * conservative estimate of the redeem, term by term from the deployed verifier's cost structure with an explicit safety margin, and fails
+ * closed (null, which the preflight reports as `CapacityPreflight`) for anything it cannot estimate. {@link ProvisionalGasModel} is NB2-07's earlier over-estimate, kept for comparison.
  */
 
 import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
@@ -105,26 +105,29 @@ export class ProvisionalGasModel implements GasModel {
 }
 
 /**
- * The redeem gas bound (bft-core#1179, docs/nb2-gas-model.md, where the calibration and the soundness argument are): an upper bound of the vault redeem's gas limit, term by term from the deployed
- * verifier's cost structure (unicity-pos-contracts `NativeBridgeVerifierV2`, its receipt helper `Nb2ReceiptVerifier`, the vault), not a fit to
- * the token's length:
+ * The redeem gas estimate (bft-core#1179, docs/nb2-gas-model.md, where the calibration, the terms derived from the code and the terms
+ * measured are listed): a measured conservative estimate of the vault redeem's gas limit, term by term from the deployed verifier's cost
+ * structure (unicity-pos-contracts `NativeBridgeVerifierV2`, its receipt helper `Nb2ReceiptVerifier`, the vault), not a fit to the token's
+ * length. It is not a proven universal bound:
  *
- *   limit = transaction + vault + batch + membership + sha256 + execution + memory + forwarding + gasReserve
+ *   limit = transaction + vault + batch + membership + sha256 + execution + memory + forwarding + safety + gasReserve
  *
  *   transaction  21,000 + 16 per calldata byte (every byte priced as nonzero)
- *   vault        the worst measured vault call (#1098: previous endpoint, one bucket, sealing, K = 64, B = 16) + 6,000 per historical segment
+ *   vault        the worst measured call of NB2VaultBase (every phase, a never-used recipient) + 6,000 per historical segment
  *                + its copy of the evidence into the verifier call: 3 a word and the vault frame's memory expansion
  *   batch        CERT_BATCH_V2 (0x0100) exactly as charged, over the distinct claims in the verifier's batching (_flush)
  *   membership   the RSMT membership (0x0102) exactly as charged, per inclusion proof
  *   sha256       SHA-256 (0x02) of every hashed transaction, exactly (a mint's includes its justification, so nesting is counted)
  *   execution    the verifier's and the helper's own execution, each loop priced per iteration at its measured cost rounded up: per token, split
- *                edge, allocation step and inclusion proof; per transaction word copied; per RSMT sibling; per CBOR item scanned; per UC
+ *                edge, allocation step and inclusion proof; per transaction word copied; per RSMT sibling; per CBOR item each walk visits
+ *                (scan and skip, by item form); per RLP item and head of J's receipt (by form); per UC
  *                parsed (base, byte, signature, shard tree sibling, unicity tree step, non-ASCII node ID byte) and its helper frame's memory;
  *                per key lookup, key decompression and hash-table probe (the verifier's three open-addressing tables replayed on the token's
  *                own keys, state IDs and claims; an unknown claim at every occupied slot); per byte of the root's J
  *   memory       the verifier frame's memory expansion, 3 M + M^2 / 512, over a bound M (words) of its high-water: what it allocates for
  *                the token plus the largest scratch beyond its free pointer
  *   forwarding   EIP-150: the vault keeps 1/64 of the gas it forwards to the verifier, the verifier 1/64 of its largest call
+ *   safety       1/32 of the measured terms (execution, memory, vault)
  *
  * The token's own proofs are counted exactly. The pending burn of a preflight is counted at the decoder bounds: a 24 KiB UC with 16
  * signatures of 128-byte non-ASCII node IDs, 256 shard tree siblings and 32 unicity tree steps, 256 RSMT siblings, a new claim and a new
