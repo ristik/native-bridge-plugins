@@ -40,7 +40,9 @@ use super::deposit::{
 };
 use super::errors::{fail_d, refuse, Error, Nb2Error, Result, Rule, WalletReason};
 use super::evm::{decode_signed_tx, sign_tx, EvmSigner, SignedTx, TxRequest};
-use super::gas::{redeem_tx_framing, GasModel, MeasuredGasModel, RedeemShape};
+use super::gas::{
+    create_address, redeem_tx_framing, DeploymentCode, GasModel, MeasuredGasModel, RedeemShape,
+};
 use super::journal::*;
 use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
 use super::rules::{
@@ -77,6 +79,8 @@ pub struct DeploymentPins {
     pub state_read_only: bool,
     /// The plausibility bound of a stateReadOnly index read (default 64).
     pub max_jump: Option<u64>,
+    /// The chain's native gas schedules (CERT_BATCH_V2, the RSMT membership, SHA-256), as the default gas model names them.
+    pub native_gas_schedule: Option<String>,
 }
 
 type Callback<A, R> = Box<dyn Fn(A) -> R + Send + Sync>;
@@ -1252,23 +1256,58 @@ impl NativeBridgeV2 {
     /// The section 12.5 preflight for burning `token` at index `a` to `recipient`, with a fresh endpoint estimate
     /// (c_obs = max(c, a); the state read is an availability assumption, not evidence) and the payer's funds for the worst-case
     /// gas limit.
-    /// Whether the gas model applies to the deployed verifier (`bridge.ts` gasApplies): a model that says which builds it is calibrated
-    /// for (the default does) is shown the verifier's runtime code, whose hash must be Γ's; a model that does not say is used as supplied.
+    /// Whether the gas model applies to the deployment (`bridge.ts` gasApplies): a model that says which deployments it is calibrated
+    /// for (the default does) is shown the verifier's runtime code (whose hash must be Γ's), the vault's (whose hash must be the
+    /// manifest's), the code at the verifier's first CREATE address (its helper) and the manifest's native gas schedule; a model that
+    /// does not say is used as supplied.
     fn gas_applies(&self) -> Result<bool> {
         if let Some(f) = *self.gas_fits.lock().unwrap() {
             return Ok(f);
         }
-        if self.gas.supports_verifier(&[]).is_none() {
+        let empty = DeploymentCode {
+            gamma: &[],
+            verifier: &[],
+            k: 0,
+            b: 0,
+            qmax: &[],
+            verifier_code: &[],
+            helper_code: &[],
+            vault_code: &[],
+            native_gas_schedule: None,
+        };
+        if self.gas.supports_deployment(&empty).is_none() {
             return Ok(true);
         }
-        let code = self.evm.code(&self.cfg.verifier)?;
-        if he(&[&code]) != self.cfg.verifier_code_hash {
+        let verifier_code = self.evm.code(&self.cfg.verifier)?;
+        if he(&[&verifier_code]) != self.cfg.verifier_code_hash {
             return refuse(
                 WalletReason::BadDeployment,
                 "the verifier's runtime code is not the one Γ pins",
             );
         }
-        let fits = self.gas.supports_verifier(&code).unwrap_or(true);
+        let vault_code = self.evm.code(&self.cfg.vault)?;
+        if he(&[&vault_code]) != self.pins.vault_runtime_code_hash {
+            return refuse(
+                WalletReason::BadDeployment,
+                "the vault runtime code hash is not the pinned one",
+            );
+        }
+        let helper_code = self.evm.code(&create_address(&self.cfg.verifier, 1))?;
+        let qmax = self.cfg.qmax.to_bytes_be();
+        let fits = self
+            .gas
+            .supports_deployment(&DeploymentCode {
+                gamma: &self.pins.gamma,
+                verifier: &self.cfg.verifier,
+                k: self.cfg.k,
+                b: self.cfg.b,
+                qmax: &qmax,
+                verifier_code: &verifier_code,
+                helper_code: &helper_code,
+                vault_code: &vault_code,
+                native_gas_schedule: self.pins.native_gas_schedule.as_deref(),
+            })
+            .unwrap_or(true);
         *self.gas_fits.lock().unwrap() = Some(fits);
         Ok(fits)
     }
@@ -1284,7 +1323,7 @@ impl NativeBridgeV2 {
         if !self.gas_applies()? {
             return fail_d(
                 Rule::CapacityPreflight,
-                format!("the gas model {} is not calibrated for this deployment's verifier build: supply a GasModel for it", self.gas.name()),
+                format!("the gas model {} is not calibrated for this deployment (its verifier, helper and vault code, its native gas schedule): supply a GasModel for it", self.gas.name()),
             );
         }
         let st = self.evm.vault_state(&self.cfg.vault)?;

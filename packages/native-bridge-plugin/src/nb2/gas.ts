@@ -8,7 +8,7 @@
 
 import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
 
-import { concat, toHex } from '../bytes.js';
+import { concat, fromHex, toHex } from '../bytes.js';
 import { gapProofLen } from './segment.js';
 import { array, bstr, bytesN, headTag, isUint, raw, scanNative, tagContent, u16 } from './cbor.js';
 import { TAG } from './config.js';
@@ -16,7 +16,7 @@ import { HE, HU } from './crypto.js';
 import { decodeReceiptBacking } from './deposit.js';
 import { redeemCalldataLength } from './abi.js';
 import { decodeSplitJustification } from './split.js';
-import { PRED_SIGNATURE, encodeToken, mintSourceHash, resultState, stateId, tokenIdOf, type Predicate, type Token } from './token.js';
+import { PRED_SIGNATURE, encodeProof, encodeToken, mintSourceHash, resultState, stateId, tokenIdOf, type Predicate, type Token } from './token.js';
 
 /** What the gas model sees of a prospective redemption. */
 export interface RedeemShape {
@@ -36,10 +36,10 @@ export interface GasModel {
   readonly name: string;
   redeemGasLimit(s: RedeemShape): bigint | null;
   /**
-   * Whether the model is calibrated for the deployment's verifier, given its runtime code (whose hash the bridge has checked against Γ).
-   * A model without this method is the wallet's own choice and is used as supplied.
+   * Whether the model is calibrated for the deployment, given its runtime codes (the verifier's hash checked against Γ, the vault's against
+   * the manifest) and the manifest's native gas schedule. A model without this method is the wallet's own choice and is used as supplied.
    */
-  supportsVerifier?(code: Uint8Array): boolean;
+  supportsDeployment?(d: DeploymentCode): boolean;
   /** The gas limit of a deposit call. */
   depositGasLimit(): bigint;
 }
@@ -133,9 +133,11 @@ export class ProvisionalGasModel implements GasModel {
 export const REDEEM_GAS = {
   txBase: 21_000n,
   calldataByte: 16n,
-  // the vault (#1098 bench/nb2 RESULTS.md "worst"; unicity-pos-contracts#80, #81)
-  vaultWorstCall: 507_215n, // the worst over every phase, the first-generation segment 1 included
-  perSegment: 6_000n,
+  // the vault: NB2VaultBase at unicity-pos-contracts 884c4829 (both builds, {@link CALIBRATED_DEPLOYMENT}), its worst call measured over every
+  // phase (segments 0, 1 and steady; the previous endpoint, m = K-1, every identifier in one bucket in sort-adversarial order, then the seal)
+  // for a never-used recipient (G_newaccount): 525,551 at K = 64, segment 1, the whole transaction with the echo verifier; rounded up
+  vaultWorstCall: 530_000n,
+  perSegment: 6_000n, // measured 5,898 a historical segment at K = 64, its calldata included
   copyWord: 3n,
   // CERT_BATCH_V2 (ureth crates/unicity/b1 batch.rs): 60,000 + 16 C + 500 k(k-1) + 1,100 + 29,900 E + 7,200 Q + 2,000 A + 250 P
   batchCall: 61_100n,
@@ -155,15 +157,22 @@ export const REDEEM_GAS = {
   sha256Call: 60n,
   sha256Word: 12n,
   // the verifier's and the helper's own execution (measured, rounded up)
-  verifierBase: 158_000n,
+  verifierBase: 159_000n,
   perToken: 0n,
-  perEdge: 57_149n,
+  perEdge: 16_407n,
   perAllocStep: 2_000n,
-  perStep: 16_851n,
-  perParentStep: 15_435n,
+  perStep: 21_226n,
+  perParentStep: 0n,
   perTxWord: 3n,
   perSibling: 3n,
-  perItem: 757n,
+  // the verifier's CBOR walks (Nb2Cbor.scan and skip), per item visited by each walk (bft-core#1179 round 2: measured per item form under the
+  // verifier's own compiler settings, the largest form of each class raised 5%): an item, its head's argument bytes (ai 24 to 27), a nested
+  // array, map or tag (scan's depth push and pop)
+  scanItem: 410n, // measured: 389 an unsigned integer or null, 348 a byte string, 371 a text string
+  scanLong: 230n, // measured: 219 the most an argument adds (a 2-byte argument)
+  scanNode: 185n, // measured: 474 an array, 527 a map, 503 a tag, 657 a long array, 706 a long map, 782 a long tag (all with their head)
+  skipItem: 260n, // measured: 231 an integer or null, 173 a byte string, 219 an array, 236 a map, 249 a tag
+  skipLong: 90n, // measured: 80 the most an argument adds (329 a long tag)
   perUcParse: 19_100n,
   perUcByte: 7n,
   perUcIrByte: 27n,
@@ -173,12 +182,15 @@ export const REDEEM_GAS = {
   perUcSlowByte: 315n,
   perKeyLookup: 0n,
   perDecompress: 2_100n,
-  perProbe: 271n,
-  perClaim: 1_039n,
+  perProbe: 270n,
+  perClaim: 0n,
   jByte: 10n, // J's copies and Keccak (code: at most 20 gas a word)
-  // the receipt helper's RLP walk (Nb2Evm: check, head, kids; measured on receipts of up to 2,000 logs and lists of 5,000 items)
-  perRlpItem: 450n, // check() of every item of the header, each trie node and the receipt (measured at most 408)
-  perRlpHead: 1_100n, // head() with its Item: each preceding log, the selected log's topics, every kids() child (measured at most 1,040)
+  // the receipt helper's RLP walk (Nb2Evm: check, head, kids), per item form (round 2: measured on lists of each form, raised 5%)
+  perRlpItem: 320n, // check() of every item of the header, each trie node and the receipt (measured: 182 a byte, 304 a short string)
+  perRlpLong: 190n, // its long form (0xb8 to 0xbf, 0xf8 to 0xff; measured: 482 a long string, 618 a long list)
+  perRlpList: 250n, // a list (measured: 483 a short list, 541 an empty one)
+  perRlpHead: 1_070n, // head() with its Item: each preceding log, the selected log's topics, every kids() child (measured at most 1,019)
+  perRlpLongHead: 450n, // its long form (measured at most 1,371 in kids(), about 1,440 in receiptLog's walk of the logs)
   perRlpKids: 2_000n, // a kids() call's array of max Items
   coldAccess: 5_200n, // the verifier's EXTCODEHASH of its helper and the helper's code, cold on chain (2 x 2,600)
   // the verifier frame's memory high-water beyond its hash tables: words, and hundredths of a word per unit (measured, rounded up)
@@ -204,8 +216,11 @@ export const REDEEM_GAS = {
   pendingSiblings: 256,
   pendingUcItems: 40 + 256 + 3 * 32 + 2 * 16, // Nb2Cert's fixed items, one a shard tree sibling, three a step, two a signature
   pendingPairItems: 32, // the burn transfer, its certification data and path
+  pendingDataItems: 16, // the burn's return data (_returnData: d, asset, recipient, amount, minIndex)
   maxSignatures: 16,
   keyCache: 128,
+  // the explicit safety margin: 1/32 of the measured terms (about 3%)
+  safetyDivisor: 32n,
 } as const;
 
 /** One UC as the verifier, its helper and the batch see it. */
@@ -252,14 +267,18 @@ export interface RedeemFeatures {
   helperMemory: bigint; // the helper frames' memory expansion
   evmUc: UcCost; // J's EVM UC (the helper's receiptLog parses it)
   rcptItems: number; // RLP items check() visits: the header, every trie node, the receipt
+  rcptLong: number; // of which in long form
+  rcptLists: number; // of which lists
   rcptHeads: number; // head() calls: every preceding log and the selected one, its topics, every child a kids() call walks
+  rcptLongHeads: number; // of which of a long-form item
   rcptKids: number; // kids() calls
   rcptWords: number; // the receipt helper frame's allocations beyond its UC parse (words)
   ucCosts: UcCost[]; // the distinct UC shapes the helper parses (each a call of its own: the forwarding term takes the largest)
   pathWords: number; // the membership requests (words)
   maxUc: number;
   scratch: number; // the largest scratch use beyond the free pointer that the allocations after it do not cover (words)
-  items: number; // CBOR items scanned
+  scan: CborCount; // items the strict and loose scans visit: the evidence, every split justification, J, every transaction's data
+  skip: CborCount; // items skip() visits: each parent token (skip(k0)), each token's genesis, each proof's UC, each predicate's three fields
   jBytes: number;
   keyLookups: number;
   decompressions: number;
@@ -269,9 +288,12 @@ export interface RedeemFeatures {
 
 const ceil32 = (n: number): number => Math.ceil(n / 32);
 
-/** The heads of a CBOR item sequence (definite lengths, string payloads skipped): the items the verifier's scanner visits. */
-export function cborItems(b: Uint8Array): number {
-  let n = 0;
+/** What a walk of the verifier's CBOR reader visits: items, heads with argument bytes, and nested items (a non-empty array or map, a tag). */
+export interface CborCount { items: number; long: number; nodes: number }
+
+/** The items of a CBOR item sequence as Nb2Cbor's scan and skip visit them (definite lengths, string payloads skipped). */
+export function cborCount(b: Uint8Array): CborCount {
+  const c = { items: 0, long: 0, nodes: 0 };
   for (let p = 0; p < b.length;) {
     const ib = b[p++];
     const major = ib >> 5;
@@ -282,15 +304,28 @@ export function cborItems(b: Uint8Array): number {
       arg = 0;
       for (let k = 0; k < w; k++) arg = arg * 256 + (b[p + k] ?? 0);
       p += w;
+      c.long++;
     }
     if (major === 2 || major === 3) p += arg;
-    n++;
+    if (major === 6 || ((major === 4 || major === 5) && arg > 0)) c.nodes++;
+    c.items++;
   }
-  return n;
+  return c;
+}
+
+const addCount = (a: CborCount, b: CborCount, times = 1): void => {
+  a.items += times * b.items;
+  a.long += times * b.long;
+  a.nodes += times * b.nodes;
+};
+
+/** The heads of a CBOR item sequence (definite lengths, string payloads skipped): the items the verifier's scanner visits. */
+export function cborItems(b: Uint8Array): number {
+  return cborCount(b).items;
 }
 
 /** An RLP item as Nb2Evm.head reads it. */
-interface Rlp { list: boolean; pos: number; len: number; end: number }
+interface Rlp { list: boolean; at: number; pos: number; len: number; end: number }
 
 function rlpHead(b: Uint8Array, p: number, end: number): Rlp | null {
   if (p >= end) return null;
@@ -304,7 +339,7 @@ function rlpHead(b: Uint8Array, p: number, end: number): Rlp | null {
   let hdr = 1;
   let len: number;
   let list = false;
-  if (x < 0x80) return { list: false, pos: p, len: 1, end: p + 1 };
+  if (x < 0x80) return { list: false, at: p, pos: p, len: 1, end: p + 1 };
   if (x <= 0xb7) len = x - 0x80;
   else if (x <= 0xbf) {
     const n = be(p + 1, x - 0xb7);
@@ -322,24 +357,28 @@ function rlpHead(b: Uint8Array, p: number, end: number): Rlp | null {
     len = n;
   }
   if (p + hdr + len > end) return null;
-  return { list, pos: p + hdr, len, end: p + hdr + len };
+  return { list, at: p, pos: p + hdr, len, end: p + hdr + len };
 }
 
-/** Every RLP item in [p, end) (check()'s visits), or null when it is not RLP. */
-function rlpItems(b: Uint8Array, p: number, end: number, depth = 0): number | null {
-  let n = 0;
+/** Whether the item at P is in long form (a length of length: 0xb8 to 0xbf, 0xf8 to 0xff). */
+const rlpLongAt = (b: Uint8Array, p: number): boolean => (b[p] >= 0xb8 && b[p] <= 0xbf) || b[p] >= 0xf8;
+
+interface RlpCount { items: number; long: number; lists: number }
+
+/** Every RLP item in [p, end) (check()'s visits) into C, or false when it is not RLP. */
+function rlpItems(b: Uint8Array, p: number, end: number, c: RlpCount, depth = 0): boolean {
   while (p < end) {
     const it = rlpHead(b, p, end);
-    if (it === null || depth > 16) return null;
-    n++;
+    if (it === null || depth > 16) return false;
+    c.items++;
+    if (rlpLongAt(b, p)) c.long++;
     if (it.list) {
-      const k = rlpItems(b, it.pos, it.end, depth + 1);
-      if (k === null) return null;
-      n += k;
+      c.lists++;
+      if (!rlpItems(b, it.pos, it.end, c, depth + 1)) return false;
     }
     p = it.end;
   }
-  return n;
+  return true;
 }
 
 function rlpKids(b: Uint8Array, it: Rlp): Rlp[] | null {
@@ -358,9 +397,10 @@ function rlpKids(b: Uint8Array, it: Rlp): Rlp[] | null {
  * receipt; kids() of the header (20), each node (17), the receipt (4) and the log (3), each walking every child; head() of every log up to
  * the selected one and of its topics; the allocations of those calls (an Item is 4 words, a kids() array 1 + 5 max) and the log's data.
  */
-function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint): { items: number; heads: number; kids: number; words: number } | null {
-  let items = 0;
+function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint): { items: number; long: number; lists: number; heads: number; longHeads: number; kids: number; words: number } | null {
+  const c: RlpCount = { items: 0, long: 0, lists: 0 };
   let heads = 0;
+  let longHeads = 0;
   let kids = 0;
   // fixed: the frame's own words, the nodes' position and length arrays, the key nibbles (18), the header widths (20); scratch: the largest
   // node or header copied for its Keccak beyond the free pointer
@@ -370,14 +410,13 @@ function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint)
     if (k === null) return null;
     kids++;
     heads += k.length;
+    for (const x of k) if (rlpLongAt(b, x.at)) longHeads++;
     words += 1 + 5 * max + 4 * k.length;
     return k;
   };
   const top = (b: Uint8Array): Rlp | null => {
-    const n = rlpItems(b, 0, b.length);
     const it = rlpHead(b, 0, b.length);
-    if (n === null || it === null || it.end !== b.length) return null;
-    items += n;
+    if (!rlpItems(b, 0, b.length, c) || it === null || it.end !== b.length) return null;
     return it;
   };
   const h = top(header);
@@ -406,6 +445,7 @@ function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint)
     const it = rlpHead(r, q, f[3].end);
     if (it === null) return null;
     heads++;
+    if (rlpLongAt(r, q)) longHeads++;
     words += 4;
     if (i === logIndex) {
       sel = it;
@@ -419,8 +459,9 @@ function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint)
   const topics = rlpKids(r, lk[1]);
   if (topics === null) return null;
   heads += topics.length;
+  for (const x of topics) if (rlpLongAt(r, x.at)) longHeads++;
   words += 4 * topics.length + 1 + topics.length + 1 + ceil32(lk[2].len);
-  return { items, heads, kids, words };
+  return { items: c.items, long: c.long, lists: c.lists, heads, longHeads, kids, words };
 }
 
 const u32 = (v: number): Uint8Array => Uint8Array.of(v >>> 24, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
@@ -551,18 +592,49 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
     return null;
   }
   if (evm === null || rcpt === null) return null;
-  // CBOR items: the evidence once, every split justification and J once (a byte string's content is scanned by the check that opens it)
-  let items = 2 + cborItems(encodeToken(part)) + cborItems(j) + (pending ? g.pendingPairItems + g.pendingUcItems : 0);
+  // the CBOR walks (NativeBridgeVerifierV2): a byte string's content is walked only by the check that opens it.
+  // scan (strict or loose, one price): the evidence [1, part] (_evidence), every split justification, so each parent token once
+  // (_splitJustification), J (_rootMint), every transaction's data (_mintAmount, _returnData, _splitBurn: each at most once)
+  // skip: every parent token (_splitJustification's skip(k0)), every token's genesis [mint, proof] (_token's skip(g)), every proof's UC
+  // (_proof), every predicate's three fields (_pred)
+  const scan: CborCount = { items: 2, long: 0, nodes: 1 };
+  const skip: CborCount = { items: 0, long: 0, nodes: 0 };
+  addCount(scan, cborCount(encodeToken(part)));
+  addCount(scan, cborCount(j));
   let allocSteps = 0;
-  for (let i = 1; i < L.length; i++) {
-    const sj = L[i].mint.justification;
-    if (sj === null) return null;
-    items += cborItems(sj);
-    try {
-      allocSteps += decodeSplitJustification(sj).proof.length;
-    } catch {
-      return null;
+  for (let i = 0; i < L.length; i++) {
+    const t = L[i];
+    if (i > 0) {
+      const sj = t.mint.justification;
+      if (sj === null) return null;
+      addCount(scan, cborCount(sj));
+      try {
+        allocSteps += decodeSplitJustification(sj).proof.length;
+      } catch {
+        return null;
+      }
     }
+    if (i < L.length - 1) addCount(skip, cborCount(encodeToken(t)));
+    // the genesis array's head and its two items
+    skip.items += 1;
+    skip.nodes += 1;
+    addCount(skip, cborCount(t.mintRaw));
+    addCount(skip, cborCount(encodeProof(t.mintProof)));
+    for (const pr of [t.mintProof, ...t.proofs]) addCount(skip, cborCount(pr.uc));
+    for (const d of [t.mint.data, ...t.transfers.map((tr) => tr.data)]) if (d !== null) addCount(scan, cborCount(d));
+    // a predicate's fields: a 1-item integer, a 1-byte code string, a 33- or 32-byte parameter string (an argument byte)
+    const predicates = 2 * (1 + t.transfers.length);
+    skip.items += 3 * predicates;
+    skip.long += predicates;
+  }
+  if (pending) {
+    // the burn and its proof at the decoder bounds, every item priced as the dearest form (an argument and nested)
+    const n = g.pendingPairItems + g.pendingUcItems;
+    addCount(scan, { items: n, long: n, nodes: n });
+    addCount(skip, { items: g.pendingUcItems, long: g.pendingUcItems, nodes: g.pendingUcItems });
+    skip.items += 6;
+    skip.long += 2;
+    addCount(scan, { items: g.pendingDataItems, long: g.pendingDataItems, nodes: g.pendingDataItems });
   }
   // the key cache: every signature predicate in parse order (the part, then each parent; per token its mint's recipient and source, then
   // each transfer's recipient and source); the burn's recipient is a burn predicate, its source the part's owner
@@ -609,7 +681,8 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
     tokens: L.length, edges: L.length - 1, allocSteps, steps: n, parentSteps: L.slice(0, -1).reduce((m, t) => m + 1 + t.transfers.length, 0), txWords: 0, maxTx: 0, siblings: 0, ucParses: n + 1, ucBytes: evm.bytes, ucIr: evm.ir, ucSignatures: evm.signatures,
     ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, helperMemory: memoryGas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
     evmUc: { bytes: evm.bytes, ir: evm.ir, signatures: evm.signatures, stc: evm.stc, utc: evm.utc, slow: evm.slow }, ucCosts: [],
-    rcptItems: rcpt.items, rcptHeads: rcpt.heads, rcptKids: rcpt.kids, rcptWords: rcpt.words, pathWords: 0, maxUc: evm.bytes, scratch: 24, items, jBytes: j.length,
+    rcptItems: rcpt.items, rcptLong: rcpt.long, rcptLists: rcpt.lists, rcptHeads: rcpt.heads, rcptLongHeads: rcpt.longHeads, rcptKids: rcpt.kids, rcptWords: rcpt.words,
+    pathWords: 0, maxUc: evm.bytes, scratch: 24, scan, skip, jBytes: j.length,
     keyLookups, decompressions: keys.misses, probes: keys.probes + sids.probes + claimIds.probes + unknownProbes, claims,
   };
   // a transaction is hashed from a copy at the free pointer (SHA-256 of calldata); every later step allocates at least its UC's slice and its
@@ -693,7 +766,22 @@ export function verifierMemoryWords(f: RedeemFeatures): number {
   return g.memBase + Math.ceil(per / 100) + tables + f.scratch;
 }
 
-/** The bound's terms, each an upper bound of its part of the redeem's gas. */
+/** The verifier's CBOR walks at the bound's prices. */
+export function walkGas(f: RedeemFeatures): bigint {
+  const g = REDEEM_GAS;
+  const B = (n: number): bigint => BigInt(n);
+  return g.scanItem * B(f.scan.items) + g.scanLong * B(f.scan.long) + g.scanNode * B(f.scan.nodes) + g.skipItem * B(f.skip.items) + g.skipLong * B(f.skip.long);
+}
+
+/** The receipt helper's RLP walk at the bound's prices. */
+export function receiptWalkGas(f: RedeemFeatures): bigint {
+  const g = REDEEM_GAS;
+  const B = (n: number): bigint => BigInt(n);
+  return g.perRlpItem * B(f.rcptItems) + g.perRlpLong * B(f.rcptLong) + g.perRlpList * B(f.rcptLists) + g.perRlpHead * B(f.rcptHeads) + g.perRlpLongHead * B(f.rcptLongHeads)
+    + g.perRlpKids * B(f.rcptKids);
+}
+
+/** The estimate's terms: each is derived from the code or measured (docs/nb2-gas-model.md lists which). */
 export interface GasTerms {
   transaction: bigint;
   vault: bigint;
@@ -703,6 +791,7 @@ export interface GasTerms {
   execution: bigint;
   memory: bigint;
   forwarding: bigint;
+  safety: bigint;
   reserve: bigint;
   limit: bigint;
   memoryWords: number;
@@ -720,25 +809,27 @@ export function priceFeatures(f: RedeemFeatures, evidenceBytes: number, proofs: 
   const membership = B(f.steps) * (g.memberCall + g.memberByte * 136n + g.memberStep) + B(f.siblings) * (32n * g.memberByte + g.memberStep);
   const sha256 = B(f.steps) * g.sha256Call + B(f.txWords) * g.sha256Word;
   const execution = g.verifierBase + g.perToken * B(f.tokens) + g.perEdge * B(f.edges) + g.perAllocStep * B(f.allocSteps) + g.perStep * B(f.steps) + g.perParentStep * B(f.parentSteps)
-    + g.perTxWord * B(f.txWords) + g.perSibling * B(f.siblings) + g.perItem * B(f.items)
+    + g.perTxWord * B(f.txWords) + g.perSibling * B(f.siblings) + walkGas(f)
     + g.perUcParse * B(f.ucParses) + g.perUcByte * B(f.ucBytes) + g.perUcIrByte * B(f.ucIr) + g.perUcSignature * B(f.ucSignatures) + g.perUcStc * B(f.ucStc) + g.perUcUtc * B(f.ucUtc)
     + g.perUcSlowByte * B(f.ucSlow) + f.helperMemory
     + g.perKeyLookup * B(f.keyLookups) + g.perDecompress * B(f.decompressions) + g.perProbe * B(f.probes) + g.perClaim * B(f.claims.length) + g.jByte * B(f.jBytes)
-    + g.perRlpItem * B(f.rcptItems) + g.perRlpHead * B(f.rcptHeads) + g.perRlpKids * B(f.rcptKids) + g.coldAccess;
+    + receiptWalkGas(f) + g.coldAccess;
   const memoryWords = verifierMemoryWords(f);
   const memory = memoryGas(memoryWords);
+  // the explicit safety margin over the measured terms (the verifier's execution and memory, the vault's call): see docs/nb2-gas-model.md
+  const safety = (execution + memory + vault) / g.safetyDivisor + 1n;
   const verifier = batch.gas + membership + sha256 + execution + memory;
   // EIP-150 at the verifier's own calls: the largest of its batch calls, its helper calls (one a UC; J's receipt with its EVM UC)
   let largest = batch.largest;
   for (const c of f.ucCosts) if (helperGas(c) > largest) largest = helperGas(c);
   const receipt = helperGas(f.evmUc) - helperMemory(f.evmUc.bytes) + memoryGas(3 * ceil32(f.evmUc.bytes) + 64 + f.rcptWords) + g.jByte * B(f.jBytes)
-    + g.perRlpItem * B(f.rcptItems) + g.perRlpHead * B(f.rcptHeads) + g.perRlpKids * B(f.rcptKids);
+    + receiptWalkGas(f);
   if (receipt > largest) largest = receipt;
   const inner = largest / 63n + 1n;
   const forwarding = (verifier + inner) / 63n + 1n + inner;
   const reserve = MEASURED.gasReserve;
-  const limit = transaction + vault + verifier + forwarding + reserve;
-  return { transaction, vault, batch: batch.gas, membership, sha256, execution, memory, forwarding, reserve, limit, memoryWords };
+  const limit = transaction + vault + verifier + forwarding + safety + reserve;
+  return { transaction, vault, batch: batch.gas, membership, sha256, execution, memory, forwarding, safety, reserve, limit, memoryWords };
 }
 
 export function redeemGasTerms(s: RedeemShape): GasTerms | null {
@@ -746,36 +837,121 @@ export function redeemGasTerms(s: RedeemShape): GasTerms | null {
   return f === null ? null : priceFeatures(f, s.evidenceBytes, s.proofs, s.K);
 }
 
+/** The native gas schedules {@link REDEEM_GAS} assumes (ureth unicity/main crates/unicity/b1, profile 7; SHA-256 as in Cancun). */
+export const NATIVE_GAS_SCHEDULE = 'CERT_BATCH_V2 61100+16C+500K(K-1)+29900E+7200Q+2000A+250P; RSMT 2000+16L+250(1+S); SHA256 60+12W';
+
 /**
- * The verifier build {@link REDEEM_GAS} is calibrated for: unicity-pos-contracts 884c4829 `src/nb2/verifier` (solc 0.8.37, via-IR, optimizer
- * runs 1), the runtime code both builds deploy. Its immutables (admitsTestSet, the helper's address, the helper's code hash) differ by
- * deployment, so the code is compared with them zeroed, and the helper code hash it pins must be the calibrated helper's. The native
- * schedules assumed are ureth unicity/main 7f625ea (crates/unicity/b1).
+ * The deployment {@link REDEEM_GAS} is calibrated for: unicity-pos-contracts 884c4829 `src/nb2` as deploy_nb2.py creates it (solc 0.8.37,
+ * via-IR; the verifier at optimizer runs 1, the vault at 200), its helper, and {@link NATIVE_GAS_SCHEDULE}. Each runtime is the artifact's
+ * code with its immutables filled in; the immutables are all derived from Γ and the verifier's address, so the expected runtime is rebuilt
+ * from them and compared with the deployed one in full ({@link calibratedDeployment}).
  */
-export const CALIBRATED_VERIFIER = {
-  codeLength: 19_574,
-  maskedCodeHash: '65fbc862ae2ea16729506cd9e6a62458785751b690103ce25d9515495029f201',
-  immutables: [[325, 32], [368, 32], [3_071, 32], [8_417, 32], [8_473, 32], [8_541, 32], [12_187, 32], [15_504, 32]],
-  helperCodeHashAt: [368, 8_417],
+export const CALIBRATED_DEPLOYMENT = {
+  verifier: {
+    codeLength: 19_574,
+    maskedCodeHash: '65fbc862ae2ea16729506cd9e6a62458785751b690103ce25d9515495029f201',
+    admitsTestSet: [8_541, 12_187],
+    receipts: [325, 3_071, 8_473, 15_504],
+    receiptsCodeHash: [368, 8_417],
+  },
   helperCodeHash: '16f1381ed6c1d9cd1c14b467fcfb2ec84ab8903f65da506048fbb2e2c10ffe23',
+  vault: {
+    codeLength: 6_363,
+    maskedCodeHash: '9bc8cce34b22e45345a9a49c28a4041229f748c8d13964e69fbf2020b90545e4',
+    // D, VERIFIER, QMAX, K, LOGK, LOGB, GLEN, G0 to G11 (NB2VaultBase's immutables in declaration order)
+    immutables: [
+      [103, 1_318, 2_642, 4_362, 5_801], [1_218], [5_648], [1_460, 1_792, 1_924, 1_986, 2_090, 2_181, 2_222, 2_391, 2_455, 2_500, 4_057, 6_226],
+      [375, 4_228, 4_291, 4_415, 4_531, 4_761], [519, 576, 1_529, 1_567, 1_607, 1_642, 2_031, 2_139, 2_266, 2_344, 3_419, 3_468, 3_543, 3_639, 3_688, 4_019, 6_189],
+      [1_097, 4_929], [641, 5_044], [676, 5_079], [713, 5_117], [751, 5_155], [789, 5_193], [827, 5_231], [865, 5_269], [903, 5_307], [941, 5_345], [980, 5_384],
+      [1_019, 5_423], [1_058, 5_462],
+    ],
+  },
 } as const;
 
-/** Whether CODE is the calibrated verifier build (immutables zeroed) pinning the calibrated helper. */
-export function calibratedVerifier(code: Uint8Array): boolean {
-  const c = CALIBRATED_VERIFIER;
-  if (code.length !== c.codeLength) return false;
-  for (const at of c.helperCodeHashAt) if (toHex(code.subarray(at, at + 32)) !== c.helperCodeHash) return false;
-  const m = Uint8Array.from(code);
-  for (const [at, n] of c.immutables) m.fill(0, at, at + n);
-  return toHex(HE(m)) === c.maskedCodeHash;
+/** What the bridge shows a gas model of the deployment (codes from the RPC; the vault's and the verifier's hashes already checked). */
+export interface DeploymentCode {
+  gamma: Uint8Array;
+  verifier: Uint8Array; // the verifier's address
+  K: bigint;
+  B: bigint;
+  Qmax: bigint;
+  verifierCode: Uint8Array;
+  /** The code at the verifier's first CREATE address ({@link createAddress}(verifier, 1)), where its constructor deploys the helper. */
+  helperCode: Uint8Array;
+  vaultCode: Uint8Array;
+  /** The deployment manifest's `nativeGasSchedule` pin, when it has one. */
+  nativeGasSchedule?: string;
 }
 
-/** The default model: {@link REDEEM_GAS}, for the {@link CALIBRATED_VERIFIER} build only (the bridge refuses it for any other). */
-export class MeasuredGasModel implements GasModel {
-  public readonly name = 'bound-nb2-1179';
+/** The address of the contract ADDRESS creates with nonce NONCE (keccak256(RLP([address, nonce]))[12:]). */
+export function createAddress(address: Uint8Array, nonce: bigint): Uint8Array {
+  const n = nonce === 0n ? new Uint8Array() : bigBytes(nonce);
+  const item = n.length === 1 && n[0] < 0x80 ? n : concat(Uint8Array.of(0x80 + n.length), n);
+  const body = concat(Uint8Array.of(0x94), address, item);
+  return HE(concat(Uint8Array.of(0xc0 + body.length), body)).slice(12);
+}
 
-  public supportsVerifier(code: Uint8Array): boolean {
-    return calibratedVerifier(code);
+const bigBytes = (v: bigint): Uint8Array => {
+  const out: number[] = [];
+  for (let x = v; x > 0n; x >>= 8n) out.unshift(Number(x & 0xffn));
+  return Uint8Array.from(out);
+};
+
+const word = (v: bigint | Uint8Array): Uint8Array => {
+  const w = new Uint8Array(32);
+  const b = typeof v === 'bigint' ? bigBytes(v) : v;
+  w.set(b, 32 - b.length);
+  return w;
+};
+
+const log2Ceil = (v: bigint): bigint => {
+  let n = 0n;
+  while (1n << n < v) n++;
+  return n;
+};
+
+/** Whether CODE is the template of length N with hash MASKED once POSITIONS are zeroed and every occurrence holds its expected word. */
+function rebuilt(code: Uint8Array, length: number, masked: string, positions: readonly (readonly number[])[], values: Uint8Array[]): boolean {
+  if (code.length !== length) return false;
+  const m = Uint8Array.from(code);
+  for (let i = 0; i < positions.length; i++) {
+    for (const at of positions[i]) {
+      if (toHex(code.subarray(at, at + 32)) !== toHex(values[i])) return false;
+      m.fill(0, at, at + 32);
+    }
+  }
+  return toHex(HE(m)) === masked;
+}
+
+/**
+ * Whether D is the calibrated deployment: the verifier's, the helper's and the vault's runtimes are exactly the calibrated artifacts with the
+ * immutables this deployment must have (admitsTestSet unless (K, B) is the production pair; the helper at the verifier's first CREATE
+ * address with the calibrated code hash, which the verifier pins; the vault's D = H_U(Γ), verifier, Qmax, K, log2 K, log2 B and Γ's twelve
+ * words), and the manifest pins {@link NATIVE_GAS_SCHEDULE}.
+ */
+export function calibratedDeployment(d: DeploymentCode): boolean {
+  const c = CALIBRATED_DEPLOYMENT;
+  if (d.nativeGasSchedule !== NATIVE_GAS_SCHEDULE) return false;
+  if (toHex(HE(d.helperCode)) !== c.helperCodeHash) return false;
+  const production = d.K === 64n && d.B === 16n;
+  const v = c.verifier;
+  const helper = createAddress(d.verifier, 1n);
+  if (!rebuilt(d.verifierCode, v.codeLength, v.maskedCodeHash, [v.admitsTestSet, v.receipts, v.receiptsCodeHash],
+    [word(production ? 0n : 1n), word(helper), fromHex(c.helperCodeHash)!])) return false;
+  if (d.gamma.length > 384) return false;
+  const padded = new Uint8Array(384);
+  padded.set(d.gamma);
+  const values = [HU(d.gamma), word(d.verifier), word(d.Qmax), word(d.K), word(log2Ceil(d.K)), word(log2Ceil(d.B)), word(BigInt(d.gamma.length))];
+  for (let i = 0; i < 12; i++) values.push(padded.slice(32 * i, 32 * i + 32));
+  return rebuilt(d.vaultCode, c.vault.codeLength, c.vault.maskedCodeHash, c.vault.immutables, values);
+}
+
+/** The default model: {@link REDEEM_GAS}, for the {@link CALIBRATED_DEPLOYMENT} only (the bridge refuses it for any other). */
+export class MeasuredGasModel implements GasModel {
+  public readonly name = 'estimate-nb2-1179';
+
+  public supportsDeployment(d: DeploymentCode): boolean {
+    return calibratedDeployment(d);
   }
 
   public redeemGasLimit(s: RedeemShape): bigint | null {

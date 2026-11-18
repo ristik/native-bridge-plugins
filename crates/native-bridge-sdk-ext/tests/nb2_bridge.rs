@@ -608,7 +608,7 @@ fn the_default_gas_bound_is_refused_for_a_verifier_it_is_not_calibrated_for() {
     let mut o = w.options("w", World::store());
     o.gas = None;
     let b = NativeBridgeV2::open(o).unwrap();
-    assert_eq!(b.gas.name(), "bound-nb2-1179");
+    assert_eq!(b.gas.name(), "estimate-nb2-1179");
     let t = minted(&b, &payer, &owner, 3);
     assert_eq!(
         reason(b.plan_return(&t, &recipient("recipient"), &payer.address(), None)),

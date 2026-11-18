@@ -75,6 +75,7 @@ export function pinsOf(release: { pins: Record<string, unknown> }): DeploymentPi
     gamma: unhex(p.gamma as string), build: p.build as 'test' | 'production', vaultRuntimeCodeHash: unhex(p.vaultRuntimeCodeHash as string),
     maxEncodedTxBytes: BigInt(p.maxEncodedTxBytes as number), userGasLimit: BigInt(p.userGasLimit as string), gasReserve: BigInt(p.gasReserve as string),
     returnReserveSegments: BigInt(p.returnReserveSegments as number), deploymentBlock: BigInt(p.deploymentBlock as number), stateReadOnly: p.stateReadOnly as boolean,
+    ...(typeof p.nativeGasSchedule === 'string' ? { nativeGasSchedule: p.nativeGasSchedule } : {}),
   };
 }
 

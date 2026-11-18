@@ -60,13 +60,13 @@ test('preflight: an oversized token, unfundable gas and an unboundable gas cost 
   assert.ok(plan.gasLimit > 500_000n && plan.gasLimit < 60_000_000n);
   // the bound stays above NB2-05's mint + burn token (748,672) plus the worst vault call and the reserve
   assert.ok(plan.gasLimit >= 748_672n + 487_339n + 500_000n, `gas limit ${plan.gasLimit}`);
-  assert.equal(ok.w.gas.name, 'bound-nb2-1179');
+  assert.equal(ok.w.gas.name, 'estimate-nb2-1179');
   assert.ok(new ProvisionalGasModel().name.length > 0);
 });
 
-test('the default gas bound is refused for a verifier it is not calibrated for: the stand-in verifier code is not Γ\'s', async () => {
+test('the default gas estimate is refused for a verifier it is not calibrated for: the stand-in verifier code is not Γ\'s', async () => {
   const s = await minted({ gas: undefined });
-  assert.equal(s.w.gas.name, 'bound-nb2-1179');
+  assert.equal(s.w.gas.name, 'estimate-nb2-1179');
   assert.equal(await outcome(s.w.planReturn(s.token, r, s.payer.address)), 'BadDeployment');
   // the world's own tests supply the model as a wallet supplies its own (world.ts WORLD_GAS): no build check, the bound as computed
 });

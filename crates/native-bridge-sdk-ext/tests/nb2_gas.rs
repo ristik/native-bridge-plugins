@@ -1,13 +1,13 @@
-//! The redeem gas bound (`nb2::gas`, bound-nb2-1179) against the shared vectors (`tests/nb2-gas/gas-vectors.json`, real evidence of
+//! The redeem gas estimate (`nb2::gas`, estimate-nb2-1179) against the shared vectors (`tests/nb2-gas/gas-vectors.json`, real evidence of
 //! the bft-core#1179 measurement lane, written by the TypeScript plug-in's `scripts/gen-nb2-gas-vectors.ts`): every feature and term,
 //! exactly as the TypeScript plug-in computes them (`test/nb2/gas.test.ts`).
 #![cfg(feature = "host")]
 
 use native_bridge_sdk_ext::nb2::bridge::lineage_of;
 use native_bridge_sdk_ext::nb2::gas::{
-    batch_gas, calibrated_verifier, cbor_items, memory_gas, price_features, redeem_features,
-    redeem_gas_terms, Claim, GasModel, GasTerms, MeasuredGasModel, RedeemFeatures, RedeemShape,
-    UcCost,
+    batch_gas, calibrated_deployment, cbor_count, cbor_items, create_address, memory_gas,
+    price_features, redeem_features, redeem_gas_terms, CborCount, Claim, DeploymentCode, GasModel,
+    GasTerms, MeasuredGasModel, RedeemFeatures, RedeemShape, UcCost, NATIVE_GAS_SCHEDULE,
 };
 use native_bridge_sdk_ext::nb2::token::Token;
 use native_bridge_sdk_ext::nb2::util::from_hex;
@@ -31,6 +31,10 @@ fn uc(c: &UcCost) -> Value {
     json!({"bytes": c.bytes, "ir": c.ir, "signatures": c.signatures, "stc": c.stc, "utc": c.utc, "slow": c.slow})
 }
 
+fn walk(c: &CborCount) -> Value {
+    json!({"items": c.items, "long": c.long, "nodes": c.nodes})
+}
+
 /// The features as the TypeScript plug-in writes them (camelCase, bigints as strings).
 fn features_json(f: &RedeemFeatures) -> Value {
     let claims: Vec<Value> = f
@@ -41,8 +45,8 @@ fn features_json(f: &RedeemFeatures) -> Value {
     json!({
         "tokens": f.tokens, "edges": f.edges, "allocSteps": f.alloc_steps, "steps": f.steps, "parentSteps": f.parent_steps, "txWords": f.tx_words, "maxTx": f.max_tx,
         "siblings": f.siblings, "ucParses": f.uc_parses, "ucBytes": f.uc_bytes, "ucIr": f.uc_ir, "ucSignatures": f.uc_signatures, "ucStc": f.uc_stc,
-        "ucUtc": f.uc_utc, "ucSlow": f.uc_slow, "helperMemory": f.helper_memory.to_string(), "evmUc": uc(&f.evm_uc), "rcptItems": f.rcpt_items, "rcptHeads": f.rcpt_heads, "rcptKids": f.rcpt_kids, "rcptWords": f.rcpt_words, "ucCosts": f.uc_costs.iter().map(uc).collect::<Vec<_>>(),
-        "pathWords": f.path_words, "maxUc": f.max_uc, "scratch": f.scratch, "items": f.items, "jBytes": f.j_bytes, "keyLookups": f.key_lookups,
+        "ucUtc": f.uc_utc, "ucSlow": f.uc_slow, "helperMemory": f.helper_memory.to_string(), "evmUc": uc(&f.evm_uc), "rcptItems": f.rcpt_items, "rcptLong": f.rcpt_long, "rcptLists": f.rcpt_lists, "rcptHeads": f.rcpt_heads, "rcptLongHeads": f.rcpt_long_heads, "rcptKids": f.rcpt_kids, "rcptWords": f.rcpt_words, "ucCosts": f.uc_costs.iter().map(uc).collect::<Vec<_>>(),
+        "pathWords": f.path_words, "maxUc": f.max_uc, "scratch": f.scratch, "scan": walk(&f.scan), "skip": walk(&f.skip), "jBytes": f.j_bytes, "keyLookups": f.key_lookups,
         "decompressions": f.decompressions, "probes": f.probes, "claims": claims,
     })
 }
@@ -51,7 +55,7 @@ fn terms_json(t: &GasTerms) -> Value {
     json!({
         "transaction": t.transaction.to_string(), "vault": t.vault.to_string(), "batch": t.batch.to_string(),
         "membership": t.membership.to_string(), "sha256": t.sha256.to_string(), "execution": t.execution.to_string(),
-        "memory": t.memory.to_string(), "forwarding": t.forwarding.to_string(), "reserve": t.reserve.to_string(),
+        "memory": t.memory.to_string(), "forwarding": t.forwarding.to_string(), "safety": t.safety.to_string(), "reserve": t.reserve.to_string(),
         "limit": t.limit.to_string(), "memoryWords": t.memory_words,
     })
 }
@@ -98,7 +102,7 @@ fn shared_vectors_reproduce_exactly() {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(FILE).unwrap()).unwrap();
     assert_eq!(v["model"], MeasuredGasModel.name());
     let vectors = v["vectors"].as_array().unwrap();
-    assert!(vectors.len() >= 13);
+    assert!(vectors.len() >= 18);
     let mut nulls = 0;
     for vec in vectors {
         let name = vec["name"].as_str().unwrap();
@@ -125,6 +129,28 @@ fn shared_vectors_reproduce_exactly() {
     }
     // the 17-signature seal and the non-text signature key, every case
     assert_eq!(nulls, 2 * 5);
+}
+
+#[test]
+fn every_vector_measured_in_the_lab_is_covered() {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(FILE).unwrap()).unwrap();
+    let mut measured = 0;
+    for vec in v["vectors"].as_array().unwrap() {
+        let Some(lab) = vec["labGas"].as_str() else {
+            continue;
+        };
+        measured += 1;
+        let lab: u64 = lab.parse().unwrap();
+        let (_, l, e, pending, proofs, k) = cases(vec).remove(0);
+        let t = redeem_gas_terms(&shape(&l, e, pending, proofs, k)).unwrap();
+        assert!(
+            t.execution + t.memory + t.sha256 >= lab,
+            "{}: {} < {lab}",
+            vec["name"],
+            t.execution + t.memory + t.sha256
+        );
+    }
+    assert!(measured >= 14);
 }
 
 #[test]
@@ -157,7 +183,11 @@ fn preflight_dominates_redemption_and_more_never_costs_less() {
             assert!(lp >= lr, "{name} K {k}");
             for (a, b, what) in [
                 (fp.steps, fr.steps, "steps"),
-                (fp.items, fr.items, "items"),
+                (fp.scan.items, fr.scan.items, "scan.items"),
+                (fp.scan.long, fr.scan.long, "scan.long"),
+                (fp.scan.nodes, fr.scan.nodes, "scan.nodes"),
+                (fp.skip.items, fr.skip.items, "skip.items"),
+                (fp.skip.long, fr.skip.long, "skip.long"),
                 (fp.tx_words, fr.tx_words, "txWords"),
                 (fp.siblings, fr.siblings, "siblings"),
                 (fp.uc_bytes, fr.uc_bytes, "ucBytes"),
@@ -174,10 +204,17 @@ fn preflight_dominates_redemption_and_more_never_costs_less() {
             // one more of any counted unit never lowers the bound
             let base = price_features(&fr, red.2, 0, 4).limit;
             type Bump = fn(&mut RedeemFeatures);
-            let bumps: [(&str, Bump); 15] = [
+            let bumps: [(&str, Bump); 22] = [
                 ("steps", |f| f.steps += 1),
-                ("parentSteps", |f| f.parent_steps += 1),
-                ("items", |f| f.items += 1),
+                ("scan.items", |f| f.scan.items += 1),
+                ("scan.long", |f| f.scan.long += 1),
+                ("skip.items", |f| f.skip.items += 1),
+                ("skip.long", |f| f.skip.long += 1),
+                ("rcptItems", |f| f.rcpt_items += 1),
+                ("rcptLong", |f| f.rcpt_long += 1),
+                ("rcptLists", |f| f.rcpt_lists += 1),
+                ("rcptHeads", |f| f.rcpt_heads += 1),
+                ("rcptLongHeads", |f| f.rcpt_long_heads += 1),
                 ("siblings", |f| f.siblings += 1),
                 ("ucBytes", |f| f.uc_bytes += 1),
                 ("ucIr", |f| f.uc_ir += 1),
@@ -276,32 +313,142 @@ fn fail_closed() {
     assert!(s(&bad, 0).is_none());
 }
 
-#[test]
-fn the_default_bound_applies_to_the_calibrated_verifier_build_only() {
-    let code = from_hex(
-        std::fs::read_to_string(concat!(
+struct Dep {
+    gamma: Vec<u8>,
+    verifier: Vec<u8>,
+    helper: String,
+    k: u64,
+    b: u64,
+    qmax: Vec<u8>,
+    verifier_code: Vec<u8>,
+    helper_code: Vec<u8>,
+    vault_code: Vec<u8>,
+}
+
+fn deployment(build: &str) -> Dep {
+    let d: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/nb2-gas/verifier-runtime.hex"
+            "/../../tests/nb2-gas/deployment.json"
         ))
-        .unwrap()
-        .trim(),
+        .unwrap(),
     )
     .unwrap();
-    assert!(calibrated_verifier(&code));
-    assert_eq!(MeasuredGasModel.supports_verifier(&code), Some(true));
-    let mut other = code.clone();
-    other[325 + 31] ^= 1;
-    other[12_187 + 31] ^= 1;
-    assert!(
-        calibrated_verifier(&other),
-        "another deployment of the build"
+    let h = |v: &Value| from_hex(v.as_str().unwrap().trim_start_matches("0x")).unwrap();
+    let qmax: u128 = d[build]["Qmax"].as_str().unwrap().parse().unwrap();
+    let qb: Vec<u8> = qmax
+        .to_be_bytes()
+        .iter()
+        .copied()
+        .skip_while(|&x| x == 0)
+        .collect();
+    Dep {
+        gamma: h(&d[build]["gamma"]),
+        verifier: h(&d[build]["verifier"]),
+        helper: d[build]["helper"].as_str().unwrap().to_lowercase(),
+        k: d[build]["K"].as_u64().unwrap(),
+        b: d[build]["B"].as_u64().unwrap(),
+        qmax: qb,
+        verifier_code: h(&d[build]["verifierCode"]),
+        helper_code: h(&d["helperCode"]),
+        vault_code: h(&d[build]["vaultCode"]),
+    }
+}
+
+fn code_of<'a>(d: &'a Dep, schedule: Option<&'a str>) -> DeploymentCode<'a> {
+    DeploymentCode {
+        gamma: &d.gamma,
+        verifier: &d.verifier,
+        k: d.k,
+        b: d.b,
+        qmax: &d.qmax,
+        verifier_code: &d.verifier_code,
+        helper_code: &d.helper_code,
+        vault_code: &d.vault_code,
+        native_gas_schedule: schedule,
+    }
+}
+
+fn flip(b: &[u8], at: usize) -> Vec<u8> {
+    let mut c = b.to_vec();
+    c[at] ^= 1;
+    c
+}
+
+#[test]
+fn the_default_estimate_applies_to_the_calibrated_deployment_only() {
+    for build in ["test", "production"] {
+        let d = deployment(build);
+        let ok = code_of(&d, Some(NATIVE_GAS_SCHEDULE));
+        assert!(calibrated_deployment(&ok), "{build}");
+        assert_eq!(MeasuredGasModel.supports_deployment(&ok), Some(true));
+        let helper = create_address(&d.verifier, 1);
+        let hex: String = helper.iter().map(|x| format!("{x:02x}")).collect();
+        assert_eq!(format!("0x{hex}"), d.helper);
+        // one occurrence of an immutable changed alone (the helper address at its last use, admitsTestSet, the helper hash)
+        for at in [15_504 + 31, 325 + 31, 12_187 + 31, 368 + 31, 1_000] {
+            let v = flip(&d.verifier_code, at);
+            assert!(
+                !calibrated_deployment(&DeploymentCode {
+                    verifier_code: &v,
+                    ..code_of(&d, Some(NATIVE_GAS_SCHEDULE))
+                }),
+                "{build} verifier {at}"
+            );
+        }
+        let mut moved = d.verifier_code.clone();
+        for at in [325, 3_071, 8_473, 15_504] {
+            moved[at + 31] ^= 1;
+        }
+        assert!(!calibrated_deployment(&DeploymentCode {
+            verifier_code: &moved,
+            ..code_of(&d, Some(NATIVE_GAS_SCHEDULE))
+        }));
+        assert!(!calibrated_deployment(&DeploymentCode {
+            verifier_code: &d.verifier_code[1..],
+            ..code_of(&d, Some(NATIVE_GAS_SCHEDULE))
+        }));
+        let hc = flip(&d.helper_code, 100);
+        assert!(!calibrated_deployment(&DeploymentCode {
+            helper_code: &hc,
+            ..code_of(&d, Some(NATIVE_GAS_SCHEDULE))
+        }));
+        for at in [103 + 31, 4_057 + 31, 641 + 31, 1_218 + 31, 3_000] {
+            let v = flip(&d.vault_code, at);
+            assert!(
+                !calibrated_deployment(&DeploymentCode {
+                    vault_code: &v,
+                    ..code_of(&d, Some(NATIVE_GAS_SCHEDULE))
+                }),
+                "{build} vault {at}"
+            );
+        }
+        let g = flip(&d.gamma, d.gamma.len() - 1);
+        assert!(!calibrated_deployment(&DeploymentCode {
+            gamma: &g,
+            ..code_of(&d, Some(NATIVE_GAS_SCHEDULE))
+        }));
+        assert!(!calibrated_deployment(&code_of(&d, None)));
+        assert!(!calibrated_deployment(&code_of(&d, Some("another"))));
+    }
+}
+
+#[test]
+fn cbor_walk_counts() {
+    assert_eq!(
+        cbor_count(&[0xd9, 0x98, 0x58, 0x81, 0x59, 0x00, 0x02, 0x01, 0x02]),
+        CborCount {
+            items: 3,
+            long: 2,
+            nodes: 2
+        }
     );
-    let mut byte = code.clone();
-    byte[1_000] ^= 1;
-    assert!(!calibrated_verifier(&byte));
-    let mut helper = code.clone();
-    helper[368] ^= 1;
-    assert!(!calibrated_verifier(&helper));
-    assert!(!calibrated_verifier(&code[1..]));
-    assert!(!calibrated_verifier(&[]));
+    assert_eq!(
+        cbor_count(&[0x80, 0xa0, 0xc1, 0x00, 0x18, 0x20]),
+        CborCount {
+            items: 5,
+            long: 1,
+            nodes: 1
+        }
+    );
 }

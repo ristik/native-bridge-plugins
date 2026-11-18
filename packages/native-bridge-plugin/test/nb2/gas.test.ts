@@ -1,5 +1,5 @@
 /**
- * The redeem gas bound (src/nb2/gas.ts, bound-nb2-1179): the shared vectors (tests/nb2-gas/gas-vectors.json, real evidence of the bft-core#1179
+ * The redeem gas estimate (src/nb2/gas.ts, estimate-nb2-1179): the shared vectors (tests/nb2-gas/gas-vectors.json, real evidence of the bft-core#1179
  * measurement lane) reproduced exactly, as the Rust plug-in reproduces them (crates/native-bridge-sdk-ext/tests/nb2_gas.rs), and the bound's
  * structure: the native schedules, the pending burn at its bounds, the fail-closed inputs.
  */
@@ -9,13 +9,16 @@ import { test } from 'node:test';
 
 import { fromHex } from '../../src/bytes.js';
 import { lineageOf } from '../../src/nb2/bridge.js';
-import { batchGas, calibratedVerifier, cborItems, memoryGas, MeasuredGasModel, priceFeatures, redeemFeatures, redeemGasTerms, REDEEM_GAS, type RedeemShape } from '../../src/nb2/gas.js';
+import {
+  batchGas, calibratedDeployment, cborCount, cborItems, createAddress, memoryGas, MeasuredGasModel, NATIVE_GAS_SCHEDULE, priceFeatures, redeemFeatures, redeemGasTerms, REDEEM_GAS,
+  type DeploymentCode, type RedeemFeatures, type RedeemShape,
+} from '../../src/nb2/gas.js';
 import { type Token } from '../../src/nb2/token.js';
 import { decodeEvidence } from '../../src/nb2/verify.js';
 
 const FILE = new URL('../../../../tests/nb2-gas/gas-vectors.json', import.meta.url);
 interface Case { input: string; pendingTransactions: number; proofs: string; K: string; evidenceBytes: number; features: unknown; terms: unknown }
-const file = JSON.parse(readFileSync(FILE, 'utf8')) as { model: string; vectors: { name: string; evidence: string; cases: Case[] }[] };
+const file = JSON.parse(readFileSync(FILE, 'utf8')) as { model: string; vectors: { name: string; labGas?: string; evidence: string; cases: Case[] }[] };
 const json = (v: unknown): unknown => JSON.parse(JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x)));
 
 /** The part before its burn: the evidence's last transfer pair dropped (the preflight's token). */
@@ -31,7 +34,7 @@ const shapes = (v: { evidence: string; cases: Case[] }): [Case, RedeemShape][] =
 
 test('the shared vectors: every feature and term, exactly (a null bound where the vector fails closed)', () => {
   assert.equal(file.model, new MeasuredGasModel().name);
-  assert.ok(file.vectors.length >= 13);
+  assert.ok(file.vectors.length >= 18);
   let nulls = 0;
   for (const v of file.vectors) {
     for (const [c, s] of shapes(v)) {
@@ -44,6 +47,22 @@ test('the shared vectors: every feature and term, exactly (a null bound where th
   }
   // the 17-signature seal and the non-text signature key, every case
   assert.equal(nulls, 2 * 5);
+});
+
+test('every vector measured in the lab: the estimate\'s execution, memory and SHA-256 terms at redemption cover the deployed verifier\'s gas', () => {
+  let measured = 0;
+  for (const v of file.vectors) {
+    if (v.labGas === undefined) continue;
+    measured++;
+    const [, s] = shapes(v)[0];
+    const t = redeemGasTerms(s)!;
+    assert.ok(t.execution + t.memory + t.sha256 >= BigInt(v.labGas), `${v.name}: ${t.execution + t.memory + t.sha256} < ${v.labGas}`);
+  }
+  // the review's counterexamples above the splits among them
+  assert.ok(measured >= 14);
+  for (const n of ['split-above-2-levels-32-unicity-steps', 'split-above-3-levels-32-unicity-steps', 'split-above-5-levels-16-signatures-8-steps', 'split-above-7-levels-32-unicity-steps']) {
+    assert.ok(file.vectors.some((v) => v.name === n && v.labGas !== undefined), n);
+  }
 });
 
 test('every vector: the preflight is at or above the redemption at the same proofs, and so is each pending-dependent feature', () => {
@@ -60,8 +79,11 @@ test('every vector: the preflight is at or above the redemption at the same proo
         continue;
       }
       assert.ok(redeemGasTerms({ ...pre[1], proofs: 17n })!.limit >= redeemGasTerms(red[1])!.limit, `${v.name} K ${K}`);
-      for (const k of ['steps', 'items', 'txWords', 'siblings', 'ucBytes', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'keyLookups'] as const) {
+      for (const k of ['steps', 'txWords', 'siblings', 'ucBytes', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'keyLookups'] as const) {
         assert.ok(fp[k] >= fr[k], `${v.name} K ${K}: ${k} ${fp[k]} < ${fr[k]}`);
+      }
+      for (const w of ['scan', 'skip'] as const) {
+        for (const k of ['items', 'long', 'nodes'] as const) assert.ok(fp[w][k] >= fr[w][k], `${v.name} K ${K}: ${w}.${k}`);
       }
       assert.ok(fp.claims.length >= fr.claims.length);
     }
@@ -87,9 +109,12 @@ test('the native schedules: CERT_BATCH_V2 balanced at 16 claims and 256 KiB, mem
   assert.equal(memoryGas(50_000), 150_000n + 4_882_812n);
 });
 
-test('CBOR items: heads, string payloads skipped', () => {
+test('CBOR items: heads, string payloads skipped; argument heads and nested items counted for the walks', () => {
   assert.equal(cborItems(Uint8Array.of(0x82, 0x01, 0x43, 0xaa, 0xbb, 0xcc)), 3);
   assert.equal(cborItems(Uint8Array.of(0xd9, 0x98, 0x58, 0x81, 0x59, 0x00, 0x02, 0x01, 0x02)), 3);
+  // a long tag, a one-item array, a long byte string; an empty array is not nested (scan pushes no depth for it)
+  assert.deepEqual(cborCount(Uint8Array.of(0xd9, 0x98, 0x58, 0x81, 0x59, 0x00, 0x02, 0x01, 0x02)), { items: 3, long: 2, nodes: 2 });
+  assert.deepEqual(cborCount(Uint8Array.of(0x80, 0xa0, 0xc1, 0x00, 0x18, 0x20)), { items: 5, long: 1, nodes: 1 });
 });
 
 test('the pending burn is counted at its bounds, and more of the token never costs less', () => {
@@ -109,9 +134,17 @@ test('the pending burn is counted at its bounds, and more of the token never cos
     const [, r] = shapes(w)[0];
     const fr = redeemFeatures(r);
     if (fr === null) continue;
-    for (const k of ['steps', 'parentSteps', 'items', 'siblings', 'ucBytes', 'ucIr', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'decompressions', 'txWords', 'edges', 'allocSteps', 'jBytes'] as const) {
-      const more = { ...fr, [k]: fr[k] + 1 };
-      assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > priceFeatures(fr, r.evidenceBytes, 0n, 4n).limit, `${w.name}: ${k}`);
+    const base = priceFeatures(fr, r.evidenceBytes, 0n, 4n).limit;
+    for (const k of ['steps', 'siblings', 'ucBytes', 'ucIr', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'decompressions', 'txWords', 'edges', 'allocSteps', 'jBytes',
+      'rcptItems', 'rcptLong', 'rcptLists', 'rcptHeads', 'rcptLongHeads', 'rcptKids'] as const) {
+      const more: RedeemFeatures = { ...fr, [k]: fr[k] + 1 };
+      assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > base, `${w.name}: ${k}`);
+    }
+    for (const wk of ['scan', 'skip'] as const) {
+      for (const k of ['items', 'long'] as const) {
+        const more: RedeemFeatures = { ...fr, [wk]: { ...fr[wk], [k]: fr[wk][k] + 1 } };
+        assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > base, `${w.name}: ${wk}.${k}`);
+      }
     }
   }
 });
@@ -126,23 +159,56 @@ test('fail closed: no lineage, a UC that does not parse, more than one pending t
   assert.equal(redeemGasTerms({ ...s, lineage: [...s.lineage.slice(0, -1), bad] }), null);
 });
 
-test('the default bound applies to the calibrated verifier build only: its runtime code with the immutables zeroed, pinning the calibrated helper', () => {
-  const code = fromHex(readFileSync(new URL('../../../../tests/nb2-gas/verifier-runtime.hex', import.meta.url), 'utf8').trim())!;
+interface DeploymentJson { helperCode: string; [build: string]: string | { gamma: string; verifier: string; helper: string; K: number; B: number; Qmax: string; verifierCode: string; vaultCode: string } }
+const DEP = JSON.parse(readFileSync(new URL('../../../../tests/nb2-gas/deployment.json', import.meta.url), 'utf8')) as DeploymentJson;
+const deployment = (build: 'test' | 'production'): DeploymentCode => {
+  const d = DEP[build] as Exclude<DeploymentJson[string], string>;
+  return {
+    gamma: fromHex(d.gamma.slice(2))!, verifier: fromHex(d.verifier.slice(2))!, K: BigInt(d.K), B: BigInt(d.B), Qmax: BigInt(d.Qmax), verifierCode: fromHex(d.verifierCode.slice(2))!,
+    helperCode: fromHex(DEP.helperCode.slice(2))!, vaultCode: fromHex(d.vaultCode.slice(2))!, nativeGasSchedule: NATIVE_GAS_SCHEDULE,
+  };
+};
+const flip = (b: Uint8Array, at: number): Uint8Array => {
+  const c = Uint8Array.from(b);
+  c[at] ^= 1;
+  return c;
+};
+
+test('the default estimate applies to the calibrated deployment only: each runtime rebuilt from the artifact and the deployment\'s own values', () => {
   const m = new MeasuredGasModel();
-  assert.equal(calibratedVerifier(code), true);
-  assert.equal(m.supportsVerifier(code), true);
-  // another deployment of the same build: other immutables (the helper's address, admitsTestSet)
-  const other = Uint8Array.from(code);
-  other[325 + 31] ^= 1;
-  other[12_187 + 31] ^= 1;
-  assert.equal(calibratedVerifier(other), true);
-  // another build: one code byte, a helper with other code, another length
-  const byte = Uint8Array.from(code);
-  byte[1_000] ^= 1;
-  assert.equal(calibratedVerifier(byte), false);
-  const helper = Uint8Array.from(code);
-  helper[368] ^= 1;
-  assert.equal(calibratedVerifier(helper), false);
-  assert.equal(calibratedVerifier(code.subarray(1)), false);
-  assert.equal(calibratedVerifier(new Uint8Array()), false);
+  for (const build of ['test', 'production'] as const) {
+    const d = deployment(build);
+    // a genuine deployment (the runtimes of a live release, rebuilt from the artifacts and checked against its code hashes)
+    assert.equal(calibratedDeployment(d), true, build);
+    assert.equal(m.supportsDeployment(d), true);
+    assert.equal(createAddress(d.verifier, 1n).length, 20);
+    // the helper at the verifier's first CREATE address
+    const h = DEP[build] as { helper: string };
+    assert.equal(`0x${Buffer.from(createAddress(d.verifier, 1n)).toString('hex')}`, h.helper.toLowerCase());
+    // one occurrence of an immutable changed alone (sol's and astra's case: the helper address at its last use; admitsTestSet at one
+    // use; the helper code hash at one use)
+    for (const at of [15_504 + 31, 325 + 31, 12_187 + 31, 368 + 31]) assert.equal(calibratedDeployment({ ...d, verifierCode: flip(d.verifierCode, at) }), false, `${build} verifier ${at}`);
+    // every occurrence of the helper address changed together: another helper than the one at the verifier's CREATE address
+    const moved = Uint8Array.from(d.verifierCode);
+    for (const at of [325, 3_071, 8_473, 15_504]) moved[at + 31] ^= 1;
+    assert.equal(calibratedDeployment({ ...d, verifierCode: moved }), false);
+    // admitsTestSet consistent with (K, B), in every occurrence
+    const flipped = Uint8Array.from(d.verifierCode);
+    for (const at of [8_541, 12_187]) flipped[at + 31] ^= 1;
+    assert.equal(calibratedDeployment({ ...d, verifierCode: flipped }), false);
+    // another build: one code byte, another length
+    assert.equal(calibratedDeployment({ ...d, verifierCode: flip(d.verifierCode, 1_000) }), false);
+    assert.equal(calibratedDeployment({ ...d, verifierCode: d.verifierCode.subarray(1) }), false);
+    // another helper
+    assert.equal(calibratedDeployment({ ...d, helperCode: flip(d.helperCode, 100) }), false);
+    // the vault: one occurrence of D, K or Γ's first word changed alone, a code byte, another Γ, another verifier, another Qmax
+    for (const at of [103 + 31, 4_057 + 31, 641 + 31, 1_218 + 31]) assert.equal(calibratedDeployment({ ...d, vaultCode: flip(d.vaultCode, at) }), false, `${build} vault ${at}`);
+    assert.equal(calibratedDeployment({ ...d, vaultCode: flip(d.vaultCode, 3_000) }), false);
+    assert.equal(calibratedDeployment({ ...d, gamma: flip(d.gamma, d.gamma.length - 1) }), false);
+    assert.equal(calibratedDeployment({ ...d, Qmax: d.Qmax + 1n }), false);
+    // the native schedule: absent or another
+    const { nativeGasSchedule: _drop, ...noSchedule } = d;
+    assert.equal(calibratedDeployment(noSchedule), false);
+    assert.equal(calibratedDeployment({ ...d, nativeGasSchedule: `${NATIVE_GAS_SCHEDULE} ` }), false);
+  }
 });

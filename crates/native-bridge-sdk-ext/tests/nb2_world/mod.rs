@@ -1002,6 +1002,7 @@ pub fn pins_of(chain: &FakeChain) -> DeploymentPins {
         deployment_block: 1,
         state_read_only: false,
         max_jump: None,
+        native_gas_schedule: None,
     }
 }
 
