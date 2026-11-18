@@ -34,7 +34,7 @@ const shapes = (v: { evidence: string; cases: Case[] }): [Case, RedeemShape][] =
 
 test('the shared vectors: every feature and term, exactly (a null bound where the vector fails closed)', () => {
   assert.equal(file.model, new MeasuredGasModel().name);
-  assert.ok(file.vectors.length >= 18);
+  assert.ok(file.vectors.length >= 19);
   let nulls = 0;
   for (const v of file.vectors) {
     for (const [c, s] of shapes(v)) {
@@ -59,8 +59,8 @@ test('every vector measured in the lab: the estimate\'s execution, memory and SH
     assert.ok(t.execution + t.memory + t.sha256 >= BigInt(v.labGas), `${v.name}: ${t.execution + t.memory + t.sha256} < ${v.labGas}`);
   }
   // the review's counterexamples above the splits among them
-  assert.ok(measured >= 14);
-  for (const n of ['split-above-2-levels-32-unicity-steps', 'split-above-3-levels-32-unicity-steps', 'split-above-5-levels-16-signatures-8-steps', 'split-above-7-levels-32-unicity-steps']) {
+  assert.ok(measured >= 15);
+  for (const n of ['split-above-2-levels-32-unicity-steps', 'split-above-3-levels-32-unicity-steps', 'split-above-5-levels-16-signatures-8-steps', 'split-above-7-levels-32-unicity-steps', 'four-byte-utf8-node-ids-shared-prefix']) {
     assert.ok(file.vectors.some((v) => v.name === n && v.labGas !== undefined), n);
   }
 });
@@ -136,7 +136,7 @@ test('the pending burn is counted at its bounds, and more of the token never cos
     if (fr === null) continue;
     const base = priceFeatures(fr, r.evidenceBytes, 0n, 4n).limit;
     for (const k of ['steps', 'siblings', 'ucBytes', 'ucIr', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'decompressions', 'txWords', 'edges', 'allocSteps', 'jBytes',
-      'rcptItems', 'rcptLong', 'rcptLists', 'rcptHeads', 'rcptLongHeads', 'rcptKids'] as const) {
+      'rcptItems', 'rcptLong', 'rcptLists', 'rcptHeads', 'rcptLongHeads', 'rcptKids', 'ucKeyWords'] as const) {
       const more: RedeemFeatures = { ...fr, [k]: fr[k] + 1 };
       assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > base, `${w.name}: ${k}`);
     }

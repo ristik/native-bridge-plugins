@@ -28,7 +28,7 @@ fn before_burn(t: &Token) -> Token {
 }
 
 fn uc(c: &UcCost) -> Value {
-    json!({"bytes": c.bytes, "ir": c.ir, "signatures": c.signatures, "stc": c.stc, "utc": c.utc, "slow": c.slow})
+    json!({"bytes": c.bytes, "ir": c.ir, "signatures": c.signatures, "stc": c.stc, "utc": c.utc, "slow": c.slow, "keyWords": c.key_words})
 }
 
 fn walk(c: &CborCount) -> Value {
@@ -45,7 +45,7 @@ fn features_json(f: &RedeemFeatures) -> Value {
     json!({
         "tokens": f.tokens, "edges": f.edges, "allocSteps": f.alloc_steps, "steps": f.steps, "parentSteps": f.parent_steps, "txWords": f.tx_words, "maxTx": f.max_tx,
         "siblings": f.siblings, "ucParses": f.uc_parses, "ucBytes": f.uc_bytes, "ucIr": f.uc_ir, "ucSignatures": f.uc_signatures, "ucStc": f.uc_stc,
-        "ucUtc": f.uc_utc, "ucSlow": f.uc_slow, "helperMemory": f.helper_memory.to_string(), "evmUc": uc(&f.evm_uc), "rcptItems": f.rcpt_items, "rcptLong": f.rcpt_long, "rcptLists": f.rcpt_lists, "rcptHeads": f.rcpt_heads, "rcptLongHeads": f.rcpt_long_heads, "rcptKids": f.rcpt_kids, "rcptWords": f.rcpt_words, "ucCosts": f.uc_costs.iter().map(uc).collect::<Vec<_>>(),
+        "ucUtc": f.uc_utc, "ucSlow": f.uc_slow, "ucKeyWords": f.uc_key_words, "helperMemory": f.helper_memory.to_string(), "evmUc": uc(&f.evm_uc), "rcptItems": f.rcpt_items, "rcptLong": f.rcpt_long, "rcptLists": f.rcpt_lists, "rcptHeads": f.rcpt_heads, "rcptLongHeads": f.rcpt_long_heads, "rcptKids": f.rcpt_kids, "rcptWords": f.rcpt_words, "ucCosts": f.uc_costs.iter().map(uc).collect::<Vec<_>>(),
         "pathWords": f.path_words, "maxUc": f.max_uc, "scratch": f.scratch, "scan": walk(&f.scan), "skip": walk(&f.skip), "jBytes": f.j_bytes, "keyLookups": f.key_lookups,
         "decompressions": f.decompressions, "probes": f.probes, "claims": claims,
     })
@@ -102,7 +102,7 @@ fn shared_vectors_reproduce_exactly() {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(FILE).unwrap()).unwrap();
     assert_eq!(v["model"], MeasuredGasModel.name());
     let vectors = v["vectors"].as_array().unwrap();
-    assert!(vectors.len() >= 18);
+    assert!(vectors.len() >= 19);
     let mut nulls = 0;
     for vec in vectors {
         let name = vec["name"].as_str().unwrap();
@@ -150,7 +150,7 @@ fn every_vector_measured_in_the_lab_is_covered() {
             t.execution + t.memory + t.sha256
         );
     }
-    assert!(measured >= 14);
+    assert!(measured >= 15);
 }
 
 #[test]
@@ -204,7 +204,8 @@ fn preflight_dominates_redemption_and_more_never_costs_less() {
             // one more of any counted unit never lowers the bound
             let base = price_features(&fr, red.2, 0, 4).limit;
             type Bump = fn(&mut RedeemFeatures);
-            let bumps: [(&str, Bump); 22] = [
+            let bumps: [(&str, Bump); 23] = [
+                ("ucKeyWords", |f| f.uc_key_words += 1),
                 ("steps", |f| f.steps += 1),
                 ("scan.items", |f| f.scan.items += 1),
                 ("scan.long", |f| f.scan.long += 1),

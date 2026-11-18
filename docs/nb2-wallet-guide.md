@@ -390,7 +390,7 @@ measured the same within 2%. The deposit and the walkthrough's `back` are from t
 **What the user has to hold.** The redeem transaction's gas limit is the estimate plus `gasReserve` = 500,000 (spec section 12.4): other
 users' payments can make any return the sealing one (the K-th payment of a segment seals it, up to about 230,000 gas more) or the worst scan
 of the recent buffers (up to about 283,000 more). The reserve is limit, not spend: only the return that seals pays the sealing gas. The preflight before the burn uses
-a larger, conservative estimate: the burn is counted at the decoder's bounds (about 3.3M gas) and 64 segments of future history are added. The
+a larger, conservative estimate: the burn is counted at the decoder's bounds (about 3.4M gas) and 64 segments of future history are added. The
 walkthrough's 0.04 part was planned at 7,643,951 gas (that transcript was recorded under the earlier model, measured-nb2-05), sent with a limit of 1,906,818, and used 1,394,583 (8,804 bytes of calldata). The paying address must be able to
 fund the preflight's limit at twice the base fee plus the tip, or the preflight refuses with `InsufficientFunds` and nothing is burned.
 

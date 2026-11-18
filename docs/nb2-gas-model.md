@@ -51,7 +51,8 @@ bounds instead of counted:
 - **The pending burn** of a preflight is counted at the decoder bounds. Its UC is 24 KiB with 16 signatures of 128-byte non-ASCII
   node IDs, 256 shard tree siblings, 32 unicity tree steps and a 448-byte input record. Its path has 256 RSMT siblings. Its claim is
   new, in a new epoch. At an unknown claim digest it probes every occupied slot. Its CBOR items are priced as the dearest form. On the
-  K = 4 lane this costs about 3.3M gas (the envelope's `preBurnBurnBound`).
+  K = 4 lane this costs about 3.4M gas (the envelope's `preBurnBurnBound`). Its seal's keys are counted as sharing all but their last
+  word.
 - **Inputs it cannot read.** A UC that does not parse, or one with more than 16 signatures, gives null. The preflight reports that as
   `CapacityPreflight` (fail closed).
 
@@ -92,7 +93,8 @@ each form's marginal cost over 100 to 300 repetitions), the dearest form of each
 | a UC byte (all copies) | 7 | measured, plus 1 for the verifier's copies |
 | a byte of the UC's input record | 27 | measured on real UCs |
 | a seal signature; a shard tree sibling; a unicity tree step | 1,784; 1,798; 2,146 | measured on synthetic UCs; a sibling adds the verifier's `_inShard` at 250 a shard bit (measured 170 on 64- and 200-bit shards) |
-| a byte of a node ID with a non-ASCII byte (the helper's byte-wise UTF-8 check) | 315 | measured |
+| a byte of a node ID with a non-ASCII byte (the helper's byte-wise UTF-8 check) | 367 | measured per character width (round 3): `_utf8`'s slow path runs once a character, so a byte costs more the wider the character: 301 on 2-byte, 337 to 342 on 3-byte, 345 to 349 on 4-byte (U+10000, U+10FFFF); the dearest raised 5% |
+| a word `_less` compares beyond the first, over the seal's consecutive keys | 320 | words counted from the keys (round 3: up to each pair's first differing word); measured 905 a compare of 128-byte keys sharing 124 bytes (3 more words), raised 5% |
 | a byte of J | 10 | code (its copies and the trie nodes' and header's Keccak: at most 20 gas a word) |
 | an RLP item of the header, a trie node or the receipt (`check()`) | 320, +190 in long form, +250 a list | measured per form (round 2): 182 a byte, 304 a short string, 482 a long string, 483 a short list, 541 an empty list, 618 a long list |
 | a `head()` with its Item: each log up to the selected one, its topics, every child a `kids()` call walks | 1,070, +450 in long form | measured per form: at most 1,019 short and 1,371 long in `kids()`; about 1,440 for a long log in `receiptLog`'s walk |
@@ -179,7 +181,9 @@ helper. The default estimate applies only when (`calibratedDeployment`):
 - the vault's runtime is the calibrated `NB2VaultBase` artifact (both builds share it) with every immutable derived from Γ: `D = H_U(Γ)`,
   the verifier, `Qmax`, `K`, `log2 K`, `log2 B` and Γ's length and twelve words;
 - the manifest pins `nativeGasSchedule`, naming the native schedules the estimate assumes (`NATIVE_GAS_SCHEDULE`: CERT_BATCH_V2, the RSMT
-  membership and SHA-256 with their coefficients). The release writes it from the pinned ureth.
+  membership and SHA-256 with their coefficients). It is a declared pin: `release_nb2.py` restates it as a literal for the ureth it
+  pins; neither the release nor the plug-in derives it from ureth or probes the chain, so the check proves only that the release was
+  written for this estimate.
 
 For any other deployment the default estimate is refused before the burn (`CapacityPreflight`). A wallet that supplies its own model is
 responsible for it. The payout is to an account without code; a contract recipient's own execution is not estimated (the wallet warns
@@ -191,14 +195,17 @@ Everything was measured on throwaway K = 4 generations, `tn-nb2-refit`, on the d
 contracts `884c4829`, the release whose verifier is deployed.
 
 - **The forge lab** runs the deployed verifier's bytecode on real evidence files, with constant stubs at `0x0100` and `0x0102`, whose
-  schedules are then added exactly. It records the verifier's gas, its free pointer and its memory high-water. It covers 176 files:
+  schedules are then added exactly. It records the verifier's gas, its free pointer and its memory high-water. It covers 214 files:
   - 44 from the consolidation measurement (raw, consolidated before and after the burn, trimmed seals);
   - 92 from the lane: 1 to 315 transfers in 16 certificate groups; one batch; consolidated; a certificate per transfer; 151 and 261
     fresh owner keys; trimmed; 1, 2, 3, 6 and 10 split levels; small returns;
   - 10 synthetic part tokens (16 signatures; 128-byte ASCII or non-ASCII node IDs; 64- and 200-bit shards; 32 unicity tree steps; 24 KiB
     seals; everything at once);
   - 30 from the round-2 review: lane tokens at 1 to 7 split levels with every UC above the part rebuilt (4 or 16 signatures, 8, 16, 24 or
-    32 unicity tree steps) and each child mint re-signed, and lane tokens with smaller UCs in the part.
+    32 unicity tree steps) and each child mint re-signed, and lane tokens with smaller UCs in the part;
+  - 38 from the round-3 review: node IDs of 2-, 3- and 4-byte UTF-8 characters at their branch edges, with and without a 124-byte shared
+    key prefix, in the part and above 1 to 10 split levels, and further variants above the splits (1 or 16 signatures, 0 or 32 steps, 200
+    shard tree siblings, 1,400-byte signatures, everything at once).
 - **The walk microbenchmarks** (`RefitWalk`): each CBOR form under `scan` (strict and loose) and `skip`, each RLP form under `check()` and
   `kids()`, compiled in `src/nb2/verifier` so that they take the verifier's settings (via-IR, optimizer runs 1).
 - **The receipt parser** (`RefitRcpt`) on 31 receipts, short and long forms.
@@ -212,8 +219,9 @@ contracts `884c4829`, the release whose verifier is deployed.
 raised (5% for the helper and the split terms, 2% for unsplit execution and memory) and the intercept raised to the largest residual. The
 split terms are the least pair (per parent step, per edge) that covers every split file over the unsplit execution, raised by 5%.
 
-On all 176 lab files the estimate's execution, memory and SHA-256 terms, without the safety margin, are 1.063 to 1.23 times the lab's
-measured gas. The review's counterexamples, which round 1 underestimated by up to 1.03M gas (3.7%), are now 1.097 to 1.140 times it:
+On all 214 lab files the estimate's execution, memory and SHA-256 terms, without the safety margin, are 1.064 to 1.55 times the lab's
+measured gas. The round-3 UTF-8 shapes, which round 2 underestimated by up to 5.8% (2.8% after the margin), are now 1.065 (U+10FFFF IDs)
+to 1.095 times it; U+10000 IDs sharing a 124-byte prefix are 1.079. The review's counterexamples, which round 1 underestimated by up to 1.03M gas (3.7%), are now 1.097 to 1.140 times it:
 
 | File | Lab gas | Estimate (exec + mem + sha) | Ratio | Round 1 |
 |---|---:|---:|---:|---:|
@@ -224,12 +232,13 @@ measured gas. The review's counterexamples, which round 1 underestimated by up t
 | q-e7n-s16u8 | 8,510,081 | 9,652,761 | 1.134 | −31,777 |
 | q-e7n-u32 | 10,473,683 | 11,898,259 | 1.136 | −384,938 |
 
-**Shared vectors.** `tests/nb2-gas/gas-vectors.json` holds 18 evidence files; both plug-ins reproduce every feature and term of each.
+**Shared vectors.** `tests/nb2-gas/gas-vectors.json` holds 19 evidence files; both plug-ins reproduce every feature and term of each.
 Six are lane tokens (1 and 10 transfers, 3 and 10 split levels, 151 fresh keys, trimmed seals); four are the synthetic part tokens (a
 200-bit shard, 16 signatures with non-ASCII IDs, 16 signatures, 24 KiB seals over the batch's byte cap); four are the review's
-counterexamples above the splits (2, 3 and 7 levels with 32 unicity tree steps, 5 levels with 16 signatures and 8 steps); two are receipts
+counterexamples above the splits (2, 3 and 7 levels with 32 unicity tree steps, 5 levels with 16 signatures and 8 steps); one is the
+round-3 review's 4-byte UTF-8 node IDs sharing a 124-byte prefix; two are receipts
 (a deposit after 2,000 logs, and after 560 long-form logs with 56-byte data); two must fail closed (17 signatures, a non-text signature
-key). Each is checked at redemption (P 0 and 17 at K = 4, P 17 at K = 64) and at the preflight (K = 4 and 64). The 14 that the lab
+key). Each is checked at redemption (P 0 and 17 at K = 4, P 17 at K = 64) and at the preflight (K = 4 and 64). The 15 that the lab
 measured carry their lab gas, and both suites check that the estimate's execution, memory and SHA-256 terms are at or above it.
 
 The scripts and the raw data are in `~/evidence/nb2-gas-refit/` on the dev server (`lab/`, `r2/lab/`: `fit4.py`, `features.jsonl`,
@@ -262,7 +271,7 @@ Over all 87 measurements (21 burns at P = 0 to 17, `validate-r2.jsonl`):
 
 - the estimate at redemption is 1.085 to 1.69 times the real gas: about 1.09 at 250 to 300 transfers, and more for small tokens, where the
   vault's K = 64 worst call dominates;
-- the preflight is 1.16 to 5.2 times the real gas;
+- the preflight is 1.16 to 5.3 times the real gas;
 - no measurement lies above its estimate.
 
 **The live boundary** (the lane's `boundary` stage, bft-core#1179). It used fresh tokens in 16 certificate groups at the pinned limits and
@@ -273,6 +282,10 @@ executed every probe as it was judged: each admitted one burned and paid, each r
 - Round 2 (this estimate, nbp `36e6fa16`), on a fresh generation: admitted 268 and refused 270. The ones admitted at 264 and 268 transfers
   (preflight 57.5M and 59.6M) were burned and paid, using 47,234,911 and 49,176,865 gas. The ones refused at 270, 273 and 279 were over
   `userGasLimit` by their own estimate (60.4M to 61.4M), were refused again and shown unspent.
+
+Round 3's prices (UTF-8 widths, key compares) do not change these lane tokens at redemption (their node IDs are ASCII and differ within
+a compare's first word); they add about 0.13M to the preflight's pending burn, so the admitted 268 (59.57M) stays under 60M and the boundary
+does not move.
 
 The boundary moved down from round 1's 286 because the estimate now prices the walks per item form, the vault for a fresh recipient, and
 the safety margin.
@@ -288,7 +301,7 @@ The margin has four parts:
 2. **The safety margin: 1/32 of the measured terms, about 1.4M gas at the boundary.** It covers what the measurements may miss: shapes
    between and beyond the measured ones, branch combinations the microbenchmarks did not take, and the 1.5% tolerance of the node's
    `eth_estimateGas`.
-3. **The pending burn at its bounds: about 3.3M gas, about 16 transfers at the boundary.** This keeps the preflight conservative before the
+3. **The pending burn at its bounds: about 3.4M gas, about 16 transfers at the boundary.** This keeps the preflight conservative before the
    burn exists. The burn's own UC, path and claim are unknown until it is certified, and its UC can come from a later epoch with more
    signatures.
 4. **The reserve: 64 segments and `gasReserve`.** The preflight charges 64 segments beyond those already owed (about 8,100 gas each at
@@ -308,13 +321,16 @@ The margin has four parts:
   less. A token far outside the measured shapes (for instance many more items per proof than any lab file) is covered only as far as the
   per-form prices and the safety margin reach.
 - **The constants are those of the deployed contracts** (`884c4829`, solc 0.8.37, via-IR, the verifier at `optimizer_runs = 1`) and of
-  the named native schedules. The bridge enforces both (above). A new build or a repricing needs a new calibration and a new
+  the named native schedules. The calibrated artifacts are those of a full-project build, `forge build` at the repository root of
+  unicity-pos-contracts `884c4829`, as the bridge image builds them (19,574-byte verifier). Solc's via-IR output depends on the compile
+  unit: `forge build src/nb2` alone gives an 18,886-byte verifier from the same sources and settings, which the gate refuses. The bridge enforces both (above). A new build or a repricing needs a new calibration and a new
   `CALIBRATED_DEPLOYMENT` or `NATIVE_GAS_SCHEDULE`.
 - **The native schedules are ureth `unicity/main` at `7f625ea`** (`crates/unicity/b1` batch.rs and rsmt.rs). There, a registry word read
-  is `READ_GAS` = 100, which ureth marks as provisional. The manifest's `nativeGasSchedule` is the release's statement of the chain's
-  schedule; the plug-in does not probe the chain for it.
+  is `READ_GAS` = 100, which ureth marks as provisional. The manifest's `nativeGasSchedule` is a declared pin, the release's statement of
+  the chain's schedule; the plug-in does not probe the chain for it.
 - **Shapes the lane cannot produce** are covered by the per-unit prices, measured on synthetic UCs: shard tree siblings, more unicity tree
-  steps, more signatures, long or non-ASCII node IDs and long summaries, above and below the splits. J's per-byte cost is from the code.
+  steps, more signatures, long or non-ASCII node IDs (2-, 3- and 4-byte characters, keys sharing long prefixes) and long summaries, above
+  and below the splits. J's per-byte cost is from the code. A root chain whose node IDs are libp2p peer IDs produces ASCII IDs only.
 - **The vault term is K = 64's worst call,** which is above every test-pair call. K = 128 or larger would need its own vault measurement.
 - **The receipt walk's fixed part** (a receipt with no other logs) is about 250 gas above its terms; the verifier's base covers it.
 - **The replayed probe and decompression counts** are checked against the verifier's code and through the lab's totals, not against the

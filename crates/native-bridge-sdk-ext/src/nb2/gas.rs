@@ -177,7 +177,8 @@ pub mod redeem_gas {
     pub const PER_UC_SIGNATURE: u64 = 1_784;
     pub const PER_UC_STC: u64 = 1_798;
     pub const PER_UC_UTC: u64 = 2_146;
-    pub const PER_UC_SLOW_BYTE: u64 = 315;
+    pub const PER_UC_SLOW_BYTE: u64 = 367;
+    pub const PER_UC_KEY_WORD: u64 = 320;
     pub const PER_KEY_LOOKUP: u64 = 0;
     pub const PER_DECOMPRESS: u64 = 2_100;
     pub const PER_PROBE: u64 = 270;
@@ -226,6 +227,7 @@ struct UcShape {
     stc: usize,
     utc: usize,
     slow: usize,
+    key_words: usize,
     epoch: Option<u64>,
     claim_bytes: usize,
     claim_key: Option<[u8; 32]>,
@@ -249,6 +251,7 @@ pub struct UcCost {
     pub stc: usize,
     pub utc: usize,
     pub slow: usize,
+    pub key_words: usize,
 }
 
 /// The helper's certificate() on one UC, at the bound's coefficients (its execution and its frame's memory).
@@ -262,6 +265,7 @@ pub fn helper_gas(c: &UcCost) -> u64 {
         + g::PER_UC_STC * u(c.stc)
         + g::PER_UC_UTC * u(c.utc)
         + g::PER_UC_SLOW_BYTE * u(c.slow)
+        + g::PER_UC_KEY_WORD * u(c.key_words)
         + helper_memory(c.bytes)
 }
 
@@ -283,6 +287,7 @@ pub struct RedeemFeatures {
     pub uc_stc: usize,
     pub uc_utc: usize,
     pub uc_slow: usize,
+    pub uc_key_words: usize,
     pub helper_memory: u64,
     pub evm_uc: UcCost,
     pub rcpt_items: usize,
@@ -359,6 +364,15 @@ pub fn cbor_count(b: &[u8]) -> CborCount {
     c
 }
 
+/// The words Nb2Cert._less reads comparing encoded keys A and B (`gas.ts` compareWords).
+fn compare_words(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    match (0..n).find(|&i| a[i] != b[i]) {
+        Some(i) => i / 32 + 1,
+        None => ceil32(n).max(1),
+    }
+}
+
 /// A UC in Nb2Cert.parse's shape: tag 39001 [1, IR, trHash, scHash, STC, UTC, seal]; None when it is not that shape.
 fn uc_shape(uc: &[u8]) -> Option<UcShape> {
     let it = scan_native(uc).ok()?;
@@ -380,6 +394,7 @@ fn uc_shape(uc: &[u8]) -> Option<UcShape> {
         return None;
     }
     let mut slow = 0;
+    let mut key_words = 0;
     for k in (0..sigs.kids.len()).step_by(2) {
         if sigs.kids[k].major != 3 {
             return None;
@@ -387,6 +402,9 @@ fn uc_shape(uc: &[u8]) -> Option<UcShape> {
         let id = sigs.kids[k].data;
         if id.iter().any(|&x| x >= 0x80) {
             slow += id.len();
+        }
+        if k > 0 {
+            key_words += compare_words(raw(uc, &sigs.kids[k - 2]), raw(uc, &sigs.kids[k])) - 1;
         }
     }
     let state_hash = bytes_n(&irc[4], 32).ok()?;
@@ -411,6 +429,7 @@ fn uc_shape(uc: &[u8]) -> Option<UcShape> {
         stc: stc[2].kids.len(),
         utc: utc[2].kids.len(),
         slow,
+        key_words,
         epoch: Some(seal[3].arg),
         claim_bytes: claim.len(),
         claim_key: Some(he(&[&claim])),
@@ -742,6 +761,7 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
             stc: g::PENDING_STC,
             utc: g::PENDING_UTC,
             slow: g::PENDING_SIGNATURES * g::PENDING_ID_BYTES,
+            key_words: (g::PENDING_SIGNATURES - 1) * (ceil32(g::PENDING_ID_BYTES + 2) - 1),
             epoch: None,
             claim_bytes: 4 + 2 + g::PENDING_SHARD_BYTES + 96 + 4 + g::PENDING_UC_BYTES,
             claim_key: None,
@@ -886,6 +906,7 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
         uc_stc: evm.stc,
         uc_utc: evm.utc,
         uc_slow: evm.slow,
+        uc_key_words: evm.key_words,
         helper_memory: memory_gas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
         evm_uc: UcCost {
             bytes: evm.bytes,
@@ -894,6 +915,7 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
             stc: evm.stc,
             utc: evm.utc,
             slow: evm.slow,
+            key_words: evm.key_words,
         },
         uc_costs: Vec::new(),
         rcpt_items: rcpt.items,
@@ -930,6 +952,7 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
         f.uc_stc += st.uc.stc;
         f.uc_utc += st.uc.utc;
         f.uc_slow += st.uc.slow;
+        f.uc_key_words += st.uc.key_words;
         f.helper_memory += helper_memory(st.uc.bytes);
         let c = UcCost {
             bytes: st.uc.bytes,
@@ -938,6 +961,7 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
             stc: st.uc.stc,
             utc: st.uc.utc,
             slow: st.uc.slow,
+            key_words: st.uc.key_words,
         };
         if !f.uc_costs.contains(&c) {
             f.uc_costs.push(c);
@@ -1086,6 +1110,7 @@ pub fn price_features(f: &RedeemFeatures, evidence_bytes: usize, proofs: u64, k:
         + g::PER_UC_STC * u(f.uc_stc)
         + g::PER_UC_UTC * u(f.uc_utc)
         + g::PER_UC_SLOW_BYTE * u(f.uc_slow)
+        + g::PER_UC_KEY_WORD * u(f.uc_key_words)
         + f.helper_memory
         + g::PER_KEY_LOOKUP * u(f.key_lookups)
         + g::PER_DECOMPRESS * u(f.decompressions)

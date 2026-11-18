@@ -182,7 +182,9 @@ export const REDEEM_GAS = {
   perUcSignature: 1_784n,
   perUcStc: 1_798n, // the helper's 1,548 and the verifier's _inShard, 250 a shard bit (measured 170)
   perUcUtc: 2_146n,
-  perUcSlowByte: 315n,
+  perUcSlowByte: 367n, // round 3: Nb2Cert._utf8's slow path costs a byte up to 349 (U+10FFFF; 301 on 2-byte, 337 to 342 on 3-byte, 345 on
+  // U+10000), raised 5%
+  perUcKeyWord: 320n, // _less beyond each compare's first word: measured 905 a compare of 128-byte keys sharing 124 bytes (3 more words), raised 5%
   perKeyLookup: 0n,
   perDecompress: 2_100n,
   perProbe: 270n,
@@ -234,20 +236,21 @@ interface UcShape {
   stc: number; // shard tree siblings (= the shard's depth)
   utc: number; // unicity tree steps
   slow: number; // bytes of node IDs with a non-ASCII byte (the helper's byte-wise UTF-8 check)
+  keyWords: number; // words _less compares beyond the first, over the seal's consecutive keys
   epoch: bigint | null; // null: unknown (the pending burn's)
   claimBytes: number; // 4 + 2 + shard + 96 + 4 + bytes
   claimKey: string | null; // keccak of the claim; null: unknown
 }
 
 /** A UC's shape as the helper's parse prices it. */
-export interface UcCost { bytes: number; ir: number; signatures: number; stc: number; utc: number; slow: number }
+export interface UcCost { bytes: number; ir: number; signatures: number; stc: number; utc: number; slow: number; keyWords: number }
 
 /** The helper's certificate() on one UC, at the bound's coefficients (its execution and its frame's memory). */
 export function helperGas(c: UcCost): bigint {
   const g = REDEEM_GAS;
   const B = (n: number): bigint => BigInt(n);
   return g.perUcParse + g.perUcByte * B(c.bytes) + g.perUcIrByte * B(c.ir) + g.perUcSignature * B(c.signatures) + g.perUcStc * B(c.stc) + g.perUcUtc * B(c.utc)
-    + g.perUcSlowByte * B(c.slow) + helperMemory(c.bytes);
+    + g.perUcSlowByte * B(c.slow) + g.perUcKeyWord * B(c.keyWords) + helperMemory(c.bytes);
 }
 
 /** What the bound counts, extracted from the lineage. */
@@ -267,6 +270,7 @@ export interface RedeemFeatures {
   ucStc: number;
   ucUtc: number;
   ucSlow: number;
+  ucKeyWords: number;
   helperMemory: bigint; // the helper frames' memory expansion
   evmUc: UcCost; // J's EVM UC (the helper's receiptLog parses it)
   rcptItems: number; // RLP items check() visits: the header, every trie node, the receipt
@@ -467,6 +471,13 @@ function receiptShape(header: Uint8Array, nodes: Uint8Array[], logIndex: bigint)
   return { items: c.items, long: c.long, lists: c.lists, heads, longHeads, kids, words };
 }
 
+/** The words Nb2Cert._less reads comparing encoded keys A and B: up to the first word that differs within the shorter (at least one). */
+function compareWords(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return Math.floor(i / 32) + 1;
+  return Math.max(1, ceil32(n));
+}
+
 const u32 = (v: number): Uint8Array => Uint8Array.of(v >>> 24, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
 
 /** A UC in Nb2Cert.parse's shape: tag 39001 [1, IR, trHash, scHash, STC, UTC, seal]; null when it is not that shape. */
@@ -485,14 +496,16 @@ function ucShape(uc: Uint8Array): UcShape | null {
     if (stc[2].major !== 4 || !isUint(utc[1]) || utc[2].major !== 4 || !isUint(seal[3]) || sigs.major !== 5) return null;
     if (utc[1].arg > 0xffffffffn || shard.length > 0xffff) return null;
     let slow = 0;
+    let keyWords = 0;
     for (let k = 0; k < sigs.kids.length; k += 2) {
       const id = sigs.kids[k].data;
       if (sigs.kids[k].major !== 3 || id === undefined) return null;
       if (id.some((x) => x >= 0x80)) slow += id.length;
+      if (k > 0) keyWords += compareWords(raw(uc, sigs.kids[k - 2]), raw(uc, sigs.kids[k])) - 1;
     }
     const claim = concat(u32(Number(utc[1].arg)), u16(shard.length), shard, sch, bytesN(irc[4], 32), HU(raw(uc, ir)), u32(uc.length), uc);
     return {
-      bytes: uc.length, ir: ir.end - ir.start, signatures: sigs.kids.length / 2, stc: stc[2].kids.length, utc: utc[2].kids.length, slow, epoch: seal[3].arg,
+      bytes: uc.length, ir: ir.end - ir.start, signatures: sigs.kids.length / 2, stc: stc[2].kids.length, utc: utc[2].kids.length, slow, keyWords, epoch: seal[3].arg,
       claimBytes: claim.length, claimKey: toHex(HE(claim)),
     };
   } catch {
@@ -576,7 +589,8 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
   const head = headOf(part);
   if (pending) {
     const uc: UcShape = {
-      bytes: g.pendingUcBytes, ir: g.pendingIrBytes, signatures: g.pendingSignatures, stc: g.pendingStc, utc: g.pendingUtc, slow: g.pendingSignatures * g.pendingIdBytes, epoch: null,
+      bytes: g.pendingUcBytes, ir: g.pendingIrBytes, signatures: g.pendingSignatures, stc: g.pendingStc, utc: g.pendingUtc, slow: g.pendingSignatures * g.pendingIdBytes,
+      keyWords: (g.pendingSignatures - 1) * (ceil32(g.pendingIdBytes + 2) - 1), epoch: null,
       claimBytes: 4 + 2 + g.pendingShardBytes + 96 + 4 + g.pendingUcBytes, claimKey: null,
     };
     steps.push({ tx: g.pendingTxBytes, siblings: g.pendingSiblings, uc, sid: stateId(head.owner, head.state) });
@@ -682,8 +696,8 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
   }
   const f: RedeemFeatures = {
     tokens: L.length, edges: L.length - 1, allocSteps, steps: n, parentSteps: L.slice(0, -1).reduce((m, t) => m + 1 + t.transfers.length, 0), txWords: 0, maxTx: 0, siblings: 0, ucParses: n + 1, ucBytes: evm.bytes, ucIr: evm.ir, ucSignatures: evm.signatures,
-    ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, helperMemory: memoryGas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
-    evmUc: { bytes: evm.bytes, ir: evm.ir, signatures: evm.signatures, stc: evm.stc, utc: evm.utc, slow: evm.slow }, ucCosts: [],
+    ucStc: evm.stc, ucUtc: evm.utc, ucSlow: evm.slow, ucKeyWords: evm.keyWords, helperMemory: memoryGas(3 * ceil32(evm.bytes) + 64 + rcpt.words),
+    evmUc: { bytes: evm.bytes, ir: evm.ir, signatures: evm.signatures, stc: evm.stc, utc: evm.utc, slow: evm.slow, keyWords: evm.keyWords }, ucCosts: [],
     rcptItems: rcpt.items, rcptLong: rcpt.long, rcptLists: rcpt.lists, rcptHeads: rcpt.heads, rcptLongHeads: rcpt.longHeads, rcptKids: rcpt.kids, rcptWords: rcpt.words,
     pathWords: 0, maxUc: evm.bytes, scratch: 24, scan, skip, jBytes: j.length,
     keyLookups, decompressions: keys.misses, probes: keys.probes + sids.probes + claimIds.probes + unknownProbes, claims,
@@ -705,9 +719,11 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
     f.ucStc += st.uc.stc;
     f.ucUtc += st.uc.utc;
     f.ucSlow += st.uc.slow;
+    f.ucKeyWords += st.uc.keyWords;
     f.helperMemory += helperMemory(st.uc.bytes);
-    const c = { bytes: st.uc.bytes, ir: st.uc.ir, signatures: st.uc.signatures, stc: st.uc.stc, utc: st.uc.utc, slow: st.uc.slow };
-    if (!f.ucCosts.some((x) => x.bytes === c.bytes && x.ir === c.ir && x.signatures === c.signatures && x.stc === c.stc && x.utc === c.utc && x.slow === c.slow)) {
+    const c = { bytes: st.uc.bytes, ir: st.uc.ir, signatures: st.uc.signatures, stc: st.uc.stc, utc: st.uc.utc, slow: st.uc.slow, keyWords: st.uc.keyWords };
+    if (!f.ucCosts.some((x) => x.bytes === c.bytes && x.ir === c.ir && x.signatures === c.signatures && x.stc === c.stc && x.utc === c.utc && x.slow === c.slow
+      && x.keyWords === c.keyWords)) {
       f.ucCosts.push(c);
     }
     f.pathWords += 1 + ceil32(104 + 32 * (st.siblings + 1));
@@ -814,7 +830,7 @@ export function priceFeatures(f: RedeemFeatures, evidenceBytes: number, proofs: 
   const execution = g.verifierBase + g.perToken * B(f.tokens) + g.perEdge * B(f.edges) + g.perAllocStep * B(f.allocSteps) + g.perStep * B(f.steps) + g.perParentStep * B(f.parentSteps)
     + g.perTxWord * B(f.txWords) + g.perSibling * B(f.siblings) + walkGas(f)
     + g.perUcParse * B(f.ucParses) + g.perUcByte * B(f.ucBytes) + g.perUcIrByte * B(f.ucIr) + g.perUcSignature * B(f.ucSignatures) + g.perUcStc * B(f.ucStc) + g.perUcUtc * B(f.ucUtc)
-    + g.perUcSlowByte * B(f.ucSlow) + f.helperMemory
+    + g.perUcSlowByte * B(f.ucSlow) + g.perUcKeyWord * B(f.ucKeyWords) + f.helperMemory
     + g.perKeyLookup * B(f.keyLookups) + g.perDecompress * B(f.decompressions) + g.perProbe * B(f.probes) + g.perClaim * B(f.claims.length) + g.jByte * B(f.jBytes)
     + receiptWalkGas(f) + g.coldAccess;
   const memoryWords = verifierMemoryWords(f);
