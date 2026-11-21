@@ -10,6 +10,7 @@ use num_bigint::BigUint;
 use super::config::{
     asset_uct, construct, domain_of, log2, Config, Environment, Params, MAX_DEPOSIT, MAX_SEGMENT,
 };
+use super::crypto::parse_key;
 use super::deposit::{FIRST_OWNER_BYTES, FIRST_OWNER_PREFIX};
 use super::errors::{fail, Error, Nb2Error, Result, Rule};
 use super::segment::{bucket_of, fold_history, gap_proof_len, genesis_head, next_head, GapTree};
@@ -230,8 +231,8 @@ impl VaultModel {
             return fail(Rule::ZeroValue);
         }
         if first_owner.len() != FIRST_OWNER_BYTES
-            || first_owner[..9] != FIRST_OWNER_PREFIX
-            || (first_owner[9] != 2 && first_owner[9] != 3)
+            || first_owner[..FIRST_OWNER_PREFIX.len()] != FIRST_OWNER_PREFIX
+            || parse_key(&first_owner[FIRST_OWNER_PREFIX.len()..]).is_err()
         {
             return fail(Rule::BadFirstOwner);
         }

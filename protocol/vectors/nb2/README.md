@@ -8,7 +8,8 @@ protocol 9). Consumers import it by the digest in `nb2-vectors.json.sha256`. The
 go run ./nb2ref/cmd/nb2vectors -out <this directory>     # in a ristik/bft-core checkout
 ```
 
-The output is a pure function of the code, and bft-core `nb2ref/testdata/nb2-vectors.json.sha256` pins the same digest.
+The output is a pure function of the code. This copy was generated at bft-core commit `d8800f36d`, whose
+`nb2ref/testdata/nb2-vectors.json.sha256` pins the same digest.
 While the file is generated, the reference replays every vector. Negative vectors are isolated: each faults one rule,
 and every other check of its input holds. The exceptions are the deliberate multi-fault ordering vectors
 `LogEmitter-before-topics`, `SealRoot-before-epoch`, `DepositUC-root-before-epoch`, `seal-root-before-epoch` and the

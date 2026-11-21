@@ -166,6 +166,9 @@ pub fn decode_deposit_proof(b: &[u8]) -> Result<DepositProof> {
     if b.len() > limits::JUSTIFICATION_BYTES {
         return fail(Rule::InputTooLarge);
     }
+    if b.first().is_some_and(|head| head >> 5 != MAJ_ARRAY) {
+        return fail(Rule::Shape);
+    }
     decode_deposit_proof_item(&scan_one(b)?)
 }
 

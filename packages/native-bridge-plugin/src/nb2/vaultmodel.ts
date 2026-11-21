@@ -6,6 +6,7 @@
  */
 import { eq, toHex } from '../bytes.js';
 import { ASSET_UCT, MAX_DEPOSIT, MAX_SEGMENT, construct, domainOf, log2, type Config, type Environment, type Params } from './config.js';
+import { parseKey } from './crypto.js';
 import { FIRST_OWNER_BYTES, FIRST_OWNER_PREFIX } from './deposit.js';
 import { Nb2Error, fail } from './errors.js';
 import { GapTree, bucketOf, cmp, foldHistory, gapProofLen, genesisHead, nextHead } from './segment.js';
@@ -87,7 +88,12 @@ export class VaultModel {
   public deposit(value: bigint, firstOwner: Uint8Array, rho: Uint8Array): void {
     if (this.entered) fail('Reentrancy');
     if (value <= 0n) fail('ZeroValue');
-    if (firstOwner.length !== FIRST_OWNER_BYTES || !eq(firstOwner.subarray(0, 9), FIRST_OWNER_PREFIX) || (firstOwner[9] !== 2 && firstOwner[9] !== 3)) fail('BadFirstOwner');
+    if (firstOwner.length !== FIRST_OWNER_BYTES || !eq(firstOwner.subarray(0, FIRST_OWNER_PREFIX.length), FIRST_OWNER_PREFIX)) fail('BadFirstOwner');
+    try {
+      parseKey(firstOwner.subarray(FIRST_OWNER_PREFIX.length));
+    } catch {
+      fail('BadFirstOwner');
+    }
     if (value > this.cfg.Qmax - this.q) throw argsErr('LiabilityCap', this.q, value, this.cfg.Qmax);
     const n = this.n;
     if (n >= MAX_DEPOSIT) fail('DepositCounterExhausted');

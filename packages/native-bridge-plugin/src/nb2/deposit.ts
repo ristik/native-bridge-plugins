@@ -3,7 +3,7 @@ import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
 import { concat, eq } from '../bytes.js';
-import { array, ascii, bstr, bytesN, cArr, cBytes, cTag, cUint, scanOne, tagContent, u256, uintIn, version, type Item } from './cbor.js';
+import { MAJ_ARRAY, array, ascii, bstr, bytesN, cArr, cBytes, cTag, cUint, scanOne, tagContent, u256, uintIn, version, type Item } from './cbor.js';
 import { DOMAIN, MAX_DEPOSIT, MAX_INDEX, TAG, V2_VERSION, type Config } from './config.js';
 import { HE, HU } from './crypto.js';
 import { fail } from './errors.js';
@@ -67,6 +67,7 @@ export function decodeReceiptBacking(b: Uint8Array): ReceiptBacking {
 /** A standalone DepositProof container (a seal receipt). */
 export function decodeDepositProof(b: Uint8Array): DepositProof {
   if (b.length > LIMITS.justificationBytes) fail('InputTooLarge');
+  if (b.length !== 0 && b[0] >> 5 !== MAJ_ARRAY) fail('Shape');
   return decodeDepositProofItem(scanOne(b));
 }
 

@@ -16,6 +16,7 @@ class NB2VectorTests(unittest.TestCase):
 
     def test_digest(self):
         want = (DIR / 'nb2-vectors.json.sha256').read_text().strip()
+        self.assertEqual(want, '74cdb261ba65c0b052a34bc7cd2dbcc91a5d0f7fc7cca01f3639a7d4990c11ed')
         self.assertEqual(hashlib.sha256(self.raw).hexdigest(), want)
 
     def test_profile_and_protocol(self):
@@ -42,7 +43,7 @@ class NB2VectorTests(unittest.TestCase):
 
 class ContinuationVectorTests(unittest.TestCase):
     def test_pinned_manifests_and_files(self):
-        self.assertGreater(check(), 100)
+        self.assertEqual(check(), 283)
 
 
 if __name__ == '__main__':

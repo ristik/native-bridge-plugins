@@ -2,6 +2,7 @@
 
 use native_bridge_sdk_ext::nb2::config::{decode_config, domain_of, production_params};
 use native_bridge_sdk_ext::nb2::crypto::hu;
+use native_bridge_sdk_ext::nb2::errors::Rule;
 use native_bridge_sdk_ext::nb2::split::{
     decode_split_justification, decode_sum_proof, encode_split_justification, encode_sum_proof,
     parent_link, split_output_commitment,
@@ -11,7 +12,7 @@ use native_bridge_sdk_ext::nb2::token::{
     signature_predicate, state_id, value_data, Token,
 };
 use native_bridge_sdk_ext::nb2::trust::TrustInput;
-use native_bridge_sdk_ext::nb2::util::from_hex;
+use native_bridge_sdk_ext::nb2::util::{from_hex, u256};
 use native_bridge_sdk_ext::nb2::verify::{verdict_abi, verify_held, verify_return, verify_split};
 
 const DIR: &str = concat!(
@@ -70,6 +71,10 @@ fn independent_signed_transcripts() {
         "held-sibling-2",
         "parent-over-32-pages",
         "transfers-600",
+        "shared-claim",
+        "alternate-certificate",
+        "capped-root",
+        "combined-large-receipt-and-paths",
     ] {
         let evidence = read(&format!("transcripts/{name}/evidence.bin"));
         let trust = TrustInput::from_bundle(
@@ -107,18 +112,57 @@ fn independent_signed_transcripts() {
             }
         }
         if expected.is_empty() {
-            assert!(
-                verify_held(&cfg, &domain, &trust, &part)
-                    .unwrap()
-                    .amount
-                    .bits()
-                    > 0
+            let held = verify_held(&cfg, &domain, &trust, &part).unwrap();
+            let holding = [
+                held.owner.params.as_slice(),
+                &held.state,
+                &held.token_id,
+                &u256(&held.amount),
+            ]
+            .concat();
+            assert_eq!(
+                holding,
+                read(&format!("transcripts/{name}/holding.bin")),
+                "{name}"
             );
         } else {
             let v = verify_return(&gamma, &evidence, &trust, &params)
                 .unwrap_or_else(|e| panic!("{name}: {e:?}"));
             assert_eq!(verdict_abi(&v), expected, "{name}");
         }
+    }
+}
+
+#[test]
+fn published_malformed_lineages_are_refused() {
+    let gamma = read("gamma.bin");
+    let params = production_params();
+    let cfg = decode_config(&gamma, &params).unwrap();
+    let trust =
+        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
+    let cases = [
+        ("continuing-transfer-data", Rule::TransferData),
+        ("expired-transfer", Rule::DeadlineExpired),
+        ("recursive-reason", Rule::InputTooLarge),
+        ("repeated-mint-sid", Rule::RepeatedSID),
+        ("wrong-amount", Rule::SplitProof),
+        ("wrong-deadline", Rule::SplitProof),
+        ("wrong-link", Rule::SplitJustif),
+        ("wrong-root-amount", Rule::MintData),
+        ("wrong-root-owner", Rule::MintOwner),
+        ("wrong-root-secret", Rule::SecretOpening),
+        ("wrong-sum", Rule::SplitSum),
+    ];
+    for (name, rule) in cases {
+        let path = format!("transcripts/refusals/{name}");
+        assert_eq!(read(&format!("{path}/stage.txt")), b"BadStep\n");
+        let evidence = read(&format!("{path}/evidence.bin"));
+        let error = verify_return(&gamma, &evidence, &trust, &params).unwrap_err();
+        assert_eq!(
+            error.rule().map(|error| error.rule),
+            Some(rule),
+            "{name}: {error:?}"
+        );
     }
 }
 

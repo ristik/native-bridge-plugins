@@ -2,7 +2,7 @@
 
 Status: **NB2 continuation v1.1, `NATIVE_BRIDGE_PROTO_VERSION=10`, development profile.** The plug-ins implement the
 configuration and lineage relation from §§1–2 and the authority and object bounds from §§4–5 and 7 of the
-[NB2 continuation specification](https://github.com/ristik/bft-core/blob/2724e41be/docs/design/nb2-continuation-v1.1.md).
+[NB2 continuation specification](https://github.com/ristik/bft-core/blob/d8800f36d/docs/design/nb2-continuation-v1.1.md).
 Use a fresh generation and a deployment manifest that authenticates that release, its profile digest and execution history.
 The protocol 10 decoder accepts only the flat wire below.
 
@@ -399,8 +399,8 @@ return data): call `verifyReturn` directly or run the wallet's own verifier to r
 ## Corpus
 
 `protocol/vectors/nb2-continuation-v1.1/` contains T1's golden bytes and signed transcripts from bft-core
-commit `2724e41be`. Both SDK extension suites verify the transcript lineage against its pinned UTB.
-The transcript manifest digest is `39657f1e66eec4c9b1c02e91feb109999cb7d64e8c60ade2110f70dfd8f9220e`.
+commit `d8800f36d`. Both SDK extension suites verify the transcript lineage against its pinned UTB.
+The transcript manifest digest is `41856353c08fa85b87ce59e470ac152213ac7de3031fb8a721989ae08755a651`.
 `protocol/vectors/nb2/` retains protocol 9 vectors for common custody, receipt and primitive regression checks.
 The old gas calibration is retained for historical comparison. The default measured gas model requires its
 calibrated artifacts, so protocol 10 must use a qualified model supplied for its deployment before wallet burns.

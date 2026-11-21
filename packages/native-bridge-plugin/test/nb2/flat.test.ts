@@ -3,12 +3,13 @@ import { readFileSync } from 'node:fs';
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import { test } from 'node:test';
+import { concat } from '../../src/bytes.js';
 import { decodeConfig, domainOf, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { TrustInput } from '../../src/nb2/trust.js';
 import { decodeToken, encodeToken, encodeMint, encodeTransfer, encodeCertification, lineageOf, stateId, tokenIdOf, valueData } from '../../src/nb2/token.js';
 import { decodeSplitJustification, decodeSumProof, encodeSplitJustification, encodeSumProof, parentLink, splitOutputCommitment, SumTree } from '../../src/nb2/split.js';
 import { mintRequest } from '../../src/nb2/tokenops.js';
-import { ascii, u16, u64 } from '../../src/nb2/cbor.js';
+import { ascii, u16, u64, u256 } from '../../src/nb2/cbor.js';
 import { HE, HU } from '../../src/nb2/crypto.js';
 import { verdictAbi, verifyHeld, verifyReturn, verifySplit } from '../../src/nb2/verify.js';
 
@@ -17,7 +18,8 @@ const read = (name: string): Uint8Array => Uint8Array.from(readFileSync(new URL(
 const gamma = read('gamma.bin');
 const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
 const domain = domainOf(gamma);
-const scenarios = ['root', 'transfers', 'one-split', 'depth-20', 'held-sibling-0', 'held-sibling-1', 'held-sibling-2', 'parent-over-32-pages', 'transfers-600'];
+const scenarios = ['root', 'transfers', 'one-split', 'depth-20', 'held-sibling-0', 'held-sibling-1', 'held-sibling-2', 'parent-over-32-pages', 'transfers-600',
+  'shared-claim', 'alternate-certificate', 'capped-root', 'combined-large-receipt-and-paths'];
 
 function pageRoot(evidence: Uint8Array): Uint8Array {
   const domainHash = (label: string, ...fields: Uint8Array[]): Uint8Array =>
@@ -79,10 +81,36 @@ for (const name of scenarios) {
         assert.deepEqual(HU(level.transfersRaw[j]), level.proofs[j].cd.txHash);
       }
     }
-    if (expected.length === 0) assert.ok((await verifyHeld(cfg, domain, trust, part)).amount > 0n);
-    else assert.deepEqual(verdictAbi(await verifyReturn(gamma, evidence, trust, PRODUCTION_PARAMS)), expected);
+    if (expected.length === 0) {
+      const held = await verifyHeld(cfg, domain, trust, part);
+      assert.deepEqual(concat(held.owner.params, held.state, held.tokenId, u256(held.amount)), read(path + 'holding.bin'));
+    } else {
+      assert.deepEqual(verdictAbi(await verifyReturn(gamma, evidence, trust, PRODUCTION_PARAMS)), expected);
+    }
   });
 }
+
+test('published alternate certificate preserves the shared claim return', () => {
+  const original = 'transcripts/shared-claim/';
+  const alternate = 'transcripts/alternate-certificate/';
+  assert.notDeepEqual(pageRoot(read(original + 'evidence.bin')), pageRoot(read(alternate + 'evidence.bin')));
+  assert.deepEqual(read(original + 'verdict.bin'), read(alternate + 'verdict.bin'));
+});
+
+test('published malformed lineages are refused', async () => {
+  const trust = await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis);
+  const cases = {
+    'continuing-transfer-data': 'TransferData', 'expired-transfer': 'DeadlineExpired',
+    'recursive-reason': 'InputTooLarge', 'repeated-mint-sid': 'RepeatedSID',
+    'wrong-amount': 'SplitProof', 'wrong-deadline': 'SplitProof', 'wrong-link': 'SplitJustif',
+    'wrong-root-amount': 'MintData', 'wrong-root-owner': 'MintOwner', 'wrong-root-secret': 'SecretOpening', 'wrong-sum': 'SplitSum',
+  };
+  for (const [name, rule] of Object.entries(cases)) {
+    const path = `transcripts/refusals/${name}/`;
+    assert.equal(new TextDecoder().decode(read(path + 'stage.txt')).trim(), 'BadStep');
+    await assert.rejects(verifyReturn(gamma, read(path + 'evidence.bin'), trust, PRODUCTION_PARAMS), { rule }, name);
+  }
+});
 
 test('held siblings require their own allocation and a verified parent spend', async () => {
   const dir = 'transcripts/held-sibling-0/';

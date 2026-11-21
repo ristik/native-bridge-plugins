@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / "protocol/vectors/nb2-continuation-v1.1"
 PINNED = {
     "MANIFEST": "3be02f4163a1a9e06d5b83c0a50ab8468c6a060c1352d3a969a96b477be28034",
-    "transcripts/MANIFEST": "39657f1e66eec4c9b1c02e91feb109999cb7d64e8c60ade2110f70dfd8f9220e",
+    "transcripts/MANIFEST": "41856353c08fa85b87ce59e470ac152213ac7de3031fb8a721989ae08755a651",
 }
 
 
