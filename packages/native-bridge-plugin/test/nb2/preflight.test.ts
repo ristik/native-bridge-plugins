@@ -5,7 +5,7 @@ import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/Cer
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { SignaturePredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicate.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
 import { TokenSalt } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenSalt.js';
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js';
 
@@ -13,7 +13,7 @@ import { eq } from '../../src/bytes.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
-import { decodeToken, signaturePredicate } from '../../src/nb2/token.js';
+import { decodeToken, encodeProof, signaturePredicate } from '../../src/nb2/token.js';
 import { localOwner, mintRequest } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, setup, VAULT } from './world.js';
 import type { GasModel } from '../../src/nb2/gas.js';
@@ -97,7 +97,7 @@ test('index rule: a plain state() read is not evidence outside stateReadOnly; an
   assert.equal((await u.w.planReturn(u.token, r, u.payer.address)).a, 0n);
 });
 
-test('SDK parity: the plug-in mint is the SDK mint, and the SDK decodes the minted token', async () => {
+test('SDK parity: the plug-in mint is the SDK mint, and the SDK decodes its inclusion proof', async () => {
   const s = await minted();
   const t = decodeToken(s.token);
   const sdkMint = await MintTransaction.create(NetworkId.fromId(t.mint.network), SignaturePredicate.create(s.owner.publicKey), {
@@ -106,8 +106,8 @@ test('SDK parity: the plug-in mint is the SDK mint, and the SDK decodes the mint
   assert.ok(eq(sdkMint.toCBOR(), t.mintRaw));
   const ours = mintRequest({ ...t.mint, recipient: signaturePredicate(s.owner.publicKey) });
   assert.ok(eq((await CertificationData.fromMintTransaction(sdkMint)).toCBOR(), ours.cd));
-  const sdk = await SdkToken.fromCBOR(s.token);
-  assert.ok(eq(sdk.toCBOR(), s.token));
+  const proof = encodeProof(t.mintProof);
+  assert.ok(eq(InclusionProof.fromCBOR(proof).toCBOR(), proof));
 });
 
 test('unlock recovery IDs 2 and 3 are refused (astra delta ruling): such a lineage is not returnable', async () => {

@@ -31,17 +31,14 @@ import { burnIndex, capacityExceeded, capacityPreflight, checkStateRead, verifyS
 import { AmbiguousBroadcast, EvmReader, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
 import { buildHistory, checkSegmentLog, gapProofLen, genesisHead, type Segment } from './segment.js';
-import { encodeToken, decodeToken, burnPredicate, signaturePredicate, tokenIdOf, valueData, type Token } from './token.js';
+import { encodeToken, decodeToken, burnPredicate, signaturePredicate, tokenIdOf, valueData, lineageOf } from './token.js';
 import {
-  appendTransfer, certifyChecked, childMint, freshMask, mintRequest, splitPlan, tokenOfMint, transferRequest, type Aggregator, type OwnerSigner,
+  appendTransfer, certifyChecked, childMint, freshMask, mintRequest, splitPlan, tokenOfChild, tokenOfMint, transferRequest, type Aggregator, type OwnerSigner,
 } from './tokenops.js';
 import { bindTrust, type TrustInput } from './trust.js';
-import { decodeEvidence, encodeReturnData, evidenceOf, verifyHeld, verifyPart, type Verdict } from './verify.js';
+import { decodeEvidence, encodeReturnData, evidenceOf, verifyHeld, verifyPart, verifySplit, type Verdict } from './verify.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { decodeSplitJustification } from './split.js';
-import { headTag } from './cbor.js';
-import { TAG } from './config.js';
 
 /** The deployment manifest pins outside D (section 4.3; the manifest schema is NB2-09's). */
 export interface DeploymentPins {
@@ -453,10 +450,10 @@ export class NativeBridgeV2 {
 
   // ==== circulation =====================================================================================================
 
-  /** Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount and owner. */
-  public async verifyToken(token: Uint8Array): Promise<{ tokenId: Uint8Array; amount: bigint; owner: Uint8Array | null }> {
+  /** Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount, owner and spendable state. */
+  public async verifyToken(token: Uint8Array): Promise<{ tokenId: Uint8Array; amount: bigint; owner: Uint8Array | null; state: Uint8Array }> {
     const h = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token)));
-    return { tokenId: h.tokenId, amount: h.amount, owner: h.owner.type === 1n ? h.owner.params : null };
+    return { tokenId: h.tokenId, amount: h.amount, owner: h.owner.type === 1n ? h.owner.params : null, state: h.state };
   }
 
   /** An ordinary transfer to `toKey`; the result is verified before it is returned. */
@@ -470,7 +467,7 @@ export class NativeBridgeV2 {
   }
 
   /**
-   * Split a held token into whole parts (burn-and-mint with the protocol 6 lineage formats). The plan is journaled first, then the burn's
+   * Split a held token into whole parts. The plan is journaled first, then the burn's
    * exact request, the burned parent and each child as it is minted; a call with the same `splitId` resumes.
    */
   public split(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], splitId?: Uint8Array): Promise<Uint8Array[]> {
@@ -482,7 +479,7 @@ export class NativeBridgeV2 {
     let rec = await this.journal.splitForUpdate(hex(id));
     if (rec === null) {
       const held = await this.verifyToken(token);
-      if (outputs.length < 2) refuse('BadInput', 'a split has at least two outputs');
+      if (outputs.length === 0) refuse('BadInput', 'a split requires an output');
       let sum = 0n;
       for (const o of outputs) {
         if (o.amount <= 0n) refuse('BadInput', 'every output amount is positive');
@@ -512,11 +509,13 @@ export class NativeBridgeV2 {
       await this.journal.putSplit(rec);
     }
     const burned = unhex(rec.burned!);
+    const split = await this.retryingTrust(() => verifySplit(this.cfg, this.domain, this.opts.trust, decodeToken(burned)));
+    if (!eq(split.manifest, plan.tree.root)) refuse('ProviderFault', 'certified split manifest differs from the plan');
     for (let k = 0; k < rec.outputs.length; k++) {
       if (rec.outputs[k].token !== null) continue;
-      const m = childMint(burned, plan.tree, plan.children[k]);
-      const { tx, cd } = mintRequest(m);
-      const child = tokenOfMint(tx, await certifyChecked(this.opts.aggregator, cd));
+      const { mint, allocation } = childMint(split.link, plan.tree, plan.children[k]);
+      const { tx, cd } = mintRequest(mint);
+      const child = tokenOfChild(burned, allocation, tx, await certifyChecked(this.opts.aggregator, cd));
       const v = await this.verifyToken(child);
       if (v.amount !== undec(rec.outputs[k].amount)) refuse('ProviderFault', 'a split child has another amount');
       rec.outputs[k].token = hex(child);
@@ -935,15 +934,7 @@ export class NativeBridgeV2 {
   }
 }
 
-/** The lineage of a part, root first. */
-export function lineageOf(part: Token): Token[] {
-  const chain: Token[] = [part];
-  for (let cur = part; cur.mint.justification !== null && headTag(cur.mint.justification) === TAG.splitJustification;) {
-    cur = decodeSplitJustification(cur.mint.justification).parent;
-    chain.unshift(cur);
-  }
-  return chain;
-}
+export { lineageOf };
 
 /**
  * An upper bound of the encoded [burn transfer, inclusion proof] pair with return data of `rLen` bytes: the transfer, the
@@ -952,7 +943,7 @@ export function lineageOf(part: Token): Token[] {
 export const burnPairBound = (rLen: number): number => {
   const transfer = 3 + 1 + 45 + 34 + 3 + rLen + 9;
   const cd = 3 + 1 + 45 + 34 + 34 + 9 + 67;
-  return 4 + transfer + 3 + 1 + cd + 9 + 3 + 32 + 32 * 256 + (24 << 10);
+  return 4 + 1 + transfer + 3 + 1 + cd + 9 + 3 + 32 + 32 * 256 + (24 << 10);
 };
 
 /** Everything of the redeem transaction besides the evidence and the gap proofs: ABI heads and padding, the start head, the envelope. */

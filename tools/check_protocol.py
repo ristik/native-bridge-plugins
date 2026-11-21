@@ -21,20 +21,23 @@ def load(path):
 
 
 def check_v2_profile():
-    """Native bridge v2 (protocol 9, bft-core#1097): the profile binds its normative artifacts by digest."""
+    """Native bridge v2 (protocol 10, bft-core#1097): the profile binds its normative artifacts by digest."""
     profile = load('protocol/profile.json')
-    assert profile['nativeBridgeProtocolVersion'] == 9 and profile['identityFamily'] == 'unicity-native-nb2'
+    assert profile['nativeBridgeProtocolVersion'] == 10 and profile['identityFamily'] == 'unicity-native-nb2-11'
     assert profile['tags']['receiptBacking'] == 39051 and profile['tags']['segmentReturn'] == 39052
     assert profile['versions']['depositProof'] == 1 and profile['versions']['depositProofArity'] == 6
+    assert profile['versions']['config'] == profile['versions']['splitJustification'] == 2
+    assert profile['flatEvidence']['wireVersion'] == 0x0101
+    assert profile['flatEvidence']['magic'] == 'NB2L'
     assert 'pdrBytes' not in profile['limits']
     assert set(profile['normativeArtifactSha256']) == set(profile['normativeArtifacts'])
     for name, expected in profile['normativeArtifactSha256'].items():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, f'v2 normative artifact digest mismatch: {name}'
     abi = load('protocol/abi.json')
-    assert abi['nativeBridgeProtocolVersion'] == 9
+    assert abi['nativeBridgeProtocolVersion'] == 10
     assert [f['name'] for f in abi['vault']['functions']] == ['deposit', 'redeem', 'domain', 'config', 'state']
     assert len({e['selector'] for e in abi['vault']['errors']}) == len(abi['vault']['errors'])
-    assert 'NATIVE_BRIDGE_PROTO_VERSION=9' in (ROOT / 'protocol/interop.md').read_text()
+    assert 'NATIVE_BRIDGE_PROTO_VERSION=10' in (ROOT / 'protocol/interop.md').read_text()
 
 
 def main():

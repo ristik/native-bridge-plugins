@@ -17,8 +17,8 @@ test('the package root loads without Node process/Buffer and exports the trust i
   }
 });
 
-test('the nb2 entry is protocol 9', async () => {
+test('the nb2 entry is protocol 10', async () => {
   const p = await import('../../packages/native-bridge-plugin/lib/nb2/index.js');
-  assert.equal(p.NATIVE_BRIDGE_PROTO_VERSION, 9);
+  assert.equal(p.NATIVE_BRIDGE_PROTO_VERSION, 10);
   assert.equal(typeof p.NativeBridgeV2, 'function');
 });

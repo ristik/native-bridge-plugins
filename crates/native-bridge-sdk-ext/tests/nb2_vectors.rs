@@ -10,7 +10,7 @@ use native_bridge_sdk_ext::nb2::abi::{
     classify_redeem_error, decode_revert, revert_data, selector, selector_of, signature_of, ErrArg,
 };
 use native_bridge_sdk_ext::nb2::config::{
-    asset_uct, build_params, construct, decode_config, domain_of, Build, Environment,
+    asset_uct, build_params, decode_config, domain_of, Build, Config,
 };
 use native_bridge_sdk_ext::nb2::crypto::{minter_scalar_valid, verify_unlock_digest};
 use native_bridge_sdk_ext::nb2::deposit::{
@@ -28,7 +28,7 @@ use native_bridge_sdk_ext::nb2::util::{arr, from_hex, hex0x, u256, u256_64};
 use native_bridge_sdk_ext::nb2::vaultmodel::{
     RecipientBehaviour, VaultEvent, VaultModel, VerifierAnswer,
 };
-use native_bridge_sdk_ext::nb2::verify::{verdict_abi, verify_return};
+use native_bridge_sdk_ext::nb2::verify::decode_evidence;
 use native_bridge_sdk_ext::trust::TrustInput;
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -133,18 +133,6 @@ fn norm(x: &Value) -> Value {
     json!({"error": s("error"), "args": x.get("args").cloned().unwrap_or(json!([])), "onChain": s("onChainError"), "revert": s("revert")})
 }
 
-/// A ConfigShape error carries its field; the vectors name only the rule.
-fn plain(e: Error) -> Error {
-    match e {
-        Error::Rule(mut n) if n.config_field.is_some() => {
-            n.config_field = None;
-            n.detail = None;
-            Error::Rule(n)
-        }
-        other => other,
-    }
-}
-
 struct Dep {
     trust: TrustInput,
     gamma: Vec<u8>,
@@ -240,86 +228,24 @@ fn primitives() {
     }
 }
 
-#[test]
-fn deployments_decode_under_their_build() {
-    let (_, f) = file();
-    for (name, v) in f["deployments"].as_object().unwrap() {
-        let cfg = decode_config(&hx(&v["gamma"]), &build_params(build_of(v))).unwrap();
-        assert_eq!(hex0x(&domain_of(&hx(&v["gamma"]))), v["domain"], "{name}");
-        assert_eq!(cfg.k, u(&v["K"]));
-        assert_eq!(cfg.b, u(&v["B"]));
-    }
-    assert_eq!(
-        deployments(&f).len(),
-        f["deployments"].as_object().unwrap().len()
-    );
+// Historical custody vectors retain their original domain. Only their unchanged configuration fields are used.
+fn fixture_config(gamma: &[u8], build: Build) -> Config {
+    let mut cfg = gamma.to_vec();
+    cfg[17] = 2;
+    decode_config(&cfg, &build_params(build)).unwrap()
 }
 
 #[test]
-fn config_shape_and_bad_config() {
+fn protocol_9_signed_corpus_is_refused_by_protocol_10() {
     let (_, f) = file();
-    for v in f["config"].as_array().unwrap() {
-        let p = build_params(build_of(
-            &f["deployments"][v["deployment"].as_str().unwrap()],
-        ));
-        let gamma = hx(&v["gamma"]);
-        let ve = decode_config(&gamma, &p).err().map(plain);
-        let env = Environment {
-            address: arr(&hx(&v["address"])),
-            chain_id: u(&v["chainId"]),
-            verifier_code_hash: arr(&hx(&v["verifierCodeHash"])),
-        };
-        let ce = construct(&gamma, &env, &p).err();
-        assert_eq!(
-            expect_of(ve.as_ref()),
-            norm(&v["verifier"]),
-            "{} verifier: {ve:?}",
-            v["id"]
-        );
-        assert_eq!(
-            expect_of(ce.as_ref()),
-            norm(&v["constructor"]),
-            "{} constructor: {ce:?}",
-            v["id"]
-        );
+    for d in f["deployments"].as_object().unwrap().values() {
+        let gamma = hx(&d["gamma"]);
+        assert!(decode_config(&gamma, &build_params(build_of(d))).is_err());
+        assert_eq!(hex0x(&domain_of(&gamma)), d["domain"].as_str().unwrap());
     }
-}
-
-#[test]
-fn verifier_on_every_token_vector() {
-    let (_, f) = file();
-    let deps = deployments(&f);
-    let mut failures = Vec::new();
-    for v in f["verifier"].as_array().unwrap() {
-        let d = &deps[v["deployment"].as_str().unwrap()];
-        let gamma = if v["gamma"].is_string() {
-            hx(&v["gamma"])
-        } else {
-            d.gamma.clone()
-        };
-        let r = verify_return(
-            &gamma,
-            &hx(&v["evidence"]),
-            &d.trust,
-            &build_params(d.build),
-        );
-        let e = r.as_ref().err().cloned().map(plain);
-        if expect_of(e.as_ref()) != norm(&v["expect"]) {
-            failures.push(format!(
-                "{}: got {} ({e:?}), want {}",
-                v["id"],
-                expect_of(e.as_ref()),
-                norm(&v["expect"])
-            ));
-            continue;
-        }
-        if let Ok(vd) = r {
-            if hex0x(&verdict_abi(&vd)) != v["verdict"]["abi"].as_str().unwrap() {
-                failures.push(format!("{}: verdict differs", v["id"]));
-            }
-        }
+    for item in f["verifier"].as_array().unwrap() {
+        assert!(decode_evidence(&hx(&item["evidence"])).is_err());
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -329,7 +255,7 @@ fn seal_receipts_and_the_burn_index() {
     let mut failures = Vec::new();
     for v in f["sealReceipts"].as_array().unwrap() {
         let d = &deps[v["deployment"].as_str().unwrap()];
-        let cfg = decode_config(&d.gamma, &build_params(d.build)).unwrap();
+        let cfg = fixture_config(&d.gamma, d.build);
         let domain = domain_of(&d.gamma);
         let result_of = |sr: Option<&SealReceipt>| -> Value {
             let (a, start) = burn_index(&cfg, &domain, sr);
@@ -518,12 +444,8 @@ fn vault_model_every_vault_vector_step_by_step() {
     };
     for v in f["vault"].as_array().unwrap() {
         let d = &f["deployments"][v["deployment"].as_str().unwrap()];
-        let env = Environment {
-            address: arr(&hx(&d["vault"])),
-            chain_id: u(&d["chainId"]),
-            verifier_code_hash: arr(&hx(&d["verifierCodeHash"])),
-        };
-        let mut vt = VaultModel::new(&hx(&d["gamma"]), &env, &build_params(build_of(d))).unwrap();
+        let gamma = hx(&d["gamma"]);
+        let mut vt = VaultModel::with_config(&gamma, fixture_config(&gamma, build_of(d)));
         if let Some(h) = v.get("harnessState") {
             vt.set_state(
                 u(&h["deposits"]),

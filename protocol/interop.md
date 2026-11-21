@@ -1,16 +1,10 @@
 # Native bridge interoperability contract
 
-Status: **native bridge v2, `NATIVE_BRIDGE_PROTO_VERSION=9`, development profile, frozen, not activated.** This document
-is the sole normative native byte contract of the plug-ins. The design, the plain-language data flow, the safety
-argument and the structural model are in ristik/bft-core `docs/design/native-bridge-v2.md` (NB2-01, bft-core#1097);
-section numbers in brackets below (`[§n]`) point there. The two carry the same bytes; a difference is a bug, and the
-bft-core document is the reference.
-
-v2 replaces protocol 7 outright: lock records, per-lock accounting, lock-proof storage proofs, `0x0104`/`0x0105`
-kernels, the anchor-table envelope and the deployment manifest schema v1 are gone. There is no migration, dual decoder
-or compatibility. The protocol 7 artifacts in `protocol/legacy-v7/` and the corpus in `protocol/vectors/` remain only
-because the old plug-in code still tests against them; they are not part of this profile and bft-core#1106 (NB2-10)
-removes them with that code.
+Status: **NB2 continuation v1.1, `NATIVE_BRIDGE_PROTO_VERSION=10`, development profile.** The plug-ins implement the
+configuration and lineage relation from §§1–2 and the authority and object bounds from §§4–5 and 7 of the
+[NB2 continuation specification](https://github.com/ristik/bft-core/blob/2724e41be/docs/design/nb2-continuation-v1.1.md).
+Use a fresh generation and a deployment manifest that authenticates that release, its profile digest and execution history.
+The protocol 10 decoder accepts only the flat wire below.
 
 The gas bake-off (bft-core#1098, NB2-02; ristik/unicity-pos-contracts#80 `bench/nb2/RESULTS.md`) fixed `K = 64`,
 `B = 16`, position-tag recent buffers, the circular-gap commitment and `gasReserve` 500,000. The remaining **PARAM**
@@ -34,12 +28,11 @@ and signer text keys. Decode and validate those objects with that encoding and i
 map keys. Do not apply the NB2 array-only item whitelist recursively inside a native certificate. SDK
 transaction/predicate encodings remain those of the pinned SDK revisions.
 
-Nesting depth (`cborDepth` 16): a decoding unit is a top-level input (Γ, `evidence`) or a byte string the profile
-decodes as CBOR (`J` or a split justification in a mint's `b(J)`, `R` in transfer data, `data`). Its top-level item is
-at depth 0 and each array, map or tag opening adds 1 for its children; children above depth 16 are `InputTooLarge`. A
-byte-string-wrapped child is scanned afresh from depth 0, so lineage depth never accumulates. The `evidence` scan
-includes the inline aggregator UCs. UC size bounds: the EVM receipt UC `evmUcBytes` 16,384, each aggregator UC
-`aggregatorUcBytes` 24,576 (bft-core `b1ref.MaxUCBytes`).
+Each framed mint, inclusion proof, transfer pair and allocation is a separate CBOR decoding unit. A byte string
+opened as CBOR starts another unit. The top item has depth zero. Every array, map or tag, including an empty
+container, requires depth + 1 ≤ 16. Decode children at depth + 1. Transfer pairs include their inline UCs within
+the same depth budget. Maps and text are limited to the canonical native certificate fields. A page or packet boundary
+has no effect on a unit's depth. Receipt UCs are limited to 16,384 bytes and aggregator UCs to 24,576 bytes.
 
 Domain literals are ASCII byte strings. Hashes, salts, IDs and identifiers are 32 bytes, addresses 20, compressed
 secp256k1 keys 33. An amount is a minimal positive unsigned big-endian bstr of 1..32 bytes (no leading zero); in the EVM
@@ -60,14 +53,14 @@ New CBOR tags: `39051` receipt-backed mint reason `J`, `39052` segment return da
 ## Configuration and domain [§4]
 
 ```
-Γ = C(b("UNICITY_NB2_CFG"),1,network,b(rootGenesis32),b(executionGenesis32),chainId,
+Γ = C(b("UNICITY_NB2_CFG"),2,network,b(rootGenesis32),b(executionGenesis32),chainId,
       evmPartition,b(evmShard),aggregatorPartition,b(vault20),b(asset32),b(ty32),b(aid32),
       b(semanticProfileHash32),b(verifier20),b(verifierCodeHash32),K,B,b(Qmax))
 D = H(Γ)
 
 Dstr  = networkDecimal+":"+rootGenesisHex+":"+executionGenesisHex+":"+chainIdDecimal
-ty    = H(UTF8("unicity-bridge:unicity-native-nb2:"+Dstr))
-aid   = H(UTF8("unicity-bridge-coin:unicity-native-nb2:"+Dstr))
+ty    = H(UTF8("unicity-bridge:unicity-native-nb2-11:"+Dstr))
+aid   = H(UTF8("unicity-bridge-coin:unicity-native-nb2-11:"+Dstr))
 asset = H(UTF8("unicity-nb2-asset:native-uct"))
 ```
 
@@ -117,8 +110,7 @@ certified `Deposited` events; an optional look-ahead does not replace the mark. 
 guaranteed in the presence of arbitrary abandoned intents. Never derive `r` from public or low-entropy values. Reusing
 `r` is prohibited wallet behavior; distinct deposit nonces still derive distinct root IDs.
 
-The vault, under its reentrancy guard: `msg.value > 0` (`ZeroValue`); `firstOwner` exactly the 42 bytes above with
-`key33[0]` in {02, 03} (`BadFirstOwner`); `msg.value <= Qmax - Q` (`LiabilityCap`); `n < 2^56-1`
+The vault, under its reentrancy guard: `msg.value > 0` (`ZeroValue`); `firstOwner` exactly the 42 bytes above with a valid compressed secp256k1 point (`BadFirstOwner`); `msg.value <= Qmax - Q` (`LiabilityCap`); `n < 2^56-1`
 (`DepositCounterExhausted`); then `n += 1`, `Q += msg.value` and the event. Deposit numbers start at 1. No refund, no
 per-deposit storage, no ID derivation on chain.
 
@@ -135,8 +127,7 @@ data = tag(39050,[1,[[b(aid),b(v)]],null])
 that carried a PDR, is rejected (`Shape`). `evmUC` is the complete canonical native UnicityCertificate.
 `n` in [1, 2^56-1], indices below 2^32. The receipt is the value
 of the last trie node, never carried twice. Bounds (`profile.json` `limits`, `evmUcBytes` 16,384 for `evmUC`) apply before any cryptography.
-`justificationBytes` bounds the root reason `J` (tag 39051, with its `DepositProof`) only, never a split justification
-(tag 39044), which embeds its parent token: a lineage has no depth cap beyond the evidence size, `L_max` and gas.
+The root reason is bounded at 65,536 bytes and the entire signed root mint at 66,048 bytes.
 
 Verification, in order, each failure a named rule (bft-core §14): `J.D == D` (`MintDomain`); `evmUC` verified under
 the authenticated historical root authority of its own seal epoch for exactly Γ.`evmPartition` and Γ.`evmShard`
@@ -171,7 +162,7 @@ continuation of this vault. D alone does not prove execution ancestry. Wallets M
 binding and its pinned vault code (bft-core §4.3, §12.1); the on-chain verifier uses the corresponding
 chain-authenticated historical authority. The same rule applies to seal receipts (wallet obligation 2).
 
-## SDK wire (unchanged)
+## SDK transactions and flat token wire
 
 Pins: the ristik SDK lines (`integration/enshrined-evm`), JS `c5840ef5f59201c52ea6cf7034ee02cb48d54007`
 (4.0.0-utb.c5840ef), Rust `de79e6c1e393a1846b75bca0640b9ec9a55aa143` (unicity-token). No other SDK fork or patch is
@@ -182,7 +173,6 @@ P = tag(39032,[1,b(encode_uint(type)),b(params)])
 M = tag(39041,[2,network,P0,b(salt32),b(ty32),b(J),b(data),e])
 T = tag(39045,[2,Pnext,b(mask32),dataOrNull,e])
 CD = tag(39031,[2,Psource,b(sourceHash32),b(txHash32),e,b(unlock65)])
-Token = tag(39040,[2,[M,proof0],[[T1,proof1],...]])
 proof = tag(39033,[1,CD,t,b(bitmap32||siblings32...),UC])
 data = tag(39050,[1,[[b(aid32),b(amount)]],null])
 ```
@@ -209,7 +199,7 @@ deadline identical to the reconstructed transaction, including null. Token unloc
 1<=s<=n/2, ID 0..3 under the SDK, but **ID 0 or 1 only for NB2** (below). Recover using the supplied ID, require the
 recovered compressed key equal to the source key, then compact verify. Never normalize s/ID.
 
-**NB2 unlock restriction (versioned, protocol 9 profile artifact 5).** An NB2-eligible token's unlock signatures
+**NB2 unlock restriction.** An NB2-eligible token's unlock signatures
 must all use recovery ID 0 or 1. Recovery IDs 2 and 3 are refused with `UnlockRecovery` in every implementation: wallets,
 provenance and token admission in the plug-ins, the Go reference and the Solidity verifier. This deliberately narrows
 the pinned SDK's unlock relation (which admits IDs 0..3) for bridge eligibility only; it is not unchanged SDK
@@ -228,24 +218,40 @@ the history holds the epoch. On chain the verifier reads the same history from t
 deposit and seal receipt alike, is judged under the deployment-binding and chain-continuity rule above; a validator
 rotation never invalidates an earlier receipt.
 
-## Split lineage (unchanged formats)
+## Split lineage and export
 
-```
-Manifest = tag(39046,[b(root32)])
-leaf     = H(0x10 || key32 || data32 || u256(v))        // key = child token ID
-node     = H(0x11 || u8(depth) || hL || u256(sL) || hR || u256(sR))
-Proof    = [[depth,b(hash32),b(sum)],...]               // leaf first
-data     = H(C(b("UNICITY_SPLIT_OUTPUT"),b(parentId),network,b(P),b(salt),
-               b(childId),b(ty),b(exactChildMintData)))
-SplitJ   = tag(39044,[ParentToken,[Proof]])             // the child mint's reason
+```text
+blob(x) = u32(len(x)) || x
+E       = ASCII("NB2L") || u16(0x0101) || u64(levelCount) || level[0] || …
+level   = blob(allocation) || blob(M) || blob(proofM) || u64(transferCount) || entry[0] || …
+entry   = blob(C(T, proofT))
+Jchild  = tag(39044,[2,b(parentLink)])
+manifest = tag(39046,[b(manifestRoot)])
+parentLink = H("UNICITY/NB2/1.1/PARENT" || D || parentId || splitSID ||
+               splitTxHash || manifestRoot || u256(parentAmount))
+output = H(C(b("UNICITY_NB2_11_OUTPUT"),b(parentId),network,b(exact owner predicate),
+             b(salt),b(childId),b(ty),b(exact mint data),deadline))
+leaf = H(0x10 || childId || output || u256(value))
+node = H(0x11 || u8(depth) || leftHash || u256(leftSum) || rightHash || u256(rightSum))
 ```
 
-Sums are checked in 256 bits, `1 <= v < 2^256`; a key's side at a node is bit `depth` of the key, MSB first; a proof
-has at most 256 steps with strictly decreasing depths. The verifier walks from the returned part to the root while
-the mint reason is SplitJ; the root's reason must be `J`. One state-ID set covers the lineage (`RepeatedSID`). Every
-non-returned token of the walk ends in its manifest burn (`SplitBurn`, `SplitManifest`); each edge's proof verifies
-against the parent's manifest root (`SplitProof`) and sums to the parent's amount (`SplitSum`). Whole parts return
-independently; no per-lock accounting exists.
+Export each part as E. Import consumes every byte and verifies all levels from root to leaf. Root allocation
+is empty. Each child allocation is a complete CBOR array of up to 256 leaf-first `[depth,b(siblingHash),A(siblingSum)]`
+steps in strictly decreasing depth order. A singleton proof is `80` hex. Depth identifies the bit counted from the MSB
+of childId. Fold with checked u256 sums and require both the manifest root and the full amount of the authenticated
+parent. Allocation is bounded at 20,480 bytes. A child mint is bounded at 512 bytes by the framing decoder.
+Mint proof bytes plus the eight-byte transfer count are bounded at 40,960 bytes. Each transfer pair payload may
+be at most 40,960 bytes. The native proof bitmap and siblings may occupy at most 8,224 bytes.
+
+Choose child fields and build the radix tree over distinct child IDs first. Sign and certify the parent's split
+transfer, binding its manifest bytes with a burn predicate. Verify the parent lineage and terminal split, and derive
+parentLink from that verified spend. Then sign and certify each child mint with its fixed parentLink and export only
+its selection of the allocation proof with the complete necessary ancestors. Every mint and transfer consumes a
+certified source. The signed child mint is independent of the external proof presentation.
+
+All ancestors end in a split. A held terminal level has a signature-owned mint with zero transfers or ends in
+a signature-owned transfer with null data. Every level of a redemption has at least one transfer and the final
+transfer is the return burn. A held import yields the authenticated owner, state, token ID and amount.
 
 ## Return burn and redemption identifier [§8]
 
@@ -299,7 +305,7 @@ not authorize wider values.
 
 ```
 redeem(bytes evidence, bytes32 claimedEta, uint64 claimedStart, bytes history)
-evidence = C(1, Token)                                   // the returned part, inline tag 39040
+evidence = E                                            // the complete flat return lineage
 history  = empty                                         // P = 0
          | startHead32 || proof_0 || ... || proof_{P-1}  // P >= 1
 ```
@@ -330,26 +336,12 @@ interface INativeBridgeVerifierV2 {
 }
 ```
 
-The verifier's order is frozen (bft-core §11.2): Γ (`ConfigShape`); `evidence = C(1, Token)` (`EvidenceShape`, then
-the nested wire rules); the walk to the root (39044 is a split reason: `SplitJustif`, `SplitProofCount`,
-`SplitProofShape`, the inline parent's wire rules; 39051 ends it; anything else `MintReason`); the root's J in its
-order; root first, every token: mint fields (`MintShape`, `MintType`, `MintData`), `NoTransfers`, then the mint and each
-transfer (`CDMismatch`, `DeadlineMismatch`, the unlock rules, `DeadlineExpired`, `RepeatedSID`, then its inclusion
-proof: the UC per-UC order below, then `InclusionProof`, `ReferenceTime`), each intermediate transfer (`BurnNotFinal`, `TransferData`), a
-parent's split burn (`SplitBurn`, `SplitManifest`), each child's edge (`SplitProof`, `SplitSum`); the part's burn
-(`NotBurn`, `ReturnData`, `ReturnIndex`, `ReturnDomain`, `ReturnAsset` against the `a_UCT` constant, `ReturnAmount`,
-`ReturnRecipient`, `BurnReason`); then `btid`, `eta` and the authenticated tuple.
-
-Per-UC order (frozen): `UnsupportedCertificateEncoding`, `SealNetwork`, `CertStructure`, `SealRoot`, then the authority
-verdict (epoch entry, round interval, quorum). On chain `0x0100` `CERT_BATCH_V2` returns one bool for that verdict, so
-its on-chain name is `QuorumNotMet` (aggregator UC) or `DepositUC` (EVM UC); `SealEpoch` and `NoEntryForEpoch` are
-wallet-side names only, and wallets, holding the bundle, retry `NoEntryForEpoch`. Recovery IDs 2 and 3 are
-`UnlockRecovery` everywhere, on chain and in wallets (NB2 unlock restriction above). The verifier puts UC claims into the fewest `0x0100` calls,
-flushes them before raising any later rule and before returning, and on a false result re-checks one claim at a time in
-order and reports the earliest failure. Where a rejected authority verdict has different wallet and on-chain names,
-a vector carries its wallet rule name and an `onChainError` field containing the on-chain name. An error-name mapping
-does not authorize an acceptance difference. It reverts with `<RuleName>()`. [`abi.json`](abi.json) has every
-selector, topic and data length.
+The verifier authenticates each source under the network's historical authority, compares the exact certification
+data and unlock, enforces the nullable deadline, checks RSMT membership and records the SID across the entire
+lineage. The claim map covers the deposit UC and every aggregator UC. Uses with the same complete canonical seal,
+partition and shard must have the same canonical claim. A different authorized seal presentation yields a different
+key and still requires full verification. The package's held and split verifiers do not produce a payout verdict.
+The recovery packet format and failure ordering are specified in §§3–6 of the continuation specification.
 
 ## Wallet obligations [§12]
 
@@ -384,8 +376,7 @@ selector, topic and data length.
    If it leaves insufficient reserve, obtain a newer authenticated receipt or refuse. Freshness and future inclusion
    remain availability assumptions: even this check does not guarantee redemption against an indefinitely stale view
    or arbitrary subsequent traffic. `L_T` before the burn is a conservative upper bound: the held evidence plus the burn transfer with its exact `R`, its CD, and an inclusion proof at the decoder bounds (an RSMT path of up to 256 siblings and an aggregator UC up to `aggregatorUcBytes` = 24,576 bytes). At redemption refuse if `P > P_max` or the gas exceeds `userGasLimit`
-   (`CapacityExceeded`). This release has no recovery for an oversized claim
-   (bft-core#1108 is deferred).
+   (`CapacityExceeded`). Packet planning and recovery fee qualification are release work under NB2-C T5 and T6.
 6. **Recipient.** Default to a controlled EOA. Simulation of a contract recipient is not a guarantee.
 7. **Receiving.** When receiving a token intended for return, verify its whole lineage against the NB2 unlock
    restriction and refuse or flag it if any unlock uses recovery ID 2 or 3, so a previous owner cannot hand over a
@@ -407,17 +398,9 @@ return data): call `verifyReturn` directly or run the wallet's own verifier to r
 
 ## Corpus
 
-v2 vectors are generated once by the bft-core Go reference (NB2-03, bft-core#1099) as one file consumed by digest:
-`protocol/vectors/nb2/nb2-vectors.json` with `protocol/vectors/nb2/nb2-vectors.json.sha256`. Required (bft-core §14.7),
-for deposit receipts and identically for seal receipts: valid receipts before and after an authorized validator
-rotation, each under its own seal epoch's authority; an altered ShardConfHash without a new valid seal; the wrong
-partition, shard or root deployment; InputRecord or header tampering; the old arity-7 DepositProof rejected. Also: a
-positive token with an inline aggregator UC carrying a nonempty signature map; the stale-index capacity case (K=64,
-512 KiB, 20 KiB evidence, 2 KiB framing, c=2500, a=0: `CapacityPreflight`); byte-small, gas-oversized evidence
-(`CapacityPreflight`); `cborDepth` and `justificationBytes` boundaries; verifier revert data of 1024 bytes
-(`VerifierRefused`), 1025 and 4096 bytes (`VerifierBadReturn`); four multi-fault Γ cases for the `BadConfig` stage
-order; primitive recovery vectors for valid and
-invalid recovery IDs 2 and 3, all `UnlockRecovery` in every implementation; a seal receipt with an otherwise valid UC
-from an epoch absent from the bundle (`SealReceipt` wrapping retryable `NoEntryForEpoch`; `DepositUC` on chain); a seal at the largest admitted `K` storing
-`m = 0`.
-Until then this profile has no corpus; `protocol/vectors/` is the protocol 7 corpus of the legacy code.
+`protocol/vectors/nb2-continuation-v1.1/` contains T1's golden bytes and signed transcripts from bft-core
+commit `2724e41be`. Both SDK extension suites verify the transcript lineage against its pinned UTB.
+The transcript manifest digest is `39657f1e66eec4c9b1c02e91feb109999cb7d64e8c60ade2110f70dfd8f9220e`.
+`protocol/vectors/nb2/` retains protocol 9 vectors for common custody, receipt and primitive regression checks.
+The old gas calibration is retained for historical comparison. The default measured gas model requires its
+calibrated artifacts, so protocol 10 must use a qualified model supplied for its deployment before wallet burns.

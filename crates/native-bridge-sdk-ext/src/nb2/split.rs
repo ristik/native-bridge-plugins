@@ -1,14 +1,3 @@
-//! Split primitives of the lineage relation, unchanged from protocol 6 (`split.ts`; bft-core `nb2ref/split.go`):
-//!
-//! ```text
-//!   Manifest = tag(39046, [b(root32)])
-//!   leaf     = H(0x10 || key32 || data32 || u256(v))        // key = child token ID
-//!   node     = H(0x11 || u8(depth) || hL || u256(sL) || hR || u256(sR))
-//!   Proof    = [[depth, b(hash32), b(sum)], ...]            // leaf first, strictly decreasing depths, at most 256 steps
-//!   data     = H(C(b("UNICITY_SPLIT_OUTPUT"), b(parentId), network, b(P), b(salt), b(childId), b(ty), b(exactChildMintData)))
-//!   SplitJ   = tag(39044, [ParentToken, [Proof]])
-//! ```
-
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use num_bigint::BigUint;
@@ -16,8 +5,8 @@ use num_bigint::BigUint;
 use super::cbor::*;
 use super::config::{domain, tag};
 use super::crypto::hu;
-use super::errors::{fail, rule_err, wrap, Result, Rule};
-use super::token::{decode_token_item, encode_predicate, token_id_of, MintTx, Token};
+use super::errors::{fail, rule_err, Result, Rule};
+use super::token::{encode_predicate, token_id_of, MintTx};
 use super::util::{max_bits, u256};
 
 const MAX_SUM_PROOF_STEPS: usize = 256;
@@ -69,7 +58,8 @@ pub fn encode_sum_proof(p: &[SumStep]) -> Vec<u8> {
     )
 }
 
-fn decode_sum_proof(it: &Item<'_>) -> Result<Vec<SumStep>> {
+pub fn decode_sum_proof(bytes: &[u8]) -> Result<Vec<SumStep>> {
+    let it = scan_one(bytes)?;
     if it.major != MAJ_ARRAY || it.kids.len() > MAX_SUM_PROOF_STEPS {
         return fail(Rule::SplitProofShape);
     }
@@ -145,38 +135,43 @@ pub fn split_output_commitment(parent_id: &[u8], m: &MintTx) -> [u8; 32] {
         c_bytes(&child_id),
         c_bytes(&m.ty),
         c_bytes(m.data.as_deref().unwrap_or(&[])),
+        c_deadline(m.deadline),
     ])])
 }
 
-#[derive(Debug, Clone)]
-pub struct SplitJustification {
-    pub parent: Token,
-    pub proof: Vec<SumStep>,
+pub fn parent_link(
+    d: &[u8],
+    id: &[u8],
+    sid: &[u8],
+    tx_hash: &[u8],
+    manifest: &[u8],
+    value: &BigUint,
+) -> [u8; 32] {
+    hu(&[
+        b"UNICITY/NB2/1.1/PARENT",
+        d,
+        id,
+        sid,
+        tx_hash,
+        manifest,
+        &u256(value),
+    ])
 }
 
-/// A split reason: arity, the inline parent token (its own wire rules) and exactly one allocation proof.
-pub fn decode_split_justification(j: &[u8]) -> Result<SplitJustification> {
-    let it = scan_native(j).map_err(|e| wrap(Rule::SplitJustif, e))?;
-    let c = tag_content(&it, tag::SPLIT_JUSTIFICATION).map_err(|_| rule_err(Rule::SplitJustif))?;
-    if c.major != MAJ_ARRAY
-        || c.kids.len() != 2
-        || c.kids[0].major != MAJ_TAG
-        || c.kids[1].major != MAJ_ARRAY
-    {
-        return fail(Rule::SplitJustif);
-    }
-    if c.kids[1].kids.len() != 1 {
-        return fail(Rule::SplitProofCount);
-    }
-    let proof = decode_sum_proof(&c.kids[1].kids[0])?;
-    let parent = decode_token_item(&c.kids[0], j)?;
-    Ok(SplitJustification { parent, proof })
+pub fn decode_split_justification(bytes: &[u8]) -> Result<[u8; 32]> {
+    let decode = || {
+        let it = scan_one(bytes)?;
+        let fields = array(tag_content(&it, tag::SPLIT_JUSTIFICATION)?, 2)?;
+        version(&fields[0], 2)?;
+        Ok(super::util::arr(bytes_n(&fields[1], 32)?))
+    };
+    decode().map_err(|_: super::errors::Error| rule_err(Rule::SplitJustif))
 }
 
-pub fn encode_split_justification(parent_token: &[u8], proof: &[SumStep]) -> Vec<u8> {
+pub fn encode_split_justification(link: &[u8]) -> Vec<u8> {
     c_tag(
         tag::SPLIT_JUSTIFICATION,
-        &c_arr(&[parent_token, &c_arr(&[&encode_sum_proof(proof)])]),
+        &c_arr(&[&c_uint(2), &c_bytes(link)]),
     )
 }
 

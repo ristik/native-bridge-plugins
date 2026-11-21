@@ -11,7 +11,8 @@ import { UnicityCertificateVerifier } from '@unicitylabs/state-transition-sdk/li
 import { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js';
 import { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 
-import { eq } from '../bytes.js';
+import { eq, toHex } from '../bytes.js';
+import { HU } from './crypto.js';
 import { nativeUcScan } from '../resources.js';
 import { certificateFailure, TrustInput } from '../trust.js';
 import { NativeError } from '../errors.js';
@@ -146,4 +147,17 @@ export async function verifyEvmUc(t: TrustInput, raw: Uint8Array, c: Config): Pr
 /** Whether a state ID falls in a shard's key range (the shard ID's bits are a prefix of the ID's). */
 export function inShard(shard: ShardId, sid: Uint8Array): boolean {
   return shard.isPrefixOf(sid);
+}
+
+/** For one complete seal and shard, canonical UC equality implies exact B1 claim equality. */
+export function claimConsistency(): (uc: UnicityCertificate, raw: Uint8Array) => void {
+  const claims = new Map<string, string>();
+  return (uc, raw) => {
+    const key = [toHex(HU(uc.unicitySeal.toCBOR())), uc.unicityTreeCertificate.partitionIdentifier,
+      toHex(uc.shardTreeCertificate.shard.encode())].join('/');
+    const digest = toHex(HU(raw));
+    const previous = claims.get(key);
+    if (previous !== undefined && previous !== digest) fail('CertStructure', 'conflicting claims for the same seal and shard');
+    claims.set(key, digest);
+  };
 }

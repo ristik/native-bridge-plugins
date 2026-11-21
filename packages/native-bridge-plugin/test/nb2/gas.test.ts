@@ -1,8 +1,3 @@
-/**
- * The redeem gas estimate (src/nb2/gas.ts, estimate-nb2-1179): the shared vectors (tests/nb2-gas/gas-vectors.json, real evidence of the bft-core#1179
- * measurement lane) reproduced exactly, as the Rust plug-in reproduces them (crates/native-bridge-sdk-ext/tests/nb2_gas.rs), and the bound's
- * structure: the native schedules, the pending burn at its bounds, the fail-closed inputs.
- */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
@@ -10,84 +5,29 @@ import { test } from 'node:test';
 import { fromHex } from '../../src/bytes.js';
 import { lineageOf } from '../../src/nb2/bridge.js';
 import {
-  batchGas, calibratedDeployment, cborCount, cborItems, createAddress, memoryGas, MeasuredGasModel, NATIVE_GAS_SCHEDULE, priceFeatures, redeemFeatures, redeemGasTerms, REDEEM_GAS,
-  type DeploymentCode, type RedeemFeatures, type RedeemShape,
+  batchGas, calibratedDeployment, cborCount, cborItems, createAddress, memoryGas, MeasuredGasModel, NATIVE_GAS_SCHEDULE, redeemFeatures, redeemGasTerms, REDEEM_GAS,
+  type DeploymentCode, type RedeemShape,
 } from '../../src/nb2/gas.js';
-import { type Token } from '../../src/nb2/token.js';
+import { type LineageLevel } from '../../src/nb2/token.js';
 import { decodeEvidence } from '../../src/nb2/verify.js';
 
-const FILE = new URL('../../../../tests/nb2-gas/gas-vectors.json', import.meta.url);
-interface Case { input: string; pendingTransactions: number; proofs: string; K: string; evidenceBytes: number; features: unknown; terms: unknown }
-const file = JSON.parse(readFileSync(FILE, 'utf8')) as { model: string; vectors: { name: string; labGas?: string; evidence: string; cases: Case[] }[] };
-const json = (v: unknown): unknown => JSON.parse(JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x)));
+const evidence = readFileSync(new URL('../../../../protocol/vectors/nb2-continuation-v1.1/transcripts/one-split/evidence.bin', import.meta.url));
+const part = decodeEvidence(evidence);
+const shape: RedeemShape = { evidenceBytes: evidence.length, lineage: lineageOf(part), pendingTransactions: 0, proofs: 0n, K: 64n };
 
-/** The part before its burn: the evidence's last transfer pair dropped (the preflight's token). */
-const beforeBurn = (t: Token): Token => ({ ...t, transfers: t.transfers.slice(0, -1), proofs: t.proofs.slice(0, -1), transfersRaw: t.transfersRaw.slice(0, -1) });
+test('flat evidence is priced by its bounded signed records', () => {
+  const features = redeemFeatures(shape)!;
+  assert.equal(features.tokens, 2);
+  assert.equal(features.edges, 1);
+  assert.equal(features.steps, lineageOf(part).reduce((n, level) => n + 1 + level.transfers.length, 0));
+  const limit = (s: RedeemShape) => redeemGasTerms(s)!.limit;
+  assert.ok(limit({ ...shape, proofs: 1n }) > limit(shape));
+  assert.ok(limit({ ...shape, evidenceBytes: evidence.length + 1000 }) > limit(shape));
 
-const shapes = (v: { evidence: string; cases: Case[] }): [Case, RedeemShape][] => {
-  const part = decodeEvidence(fromHex(v.evidence)!);
-  return v.cases.map((c) => [c, {
-    evidenceBytes: c.evidenceBytes, lineage: lineageOf(c.pendingTransactions === 1 ? beforeBurn(part) : part), pendingTransactions: c.pendingTransactions,
-    proofs: BigInt(c.proofs), K: BigInt(c.K),
-  }]);
-};
-
-test('the shared vectors: every feature and term, exactly (a null bound where the vector fails closed)', () => {
-  assert.equal(file.model, new MeasuredGasModel().name);
-  assert.ok(file.vectors.length >= 19);
-  let nulls = 0;
-  for (const v of file.vectors) {
-    for (const [c, s] of shapes(v)) {
-      assert.deepEqual(json(redeemFeatures(s)), c.features, `${v.name} ${c.input} P ${c.proofs}: features`);
-      assert.deepEqual(json(redeemGasTerms(s)), c.terms, `${v.name} ${c.input} P ${c.proofs}: terms`);
-      const want = c.terms === null ? null : BigInt((c.terms as { limit: string }).limit);
-      assert.equal(new MeasuredGasModel().redeemGasLimit(s), want);
-      if (want === null) nulls++;
-    }
-  }
-  // the 17-signature seal and the non-text signature key, every case
-  assert.equal(nulls, 2 * 5);
-});
-
-test('every vector measured in the lab: the estimate\'s execution, memory and SHA-256 terms at redemption cover the deployed verifier\'s gas', () => {
-  let measured = 0;
-  for (const v of file.vectors) {
-    if (v.labGas === undefined) continue;
-    measured++;
-    const [, s] = shapes(v)[0];
-    const t = redeemGasTerms(s)!;
-    assert.ok(t.execution + t.memory + t.sha256 >= BigInt(v.labGas), `${v.name}: ${t.execution + t.memory + t.sha256} < ${v.labGas}`);
-  }
-  // the review's counterexamples above the splits among them
-  assert.ok(measured >= 15);
-  for (const n of ['split-above-2-levels-32-unicity-steps', 'split-above-3-levels-32-unicity-steps', 'split-above-5-levels-16-signatures-8-steps', 'split-above-7-levels-32-unicity-steps', 'four-byte-utf8-node-ids-shared-prefix']) {
-    assert.ok(file.vectors.some((v) => v.name === n && v.labGas !== undefined), n);
-  }
-});
-
-test('every vector: the preflight is at or above the redemption at the same proofs, and so is each pending-dependent feature', () => {
-  for (const v of file.vectors) {
-    const all = shapes(v);
-    for (const K of [4n, 64n]) {
-      const red = all.find(([c]) => c.pendingTransactions === 0 && BigInt(c.K) === K && BigInt(c.proofs) === 17n);
-      const pre = all.find(([c]) => c.pendingTransactions === 1 && BigInt(c.K) === K);
-      if (!red || !pre) continue;
-      const fr = redeemFeatures(red[1]);
-      const fp = redeemFeatures(pre[1]);
-      if (fr === null || fp === null) {
-        assert.equal(fr, fp, `${v.name}: null in one input only`);
-        continue;
-      }
-      assert.ok(redeemGasTerms({ ...pre[1], proofs: 17n })!.limit >= redeemGasTerms(red[1])!.limit, `${v.name} K ${K}`);
-      for (const k of ['steps', 'txWords', 'siblings', 'ucBytes', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'keyLookups'] as const) {
-        assert.ok(fp[k] >= fr[k], `${v.name} K ${K}: ${k} ${fp[k]} < ${fr[k]}`);
-      }
-      for (const w of ['scan', 'skip'] as const) {
-        for (const k of ['items', 'long', 'nodes'] as const) assert.ok(fp[w][k] >= fr[w][k], `${v.name} K ${K}: ${w}.${k}`);
-      }
-      assert.ok(fp.claims.length >= fr.claims.length);
-    }
-  }
+  const held = { ...part, transfers: part.transfers.slice(0, -1), transfersRaw: part.transfersRaw.slice(0, -1), proofs: part.proofs.slice(0, -1) };
+  const pending = { ...shape, lineage: lineageOf(held), pendingTransactions: 1 };
+  assert.ok(redeemFeatures(pending)!.siblings >= REDEEM_GAS.pendingSiblings);
+  assert.ok(limit(pending) >= limit(shape));
 });
 
 test('the native schedules: CERT_BATCH_V2 balanced at 16 claims and 256 KiB, memory expansion', () => {
@@ -117,45 +57,12 @@ test('CBOR items: heads, string payloads skipped; argument heads and nested item
   assert.deepEqual(cborCount(Uint8Array.of(0x80, 0xa0, 0xc1, 0x00, 0x18, 0x20)), { items: 5, long: 1, nodes: 1 });
 });
 
-test('the pending burn is counted at its bounds, and more of the token never costs less', () => {
-  const v = file.vectors[0];
-  const [, red] = shapes(v)[0];
-  const [, pre] = shapes(v)[3];
-  const f = redeemFeatures(pre)!;
-  assert.ok(f.ucBytes >= REDEEM_GAS.pendingUcBytes && f.ucStc >= REDEEM_GAS.pendingStc && f.siblings >= REDEEM_GAS.pendingSiblings);
-  assert.equal(f.claims[f.claims.length - 1].epoch, null);
-  // the preflight's bound of the part before its burn is above the bound of the burned evidence at the same proofs
-  assert.ok(redeemGasTerms(pre)!.limit > redeemGasTerms({ ...red, proofs: pre.proofs })!.limit);
-  // monotone in the proofs, in the evidence bytes and in every counted feature
-  const g = (s: RedeemShape): bigint => redeemGasTerms(s)!.limit;
-  assert.ok(g({ ...red, proofs: 1n }) > g(red));
-  assert.ok(g({ ...red, evidenceBytes: red.evidenceBytes + 1_000 }) > g(red));
-  for (const w of file.vectors) {
-    const [, r] = shapes(w)[0];
-    const fr = redeemFeatures(r);
-    if (fr === null) continue;
-    const base = priceFeatures(fr, r.evidenceBytes, 0n, 4n).limit;
-    for (const k of ['steps', 'siblings', 'ucBytes', 'ucIr', 'ucSignatures', 'ucStc', 'ucUtc', 'ucSlow', 'probes', 'decompressions', 'txWords', 'edges', 'allocSteps', 'jBytes',
-      'rcptItems', 'rcptLong', 'rcptLists', 'rcptHeads', 'rcptLongHeads', 'rcptKids', 'ucKeyWords'] as const) {
-      const more: RedeemFeatures = { ...fr, [k]: fr[k] + 1 };
-      assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > base, `${w.name}: ${k}`);
-    }
-    for (const wk of ['scan', 'skip'] as const) {
-      for (const k of ['items', 'long'] as const) {
-        const more: RedeemFeatures = { ...fr, [wk]: { ...fr[wk], [k]: fr[wk][k] + 1 } };
-        assert.ok(priceFeatures(more, r.evidenceBytes, 0n, 4n).limit > base, `${w.name}: ${wk}.${k}`);
-      }
-    }
-  }
-});
-
 test('fail closed: no lineage, a UC that does not parse, more than one pending transaction', () => {
-  const v = file.vectors[0];
-  const [, s] = shapes(v)[0];
+  const s = shape;
   assert.equal(redeemGasTerms({ ...s, lineage: [] }), null);
   assert.equal(redeemGasTerms({ ...s, pendingTransactions: 2 }), null);
   const t = s.lineage[s.lineage.length - 1];
-  const bad: Token = { ...t, proofs: t.proofs.map((p, i) => (i === 0 ? { ...p, uc: p.uc.subarray(0, p.uc.length - 1) } : p)) };
+  const bad: LineageLevel = { ...t, proofs: t.proofs.map((p, i) => (i === 0 ? { ...p, uc: p.uc.subarray(0, p.uc.length - 1) } : p)) };
   assert.equal(redeemGasTerms({ ...s, lineage: [...s.lineage.slice(0, -1), bad] }), null);
 });
 

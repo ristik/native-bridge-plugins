@@ -1,19 +1,9 @@
-/**
- * Split primitives of the lineage relation, unchanged from protocol 6 (bft-core `nb2ref/split.go`):
- *
- *   Manifest = tag(39046, [b(root32)])
- *   leaf     = H(0x10 || key32 || data32 || u256(v))        // key = child token ID
- *   node     = H(0x11 || u8(depth) || hL || u256(sL) || hR || u256(sR))
- *   Proof    = [[depth, b(hash32), b(sum)], ...]            // leaf first, strictly decreasing depths, at most 256 steps
- *   data     = H(C(b("UNICITY_SPLIT_OUTPUT"), b(parentId), network, b(P), b(salt), b(childId), b(ty), b(exactChildMintData)))
- *   SplitJ   = tag(39044, [ParentToken, [Proof]])
- */
 import { eq } from '../bytes.js';
-import { amount, array, ascii, bytesN, cAmount, cArr, cBytes, cTag, cUint, scanNative, scanOne, tagContent, u256, uintIn, type Item } from './cbor.js';
+import { amount, array, ascii, bytesN, cAmount, cArr, cBytes, cDeadline, cTag, cUint, scanOne, tagContent, u256, uintIn, type Item } from './cbor.js';
 import { DOMAIN, TAG } from './config.js';
 import { HU } from './crypto.js';
-import { Nb2Error, fail, wrap } from './errors.js';
-import { decodeTokenItem, encodePredicate, tokenIdOf, type MintTx, type Token } from './token.js';
+import { Nb2Error, fail } from './errors.js';
+import { encodePredicate, tokenIdOf, type MintTx } from './token.js';
 
 const MAX_SUM_PROOF_STEPS = 256;
 const TWO256 = 1n << 256n;
@@ -37,7 +27,8 @@ export interface SumStep { depth: number; hash: Uint8Array; sum: bigint }
 
 export const encodeSumProof = (p: SumStep[]): Uint8Array => cArr(...p.map((s) => cArr(cUint(s.depth), cBytes(s.hash), cAmount(s.sum))));
 
-function decodeSumProof(it: Item): SumStep[] {
+export function decodeSumProof(bytes: Uint8Array): SumStep[] {
+  const it = scanOne(bytes);
   if (it.major !== 4 || it.kids.length > MAX_SUM_PROOF_STEPS) fail('SplitProofShape');
   const p: SumStep[] = [];
   let prev = 256;
@@ -98,34 +89,25 @@ export function decodeSplitManifest(b: Uint8Array): Uint8Array {
 export function splitOutputCommitment(parentId: Uint8Array, m: MintTx): Uint8Array {
   const childId = tokenIdOf(m.salt, m.network);
   return HU(cArr(cBytes(ascii(DOMAIN.splitOutput)), cBytes(parentId), cUint(m.network), cBytes(encodePredicate(m.recipient)), cBytes(m.salt),
-    cBytes(childId), cBytes(m.type), cBytes(m.data ?? new Uint8Array())));
+    cBytes(childId), cBytes(m.type), cBytes(m.data ?? new Uint8Array()), cDeadline(m.deadline)));
 }
 
-export interface SplitJustification { parent: Token; proof: SumStep[] }
+export function parentLink(d: Uint8Array, id: Uint8Array, sid: Uint8Array, txHash: Uint8Array, manifest: Uint8Array, value: bigint): Uint8Array {
+  return HU(ascii('UNICITY/NB2/1.1/PARENT'), d, id, sid, txHash, manifest, u256(value));
+}
 
-/** A split reason: arity, the inline parent token (its own wire rules) and exactly one allocation proof. */
-export function decodeSplitJustification(j: Uint8Array): SplitJustification {
-  let it: Item;
+export function decodeSplitJustification(bytes: Uint8Array): Uint8Array {
   try {
-    it = scanNative(j);
-  } catch (e) {
-    return wrap('SplitJustif', e);
-  }
-  let c: Item;
-  try {
-    c = tagContent(it, TAG.splitJustification);
+    const [v, link] = array(tagContent(scanOne(bytes), TAG.splitJustification), 2);
+    uintIn(v, 2n, 2n);
+    return bytesN(link, 32);
   } catch {
     return fail('SplitJustif');
   }
-  if (c.major !== 4 || c.kids.length !== 2 || c.kids[0].major !== 6 || c.kids[1].major !== 4) fail('SplitJustif');
-  if (c.kids[1].kids.length !== 1) fail('SplitProofCount');
-  const proof = decodeSumProof(c.kids[1].kids[0]);
-  const parent = decodeTokenItem(c.kids[0], j);
-  return { parent, proof };
 }
 
-export const encodeSplitJustification = (parentToken: Uint8Array, proof: SumStep[]): Uint8Array =>
-  cTag(TAG.splitJustification, cArr(parentToken, cArr(encodeSumProof(proof))));
+export const encodeSplitJustification = (link: Uint8Array): Uint8Array =>
+  cTag(TAG.splitJustification, cArr(cUint(2), cBytes(link)));
 
 // ---- the allocation tree (the SDK's radix sparse Merkle sum tree), for building splits and fixtures -------------------
 

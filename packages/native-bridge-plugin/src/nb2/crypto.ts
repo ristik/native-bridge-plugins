@@ -67,7 +67,7 @@ export function minterScalarValid(k: Uint8Array): boolean {
 /** The universal minter's compressed public key for a token ID (an invalid scalar: no such ID is known, about 2^-128 per ID). */
 export function minterKey(id: Uint8Array): Uint8Array {
   const k = minterScalar(id);
-  if (!minterScalarValid(k)) throw new Error('nb2: minter scalar outside [1, n)');
+  if (!minterScalarValid(k)) fail('MintShape', 'minter scalar outside [1, n)');
   return secp256k1.getPublicKey(k, true);
 }
 

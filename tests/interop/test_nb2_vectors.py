@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import unittest
+from tools.vectors import check
 
 ROOT = Path(__file__).resolve().parents[2]
 DIR = ROOT / 'protocol/vectors/nb2'
@@ -18,9 +19,9 @@ class NB2VectorTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(self.raw).hexdigest(), want)
 
     def test_profile_and_protocol(self):
-        profile = (ROOT / 'protocol/profile.json').read_bytes()
-        self.assertEqual(self.doc['nativeBridgeProtocolVersion'], json.loads(profile)['nativeBridgeProtocolVersion'])
-        self.assertEqual(self.doc['semanticProfileHash'], '0x' + hashlib.sha256(profile).hexdigest())
+        self.assertEqual(self.doc['nativeBridgeProtocolVersion'], 9)
+        self.assertEqual(self.doc['semanticProfileHash'],
+                         '0xa9da5f02d629fd81f4e4ce61566e69c234157b106749e18221598909097d144f')
 
     def test_every_reachable_rule_is_vectored(self):
         named = set()
@@ -37,6 +38,11 @@ class NB2VectorTests(unittest.TestCase):
             named.add(v['expect'].get('error'))
         for rule in self.doc['rules']:
             self.assertIn(rule['name'], named, rule['name'])
+
+
+class ContinuationVectorTests(unittest.TestCase):
+    def test_pinned_manifests_and_files(self):
+        self.assertGreater(check(), 100)
 
 
 if __name__ == '__main__':

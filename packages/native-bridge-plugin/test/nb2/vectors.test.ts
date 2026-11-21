@@ -11,7 +11,7 @@ import { test } from 'node:test';
 import { toHex } from '../../src/bytes.js';
 import { u256 } from '../../src/nb2/cbor.js';
 import { ALL_RULES, Nb2Error, WalletError, type Rule } from '../../src/nb2/errors.js';
-import { ConfigError, buildParams, construct, decodeConfig, domainOf, type Build } from '../../src/nb2/config.js';
+import { ConfigError, buildParams, decodeConfig, domainOf, type Build } from '../../src/nb2/config.js';
 import { revertData, selectorOf, signatureOf, SELECTOR } from '../../src/nb2/abi.js';
 import { TAG_ARCHIVE_GENESIS, TAG_ARCHIVE_STEP, TAG_DEPOSIT_SECRET, TOPIC } from '../../src/nb2/deposit.js';
 import { ASSET_UCT } from '../../src/nb2/config.js';
@@ -20,7 +20,7 @@ import { burnIndex, capacityExceeded, capacityPreflight, checkCompanion, checkSt
 import { checkSegmentLog, foldHistory, gapProofLen, gapRoot } from '../../src/nb2/segment.js';
 import { TrustInput } from '../../src/nb2/trust.js';
 import { VaultModel, type VaultEvent, type RecipientBehaviour } from '../../src/nb2/vaultmodel.js';
-import { verdictAbi, verifyReturn } from '../../src/nb2/verify.js';
+import { decodeEvidence } from '../../src/nb2/verify.js';
 import { depositedData } from '../../src/nb2/deposit.js';
 import { segmentSealedData } from '../../src/nb2/segment.js';
 
@@ -118,59 +118,27 @@ test('primitives', () => {
   }
 });
 
-test('deployments decode under their build', async () => {
+// Historical custody vectors retain their original domain. Only their unchanged configuration fields are used.
+function fixtureConfig(gamma: Uint8Array, build: Build) {
+  const cfg = gamma.slice();
+  cfg[17] = 2;
+  return decodeConfig(cfg, buildParams(build));
+}
+
+test('the protocol 9 signed corpus is refused by protocol 10', async () => {
   for (const [name, v] of Object.entries<any>(F.deployments)) {
-    const cfg = decodeConfig(hx(v.gamma), buildParams(v.build));
-    assert.equal(h0x(domainOf(hx(v.gamma))), v.domain, name);
-    assert.equal(cfg.K, v.K);
-    assert.equal(cfg.B, v.B);
-    await dep(name);
+    const d = await dep(name);
+    assert.throws(() => decodeConfig(d.gamma, buildParams(d.build)), ConfigError);
+    assert.equal(h0x(domainOf(d.gamma)), v.domain);
   }
-});
-
-test('config: ConfigShape and BadConfig(field)', () => {
-  for (const v of F.config) {
-    const p = buildParams(F.deployments[v.deployment].build);
-    const gamma = hx(v.gamma);
-    let ve: unknown = null;
-    try {
-      decodeConfig(gamma, p);
-    } catch (e) {
-      ve = e;
-    }
-    let ce: unknown = null;
-    try {
-      construct(gamma, { address: hx(v.address), chainId: v.chainId, verifierCodeHash: hx(v.verifierCodeHash) }, p);
-    } catch (e) {
-      ce = e;
-    }
-    if (ve instanceof ConfigError) ve = new Nb2Error('ConfigShape');
-    assert.equal(norm(expectOf(ve)), norm(v.verifier), `${v.id} verifier: ${String(ve)}`);
-    assert.equal(norm(expectOf(ce)), norm(v.constructor), `${v.id} constructor: ${String(ce)}`);
-  }
-});
-
-test('verifier: verifyReturn on every token vector', async () => {
-  const failures: string[] = [];
-  for (const v of F.verifier) {
-    const d = await dep(v.deployment);
-    const gamma = v.gamma ? hx(v.gamma) : d.gamma;
-    let [vd, e] = await outcome(() => verifyReturn(gamma, hx(v.evidence), d.trust, buildParams(d.build)));
-    if (e instanceof ConfigError) e = new Nb2Error('ConfigShape');
-    if (norm(expectOf(e)) !== norm(v.expect)) {
-      failures.push(`${v.id}: got ${norm(expectOf(e))} (${String((e as Error)?.message ?? '')}), want ${norm(v.expect)}`);
-      continue;
-    }
-    if (vd !== null && h0x(verdictAbi(vd)) !== v.verdict.abi) failures.push(`${v.id}: verdict differs`);
-  }
-  assert.deepEqual(failures, []);
+  for (const item of F.verifier) assert.throws(() => decodeEvidence(hx(item.evidence)), Nb2Error);
 });
 
 test('seal receipts: SealReceipt and the burn index', async () => {
   const failures: string[] = [];
   for (const v of F.sealReceipts) {
     const d = await dep(v.deployment);
-    const cfg = decodeConfig(d.gamma, buildParams(d.build));
+    const cfg = fixtureConfig(d.gamma, d.build);
     const domain = domainOf(d.gamma);
     const resultOf = (sr: Awaited<ReturnType<typeof verifySealReceipt>> | null): any => {
       const { a, startHead } = burnIndex(cfg, domain, sr);
@@ -259,7 +227,7 @@ test('vault model: every vault vector, step by step', () => {
   const failures: string[] = [];
   for (const v of F.vault) {
     const d = F.deployments[v.deployment];
-    const vt = new VaultModel(hx(d.gamma), { address: hx(d.vault), chainId: d.chainId, verifierCodeHash: hx(d.verifierCodeHash) }, buildParams(d.build));
+    const vt = new VaultModel(hx(d.gamma), { address: hx(d.vault), chainId: d.chainId, verifierCodeHash: hx(d.verifierCodeHash) }, buildParams(d.build), fixtureConfig(hx(d.gamma), d.build));
     if (v.harnessState) {
       const h = v.harnessState;
       vt.setState(h.deposits, h.segment, h.population, BigInt(h.outstanding), hx(h.head), hx(h.previousHead), h.current.map(hx), h.previous.map(hx));

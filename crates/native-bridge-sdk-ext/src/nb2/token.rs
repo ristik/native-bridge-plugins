@@ -1,16 +1,3 @@
-//! The SDK token wire (`protocol/interop.md` "SDK wire", unchanged; `token.ts`, bft-core `nb2ref/token.go`):
-//!
-//! ```text
-//!   P     = tag(39032, [1, b(encode_uint(type)), b(params)])
-//!   M     = tag(39041, [2, network, P0, b(salt32), b(ty32), b(J), b(data), e])
-//!   T     = tag(39045, [2, Pnext, b(mask32), dataOrNull, e])
-//!   CD    = tag(39031, [2, Psource, b(sourceHash32), b(txHash32), e, b(unlock65)])
-//!   Token = tag(39040, [2, [M, proof0], [[T1, proof1], ...]])
-//!   proof = tag(39033, [1, CD, t, b(bitmap32 || siblings32...), UC])
-//! ```
-//!
-//! Decoding fails with the 14.1 encoding rules; a predicate outside the profile is `Predicate`.
-
 use alloc::vec::Vec;
 use num_bigint::BigUint;
 
@@ -22,7 +9,6 @@ use super::util::{arr, cat, min_bytes};
 
 pub const TX_VERSION: u64 = 2;
 pub const CERT_VERSION: u64 = 2;
-pub const TOKEN_VERSION: u64 = 2;
 pub const INCLUSION_VERSION: u64 = 1;
 pub const VALUE_VERSION: u64 = 1;
 pub const ENGINE_BUILTIN: u64 = 1;
@@ -182,7 +168,8 @@ pub fn encode_proof(p: &InclusionProof) -> Vec<u8> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Token {
+pub struct LineageLevel {
+    pub allocation: Vec<u8>,
     pub mint: MintTx,
     pub mint_proof: InclusionProof,
     pub transfers: Vec<TransferTx>,
@@ -192,63 +179,154 @@ pub struct Token {
     pub transfers_raw: Vec<Vec<u8>>,
 }
 
-pub fn encode_token(t: &Token) -> Vec<u8> {
-    let pairs: Vec<Vec<u8>> = t
-        .transfers
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub ancestors: Vec<LineageLevel>,
+    pub part: LineageLevel,
+}
+
+impl core::ops::Deref for Token {
+    type Target = LineageLevel;
+    fn deref(&self) -> &Self::Target {
+        &self.part
+    }
+}
+
+impl Token {
+    pub fn levels(&self) -> impl Iterator<Item = &LineageLevel> {
+        self.ancestors.iter().chain(core::iter::once(&self.part))
+    }
+}
+
+pub const MAX_TRANSFER_PAIR: usize = 40_960;
+pub const MAX_ROOT_MINT: usize = 66_048;
+pub const MAX_CHILD_MINT: usize = 512;
+pub const MAX_ALLOCATION: usize = 20_480;
+const FLAT_HEADER: &[u8] = b"NB2L\x01\x01";
+
+fn push_blob(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(
+        &u32::try_from(bytes.len())
+            .expect("blob length fits u32")
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(bytes);
+}
+
+pub fn frame_level(allocation: &[u8], mint: &[u8], proof: &[u8], pairs: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for bytes in [allocation, mint, proof] {
+        push_blob(&mut out, bytes);
+    }
+    out.extend_from_slice(&(pairs.len() as u64).to_be_bytes());
+    for pair in pairs {
+        push_blob(&mut out, pair);
+    }
+    out
+}
+
+pub fn encode_level(level: &LineageLevel) -> Vec<u8> {
+    let pairs: Vec<_> = level
+        .transfers_raw
         .iter()
-        .enumerate()
-        .map(|(i, tr)| {
-            let raw = t
-                .transfers_raw
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| encode_transfer(tr));
-            c_arr_v(&[raw, encode_proof(&t.proofs[i])])
-        })
+        .zip(&level.proofs)
+        .map(|(tx, proof)| c_arr(&[tx, &encode_proof(proof)]))
         .collect();
-    c_tag(
-        tag::TOKEN,
-        &c_arr_v(&[
-            c_uint(TOKEN_VERSION),
-            c_arr_v(&[t.mint_raw.clone(), encode_proof(&t.mint_proof)]),
-            c_arr_v(&pairs),
-        ]),
+    frame_level(
+        &level.allocation,
+        &level.mint_raw,
+        &encode_proof(&level.mint_proof),
+        &pairs,
     )
 }
 
-/// Strictly decode a token from its exact bytes.
-pub fn decode_token(b: &[u8]) -> Result<Token> {
-    let it = scan_native(b)?;
-    decode_token_item(&it, b)
+pub fn frame_lineage(levels: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = FLAT_HEADER.to_vec();
+    out.extend_from_slice(&(levels.len() as u64).to_be_bytes());
+    for level in levels {
+        out.extend_from_slice(level);
+    }
+    out
 }
 
-pub fn decode_token_item(it: &Item<'_>, b: &[u8]) -> Result<Token> {
-    let c = array(tag_content(it, tag::TOKEN)?, 3)?;
-    version(&c[0], TOKEN_VERSION)?;
-    let g = array(&c[1], 2)?;
-    if c[2].major != MAJ_ARRAY {
-        return fail(Rule::Shape);
+pub fn encode_token(t: &Token) -> Vec<u8> {
+    frame_lineage(&t.levels().map(encode_level).collect::<Vec<_>>())
+}
+
+fn take<'a>(left: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if n > left.len() {
+        return fail(Rule::Length);
     }
-    let mint = decode_mint(&g[0])?;
-    let mint_raw = raw(b, &g[0]).to_vec();
-    let mint_proof = decode_proof(&g[1], b)?;
-    let mut t = Token {
-        mint,
-        mint_proof,
-        transfers: Vec::new(),
-        proofs: Vec::new(),
-        mint_raw,
-        transfers_raw: Vec::new(),
-    };
-    for p in &c[2].kids {
-        let k = array(p, 2)?;
-        let tx = decode_transfer(&k[0])?;
-        let pr = decode_proof(&k[1], b)?;
-        t.transfers.push(tx);
-        t.proofs.push(pr);
-        t.transfers_raw.push(raw(b, &k[0]).to_vec());
+    let (out, rest) = left.split_at(n);
+    *left = rest;
+    Ok(out)
+}
+
+fn framed<'a>(left: &mut &'a [u8], max: usize) -> Result<&'a [u8]> {
+    let n = u32::from_be_bytes(arr(take(left, 4)?)) as usize;
+    if n > max {
+        return fail(Rule::InputTooLarge);
     }
-    Ok(t)
+    take(left, n)
+}
+
+/// Import exact signed bytes. Counts drive reads only after checking remaining bytes.
+pub fn decode_token(mut left: &[u8]) -> Result<Token> {
+    if take(&mut left, FLAT_HEADER.len())? != FLAT_HEADER {
+        return fail(Rule::EvidenceShape);
+    }
+    let n = u64::from_be_bytes(arr(take(&mut left, 8)?));
+    if n == 0 || n > (left.len() / 20) as u64 {
+        return fail(Rule::EvidenceShape);
+    }
+    let mut levels = Vec::new();
+    for i in 0..n {
+        let allocation = framed(&mut left, if i == 0 { 0 } else { MAX_ALLOCATION })?.to_vec();
+        if i != 0 && allocation.is_empty() {
+            return fail(Rule::SplitProofShape);
+        }
+        let mint_raw = framed(
+            &mut left,
+            if i == 0 {
+                MAX_ROOT_MINT
+            } else {
+                MAX_CHILD_MINT
+            },
+        )?;
+        let mint = decode_mint(&scan_one(mint_raw)?)?;
+        let proof_raw = framed(&mut left, 40_960 - 8)?;
+        let mint_proof = decode_proof(&scan_native(proof_raw)?, proof_raw)?;
+        let count = u64::from_be_bytes(arr(take(&mut left, 8)?));
+        if count > (left.len() / 4) as u64 {
+            return fail(Rule::Length);
+        }
+        let mut level = LineageLevel {
+            allocation,
+            mint,
+            mint_raw: mint_raw.to_vec(),
+            mint_proof,
+            transfers: Vec::new(),
+            transfers_raw: Vec::new(),
+            proofs: Vec::new(),
+        };
+        for _ in 0..count {
+            let pair = framed(&mut left, MAX_TRANSFER_PAIR)?;
+            let item = scan_native(pair)?;
+            let p = array(&item, 2)?;
+            level.transfers.push(decode_transfer(&p[0])?);
+            level.transfers_raw.push(raw(pair, &p[0]).to_vec());
+            level.proofs.push(decode_proof(&p[1], pair)?);
+        }
+        levels.push(level);
+    }
+    if !left.is_empty() {
+        return fail(Rule::Trailing);
+    }
+    let part = levels.pop().expect("nonempty lineage");
+    Ok(Token {
+        part,
+        ancestors: levels,
+    })
 }
 
 fn decode_mint(it: &Item<'_>) -> Result<MintTx> {
@@ -297,7 +375,7 @@ fn decode_cd(it: &Item<'_>) -> Result<Certification> {
         source_hash,
         tx_hash,
         deadline: dl,
-        unlock: bstr(&k[5])?.to_vec(),
+        unlock: bytes_n(&k[5], 65)?.to_vec(),
     })
 }
 

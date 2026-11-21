@@ -188,3 +188,32 @@ pub fn in_shard(shard: &ShardId, sid: &[u8]) -> bool {
 pub fn shard_bytes(uc: &UnicityCertificate) -> alloc::vec::Vec<u8> {
     uc.shard_tree_certificate.shard.encode()
 }
+
+/// For one complete seal and shard, canonical UC equality implies exact B1 claim equality.
+#[derive(Default)]
+pub(crate) struct ClaimConsistency {
+    claims: alloc::collections::BTreeMap<([u8; 32], u32, alloc::vec::Vec<u8>), [u8; 32]>,
+}
+
+impl ClaimConsistency {
+    pub(crate) fn check(&mut self, uc: &UnicityCertificate, raw: &[u8]) -> Result<()> {
+        let key = (
+            super::crypto::hu(&[&uc.unicity_seal.to_cbor()]),
+            uc.unicity_tree_certificate.partition_identifier,
+            shard_bytes(uc),
+        );
+        let digest = super::crypto::hu(&[raw]);
+        if self
+            .claims
+            .get(&key)
+            .is_some_and(|previous| *previous != digest)
+        {
+            return fail_d(
+                Rule::CertStructure,
+                "conflicting claims for the same seal and shard",
+            );
+        }
+        self.claims.insert(key, digest);
+        Ok(())
+    }
+}

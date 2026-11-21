@@ -1,19 +1,7 @@
-/**
- * The SDK token wire (`protocol/interop.md` "SDK wire", unchanged; bft-core `nb2ref/token.go`):
- *
- *   P     = tag(39032, [1, b(encode_uint(type)), b(params)])
- *   M     = tag(39041, [2, network, P0, b(salt32), b(ty32), b(J), b(data), e])
- *   T     = tag(39045, [2, Pnext, b(mask32), dataOrNull, e])
- *   CD    = tag(39031, [2, Psource, b(sourceHash32), b(txHash32), e, b(unlock65)])
- *   Token = tag(39040, [2, [M, proof0], [[T1, proof1], ...]])
- *   proof = tag(39033, [1, CD, t, b(bitmap32 || siblings32...), UC])
- *
- * Decoding fails with the 14.1 encoding rules; a predicate outside the profile is `Predicate`.
- */
-import { concat } from '../bytes.js';
+import { concat, concatBytes } from '../bytes.js';
 import {
   MAX_U64, array, ascii, bstr, bytesN, cArr, cBytes, cDeadline, cNull, cNullOr, cTag, cUint, deadline, isBytes, isTag, isUint, nullableBytes,
-  raw, scanNative, tagContent, uintIn, version, type Deadline, type Item,
+  raw, scanNative, scanOne, tagContent, uintIn, version, type Deadline, type Item,
 } from './cbor.js';
 import { TAG } from './config.js';
 import { HU, imprint, parseKey } from './crypto.js';
@@ -21,7 +9,6 @@ import { fail } from './errors.js';
 
 export const TX_VERSION = 2n;
 export const CERT_VERSION = 2n;
-export const TOKEN_VERSION = 2n;
 export const INCLUSION_VERSION = 1n;
 export const VALUE_VERSION = 1n;
 export const ENGINE_BUILTIN = 1n;
@@ -74,7 +61,8 @@ export interface InclusionProof { cd: Certification; t: bigint; bitmap: Uint8Arr
 export const encodeProof = (p: InclusionProof): Uint8Array =>
   cTag(TAG.inclusion, cArr(cUint(INCLUSION_VERSION), encodeCertification(p.cd), cUint(p.t), cBytes(concat(p.bitmap, ...p.siblings)), p.uc));
 
-export interface Token {
+export interface LineageLevel {
+  allocation: Uint8Array;
   mint: MintTx;
   mintProof: InclusionProof;
   transfers: TransferTx[];
@@ -84,34 +72,89 @@ export interface Token {
   transfersRaw: Uint8Array[];
 }
 
-export function encodeToken(t: Token): Uint8Array {
-  const pairs = t.transfers.map((tr, i) => cArr(t.transfersRaw[i] ?? encodeTransfer(tr), encodeProof(t.proofs[i])));
-  return cTag(TAG.token, cArr(cUint(TOKEN_VERSION), cArr(t.mintRaw, encodeProof(t.mintProof)), cArr(...pairs)));
+export interface Token extends LineageLevel {
+  ancestors: LineageLevel[];
 }
 
-/** Strictly decode a token from its exact bytes. */
-export function decodeToken(b: Uint8Array): Token {
-  return decodeTokenItem(scanNative(b), b);
+export const lineageOf = (token: Token): LineageLevel[] => [...token.ancestors, token];
+
+export const MAX_TRANSFER_PAIR = 40_960;
+export const MAX_ROOT_MINT = 66_048;
+export const MAX_CHILD_MINT = 512;
+export const MAX_ALLOCATION = 20_480;
+const FLAT_HEADER = Uint8Array.of(0x4e, 0x42, 0x32, 0x4c, 1, 1);
+
+function width(value: number, size: number): Uint8Array {
+  const out = new Uint8Array(size);
+  const view = new DataView(out.buffer);
+  if (size === 4) view.setUint32(0, value);
+  else view.setBigUint64(0, BigInt(value));
+  return out;
 }
 
-export function decodeTokenItem(it: Item, b: Uint8Array): Token {
-  const c = array(tagContent(it, TAG.token), 3);
-  version(c[0], TOKEN_VERSION);
-  const g = array(c[1], 2);
-  if (c[2].major !== 4) fail('Shape');
-  const mint = decodeMint(g[0]);
-  const mintRaw = raw(b, g[0]);
-  const mintProof = decodeProof(g[1], b);
-  const t: Token = { mint, mintProof, transfers: [], proofs: [], mintRaw, transfersRaw: [] };
-  for (const p of c[2].kids) {
-    const k = array(p, 2);
-    const tx = decodeTransfer(k[0]);
-    const pr = decodeProof(k[1], b);
-    t.transfers.push(tx);
-    t.proofs.push(pr);
-    t.transfersRaw.push(raw(b, k[0]));
+const blob = (bytes: Uint8Array): Uint8Array => concat(width(bytes.length, 4), bytes);
+
+export function encodeLevel(level: LineageLevel): Uint8Array {
+  const pairs = level.transfersRaw.map((tx, i) => cArr(tx, encodeProof(level.proofs[i])));
+  return frameLevel(level.allocation, level.mintRaw, encodeProof(level.mintProof), pairs);
+}
+
+export function frameLevel(allocation: Uint8Array, mint: Uint8Array, proof: Uint8Array, pairs: Uint8Array[]): Uint8Array {
+  return concatBytes([blob(allocation), blob(mint), blob(proof), width(pairs.length, 8), ...pairs.map(blob)]);
+}
+
+export function frameLineage(levels: Uint8Array[]): Uint8Array {
+  return concatBytes([FLAT_HEADER, width(levels.length, 8), ...levels]);
+}
+
+export const encodeToken = (token: Token): Uint8Array => frameLineage(lineageOf(token).map(encodeLevel));
+
+/** Import exact signed bytes. Counts drive reads only after checking remaining bytes. */
+export function decodeToken(input: Uint8Array): Token {
+  // Verification awaits historical authority, so keep the decoded signed bytes independent of the caller buffer.
+  const b = Uint8Array.from(input);
+  let offset = 0;
+  const take = (len: number): Uint8Array => {
+    if (len > b.length - offset) fail('Length');
+    const result = b.subarray(offset, offset + len);
+    offset += len;
+    return result;
+  };
+  const number = (size: number): bigint => {
+    const bytes = take(size);
+    const v = new DataView(bytes.buffer, bytes.byteOffset, size);
+    return size === 4 ? BigInt(v.getUint32(0)) : v.getBigUint64(0);
+  };
+  const framed = (max: number): Uint8Array => {
+    const len = Number(number(4));
+    if (len > max) fail('InputTooLarge');
+    return take(len);
+  };
+  if (!take(FLAT_HEADER.length).every((byte, i) => byte === FLAT_HEADER[i])) fail('EvidenceShape');
+  const n = number(8);
+  if (n === 0n || n > BigInt(Math.floor((b.length - offset) / 20))) fail('EvidenceShape');
+  const levels: LineageLevel[] = [];
+  for (let i = 0; i < Number(n); i++) {
+    const allocation = framed(i === 0 ? 0 : MAX_ALLOCATION);
+    if (i !== 0 && allocation.length === 0) fail('SplitProofShape');
+    const mintRaw = framed(i === 0 ? MAX_ROOT_MINT : MAX_CHILD_MINT);
+    const mint = decodeMint(scanOne(mintRaw));
+    const proofRaw = framed(40_960 - 8);
+    const mintProof = decodeProof(scanNative(proofRaw), proofRaw);
+    const count = number(8);
+    if (count > BigInt(Math.floor((b.length - offset) / 4))) fail('Length');
+    const level: LineageLevel = { allocation, mintRaw, mint, mintProof, transfersRaw: [], transfers: [], proofs: [] };
+    for (let j = 0; j < Number(count); j++) {
+      const pair = framed(MAX_TRANSFER_PAIR);
+      const [tx, proof] = array(scanNative(pair), 2);
+      level.transfersRaw.push(raw(pair, tx));
+      level.transfers.push(decodeTransfer(tx));
+      level.proofs.push(decodeProof(proof, pair));
+    }
+    levels.push(level);
   }
-  return t;
+  if (offset !== b.length) fail('Trailing');
+  return { ...levels.pop()!, ancestors: levels };
 }
 
 function decodeMint(it: Item): MintTx {
@@ -142,7 +185,7 @@ function decodeCD(it: Item): Certification {
   const sourceHash = bytesN(k[2], 32);
   const txHash = bytesN(k[3], 32);
   const dl = deadline(k[4]);
-  return { source, sourceHash, txHash, deadline: dl, unlock: bstr(k[5]) };
+  return { source, sourceHash, txHash, deadline: dl, unlock: bytesN(k[5], 65) };
 }
 
 const MAX_PROOF_UC_BYTES = 24 << 10;

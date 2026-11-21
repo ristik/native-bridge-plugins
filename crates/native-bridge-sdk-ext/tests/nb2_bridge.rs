@@ -1445,7 +1445,9 @@ mod sdk_aggregator {
             recipient: signature_predicate(&local_owner(&key("o")).public_key()),
             salt: vec![seed; 32],
             ty: vec![2; 32],
-            justification: None,
+            justification: Some(
+                native_bridge_sdk_ext::nb2::split::encode_split_justification(&[0; 32]),
+            ),
             data: None,
             deadline: None,
         };

@@ -232,7 +232,7 @@ to 1.095 times it; U+10000 IDs sharing a 124-byte prefix are 1.079. The review's
 | q-e7n-s16u8 | 8,510,081 | 9,652,761 | 1.134 | −31,777 |
 | q-e7n-u32 | 10,473,683 | 11,898,259 | 1.136 | −384,938 |
 
-**Shared vectors.** `tests/nb2-gas/gas-vectors.json` holds 19 evidence files; both plug-ins reproduce every feature and term of each.
+**Historical vectors.** `tests/nb2-gas/gas-vectors.json` records the measured protocol 9 build. The protocol 10 suites check flat evidence accounting with the independent T1 corpus. The deployed-artifact check gates the old bound to configuration version 1.
 Six are lane tokens (1 and 10 transfers, 3 and 10 split levels, 151 fresh keys, trimmed seals); four are the synthetic part tokens (a
 200-bit shard, 16 signatures with non-ASCII IDs, 16 signatures, 24 KiB seals over the batch's byte cap); four are the review's
 counterexamples above the splits (2, 3 and 7 levels with 32 unicity tree steps, 5 levels with 16 signatures and 8 steps); one is the
