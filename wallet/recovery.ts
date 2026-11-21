@@ -250,13 +250,16 @@ export async function restoreReturn(w: Wallet, file: string): Promise<ReturnReco
   await w.bridge.importPendingReturn(rec);
   await w.bridge.burn(bytes(rec.returnId, 32));
   const confirmed = (await w.bridge.journal.ret(rec.returnId))!;
-  if (rec.recovery) {
-    const release = recoveryRelease(w);
-    const session = await openSession(w, release, confirmed);
-    if (backup.checkpoint && !loadRecovery(w, confirmed)) {
-      // Authenticate every portable cut before writing any local checkpoint.
-      await replay(w.trust, session, confirmed, backup.checkpoint);
-      saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, settled: undefined, fees: '0' });
+  if (confirmed.recovery) {
+    const session = await openSession(w, recoveryRelease(w), confirmed);
+    if (!loadRecovery(w, confirmed)) {
+      if (backup.checkpoint) {
+        // Authenticate every portable cut before writing any local checkpoint.
+        await replay(w.trust, session, confirmed, backup.checkpoint);
+        saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, settled: undefined, fees: '0' });
+      } else {
+        saveRecovery(w, confirmed, initialJournal(session, confirmed));
+      }
     }
   }
   return confirmed;
@@ -282,6 +285,19 @@ function loadRecovery(w: Wallet, rec: ReturnRecord): RecoveryJournal | undefined
 }
 function saveRecovery(w: Wallet, rec: ReturnRecord, journal: RecoveryJournal): void {
   writeDurable(pathOf(w, rec), JSON.stringify(journal));
+}
+
+function initialJournal(s: RecoverySession, rec: ReturnRecord): RecoveryJournal {
+  const evidence = evidenceOf(bytes(rec.burned!));
+  return { version: 1, session: hx(s.id), pageRoot: hx(s.pageRoot), generation: rec.recovery!.generation,
+    evidence: hx(evidence), evidenceBytes: evidence.length, cuts: [], fees: '0' };
+}
+
+/** Commit the terminal continuation identity as soon as burn certification succeeds. */
+export async function retainTerminal(w: Wallet, rec: ReturnRecord): Promise<void> {
+  if (!rec.recovery || loadRecovery(w, rec)) return;
+  const session = await openSession(w, recoveryRelease(w), rec);
+  saveRecovery(w, rec, initialJournal(session, rec));
 }
 
 const sessions = new WeakMap<Wallet, { burned: string; generation: string; trust: TrustInput; session: RecoverySession }>();
@@ -412,9 +428,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   const paid = await reconcile();
   if (paid.state !== 'not-paid') return paid;
   const s = await openSession(w, release, rec);
-  const evidence = evidenceOf(bytes(rec.burned!));
-  const journal: RecoveryJournal = loadRecovery(w, rec) ?? { version: 1, session: hx(s.id), pageRoot: hx(s.pageRoot), generation: hx(release.generation),
-    evidence: hx(evidence), evidenceBytes: evidence.length, cuts: [], fees: '0' };
+  const journal = loadRecovery(w, rec) ?? initialJournal(s, rec);
   const cursor = await replay(w.trust, s, rec, journal);
 
   if (journal.pending === undefined) {

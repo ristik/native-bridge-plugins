@@ -114,7 +114,8 @@ Use a private local directory for the resumed journal. The payout address and am
 the holder's signed burn.
 
 ```sh
-nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb2-release.json   --rpc "$RPC" --payer-env RELAY_PAYER --return-policy relay-payer.json
+nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb2-release.json \
+  --rpc "$RPC" --payer-env RELAY_PAYER --return-policy relay-payer.json
 ```
 
 Repeat the same command if inclusion or certification is pending. Resume checks the exact

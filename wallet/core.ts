@@ -40,7 +40,7 @@ import {
 import { parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
-import { guardOrdinary, recoverStep, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
+import { guardOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -708,6 +708,7 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
     if (r === null || r.status === 'planned') w.update(label, { spent: undefined });
     throw err;
   }
+  await retainTerminal(w, (await w.bridge.journal.ret(id))!);
   w.update(label, { note: 'burned', spent: BURNED });
   return { plan, burned: b.burned, eta: b.eta, evidenceBytes: evidenceOf(b.burned).length };
 }

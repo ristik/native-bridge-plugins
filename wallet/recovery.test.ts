@@ -155,6 +155,11 @@ test('a private backup made before submission restores the exact signed burn wit
   assert.ok(restored.eta);
   const result = await burn(reopened, 'coin', undefined, undefined, caps);
   assert.equal(hx(result.eta), restored.eta);
+  const terminal = JSON.parse(readFileSync(join(reopened.dir, `recovery-${rec.returnId.slice(2)}.json`), 'utf8'));
+  assert.equal(terminal.evidenceBytes, result.evidenceBytes);
+  assert.equal(terminal.generation, rec.recovery!.generation);
+  assert.match(terminal.session, /^0x[0-9a-f]{64}$/);
+  assert.match(terminal.pageRoot, /^0x[0-9a-f]{64}$/);
 });
 
 test('large lineage relays exact pending bytes across submission and checkpoint crashes, then reconciles competing Paid', { timeout: 420_000 }, async (t) => {
