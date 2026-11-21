@@ -696,7 +696,13 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
   const e = w.entry(label);
   if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
   let plan: ReturnPlan | null = null;
-  const rec = await w.bridge.journal.ret(e.returnId ?? hx(HU(w.token(label))));
+  const source = w.token(label);
+  const sourceId = hx(HU(source));
+  const lookupId = e.returnId ?? sourceId;
+  const rec = await w.bridge.journal.ret(lookupId);
+  if (rec && (rec.returnId !== sourceId || rec.returnId !== lookupId || rec.source !== hx(source))) {
+    throw new WalletError('BadInput', 'journaled return does not match the labeled source');
+  }
   let expectedRecipient: Uint8Array | undefined;
   if (rec === null || rec.status === 'planned') {
     if (recipient === undefined && (e.returnId || rec) && !e.authorizedRecipient) {
@@ -711,7 +717,8 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
   }
   // the token is marked before its burn request is journaled, so nothing else can spend the state the burn spends; a burn that never got
   // that far (a refused last preflight) takes the mark back
-  const id = w.entry(label).returnId!;
+  const id = plan ? hx(plan.returnId) : lookupId;
+  if (!e.returnId && !plan) w.update(label, { returnId: id });
   const authorization = join(w.dir, `backup-${id.slice(2)}.txt`);
   if (backup) {
     const target = resolve(backup);
@@ -792,6 +799,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
 
 /** The CLI routes a signed cold return through the durable packet runner. */
 export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false): Promise<RecoveryResult | ReconcileResult> {
+  if (rec.status === 'paid' && (!rec.recovery || ordinary)) return w.bridge.reconcile(unhex(rec.returnId));
   const r = rec.recovery && !ordinary ? await recoverStep(w, rec, policy) :
     await w.bridge.submitRedeem(unhex(rec.returnId), w.signer, ordinaryPayout(w, rec, policy));
   return r;

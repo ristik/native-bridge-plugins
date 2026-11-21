@@ -271,7 +271,7 @@ export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string):
   }
 }
 
-export async function restoreReturn(w: Wallet, file: string): Promise<ReturnRecord> {
+export async function restoreReturn(w: Wallet, file: string, policy?: PayerPolicy): Promise<ReturnRecord> {
   const backup = JSON.parse(readFileSync(file, 'utf8')) as Backup;
   if (backup.version !== 1 || backup.gamma !== hx(w.pins.gamma) || backup.vaultRuntimeHash !== hx(w.pins.vaultRuntimeCodeHash)) {
     throw new WalletError('BadDeployment', 'backup belongs to another installed deployment');
@@ -279,47 +279,79 @@ export async function restoreReturn(w: Wallet, file: string): Promise<ReturnReco
   const rec = backup.pending;
   // Older portable checkpoint files carry the same terminal bytes as their flat evidence.
   const terminal = backup.terminal ?? backup.checkpoint?.evidence;
-  const release = rec.recovery ? recoveryRelease(w) : undefined;
-  if (release) {
-    await checkGraph(w, release);
-    if (rec.recovery!.generation !== hx(release.generation)) throw new WalletError('BadDeployment', 'backup belongs to another recovery generation');
-  }
-  if (backup.checkpoint && !release) throw new Error('portable cuts require a recovery schedule');
-  await w.bridge.importPendingReturn(rec, terminal === undefined ? undefined : bytes(terminal), async (verified) => {
-    if (!release) return;
-    const held = bytes(verified.source);
-    const { runCuts, advanceGaps } = verified.recovery!;
-    const operations = w.bridge.returnHeadroom(held).operations;
-    checkSchedule(verified, operations);
-    const { cfg, evm } = w.bridge;
-    // The wallet uses the same maximal envelope widths at admission, regardless of the current bids.
-    const limits: RecoveryLimits = {
-      gas: w.pins.userGasLimit, signedBytes: Number(w.pins.maxEncodedTxBytes), calldataBytes: 393_216,
-      chainId: cfg.chainId, maxNonce: 0n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n,
-      balance: 0n, feeBudget: 0n, worstCaseEnvelope: true,
-    };
-    if (!quoteRecoveryGapBatch(cfg.K, advanceGaps, release.calibration, limits)) {
-      throw new Nb2Error('CapacityPreflight', 'portable gap batch or settlement suffix is outside the release limits');
+  const archive = policy ? readers(w, policy) : [w.bridge.evm];
+  let replacement: RecoveryJournal | undefined;
+  const selected = await w.bridge.importPendingReturn(rec, terminal === undefined ? undefined : bytes(terminal), async (verified) => {
+    if (!verified.recovery) {
+      if (backup.checkpoint) throw new Error('portable cuts require a recovery schedule');
+      return;
     }
-    const cursor = backup.checkpoint
-      ? await replay(w, await openSession(w, release, verified), verified, backup.checkpoint)
-      : undefined;
-    const confirmedCuts = backup.checkpoint?.cuts.filter((item) => item.cut.kind === 'run').length ?? 0;
-    checkRemainingRecoveryRuns(held, runCuts, confirmedCuts, release.calibration, limits);
-    const covered = cursor?.gap?.cursor?.next ?? uint(verified.a);
-    const { segment } = await evm.vaultState(cfg.vault);
-    recoveryCatchUpCalls(advanceGaps, {
-      ...release.backlog, signedStart: covered, observed: segment > covered ? segment : covered,
-      duringProgress: confirmedCuts < runCuts.length ? release.backlog.duringProgress : 0n,
-    });
-  });
-  if (terminal === undefined) await w.bridge.burn(bytes(rec.returnId, 32));
-  const confirmed = (await w.bridge.journal.ret(rec.returnId))!;
-  if (backup.checkpoint && !loadRecovery(w, confirmed) && confirmed.burned === terminal) {
-    saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, settled: undefined, fees: undefined, attempts: undefined });
+    const release = recoveryRelease(w);
+    await checkGraph(w, release);
+    if (verified.recovery.generation !== hx(release.generation)) throw new WalletError('BadDeployment', 'backup belongs to another recovery generation');
+    // An equivalent terminal proof can have different bytes and identify another session.
+    const portable = verified.burned === terminal ? backup.checkpoint : undefined;
+    const local = loadRecovery(w, verified);
+    const { journal, cursor } = await selectCheckpoint(w, release, verified, local, portable);
+    await qualifyRestoredSchedule(w, release, verified, journal, cursor);
+    if (journal && journal !== local) replacement = journal;
+  }, archive);
+  if (selected.status === 'paid') return selected;
+  if (replacement) saveRecovery(w, selected, replacement);
+  if (selected.status === 'burn-requested') {
+    await w.bridge.burn(bytes(selected.returnId, 32));
+    await w.bridge.reconcile(bytes(selected.returnId, 32), archive);
   }
-  await retainTerminal(w, confirmed);
+  const confirmed = (await w.bridge.journal.ret(selected.returnId))!;
+  if (confirmed.status !== 'paid') await retainTerminal(w, confirmed);
   return confirmed;
+}
+
+async function selectCheckpoint(w: Wallet, release: ReleaseRecovery, rec: ReturnRecord,
+  local?: RecoveryJournal, portable?: RecoveryJournal): Promise<{ journal?: RecoveryJournal; cursor?: Cursor }> {
+  if (!local && !portable) return {};
+  const session = await openSession(w, release, rec);
+  const localCursor = local && await replay(w, session, rec, local);
+  const portableCursor = portable && await replay(w, session, rec, portable);
+  // A pending signed packet must still open its exact predecessor. Revisit the portable cursor after it resolves.
+  if (!portableCursor || local?.pending || (localCursor && !advances(portableCursor, localCursor))) {
+    return { journal: local, cursor: localCursor };
+  }
+  return {
+    journal: { ...portable!, pending: undefined, settled: local?.settled, fees: local?.fees, attempts: local?.attempts },
+    cursor: portableCursor,
+  };
+}
+
+function advances(candidate: Cursor, held: Cursor): boolean {
+  if (candidate.from !== held.from) return candidate.from > held.from;
+  const next = candidate.gap?.cursor?.next;
+  return next !== undefined && (held.gap?.cursor === undefined || next > held.gap.cursor.next);
+}
+
+async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec: ReturnRecord,
+  journal?: RecoveryJournal, cursor?: Cursor): Promise<void> {
+  const held = bytes(rec.source);
+  const { runCuts, advanceGaps } = rec.recovery!;
+  checkSchedule(rec, w.bridge.returnHeadroom(held).operations);
+  const { cfg, evm } = w.bridge;
+  // The wallet uses the same maximal envelope widths at admission, regardless of the current bids.
+  const limits: RecoveryLimits = {
+    gas: w.pins.userGasLimit, signedBytes: Number(w.pins.maxEncodedTxBytes), calldataBytes: 393_216,
+    chainId: cfg.chainId, maxNonce: 0n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n,
+    balance: 0n, feeBudget: 0n, worstCaseEnvelope: true,
+  };
+  if (!quoteRecoveryGapBatch(cfg.K, advanceGaps, release.calibration, limits)) {
+    throw new Nb2Error('CapacityPreflight', 'portable gap batch or settlement suffix is outside the release limits');
+  }
+  const confirmedCuts = journal?.cuts.filter((item) => item.cut.kind === 'run').length ?? 0;
+  checkRemainingRecoveryRuns(held, runCuts, confirmedCuts, release.calibration, limits);
+  const covered = cursor?.gap?.cursor?.next ?? uint(rec.a);
+  const { segment } = await evm.vaultState(cfg.vault);
+  recoveryCatchUpCalls(advanceGaps, {
+    ...release.backlog, signedStart: covered, observed: segment > covered ? segment : covered,
+    duringProgress: confirmedCuts < runCuts.length ? release.backlog.duringProgress : 0n,
+  });
 }
 
 type Cut = { kind: 'run'; count: number } | { kind: 'advance'; gaps: string[] } | { kind: 'settle'; gaps: string[] };
@@ -474,8 +506,6 @@ export type RecoveryResult = { state: 'paid'; txHash: Uint8Array; blockNumber: b
 
 /** Execute at most one new packet. Reconcile the same saved bytes after an ambiguous send. */
 export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): Promise<RecoveryResult> {
-  const release = recoveryRelease(w);
-  await checkGraph(w, release);
   const id = bytes(rec.returnId, 32);
   const archive = readers(w, policy);
   const reconcile = async () => {
@@ -492,6 +522,8 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   };
   const paid = await reconcile();
   if (paid.state !== 'not-paid') return paid;
+  const release = recoveryRelease(w);
+  await checkGraph(w, release);
   const s = await openSession(w, release, rec);
   const journal = loadRecovery(w, rec) ?? initialJournal(s, rec);
   const cursor = await replay(w, s, rec, journal);

@@ -788,3 +788,120 @@ test('ordinary restart refuses an unrelated certified failure hash in the send j
   await assert.rejects(resumePayout(restarted, rec, caps), /hash does not match its signed transaction/);
   assert.equal(sends, 1);
 });
+
+test('restore qualifies and keeps the same checkpoint that will execute across both orderings', async (t) => {
+  const { w, dir, manifest, open, rpc, chain, deployment } = await setup(t);
+  const original = join(dir, 'original-return.json');
+  await burn(w, 'coin', undefined, undefined, caps, original);
+  const rec = await w.returnRecord('coin');
+  const old = await open('older-local');
+  const oldRec = await restoreReturn(old, original);
+  chain.fund(old.signer.address, 10n ** 18n);
+  const localFile = (wallet: Wallet) => join(wallet.dir, `recovery-${rec.returnId.slice(2)}.json`);
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const packet = await session.run(0, session.operationCount, w.trust);
+  let refuseProgress = true;
+  chain.coldCall = async (_vault, to) => {
+    if (!eq(to, deployment.recovery)) return undefined;
+    if (refuseProgress) throw new Nb2Error('PayoutFailed');
+    return [{ address: deployment.recovery, topics: packet.event.topics, data: packet.event.data }];
+  };
+  assert.equal((await recoverStep(old, oldRec, caps)).state, 'retry');
+  const oldAttempts = JSON.parse(readFileSync(localFile(old), 'utf8')).attempts;
+  assert.equal(oldAttempts.length, 1);
+
+  const withPending = await open('pending-local');
+  const pendingRec = await restoreReturn(withPending, original);
+  chain.fund(withPending.signer.address, 10n ** 18n);
+  chain.autoMine = false;
+  assert.equal((await recoverStep(withPending, pendingRec, caps)).state, 'pending');
+  const pending = readFileSync(localFile(withPending), 'utf8');
+  chain.dropPool();
+  chain.autoMine = true;
+  refuseProgress = false;
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  const portable = join(dir, 'certified-complete.json');
+  publishReturnBackup(w, rec, portable);
+  await restoreReturn(withPending, portable);
+  assert.equal(readFileSync(localFile(withPending), 'utf8'), pending, 'the pending packet keeps its exact predecessor');
+
+  const release = JSON.parse(readFileSync(manifest, 'utf8'));
+  release.recovery.ranges = release.recovery.ranges.filter((r: { max: { entry: string } }) => r.max.entry !== 'run');
+  writeFileSync(manifest, JSON.stringify(release));
+  const ahead = await open('holder', rpc);
+  const newest = readFileSync(localFile(ahead), 'utf8');
+  await restoreReturn(ahead, original);
+  assert.equal(readFileSync(localFile(ahead), 'utf8'), newest, 'the old file cannot roll back certified Complete');
+
+  const behind = await open('older-local', rpc);
+  const imported = await restoreReturn(behind, portable);
+  const saved = readFileSync(localFile(behind), 'utf8');
+  assert.equal(JSON.parse(saved).cuts.length, 1, 'the newer portable Complete becomes the execution checkpoint');
+  assert.deepEqual(JSON.parse(saved).attempts, oldAttempts);
+  await restoreReturn(behind, portable);
+  assert.equal(readFileSync(localFile(behind), 'utf8'), saved, 'repeating the same import is a no-op');
+  chain.autoMine = false;
+  assert.equal((await recoverStep(behind, imported, caps)).state, 'pending');
+  assert.equal(JSON.parse(readFileSync(localFile(behind), 'utf8')).pending.cut.kind, 'settle');
+});
+
+test('restore reconciles certified Paid before qualifying future packets', async (t) => {
+  const { w, dir, manifest, open, rpc } = await setup(t);
+  const original = join(dir, 'paid-from-signing-backup.json');
+  await burn(w, 'coin', undefined, undefined, caps, original);
+  const rec = await w.returnRecord('coin');
+  const relayer = await open('paid-relayer');
+  await restoreReturn(relayer, original);
+  const signed = await open('signed-relayer');
+  const pending = JSON.parse(readFileSync(original, 'utf8')).pending;
+  assert.equal((await signed.bridge.importPendingReturn(pending)).status, 'burn-requested');
+  const certified = join(dir, 'paid-from-certified-backup.json');
+  publishReturnBackup(w, rec, certified);
+
+  const paid = await resumePayout(w, rec, caps, true);
+  assert.equal(paid.state, 'paid');
+  const release = JSON.parse(readFileSync(manifest, 'utf8'));
+  release.recovery.ranges = [];
+  release.recovery.backlog.qualifiedForMs = '1';
+  writeFileSync(manifest, JSON.stringify(release));
+
+  for (const [name, backup] of [['signed-relayer', original], ['paid-relayer', original], ['fresh-paid', certified]]) {
+    const device = await open(name);
+    const reconciled = await restoreReturn(device, backup, caps);
+    assert.equal(reconciled.status, 'paid', name);
+    assert.equal(reconciled.paid!.txHash, hx(paid.txHash!), name);
+    assert.ok(reconciled.paid!.receipt, name);
+  }
+  const noSearch: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_getLogs') throw new Error('archive disabled after payout');
+    return rpc.call<T>(method, params);
+  } };
+  const reopened = await open('paid-relayer', noSearch);
+  const reconciled = await restoreReturn(reopened, original);
+  assert.equal((await resumePayout(reopened, reconciled, caps)).state, 'paid');
+});
+
+test('holder burn resume repairs a missing token-index return ID without another signature', async (t) => {
+  const { w, open, dir } = await setup(t);
+  const offline = { certify: async () => { throw new Error('certifier paused before submission'); } };
+  const interrupted = await open('holder', undefined, { aggregator: offline });
+  await assert.rejects(burn(interrupted, 'coin', undefined, undefined, caps), /certifier paused/);
+  const signed = await interrupted.returnRecord('coin');
+  assert.equal(signed.status, 'burn-requested');
+  interrupted.update('coin', { returnId: undefined });
+  const reopened = await open('holder');
+  assert.equal(reopened.entry('coin').returnId, undefined);
+  const owner = reopened.owner(0);
+  reopened.owner = () => ({ ...owner, signUnlock: async () => { throw new Error('second signature'); } });
+  assert.equal((await burn(reopened, 'coin', undefined, undefined, caps)).plan, null);
+  assert.equal(reopened.entry('coin').returnId, signed.returnId);
+  const certified = await reopened.returnRecord('coin');
+  assert.equal(certified.burnRequest, signed.burnRequest);
+  assert.equal(certified.status, 'burned');
+  reopened.update('coin', { returnId: undefined });
+  const certifiedOnly = await open('holder', undefined, { aggregator: offline });
+  assert.equal((await burn(certifiedOnly, 'coin', undefined, undefined, caps)).plan, null);
+  assert.equal(certifiedOnly.entry('coin').returnId, signed.returnId);
+  assert.ok(existsSync(join(dir, 'holder', 'tokens.json')));
+});

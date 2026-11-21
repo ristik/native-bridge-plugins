@@ -123,11 +123,11 @@ nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb
 Repeat the same command if inclusion or certification is pending. Resume checks the exact
 signed request and reconstructs the session and sparse openings from the evidence. A certified
 backup can restore its burn and checkpoints locally. A backup taken before certification queries
-the aggregator for the exact pending request. Imported checkpoints are replayed against certified
-receipts before reuse. The journal stores each
-signed EVM transaction and prior cursor before submission. It advances after the exact
-checkpoint event verifies, and closes only on the pinned vault's certified `Paid` for the signed
-address and amount. A provider with missing proof data can be replaced using the alternate
+the aggregator for the exact pending request. Resume replays the local and portable checkpoints
+and qualifies the remaining work from the most advanced usable cursor. A pending signed packet
+keeps its original cursor until reconciliation. The journal records each signed EVM transaction
+before submission and advances after the exact checkpoint event verifies. Resume checks for the
+pinned vault's certified `Paid` for the signed address and amount before pricing future packets. A provider with missing proof data can be replaced using the alternate
 archives. To restart from evidence after losing the local cuts, use the original post-sign
 backup and another private journal directory. Account for fees already spent when setting the
 new payer policy.

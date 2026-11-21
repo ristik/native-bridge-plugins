@@ -781,7 +781,8 @@ export class NativeBridgeV2 {
 
   /** Authenticate the backup and its optional terminal proof before committing a return. */
   public async importPendingReturn(snapshot: ReturnRecord, terminal?: Uint8Array,
-    beforeCommit?: (verified: ReturnRecord) => Promise<void>): Promise<void> {
+    beforeCommit?: (verified: ReturnRecord) => Promise<void>,
+    archives: readonly EvmReader[] = [this.evm]): Promise<ReturnRecord> {
     const rec = structuredClone(snapshot);
     const burned = terminal && Uint8Array.from(terminal);
     if (rec.domain !== hex(this.domain)) refuse('BadInput', 'return backup belongs to another deployment');
@@ -802,12 +803,36 @@ export class NativeBridgeV2 {
       verified.burned = hex(burned);
       verified.eta = hex(verdict.eta);
     }
-    await this.locked(`return/${returnId.slice(2)}`, async () => {
+    return this.locked(`return/${returnId.slice(2)}`, async () => {
       const existing = await this.journal.retForUpdate(returnId);
-      if (existing?.burnRequest !== undefined && existing.burnRequest !== burnRequest) refuse('JournalConflict', 'another burn request is held');
-      await beforeCommit?.(structuredClone(verified));
-      if (existing?.burnRequest !== undefined && (!burned || existing.status !== 'burn-requested')) return;
-      await this.journal.putReturn(verified);
+      let selected = verified;
+      if (existing?.burnRequest !== undefined) {
+        if (existing.burnRequest !== burnRequest || existing.burnTx !== burnTx || existing.returnId !== returnId ||
+          existing.source !== source || existing.amount !== amount || existing.recipient !== recipient || existing.a !== a ||
+          existing.startHead !== startHead || existing.fromBlock !== fromBlock || existing.certificationLocator !== certificationLocator) {
+          refuse('JournalConflict', 'another signed return is held');
+        }
+        if (existing.status === 'paid') return existing;
+        selected = existing;
+        if (existing.status === 'burn-requested') {
+          if (burned) {
+            selected.burned = verified.burned;
+            selected.eta = verified.eta;
+            selected.status = 'burned';
+          } else {
+            await this.certifyReturn(selected);
+          }
+          // The signed request is already durable. Keep its verified result even if future work cannot be qualified.
+          await this.journal.putReturn(selected);
+        }
+      }
+      if (selected.eta !== undefined && (await this.findPaid(selected, archives, false))?.state === 'paid') {
+        await this.journal.putReturn(selected);
+        return selected;
+      }
+      await beforeCommit?.(structuredClone(selected));
+      if (selected === verified) await this.journal.putReturn(selected);
+      return selected;
     });
   }
 
@@ -851,20 +876,24 @@ export class NativeBridgeV2 {
     }
     if (rec.status === 'burn-requested') {
       await admission?.beforeCertification?.(structuredClone(rec));
-      const proof = await certifyChecked(this.opts.aggregator, unhex(rec.burnRequest!));
-      const burned = appendTransfer(unhex(rec.source), unhex(rec.burnTx!), proof);
-      const part = decodeEvidence(evidenceOf(burned));
-      const v = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
-      if (v.minSegment !== undec(rec.a) || v.amount !== undec(rec.amount) || !eq(v.recipient, unhex(rec.recipient))) refuse('ProviderFault', 'the certified burn is not the planned one');
-      rec.burned = hex(burned);
-      rec.eta = hex(v.eta);
-      rec.status = 'burned';
+      await this.certifyReturn(rec);
       await this.journal.putReturn(rec);
     }
     const burned = unhex(rec.burned!);
     const part = decodeEvidence(evidenceOf(burned));
     const verdict = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
     return { burned, eta: verdict.eta, verdict };
+  }
+
+  private async certifyReturn(rec: ReturnRecord): Promise<void> {
+    const proof = await certifyChecked(this.opts.aggregator, unhex(rec.burnRequest!));
+    const burned = appendTransfer(unhex(rec.source), unhex(rec.burnTx!), proof);
+    const part = decodeEvidence(evidenceOf(burned));
+    const v = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
+    if (v.minSegment !== undec(rec.a) || v.amount !== undec(rec.amount) || !eq(v.recipient, unhex(rec.recipient))) refuse('ProviderFault', 'the certified burn is not the planned one');
+    rec.burned = hex(burned);
+    rec.eta = hex(v.eta);
+    rec.status = 'burned';
   }
 
   /**
@@ -997,7 +1026,11 @@ export class NativeBridgeV2 {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
     if (rec.eta === undefined) return { state: 'not-paid' };
-    const eta = unhex(rec.eta);
+    return (await this.findPaid(rec, archives)) ?? this.reconcileSend(rec, archives, true);
+  }
+
+  private async findPaid(rec: ReturnRecord, archives: readonly EvmReader[], persist = true): Promise<ReconcileResult | undefined> {
+    const eta = unhex(rec.eta!);
     let available = false;
     let unavailable: unknown;
     let pending: ReconcileResult | undefined;
@@ -1007,7 +1040,7 @@ export class NativeBridgeV2 {
         for (const l of logs) {
           const p = decodePaid(l);
           if (p === null || !eq(l.address, this.cfg.vault) || !eq(p.eta, eta)) continue;
-          const v = await this.verifiedPaid(rec, l.transactionHash, reader);
+          const v = await this.verifiedPaid(rec, l.transactionHash, reader, persist);
           if (v?.state === 'paid') return v;
           if (v?.state === 'pending') pending = v;
         }
@@ -1020,7 +1053,6 @@ export class NativeBridgeV2 {
     }
     if (pending) return pending;
     if (!available && unavailable) throw unavailable;
-    return this.reconcileSend(rec, archives, true);
   }
 
   /** A return may sign again only after authenticating failure of its last exact send. */
@@ -1065,7 +1097,7 @@ export class NativeBridgeV2 {
    * in a receipt verified under the block's certificate. Journals `paid` and returns it; 'pending' while the block is not certified yet;
    * null when the claim does not verify (it is ignored).
    */
-  private async verifiedPaid(rec: ReturnRecord, tx: Uint8Array, reader = this.evm): Promise<ReconcileResult | null> {
+  private async verifiedPaid(rec: ReturnRecord, tx: Uint8Array, reader = this.evm, persist = true): Promise<ReconcileResult | null> {
     const eta = unhex(rec.eta!);
     try {
       const recipientWord = concat(new Uint8Array(12), unhex(rec.recipient));
@@ -1078,7 +1110,7 @@ export class NativeBridgeV2 {
       rec.paid = { txHash: hex(tx), blockNumber: dec(rp.blockNumber), blockHash: hex(rp.blockHash),
         receipt: hex(rp.encoded), txIndex: dec(rp.proof.txIndex), logIndex: dec(rp.receiptLogIndex) };
       rec.status = 'paid';
-      await this.journal.putReturn(rec);
+      if (persist) await this.journal.putReturn(rec);
       return { state: 'paid', txHash: tx, blockNumber: rp.blockNumber };
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };

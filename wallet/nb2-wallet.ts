@@ -113,7 +113,7 @@ async function relay(dir: string, args: string[], policy: PayerPolicy, ordinary:
     trustOrigin: option(args, '--trust-origin'), aggregator: option(args, '--aggregator') });
   need(args, 1, 'resume BACKUP --release FILE --rpc URL --payer-env NAME --return-policy FILE');
   const w = await new Wallet(dir, unhex(key), conn).open();
-  let rec = await restoreReturn(w, resolve(args[0]));
+  let rec = await restoreReturn(w, resolve(args[0]), policy);
   if (cold) rec = await qualifyExistingRecovery(w, rec, policy);
   await continueReturn(w, rec, policy, ordinary);
 }
