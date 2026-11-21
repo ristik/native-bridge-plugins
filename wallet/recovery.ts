@@ -8,7 +8,7 @@ import {
   buildParams, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, redeemCalldataLength, recoveryGeneration,
   recoveryRpcSource, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
-  type RedeemShape, type ReturnAdmission, type ReturnRecord, type TrustInput, type SendRecord, type TxRequest,
+  type RedeemShape, type ReturnAdmission, type ReturnRecord, type TrustInput, type SendRecord, type RedeemOptions,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
@@ -107,30 +107,49 @@ async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
   }
 }
 
-async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, spent = 0n): Promise<RecoveryLimits> {
+async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, spent = 0n): Promise<RecoveryLimits & { currentBid: bigint }> {
   const [balance, nonce, fees] = await Promise.all([w.bridge.evm.balance(payer), w.bridge.evm.nonce(payer), w.bridge.evm.fees()]);
-  if (nonce > p.maxNonce || 2n * fees.baseFee + fees.priority > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
+  const currentBid = 2n * fees.baseFee + fees.priority;
+  if (nonce > p.maxNonce || currentBid > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
     throw new Nb2Error('CapacityPreflight', 'current payer nonce, bids or remaining budget exceed the declared limits');
   }
   return { ...p, gas: p.gas < w.pins.userGasLimit ? p.gas : w.pins.userGasLimit,
     signedBytes: Math.min(p.signedBytes, Number(w.pins.maxEncodedTxBytes)), chainId: w.bridge.cfg.chainId,
-    balance, feeBudget: p.feeBudget - spent };
+    balance, currentBid, feeBudget: p.feeBudget - spent };
 }
 
-export function guardOrdinary(w: Wallet, policy: PayerPolicy) {
-  return async (req: TxRequest, prior: readonly SendRecord[]): Promise<void> => {
-    const spent = prior.reduce((fee, send) => {
-      const { request, from } = decodeSignedTx(bytes(send.raw));
-      return eq(from, w.signer.address) ? fee + request.gas * request.maxFeePerGas : fee;
-    }, 0n);
-    const limits = await limitsOf(w, policy, w.signer.address, spent);
-    const fee = req.gas * req.maxFeePerGas;
-    if (req.gas > limits.gas || req.nonce > limits.maxNonce || req.maxFeePerGas > limits.maxFeePerGas ||
-      req.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || req.data.length > limits.calldataBytes ||
-      req.data.length + 256 > limits.signedBytes || fee > limits.balance || fee > limits.feeBudget ||
-      (limits.maxTransactionFee !== undefined && fee > limits.maxTransactionFee)) {
-      throw new Nb2Error('CapacityPreflight', 'ordinary payment exceeds the remaining payer limits');
-    }
+/** Both routes reserve the maximum fee of each durable signed transaction, once per payer. */
+function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends): bigint {
+  const recovery = loadRecovery(w, rec);
+  const raw = [...ordinary.map((send) => send.raw), ...(recovery?.attempts ?? [])];
+  if (recovery?.pending) raw.push(recovery.pending.raw);
+  if (recovery?.settled?.submitted) raw.push(recovery.settled.submitted.raw);
+  const hashes = new Set<string>();
+  let fee = uint(recovery?.fees ?? '0'); // older local journals recorded only the total, conservatively retained
+  for (const signed of raw) {
+    const { request, from, hash } = decodeSignedTx(bytes(signed));
+    if (!eq(from, payer) || hashes.has(hx(hash))) continue;
+    hashes.add(hx(hash));
+    fee += request.gas * request.maxFeePerGas;
+  }
+  return fee;
+}
+
+export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): RedeemOptions {
+  return {
+    envelope: ordinaryEnvelope(w, policy),
+    archives: readers(w, policy),
+    admit: async (req, prior) => {
+      if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
+      const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior));
+      const fee = req.gas * req.maxFeePerGas;
+      if (req.gas > limits.gas || req.nonce > limits.maxNonce || req.maxFeePerGas > limits.maxFeePerGas ||
+        req.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || req.data.length > limits.calldataBytes ||
+        req.data.length + 256 > limits.signedBytes || fee > limits.balance || fee > limits.feeBudget ||
+        (limits.maxTransactionFee !== undefined && fee > limits.maxTransactionFee)) {
+        throw new Nb2Error('CapacityPreflight', 'ordinary payment exceeds the remaining payer limits');
+      }
+    },
   };
 }
 
@@ -150,20 +169,25 @@ function ordinaryGas(w: Wallet): ((shape: RedeemShape) => bigint | null) | undef
     const costs = ranges.filter((r) => r.execution > 0n && s.evidenceBytes <= r.maxEvidenceBytes && ops <= r.maxOperations && s.proofs <= r.maxGaps);
     if (costs.length === 0) return null;
     const execution = costs.reduce((lowest, r) => r.execution < lowest ? r.execution : lowest, costs[0].execution);
-    const bytes = redeemCalldataLength(s.evidenceBytes, Number(s.proofs) * gapProofLen(s.K));
+    const historyBytes = s.proofs === 0n ? 0 : 32 + Number(s.proofs) * gapProofLen(s.K);
+    const bytes = redeemCalldataLength(s.evidenceBytes, historyBytes);
     const reserve = w.pins.gasReserve < 500_000n ? 500_000n : w.pins.gasReserve;
     return 21_000n + 16n * BigInt(bytes) + (6n * execution + 4n) / 5n + reserve;
   };
 }
 
+function ordinaryEnvelope(w: Wallet, policy: PayerPolicy): ReturnAdmission['ordinaryEnvelope'] {
+  return { encodedBytes: BigInt(Math.min(policy.signedBytes, policy.calldataBytes)), gas: policy.gas, gasFor: ordinaryGas(w) };
+}
+
 export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string): ReturnAdmission {
   return {
-    ordinaryEnvelope: policy && { encodedBytes: BigInt(Math.min(policy.signedBytes, policy.calldataBytes)), gas: policy.gas, gasFor: ordinaryGas(w) },
-    checkOrdinary: async (rec, gas, fee) => {
-      if (w.release.recovery === undefined && policy === undefined) return;
+    ordinaryEnvelope: policy && ordinaryEnvelope(w, policy),
+    checkOrdinary: w.release.recovery === undefined && policy === undefined ? undefined : async (rec, gas) => {
       if (!policy) throw new Nb2Error('CapacityPreflight', 'explicit payer limits are required');
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, bytes(rec.payer ?? rec.recipient, 20));
+      const fee = gas * limits.currentBid;
       const cap = limits.maxTransactionFee ?? limits.feeBudget;
       if (w.pins.returnReserveSegments < 64n || gas > limits.gas || fee > cap || fee > limits.feeBudget || fee > limits.balance) {
         throw new Nb2Error('CapacityPreflight', 'ordinary return exceeds the payer or reserve limits');
@@ -174,7 +198,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
       const release = recoveryRelease(w);
       await checkGraph(w, release);
       const payer = bytes(rec.payer ?? rec.recipient, 20);
-      const limits = await limitsOf(w, policy, payer);
+      const limits = await limitsOf(w, policy, payer, reservedFees(w, rec, payer));
       const a = uint(rec.a);
       const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
       const plan = await preflightRecovery(w.pins.gamma, bytes(rec.source), w.trust, buildParams(w.pins.build),
@@ -205,7 +229,7 @@ export async function qualifyExistingRecovery(w: Wallet, rec: ReturnRecord, poli
   return current;
 }
 
-interface Backup { version: 1; gamma: string; vaultRuntimeHash: string; pending: ReturnRecord; checkpoint?: RecoveryJournal }
+interface Backup { version: 1; gamma: string; vaultRuntimeHash: string; pending: ReturnRecord; terminal?: string; checkpoint?: RecoveryJournal }
 
 /** A holder-selected private file. Hard-link publication cannot clobber a changed destination. */
 export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string): void {
@@ -215,8 +239,8 @@ export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string):
     recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator, recovery };
   const saved = loadRecovery(w, rec);
   // Confirmed cuts and receipts are portable. The previous payer's pending transaction is local.
-  const checkpoint = saved && { ...saved, pending: undefined, settled: undefined, fees: '0' };
-  const copy: Backup = { version: 1, gamma: hx(w.pins.gamma), vaultRuntimeHash: hx(w.pins.vaultRuntimeCodeHash), pending, checkpoint };
+  const checkpoint = saved && { ...saved, pending: undefined, settled: undefined, fees: undefined, attempts: undefined };
+  const copy: Backup = { version: 1, gamma: hx(w.pins.gamma), vaultRuntimeHash: hx(w.pins.vaultRuntimeCodeHash), pending, terminal: rec.burned, checkpoint };
   const content = JSON.stringify(copy);
   if (existsSync(file)) {
     const existing = lstatSync(file);
@@ -242,26 +266,27 @@ export async function restoreReturn(w: Wallet, file: string): Promise<ReturnReco
     throw new WalletError('BadDeployment', 'backup belongs to another installed deployment');
   }
   const rec = backup.pending;
-  if (rec.recovery) {
-    const release = recoveryRelease(w);
+  // Older portable checkpoint files carry the same terminal bytes as their flat evidence.
+  const terminal = backup.terminal ?? backup.checkpoint?.evidence;
+  const release = rec.recovery ? recoveryRelease(w) : undefined;
+  if (release) {
     await checkGraph(w, release);
-    if (rec.recovery.generation !== hx(release.generation)) throw new WalletError('BadDeployment', 'backup belongs to another recovery generation');
+    if (rec.recovery!.generation !== hx(release.generation)) throw new WalletError('BadDeployment', 'backup belongs to another recovery generation');
   }
-  await w.bridge.importPendingReturn(rec);
-  await w.bridge.burn(bytes(rec.returnId, 32));
+  if (backup.checkpoint && !release) throw new Error('portable cuts require a recovery schedule');
+  await w.bridge.importPendingReturn(rec, terminal === undefined ? undefined : bytes(terminal), async (verified) => {
+    if (!release) return;
+    checkSchedule(verified, w.bridge.returnHeadroom(bytes(verified.source)).operations);
+    if (!backup.checkpoint) return;
+    const session = await openSession(w, release, verified);
+    await replay(w, session, verified, backup.checkpoint);
+  });
+  if (terminal === undefined) await w.bridge.burn(bytes(rec.returnId, 32));
   const confirmed = (await w.bridge.journal.ret(rec.returnId))!;
-  if (confirmed.recovery) {
-    const session = await openSession(w, recoveryRelease(w), confirmed);
-    if (!loadRecovery(w, confirmed)) {
-      if (backup.checkpoint) {
-        // Authenticate every portable cut before writing any local checkpoint.
-        await replay(w.trust, session, confirmed, backup.checkpoint);
-        saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, settled: undefined, fees: '0' });
-      } else {
-        saveRecovery(w, confirmed, initialJournal(session, confirmed));
-      }
-    }
+  if (backup.checkpoint && !loadRecovery(w, confirmed) && confirmed.burned === terminal) {
+    saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, settled: undefined, fees: undefined, attempts: undefined });
   }
+  await retainTerminal(w, confirmed);
   return confirmed;
 }
 
@@ -270,7 +295,8 @@ interface Location { txHash: string; blockNumber: string; blockHash: string; txI
 interface RecoveryJournal {
   version: 1;
   session: string; pageRoot: string; evidence: string; evidenceBytes: number; generation: string;
-  fees: string;
+  fees?: string;
+  attempts?: string[];
   cuts: { cut: Exclude<Cut, { kind: 'settle' }>; location: Location; seq: string; nonce: string; priorSeq: string; state?: string; endpoint?: string; head?: string }[];
   pending?: { cut: Cut; raw: string; txHash: string; nonce: string; priorSeq: string };
   settled?: { paidTx: string; submitted?: RecoveryJournal['pending'] };
@@ -290,7 +316,7 @@ function saveRecovery(w: Wallet, rec: ReturnRecord, journal: RecoveryJournal): v
 function initialJournal(s: RecoverySession, rec: ReturnRecord): RecoveryJournal {
   const evidence = evidenceOf(bytes(rec.burned!));
   return { version: 1, session: hx(s.id), pageRoot: hx(s.pageRoot), generation: rec.recovery!.generation,
-    evidence: hx(evidence), evidenceBytes: evidence.length, cuts: [], fees: '0' };
+    evidence: hx(evidence), evidenceBytes: evidence.length, cuts: [] };
 }
 
 /** Commit the terminal continuation identity as soon as burn certification succeeds. */
@@ -312,15 +338,19 @@ async function openSession(w: Wallet, release: ReleaseRecovery, rec: ReturnRecor
     const authority = new RecoveryAuthority(trust, async (next) => w.persistAuthority(next));
     session = await RecoverySession.create(w.pins.gamma, evidenceOf(bytes(rec.burned)), authority, buildParams(w.pins.build), release.deployment);
   }
-  const { runCuts, advanceGaps } = rec.recovery;
-  if (!Array.isArray(runCuts) || runCuts.length > session.operationCount ||
+  checkSchedule(rec, session.operationCount);
+  sessions.set(w, { burned: rec.burned, generation, trust, session });
+  return session;
+}
+
+function checkSchedule(rec: ReturnRecord, operations: number): void {
+  const { runCuts, advanceGaps } = rec.recovery!;
+  if (!Array.isArray(runCuts) || runCuts.length > operations ||
     runCuts.some((count) => !Number.isSafeInteger(count) || count < 1 || count > 16) ||
-    runCuts.reduce((sum, count) => sum + count, 0) !== session.operationCount ||
+    runCuts.reduce((sum, count) => sum + count, 0) !== operations ||
     !Number.isSafeInteger(advanceGaps) || advanceGaps < 1 || advanceGaps > 1024) {
     throw new Error('admitted schedule does not cover the certified lineage');
   }
-  sessions.set(w, { burned: rec.burned, generation, trust, session });
-  return session;
 }
 
 interface Cursor { from: number; prior?: { seq: bigint; receipt: Uint8Array }; gap?: GapPrior }
@@ -344,18 +374,21 @@ async function packetOf(s: RecoverySession, trust: TrustInput, rec: ReturnRecord
     c.gap, cut.gaps.map((g) => bytes(g)), head);
 }
 
-async function replay(trust: TrustInput, s: RecoverySession, rec: ReturnRecord, journal: RecoveryJournal): Promise<Cursor> {
+async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal: RecoveryJournal): Promise<Cursor> {
   const evidence = evidenceOf(bytes(rec.burned!));
   if (journal.version !== 1 || journal.evidenceBytes !== evidence.length || journal.session !== hx(s.id) || journal.pageRoot !== hx(s.pageRoot) || journal.generation !== rec.recovery?.generation ||
     journal.evidence !== hx(evidence)) throw new Error('recovery journal does not bind the certified evidence');
   const cursor: Cursor = { from: 0 };
-  for (const item of journal.cuts) {
+  for (const [i, item] of journal.cuts.entries()) {
+    if (item.cut.kind === 'run' && item.cut.count !== rec.recovery!.runCuts[i]) throw new Error('portable cut disagrees with the admitted schedule');
+    // The saved transaction hash is a lookup hint. The certificate binds the receipt index.
     bytes(item.location.txHash, 32);
     if (uint(item.priorSeq) !== (cursor.prior?.seq ?? 0n)) throw new Error('checkpoint has the wrong preceding sequence');
     uint(item.nonce);
-    const packet = await packetOf(s, trust, rec, cursor, item.cut);
+    const packet = await withFreshAuthority(w, () => packetOf(s, w.trust, rec, cursor, item.cut));
     if (!packet.event) throw new Error('settlement is reconciled through the vault Paid receipt');
-    const receipt = await s.verifyEvent(trust, bytes(item.location.proof), packet.event);
+    const event = packet.event;
+    const receipt = await withFreshAuthority(w, () => s.verifyEvent(w.trust, bytes(item.location.proof), event));
     if (!matches(receipt, item.location)) throw new Error('checkpoint locator disagrees with its authenticated receipt');
     advanceCursor(cursor, packet, receipt.encoded);
     const state = 'state' in packet && packet.state ? hx(packet.state) : undefined;
@@ -429,10 +462,11 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   if (paid.state !== 'not-paid') return paid;
   const s = await openSession(w, release, rec);
   const journal = loadRecovery(w, rec) ?? initialJournal(s, rec);
-  const cursor = await replay(w.trust, s, rec, journal);
+  const cursor = await replay(w, s, rec, journal);
 
   if (journal.pending === undefined) {
-    const limits = await limitsOf(w, policy, w.signer.address, uint(journal.fees));
+    const current = (await w.bridge.journal.ret(rec.returnId))!;
+    const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, current, w.signer.address));
     let cut: Cut;
     let quote: RecoveryQuote | null;
     let calldata: Uint8Array;
@@ -496,30 +530,36 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     !eq(request.to, pending.cut.kind === 'settle' ? w.bridge.cfg.vault : release.deployment.recovery)) {
     throw new Error('pending transaction does not match the authenticated cut');
   }
-  const findReceipt = async () => {
+  const outcome = async (): Promise<'missing' | 'pending' | 'success' | 'failed'> => {
+    let seen = false;
+    let success = false;
     for (const reader of archive) {
       try {
         const receipt = await reader.receipt(hash);
-        if (receipt) return { receipt, reader };
+        if (!receipt) continue;
+        seen = true;
+        if (BigInt(receipt.status) === 1n) {
+          success = true;
+          continue;
+        }
+        await withFreshAuthority(w, () => reader.verifyFailedReceipt(hash, w.bridge.cfg, w.trust, receipt));
+        return 'failed';
       } catch (e) {
-        if (reader === archive.at(-1)) throw e;
+        if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+        // Metadata is only a hint. Try the next reader's complete proof.
       }
     }
-    return null;
+    return success ? 'success' : seen ? 'pending' : 'missing';
   };
-  let mined = await findReceipt();
-  if (mined === null) {
+  let mined = await outcome();
+  if (mined === 'missing') {
     try { await w.bridge.evm.sendRaw(raw); }
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
-    mined = await findReceipt();
+    mined = await outcome();
   }
-  if (mined === null) return { state: 'pending', txHash: hash };
-  if (BigInt(mined.receipt.status) !== 1n) {
-    // A failed RPC receipt alone cannot discard an ambiguous signed transaction.
-    const block = await mined.reader.headerByNumber(BigInt(mined.receipt.blockNumber));
-    if (block === null || hx(block.hash) !== mined.receipt.blockHash.toLowerCase()) return { state: 'pending', txHash: hash };
-    await withFreshAuthority(w, () => mined.reader.verifyFailedReceipt(hash, w.bridge.cfg, w.trust, block));
-    journal.fees = String(uint(journal.fees) + request.gas * request.maxFeePerGas);
+  if (mined === 'missing' || mined === 'pending') return { state: 'pending', txHash: hash };
+  if (mined === 'failed') {
+    (journal.attempts ??= []).push(pending.raw);
     delete journal.pending;
     saveRecovery(w, rec, journal);
     return { state: 'retry', txHash: hash };
@@ -534,7 +574,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     nonce: pending.nonce, priorSeq: pending.priorSeq,
     ...(cursor.gap?.cursor ? { endpoint: String(cursor.gap.cursor.next), head: hx(cursor.gap.cursor.head) } : {}),
     ...('state' in packet && packet.state ? { state: hx(packet.state) } : {}) });
-  journal.fees = String(uint(journal.fees) + request.gas * request.maxFeePerGas);
+  (journal.attempts ??= []).push(pending.raw);
   delete journal.pending;
   saveRecovery(w, rec, journal);
   return { state: 'checkpoint', txHash: hash };

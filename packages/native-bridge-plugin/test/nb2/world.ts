@@ -82,7 +82,7 @@ export const roundAtLeast = (r: bigint): void => {
   if (r > round) round = r;
 };
 
-export async function makeUc(root: Root, partition: number, stateHash: Uint8Array, blockHash: Uint8Array, timestamp: bigint): Promise<Uint8Array> {
+export async function makeUc(root: Root, partition: number, stateHash: Uint8Array, blockHash: Uint8Array, timestamp: bigint, rootEpoch = 1n): Promise<Uint8Array> {
   const ir = new InputRecord(++round, 1n, null, stateHash, new Uint8Array(), timestamp, blockHash, 0n, null);
   const conf = sha(ascii(`shard configuration ${partition}`));
   const stc = new ShardTreeCertificate(ShardId.decode(Uint8Array.of(0x80)), []);
@@ -90,7 +90,7 @@ export async function makeUc(root: Root, partition: number, stateHash: Uint8Arra
   const pkey = new Uint8Array(4);
   new DataView(pkey.buffer).setUint32(0, partition);
   const treeRoot = sha(concat(C.encodeByteString(Uint8Array.of(1)), C.encodeByteString(pkey), C.encodeByteString(sha(C.encodeByteString(shardRoot.data)))));
-  const seal = await UnicitySeal.create(NetworkId.fromId(NETWORK), round, 1n, timestamp, null, treeRoot, new Map(root.signers));
+  const seal = await UnicitySeal.create(NetworkId.fromId(NETWORK), round, rootEpoch, timestamp, null, treeRoot, new Map(root.signers));
   return new UnicityCertificate(ir, TR_HASH, conf, stc, new UnicityTreeCertificate(BigInt(partition), []), seal).toCBOR();
 }
 
@@ -162,6 +162,7 @@ export class FakeChain implements JsonRpc {
   public readonly vaultCode = ascii('fake vault runtime');
   public calls: string[] = [];
   public autoMine = true;
+  public certificateAuthority?: { root: Root; epoch: bigint };
   /** Optional cold contract stand-in for wallet journal tests. */
   public coldCall?: (vault: VaultModel, to: Uint8Array, data: Uint8Array) => Promise<Log[] | undefined>;
   private pool: Uint8Array[] = [];
@@ -211,7 +212,8 @@ export class FakeChain implements JsonRpc {
     };
     const hash = HE(encodeHeader(header));
     const parent = this.blocks[Number(n) - 1];
-    if (parent) parent.uc = await makeUc(this.root, EVM_PARTITION, parent.header.stateRoot, parent.hash, header.timestamp);
+    if (parent) parent.uc = await makeUc(this.certificateAuthority?.root ?? this.root, EVM_PARTITION, parent.header.stateRoot,
+      parent.hash, header.timestamp, this.certificateAuthority?.epoch);
     this.blocks.push({ header, hash, uc: null, receipts, raws });
   }
 

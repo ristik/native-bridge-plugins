@@ -25,6 +25,7 @@ import { dirname, join, resolve } from 'node:path';
 
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import type { ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
@@ -40,7 +41,7 @@ import {
 import { parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
-import { guardOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
+import { ordinaryPayout, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -104,6 +105,14 @@ export function parseAuthenticatedOrigin(document: unknown): AuthenticatedOrigin
     throw new Error('the authenticated B1 origin requires decimal strings usableEpoch and rootRound');
   }
   return { usableEpoch: BigInt(origin.usableEpoch), rootRound: BigInt(origin.rootRound) };
+}
+
+function newerOrigin(held: AuthenticatedOrigin, offered: AuthenticatedOrigin): AuthenticatedOrigin {
+  if (offered.usableEpoch <= held.usableEpoch && offered.rootRound <= held.rootRound) return held;
+  if (offered.usableEpoch < held.usableEpoch || offered.rootRound < held.rootRound) {
+    throw new WalletError('TrustInput', 'inconsistent authenticated origin');
+  }
+  return offered;
 }
 
 /** config.json of a wallet directory: the connection, and where the secret comes from. */
@@ -323,6 +332,7 @@ export interface OpenOptions {
   /** test seams: another RPC and aggregator than the connection's, and a gas model in place of the plug-in's default */
   rpc?: JsonRpc;
   aggregator?: Aggregator;
+  trustSource?: ITrustBaseSource;
   gas?: GasModel;
 }
 
@@ -414,7 +424,7 @@ export class Wallet {
     return parseAuthenticatedOrigin(origin);
   }
 
-  private source!: AggregatorClient;
+  private source!: ITrustBaseSource;
   private get authorityFile(): string { return join(this.dir, 'recovery-authority.json'); }
 
   /** These entries were locally authenticated when saved. Replay them under the shipped pin on reopen. */
@@ -425,14 +435,14 @@ export class Wallet {
   }
 
   public async refreshAuthority(): Promise<TrustInput> {
-    const fresh = this.readOrigin();
-    const held = this.trust.origin!;
-    if (fresh.usableEpoch < held.usableEpoch || fresh.rootRound < held.rootRound) {
-      throw new WalletError('TrustInput', 'authenticated origin rolled back');
-    }
+    const fresh = newerOrigin(this.trust.origin!, this.readOrigin());
     const next = (await this.trust.snapshot()).withAuthenticatedOrigin(fresh);
     await refreshAll(next, this.source, 64, () => undefined);
-    await this.persistAuthority(next);
+    try {
+      await this.persistAuthority(next);
+    } catch (e) {
+      throw new WalletError('TrustInput', 'could not persist the authority extension', e);
+    }
     this.trust = next;
     return next;
   }
@@ -449,18 +459,16 @@ export class Wallet {
       for (const e of shipped.history.entries) await held.history.append(e);
       this.trust = held;
     }
-    let origin = this.readOrigin();
-    if (existsSync(this.authorityFile)) {
-      const saved = JSON.parse(readFileSync(this.authorityFile, 'utf8')) as { entries: string[] };
-      const old = parseAuthenticatedOrigin(saved);
-      if (origin.usableEpoch <= old.usableEpoch && origin.rootRound <= old.rootRound) origin = old;
-      else if (origin.usableEpoch < old.usableEpoch || origin.rootRound < old.rootRound) {
-        throw new WalletError('TrustInput', 'inconsistent authenticated origin');
-      }
-      for (const entry of saved.entries) await this.trust.history.append(RootTrustBaseV2.decode(unhex(entry)));
-    }
+    const saved = existsSync(this.authorityFile) ? JSON.parse(readFileSync(this.authorityFile, 'utf8')) as {
+      usableEpoch: string; rootRound: string; entries: string[];
+    } : undefined;
+    const offered = this.readOrigin();
+    const origin = saved ? newerOrigin(parseAuthenticatedOrigin(saved), offered) : offered;
+    if (saved) for (const entry of saved.entries) await this.trust.history.append(RootTrustBaseV2.decode(unhex(entry)));
     this.trust = this.trust.withAuthenticatedOrigin(origin);
-    this.source = new AggregatorClient(this.conn.aggregator);
+    if (saved?.usableEpoch !== String(origin.usableEpoch) || saved?.rootRound !== String(origin.rootRound) ||
+      saved?.entries.length !== this.trust.history.entries.length) await this.persistAuthority(this.trust);
+    this.source = opts.trustSource ?? new AggregatorClient(this.conn.aggregator);
     const http = new HttpJsonRpc(this.conn.rpc, { retries: 20, timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);
     this.bridge = await NativeBridgeV2.open({
@@ -738,7 +746,8 @@ export class RegistryLagExpired extends Error {
  * An in-flight attempt may finish later. LAG, when given, is told how long the wait took.
  */
 export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_000, note: (reason: string) => void = () => undefined, lag?: (ms: number) => void, policy?: PayerPolicy): Promise<ReconcileResult> {
-  const id = unhex((await w.returnRecord(label)).returnId);
+  const rec = await w.returnRecord(label);
+  const id = unhex(rec.returnId);
   const started = performance.now();
   const deadline = started + REGISTRY_LAG_MS;
   let r: ReconcileResult;
@@ -750,7 +759,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
       if (performance.now() >= deadline) throw new RegistryLagExpired(label, lastRefusal);
     }
     try {
-      r = await w.bridge.submitRedeem(id, w.signer, policy && guardOrdinary(w, policy));
+      r = await w.bridge.submitRedeem(id, w.signer, policy && ordinaryPayout(w, rec, policy));
       break;
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
@@ -772,7 +781,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
 /** The CLI routes a signed cold return through the durable packet runner. */
 export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false): Promise<RecoveryResult | ReconcileResult> {
   const r = rec.recovery && !ordinary ? await recoverStep(w, rec, policy) :
-    await w.bridge.submitRedeem(unhex(rec.returnId), w.signer, guardOrdinary(w, policy));
+    await w.bridge.submitRedeem(unhex(rec.returnId), w.signer, ordinaryPayout(w, rec, policy));
   return r;
 }
 

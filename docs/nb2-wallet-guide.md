@@ -92,7 +92,9 @@ and `calldataBytes`, and decimal strings for `gas`, `maxNonce`, `maxFeePerGas`,
 `maxPriorityFeePerGas`, optional `maxTransactionFee` and total `feeBudget`. Values are ceilings,
 with fees in wei. Set `archives` to an array of independent archive RPC URLs. The wallet applies
 the stricter local and release limits, checks the payer's live balance and nonce, and accounts
-for pending and completed attempts. Use a dedicated payer account while this flow is active.
+for pending and completed attempts. Ordinary and recovered attempts from the same payer
+share a total fee budget in the local return journal. Use a dedicated payer account while
+this flow is active.
 
 ```sh
 nb2-wallet plan-return coin --recipient "$RECIPIENT" --return-policy payer.json
@@ -119,8 +121,10 @@ nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb
 ```
 
 Repeat the same command if inclusion or certification is pending. Resume checks the exact
-signed request and reconstructs the session and sparse openings from the evidence. Imported
-checkpoints are replayed against certified receipts before reuse. The journal stores each
+signed request and reconstructs the session and sparse openings from the evidence. A certified
+backup can restore its burn and checkpoints locally. A backup taken before certification queries
+the aggregator for the exact pending request. Imported checkpoints are replayed against certified
+receipts before reuse. The journal stores each
 signed EVM transaction and prior cursor before submission. It advances after the exact
 checkpoint event verifies, and closes only on the pinned vault's certified `Paid` for the signed
 address and amount. A provider with missing proof data can be replaced using the alternate
@@ -131,8 +135,8 @@ new payer policy.
 Use `redeem --recover` or `resume --recover` to qualify a previously ordinary burn for
 continuation if the ordinary packet can no longer fit. `--ordinary` asks the caller's separately
 funded payer to try the ordinary route for the same burn. Both consume the same redemption ID.
-A certified failed recovery send needs its block's receipts and raw transactions to authenticate
-the failure before pricing another attempt.
+A failed send in either route needs its block's certificate, receipts and raw transactions
+before the wallet can authorize a new attempt.
 
 ### Earlier ordinary-only walkthrough
 

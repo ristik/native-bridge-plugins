@@ -244,13 +244,14 @@ export class EvmReader {
   }
 
   /** Verify a failed receipt against its certified block before abandoning a pending send. */
-  public async verifyFailedReceipt(txHash: Uint8Array, cfg: Config, trust: TrustInput, block: { header: Header; hash: Uint8Array }): Promise<void> {
-    const receipt = await this.receipt(txHash);
-    if (!receipt || qtyOf(receipt.status, 'status') !== 0n || !eq(fixedOf(receipt.blockHash, 32, 'blockHash'), block.hash)) {
-      return refuse('ProviderFault', 'failed receipt does not match the candidate block');
-    }
+  public async verifyFailedReceipt(txHash: Uint8Array, cfg: Config, trust: TrustInput, receipt: ReceiptJson): Promise<void> {
+    if (qtyOf(receipt.status, 'status') !== 0n) return refuse('ProviderFault', 'expected a failed receipt');
+    const hash = fixedOf(receipt.blockHash, 32, 'blockHash');
+    const { header, raw } = await this.headerByHash(hash);
+    if (header.number !== qtyOf(receipt.blockNumber, 'blockNumber')) refuse('ProviderFault', 'failed receipt has the wrong block number');
+    const block = { header, hash };
     const uc = await verifyEvmUc(trust, await this.certificateOf(block.header, block.hash, true), cfg);
-    bindHeader(encodeHeader(block.header), uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
+    bindHeader(raw, uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
     const idx = qtyOf(receipt.transactionIndex, 'transactionIndex');
     const path = await this.receiptPath(block.header, block.hash, idx);
     if (!eq(mptVerify(block.header.receiptsRoot, rlpIndexKey(idx), path), encodeReceiptJson(receipt))) {
