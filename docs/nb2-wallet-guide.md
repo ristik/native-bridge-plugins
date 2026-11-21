@@ -138,8 +138,8 @@ a fresh journal. Ask the active payer to resume or produce a resolved Complete o
 
 Before signing a settlement, both payout routes check for certified Paid and for known
 settlement transactions for the same redemption ID in the readers' pending views. A visible
-pending settlement defers signing. Wallet copies use separate journals, and a gateway may
-hide its pending transactions. Two concurrent payers can therefore sign settlements from
+pending settlement defers signing. Each reader's scan checks up to 1,024 calls to the vault.
+Wallet copies use separate journals, and a gateway may hide its pending transactions. Two concurrent payers can therefore sign settlements from
 the same backup. The vault pays the return once and rejects the second settlement. With two
 competing payers, the second payer can lose one transaction fee.
 

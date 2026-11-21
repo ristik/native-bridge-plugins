@@ -146,11 +146,17 @@ function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary:
   return { total, attempts };
 }
 
-export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): RedeemOptions {
+function recoveryEmitter(w: Wallet): Uint8Array | undefined {
+  return w.release.recovery === undefined ? undefined : recoveryRelease(w).deployment.recovery;
+}
+
+export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolicy): RedeemOptions {
+  const recovery = recoveryEmitter(w);
+  if (!policy) return { recovery };
   return {
     envelope: ordinaryEnvelope(w, policy),
     archives: readers(w, policy),
-    recovery: w.release.recovery === undefined ? undefined : recoveryRelease(w).deployment.recovery,
+    recovery,
     admit: async (req, prior) => {
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior));
@@ -724,9 +730,19 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
 export async function redeemOrdinary(w: Wallet, rec: ReturnRecord, policy?: PayerPolicy): Promise<ReconcileResult> {
   const { record, result } = await reconcileForPayout(w, rec, 'ordinary', policy);
   if (result.state !== 'not-paid') return result;
-  const payout = await w.bridge.submitRedeem(bytes(record.returnId, 32), w.signer, policy && ordinaryPayout(w, record, policy));
+  const payout = await w.bridge.submitRedeem(bytes(record.returnId, 32), w.signer, ordinaryPayout(w, record, policy));
   if (payout.state === 'paid') await reconcileReturn(w, record, policy);
   return payout;
+}
+
+/** Poll the exact observed settlement even if the reader has removed it from its pending block. */
+export async function pollOrdinaryPayout(w: Wallet, rec: ReturnRecord, txHash: Uint8Array, policy?: PayerPolicy): Promise<ReconcileResult> {
+  const current = await w.bridge.journal.ret(rec.returnId);
+  if (current?.sends.some((send) => send.hash === hx(txHash))) return (await reconcileReturn(w, rec, policy)).result;
+  const archive = policy ? readers(w, policy) : [w.bridge.evm];
+  const result = await w.bridge.checkSettlement(bytes(rec.returnId, 32), archive, recoveryEmitter(w), txHash);
+  if (result.state === 'paid') retainPayment(w, rec, hx(result.txHash));
+  return result;
 }
 
 /** Execute at most one new packet. Reconcile the same saved bytes after an ambiguous send. */

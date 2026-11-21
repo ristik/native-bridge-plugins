@@ -1031,11 +1031,11 @@ export class NativeBridgeV2 {
     if (prior.state !== 'not-paid') return prior;
     let gasBump = 1n;
     for (let attempt = 0; attempt < 4; attempt++) {
-      const rtx = await this.buildRedeemInner(returnId, options.envelope);
-      const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const fresh = await this.returnRecord(returnId);
       const competing = await this.settlementGate(fresh, archives, options.recovery);
       if (competing) return competing;
+      const rtx = await this.buildRedeemInner(returnId, options.envelope);
+      const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
         options.admit && ((request) => options.admit!(request, fresh.sends)));
       fresh.executionPayer ??= hex(signer.address);
@@ -1077,19 +1077,19 @@ export class NativeBridgeV2 {
   }
 
   /** A final read-only check before signing a new settlement. */
-  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array): Promise<ReconcileResult> {
+  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array, observed?: Uint8Array): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const rec = await this.returnRecord(returnId);
       if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
       if (!rec.eta) return { state: 'not-paid' };
-      return (await this.settlementGate(rec, archives, recovery)) ?? { state: 'not-paid' };
+      return (await this.settlementGate(rec, archives, recovery, observed)) ?? { state: 'not-paid' };
     });
   }
 
-  private async settlementGate(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array): Promise<ReconcileResult | undefined> {
-    const paid = await this.findPaid(rec, archives);
-    if (paid) return paid;
+  private async settlementGate(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array,
+    observed?: Uint8Array): Promise<ReconcileResult | undefined> {
+    const pending = new Map<string, Uint8Array>();
     const eta = unhex(rec.eta!);
     const failed = new Set(rec.sends.filter((s) => s.failed).map((s) => s.hash));
     for (const reader of archives) {
@@ -1110,10 +1110,16 @@ export class NativeBridgeV2 {
             // A malformed or unverified pending call supplies no evidence.
           }
         }
-        if (!matches) continue;
-        const proof = await this.findPaid(rec, archives, true, { settlements: [hash] });
-        if (proof) return proof;
-        if (!(await this.exactFailure(hash, archives)).failed) return { state: 'pending', txHash: hash };
+        if (matches) pending.set(hex(hash), hash);
+      }
+    }
+    const settlements = [...pending.values()].filter((hash) => !observed || !eq(hash, observed));
+    if (observed) settlements.unshift(observed);
+    const proof = await this.findPaid(rec, archives, true, { settlements });
+    if (proof) return proof;
+    for (const hash of settlements) {
+      if (pending.has(hex(hash)) && !(await this.exactFailure(hash, archives)).failed) {
+        return { state: 'pending', txHash: hash };
       }
     }
   }
