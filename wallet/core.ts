@@ -630,7 +630,7 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
  * The deployed verifier reports QuorumNotMet for both a seal awaiting import and an invalid quorum. Only the
  * vault's wrapped refusal is eligible for the bounded seal-import wait.
  */
-export function isRegistryLag(e: unknown): boolean {
+export function isRegistryLag(e: unknown): e is Nb2Error {
   return e instanceof Nb2Error && e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet';
 }
 
@@ -646,29 +646,34 @@ export class RegistryLagExpired extends Error {
 
 /**
  * Return, step 3: redeem LABEL's burn on the EVM: the witness (one SegmentSealed log per segment since the burn's index, the gap proofs) is
- * built from the chain, sent, and reconciled until the payment's block is certified. A paid return answers paid without a send. A
- * Wrapped QuorumNotMet may be seal import lag. Wait and build again for up to REGISTRY_LAG_MS, then report RegistryLagExpired. LAG, when given,
- * is told how long the wait took.
+ * built from the chain, sent, and reconciled until the payment's block is certified. A paid return answers paid without a send.
+ * Wrapped QuorumNotMet may be seal import lag. Start retries only within REGISTRY_LAG_MS, then report RegistryLagExpired if still refused.
+ * An in-flight attempt may finish later. LAG, when given, is told how long the wait took.
  */
 export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_000, note: (reason: string) => void = () => undefined, lag?: (ms: number) => void): Promise<ReconcileResult> {
   const id = unhex((await w.returnRecord(label)).returnId);
-  const t0 = Date.now();
+  const started = performance.now();
+  const deadline = started + REGISTRY_LAG_MS;
   let r: ReconcileResult;
-  let waited = false;
+  let lastRefusal: Nb2Error | undefined;
   for (;;) {
+    if (lastRefusal !== undefined) {
+      const remaining = deadline - performance.now();
+      if (remaining > 0) await sleep(Math.min(pollMs, remaining));
+      if (performance.now() >= deadline) throw new RegistryLagExpired(label, lastRefusal);
+    }
     try {
       r = await w.bridge.submitRedeem(id, w.signer);
       break;
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
-      const remaining = REGISTRY_LAG_MS - (Date.now() - t0);
-      if (remaining <= 0) throw new RegistryLagExpired(label, e);
-      if (!waited) note('the verifier answers QuorumNotMet: waiting for possible seal registry lag (#1125)');
-      waited = true;
-      await sleep(Math.min(pollMs, remaining));
+      if (lastRefusal === undefined && performance.now() < deadline) {
+        note('the verifier answers QuorumNotMet: waiting for possible seal registry lag (#1125)');
+      }
+      lastRefusal = e;
     }
   }
-  if (waited) lag?.(Date.now() - t0);
+  if (lastRefusal !== undefined) lag?.(performance.now() - started);
   for (let i = 0; r.state === 'pending' && i < polls; i++) {
     await sleep(pollMs);
     r = await w.bridge.reconcile(id);

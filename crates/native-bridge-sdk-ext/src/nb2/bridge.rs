@@ -1711,11 +1711,13 @@ impl NativeBridgeV2 {
                     continue;
                 }
                 _ => {
-                    let rule = e.map_or(Rule::PayoutFailed, |e| e.rule);
-                    return Err(Error::Rule(Nb2Error::with_detail(
-                        rule,
-                        format!("redeem {} reverted: stop and tell the user", hex(&tx.hash)),
-                    )));
+                    let detail =
+                        format!("redeem {} reverted: stop and tell the user", hex(&tx.hash));
+                    let error = match e {
+                        Some(e) => redeem_refusal(e, Some(detail)),
+                        None => Nb2Error::with_detail(Rule::PayoutFailed, detail),
+                    };
+                    return Err(error.into());
                 }
             }
         }

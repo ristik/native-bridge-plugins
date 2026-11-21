@@ -10,10 +10,11 @@ import { after, test } from 'node:test';
 
 import { toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import { revertData } from '../packages/native-bridge-plugin/src/nb2/abi.js';
+import { Nb2Error } from '../packages/native-bridge-plugin/src/nb2/errors.js';
 import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
 import { WORLD_GAS, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
-import { Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type WalletConfig } from './core.js';
+import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type WalletConfig } from './core.js';
 
 const dirs: string[] = [];
 after(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
@@ -231,4 +232,26 @@ test('redeem waits out a possible seal import lag before sending once', async ()
   assert.equal(notes.length, 1);
   assert.match(notes[0], /possible seal registry lag/);
   assert.equal(sends, 1);
+});
+
+test('redeem opens no retry at the registry wait deadline', async (t) => {
+  const { w } = await withCoin();
+  await burn(w, 'coin');
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 0 });
+  t.mock.method(performance, 'now', () => Date.now());
+
+  const refusal = new Nb2Error('VerifierRefused', undefined, undefined, new Nb2Error('QuorumNotMet'));
+  const attempts: number[] = [];
+  t.mock.method(w.bridge, 'submitRedeem', async () => {
+    attempts.push(Date.now());
+    throw refusal;
+  });
+  let onWait!: () => void;
+  const waiting = new Promise<void>((resolve) => { onWait = resolve; });
+  const result = assert.rejects(redeem(w, 'coin', 0, REGISTRY_LAG_MS + 1000, onWait),
+    (e) => e instanceof RegistryLagExpired && e.refusal === refusal);
+  await waiting;
+  t.mock.timers.tick(REGISTRY_LAG_MS);
+  await result;
+  assert.deepEqual(attempts, [0]);
 });

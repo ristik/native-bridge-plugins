@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
+import { toHex } from '../../src/bytes.js';
 import { classifyRedeemError, decodeRevert, revertData } from '../../src/nb2/abi.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
@@ -105,6 +106,32 @@ test('a deployed quorum refusal is retryable and the same certified burn pays af
   refusal = new Uint8Array();
   assert.equal((await w.submitRedeem(id, payer)).state, 'paid');
   assert.equal(sends, 1);
+});
+
+test('a final refusal after a mined revert preserves the decoded inner rule', async () => {
+  const { w, payer, burned, chain } = await world();
+  const id = await burned();
+  const inner = revertData('SealRoot');
+  const refusal = revertData('VerifierRefused', inner);
+  chain.faults.recipients.set(toHex(HE(key('y')).slice(12)), 'reverts');
+  const rpc = chain.call.bind(chain);
+  let estimates = 0;
+  const hashes: string[] = [];
+  chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_estimateGas') {
+      if (++estimates === 1) return '0x1d4c0' as T;
+      throw new RpcError(200, 3, 'execution reverted', `0x${toHex(refusal)}`);
+    }
+    const result = await rpc<T>(method, params);
+    if (method === 'eth_sendRawTransaction') hashes.push(result as string);
+    return result;
+  };
+  await assert.rejects(w.submitRedeem(id, payer), (e) => e instanceof Nb2Error &&
+    e.rule === 'VerifierRefused' && e.inner?.rule === 'SealRoot' &&
+    e.args?.[0] === `0x${toHex(inner)}` && !e.retryable);
+  assert.equal(estimates, 2);
+  assert.equal(hashes.length, 1);
+  assert.equal((await rpc<{ status: string }>('eth_getTransactionReceipt', hashes)).status, '0x0');
 });
 
 test('every vault error classifies from its recorded revert data', () => {

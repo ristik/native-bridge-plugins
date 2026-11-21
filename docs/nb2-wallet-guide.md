@@ -360,9 +360,9 @@ The plug-in reports it from `buildRedeem`'s simulation as a retryable `Nb2Error`
 It keeps the original revert argument and classifies the refusal as `retry-later`. A failed preflight spends no gas. On each retry
 `submitRedeem` reconciles earlier sends and simulates against current chain state before signing.
 
-The reference wallet waits and builds again for up to 2 minutes. After that, `redeem` stops and says that the burn is intact and to run
-`redeem` again later. A refusal that persists well past the registry's import may be a real bad quorum: report it. A wallet with its own
-policy should still never treat this answer as a verdict right after a burn.
+The reference wallet starts retries within two minutes of its first submission attempt. An attempt already in progress can finish
+after that window. If the refusal persists when the window expires, `redeem` reports that the burn is intact and can be redeemed later.
+A refusal that persists after the registry imports the round may indicate an invalid quorum.
 
 ## What it costs
 

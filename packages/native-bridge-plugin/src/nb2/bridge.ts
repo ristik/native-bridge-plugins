@@ -778,7 +778,8 @@ export class NativeBridgeV2 {
         gasBump = 2n; // an out-of-gas or a transient payout failure: one retry with more gas
         continue;
       }
-      throw new Nb2Error(e?.rule ?? 'PayoutFailed', `redeem 0x${toHex(tx.hash)} reverted: stop and tell the user`);
+      const detail = `redeem 0x${toHex(tx.hash)} reverted: stop and tell the user`;
+      throw e === null ? new Nb2Error('PayoutFailed', detail) : redeemRefusal(e, detail);
     }
     return { state: 'not-paid' };
   }

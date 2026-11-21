@@ -23,6 +23,7 @@ use native_bridge_sdk_ext::nb2::rules::topic_index;
 use native_bridge_sdk_ext::nb2::segment::{build_history, check_segment_log};
 use native_bridge_sdk_ext::nb2::tokenops::{local_owner, LocalOwner, OwnerSigner};
 use native_bridge_sdk_ext::nb2::util::{arr, from_hex, hex0x};
+use native_bridge_sdk_ext::nb2::vaultmodel::RecipientBehaviour;
 use nb2_world::*;
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -536,6 +537,49 @@ fn deployed_quorum_refusal_is_retryable_until_seal_import() {
 
     x.w.chain.set_pre(None);
     assert_eq!(x.b.submit_redeem(&id, &x.payer).unwrap().state(), "paid");
+}
+
+#[test]
+fn mined_final_refusal_preserves_the_decoded_inner_rule() {
+    let x = WitnessWorld::new();
+    let id = x.burned();
+    let inner = revert_data(Rule::SealRoot, &[]);
+    let refusal = revert_data(Rule::VerifierRefused, &[ErrArg::Word(inner.clone())]);
+    x.w.chain.with(|s| {
+        s.faults
+            .recipients
+            .insert(recipient("y"), RecipientBehaviour::Reverts)
+    });
+    let estimates = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let seen_estimates = estimates.clone();
+    let seen_sends = sends.clone();
+    x.w.chain
+        .set_pre(Some(Box::new(move |method, _| match method {
+            "eth_estimateGas" if seen_estimates.fetch_add(1, Ordering::Relaxed) == 0 => {
+                Some(Ok(json!("0x1d4c0")))
+            }
+            "eth_estimateGas" => Some(Err(RpcError {
+                status: 200,
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(json!(hex0x(&refusal))),
+            })),
+            "eth_sendRawTransaction" => {
+                seen_sends.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            _ => None,
+        })));
+
+    let error = x.b.submit_redeem(&id, &x.payer).unwrap_err();
+    let rule = error.rule().unwrap();
+    assert_eq!(rule.rule, Rule::VerifierRefused);
+    assert_eq!(rule.innermost(), Rule::SealRoot);
+    assert_eq!(rule.args, vec![hex(&inner)]);
+    assert!(!error.retryable());
+    assert_eq!(estimates.load(Ordering::Relaxed), 2);
+    assert_eq!(sends.load(Ordering::Relaxed), 1);
 }
 
 #[test]
