@@ -1,4 +1,5 @@
 /** NB2 continuation v1.1 packet construction and authenticated checkpoint boundaries. */
+import { TrustBaseBundle } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js';
 import { concat, concatBytes, eq, toHex } from '../bytes.js';
 import { abiEncode } from './abi.js';
 import { ascii, be, beInt, cArr, cTag, head, raw, scanNative, u16, u64, u256 } from './cbor.js';
@@ -11,7 +12,7 @@ import { verifySealReceipt } from './rules.js';
 import { foldHistory, gapProofLen, GapTree } from './segment.js';
 import { decodeSplitManifest, parentLink } from './split.js';
 import { decodeToken, lineageOf, mintSourceHash, resultState, stateId, tokenIdOf } from './token.js';
-import { bindTrust, decodeUc, SealAheadOfOrigin, type TrustInput } from './trust.js';
+import { bindTrust, decodeUc, SealAheadOfOrigin, TrustInput } from './trust.js';
 import { parseMintData, verdictAbi, verifyPart, type Verdict } from './verify.js';
 
 const version = u16(0x0101);
@@ -191,41 +192,49 @@ export interface GapPrior { seq: bigint; cursor?: { next: bigint; head: Uint8Arr
 export interface GapPacket { shape: RecoveryShape; calldata: Uint8Array; event: RecoveryEvent | null; next: bigint; head: Uint8Array | undefined }
 export interface RunPacket { shape: RecoveryShape; calldata: Uint8Array; end: number; state: Uint8Array | null; event: RecoveryEvent }
 
-/** One authority for all sessions on a deployment. Restore the persisted checkpoint before reopening.
- * Supply an independently decoded history for each update. The callback durably saves
- * the authenticated origin and history before a newer checkpoint can be used.
- */
+async function copyTrust(input: TrustInput): Promise<TrustInput> {
+  const origin = input.origin;
+  const pin = input.id;
+  // The SDK returns a new entry array. Capture it before the caller can append.
+  const bundle = await TrustBaseBundle.encode(input.history.entries);
+  const copy = await TrustInput.fromBundle(bundle, pin);
+  return origin === undefined ? copy : copy.withAuthenticatedOrigin(origin);
+}
+
+/** One authority for all sessions on a deployment. Restore the persisted checkpoint before reopening. */
 export class RecoveryAuthority {
   #pending: Promise<unknown> = Promise.resolve();
-  #held: TrustInput;
-  #persistedTip: TrustInput['history']['tip'];
+  #held: Promise<TrustInput>;
+  #revision = 0;
   constructor(checkpoint: TrustInput, private readonly persist: (next: TrustInput) => Promise<void>) {
-    this.#held = checkpoint;
-    this.#persistedTip = checkpoint.history.tip;
+    this.#held = copyTrust(checkpoint);
+    void this.#held.catch(() => {});
   }
-  get checkpoint(): TrustInput { return this.#held; }
-  accept(offered: TrustInput, cfg: Config): Promise<TrustInput> {
+  get checkpoint(): Promise<TrustInput> { return this.#held.then(copyTrust); }
+  get revision(): number { return this.#revision; }
+  accept(offered: TrustInput, cfg: Config): Promise<void> {
+    const snapshot = copyTrust(offered);
+    void snapshot.catch(() => {});
     const next = this.#pending.then(async () => {
-      const held = this.#held;
+      const held = await this.#held;
+      const candidate = await snapshot;
       bindTrust(held, cfg);
-      bindTrust(offered, cfg);
+      bindTrust(candidate, cfg);
       const tip = held.history.tip!;
-      if (held === offered && tip === this.#persistedTip) return held;
-      const prefix = offered.history.entryForEpoch(tip.epoch);
+      const prefix = candidate.history.entryForEpoch(tip.epoch);
       if (prefix === null || !eq(await prefix.entryId(), await tip.entryId())
-        || offered.origin!.rootRound < held.origin!.rootRound || offered.origin!.usableEpoch < held.origin!.usableEpoch) {
+        || candidate.origin!.rootRound < held.origin!.rootRound || candidate.origin!.usableEpoch < held.origin!.usableEpoch) {
         refuse('TrustInput', 'recovery authority rolls back the held history or origin');
       }
-      const offeredTip = offered.history.tip;
-      if (held.history.tip !== tip) refuse('TrustInput', 'held history changed during recovery authority validation');
+      if (candidate.history.tip!.epoch === tip.epoch && candidate.origin!.rootRound === held.origin!.rootRound
+        && candidate.origin!.usableEpoch === held.origin!.usableEpoch) return;
       try {
-        await this.persist(offered);
+        await this.persist(await copyTrust(candidate));
       } catch (e) {
         throw new WalletError('TrustInput', 'could not persist recovery authority', e);
       }
-      this.#held = offered;
-      this.#persistedTip = offeredTip;
-      return offered;
+      this.#held = Promise.resolve(candidate);
+      this.#revision++;
     });
     this.#pending = next.catch(() => {});
     return next;
@@ -248,12 +257,12 @@ export class RecoverySession {
     const domain = domainOf(config);
     const snapshot = Uint8Array.from(evidence);
     const token = decodeToken(snapshot);
-    let trust: TrustInput;
+    let revision: number;
     let verdict: Verdict;
     do {
-      trust = authority.checkpoint;
-      verdict = await verifyPart(cfg, domain, trust, token);
-    } while (trust !== authority.checkpoint);
+      revision = authority.revision;
+      verdict = await verifyPart(cfg, domain, await authority.checkpoint, token);
+    } while (revision !== authority.revision);
     const pages = new Pages(snapshot);
     const header = concat(version, u64(snapshot.length), pages.root);
     const generation = hash('GEN', salt, domain);
@@ -340,12 +349,12 @@ export class RecoverySession {
     const receipt = Uint8Array.from(input);
     const proof = decodeDepositProof(receipt);
     await this.authority.accept(trust, this.cfg);
-    let held: TrustInput;
+    let revision: number;
     let log: Awaited<ReturnType<typeof verifyReceiptLog>>;
     do {
-      held = this.authority.checkpoint;
-      log = await verifyReceiptLog(this.cfg, held, proof, this.deployment.recovery);
-    } while (held !== this.authority.checkpoint);
+      revision = this.authority.revision;
+      log = await verifyReceiptLog(this.cfg, await this.authority.checkpoint, proof, this.deployment.recovery);
+    } while (revision !== this.authority.revision);
     if (log.topics.length !== 2 || !eq(log.topics[0], event.topics[0])
       || !eq(log.topics[1], event.topics[1]) || !eq(log.data, event.data)) refuse('ProviderFault', 'recovery checkpoint mismatch');
     return { encoded: receipt, blockNumber: log.header.number, blockHash: HE(proof.header), txIndex: proof.txIndex, logIndex: proof.logIndex };
@@ -387,16 +396,16 @@ export class RecoverySession {
       try {
         const proof = await source(this.deployment.recovery.slice(), this.event(event.kind, event.data.slice()));
         try {
-          const receipt = await this.verifyEvent(this.authority.checkpoint, proof, event);
-          return { receipt, trust: this.authority.checkpoint };
+          const receipt = await this.verifyEvent(await this.authority.checkpoint, proof, event);
+          return { receipt, trust: await this.authority.checkpoint };
         } catch (e) {
           let cause = e;
           while (cause instanceof Nb2Error && cause.inner && !(cause instanceof SealAheadOfOrigin)) cause = cause.inner;
           if (!refresh || (!(e instanceof Nb2Error && e.retryable) && !(cause instanceof SealAheadOfOrigin))) throw e;
-          const fresh = await refresh(this.authority.checkpoint);
+          const fresh = await refresh(await this.authority.checkpoint);
           await this.authority.accept(fresh, this.cfg);
-          const receipt = await this.verifyEvent(this.authority.checkpoint, proof, event);
-          return { receipt, trust: this.authority.checkpoint };
+          const receipt = await this.verifyEvent(await this.authority.checkpoint, proof, event);
+          return { receipt, trust: await this.authority.checkpoint };
         }
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
@@ -419,7 +428,7 @@ export class RecoverySession {
     let next = start;
     let before: Uint8Array = Uint8Array.from(head);
     for (const receipt of receipts) {
-      const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, this.authority.checkpoint, receipt);
+      const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, await this.authority.checkpoint, receipt);
       if (segment.index !== next || !eq(segment.before, before)) fail('SegmentLog', 'nonconsecutive certified seals');
       const path = GapTree.build(segment.z)!.prove(this.verdict.eta);
       if (path === null) refuse('AlreadyPaid', 'return appears in a certified sealed segment');

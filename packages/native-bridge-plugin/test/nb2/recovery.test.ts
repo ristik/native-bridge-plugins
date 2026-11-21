@@ -2,11 +2,25 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { test } from 'node:test';
 import { gunzipSync } from 'node:zlib';
+import type { RecoveryCalibrationRange, RecoveryBacklog } from '../../src/nb2/recovery-cost.js';
 import { concat, fromHex } from '../../src/bytes.js';
 import { decodeConfig, decodeDepositProof, verifyReceiptLog, Nb2Error, PRODUCTION_PARAMS, RecoveryAuthority, RecoverySession, TrustInput, WalletError } from '../../src/nb2/index.js';
 
 const fixtures = new URL('../../../../protocol/vectors/nb2-continuation-v1.1/', import.meta.url);
 const read = (file: string) => readFile(new URL(file, fixtures));
+function calibrationRanges(maxAdvance = 1024): RecoveryCalibrationRange[] {
+  const range = (entry: RecoveryCalibrationRange['max']['entry'], operations: number, gaps: number): RecoveryCalibrationRange => ({
+    minReceiptBytes: entry === 'run' ? 0 : 1,
+    max: { entry, operations, gaps, receiptBytes: 65_536, calldataBytes: 393_216, pages: 32, openingBytes: 393_216 },
+    execution: 1_000_000n + BigInt(operations) * 500_000n + BigInt(gaps) * 7000n,
+  });
+  return [
+    ...Array.from({ length: 16 }, (_, i) => range('run', i + 1, 0)),
+    ...Array.from({ length: maxAdvance }, (_, i) => range('advanceGaps', 0, i + 1)),
+    ...Array.from({ length: 1024 }, (_, i) => range('redeemRecovered', 0, i)),
+  ];
+}
+
 function trace(bytes: Buffer): Buffer[][] {
   const out: Buffer[][] = [];
   for (let p = 0; p < bytes.length;) {
@@ -51,7 +65,7 @@ for (const name of ['root', 'transfers', 'one-split', 'depth-20', 'shared-claim'
     assert.deepEqual(Buffer.from(session.pageRoot), Buffer.from(c.PageRoot, 'hex'));
     if (name === 'root') {
       const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
-      const calibration = { pins, runtimeHash: fromHex(c.RecoveryRuntimeHash)!, executionBound: () => 1_000_000n };
+      const calibration = { pins, runtimeHash: fromHex(c.RecoveryRuntimeHash)!, ranges: calibrationRanges(0) };
       const limits = { signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: cfg.chainId, maxNonce: 255n,
         maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, balance: 10n ** 18n, feeBudget: 10n ** 18n };
       const whole = await session.run(0, 2, trust);
@@ -177,13 +191,13 @@ test('cold admission prices the terminal bound, reserve, signed envelope and ref
   };
   const calibration = {
     pins: deployment.pins, runtimeHash: deployment.runtimeHash, vaultRuntimeHash: deployment.vaultRuntimeHash,
-    executionBound: ({ operations, gaps }: { operations: number; gaps: number }) => 1_000_000n + BigInt(operations) * 500_000n + BigInt(gaps) * 7000n,
+    ranges: calibrationRanges(),
   };
   const limits = {
     signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: cfg.chainId, maxNonce: 255n,
     maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, balance: 10n ** 18n, feeBudget: 10n ** 18n,
   };
-  const backlog = { signedStart: 0n, observed: 2n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n, receiptP99Ms: 1000n, finalInclusionMs: 25n, qualifiedForMs: 200_000n };
+  const backlog = { signedStart: 0n, observed: 2n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n, receiptP99Ms: 1000n, advancePeakSeals: 1n, finalInclusionMs: 25n, finalPeakSeals: 1n, qualifiedForMs: 200_000n };
   const call = (changes: Partial<typeof limits> = {}, progress: Partial<typeof backlog> = {}) =>
     preflightRecovery(gamma, held, trust, PRODUCTION_PARAMS, deployment, calibration, { ...limits, ...changes }, { ...backlog, ...progress });
   const plan = await call();
@@ -195,9 +209,8 @@ test('cold admission prices the terminal bound, reserve, signed envelope and ref
   await assert.rejects(call({ feeBudget: plan.totalFee - 1n }), { rule: 'CapacityPreflight' });
   await assert.rejects(call({}, { signedStart: 1n }), { rule: 'CapacityPreflight' });
   await assert.rejects(call({}, { peakSeals: 35n }), { rule: 'CapacityPreflight' });
-  const max64 = { ...calibration, executionBound: (shape: Parameters<typeof quoteRecovery>[0]) =>
-    shape.entry === 'advanceGaps' && shape.gaps > 64 ? null : calibration.executionBound(shape) };
-  const growing = { ...backlog, observed: 1024n, duringProgress: 0n, peakSeals: 32n };
+  const max64 = { ...calibration, ranges: calibrationRanges(64) };
+  const growing = { ...backlog, observed: 1024n, duringProgress: 0n, peakSeals: 32n, advancePeakSeals: 32n };
   const growingQuote = (changes = growing, budget = limits.feeBudget, model = max64) =>
     preflightRecovery(gamma, held, trust, PRODUCTION_PARAMS, deployment, model, { ...limits, feeBudget: budget }, changes);
   const extended = await growingQuote();
@@ -207,14 +220,25 @@ test('cold admission prices the terminal bound, reserve, signed envelope and ref
   const originalSettlement = quoteRecovery({ ...extended.settle.shape, gaps: 0, calldataBytes: 65_668 }, max64, limits)!;
   const originalBudget = extended.run.reduce((sum, step) => sum + step.fee, 17n * extended.advance.quote.fee + originalSettlement.fee);
   await assert.rejects(growingQuote(growing, originalBudget), /insufficient recovery fee budget/);
-  await assert.rejects(growingQuote({ ...growing, qualifiedForMs: 34_000n }), /unqualified catch-up horizon/);
-  await assert.rejects(growingQuote({ ...growing, finalInclusionMs: 32n }), /unqualified final inclusion window/);
+  assert.equal((await growingQuote({ ...growing, qualifiedForMs: 34_025n })).advance.calls, 34n);
+  await assert.rejects(growingQuote({ ...growing, qualifiedForMs: 34_024n }), /unqualified catch-up horizon/);
+  const { qualifiedForMs: _, ...missingHorizon } = growing;
+  await assert.rejects(growingQuote(missingHorizon as RecoveryBacklog), /unqualified backlog measurements/);
+  await assert.rejects(growingQuote({ ...growing, finalPeakSeals: 2n }), /unqualified final inclusion window/);
+  await assert.rejects(growingQuote({ ...growing, advancePeakSeals: 64n }), /insufficient certified catch-up rate/);
+  const actual = { ...extended.advance.quote.shape, receiptBytes: 2073, calldataBytes: 20_000 };
+  const narrow = { ...max64, ranges: max64.ranges.map((range) => range.max.entry === 'advanceGaps'
+    ? { ...range, minReceiptBytes: 65_536 } : range) };
+  assert.ok(quoteRecovery(extended.advance.quote.shape, narrow, limits));
+  assert.equal(quoteRecovery(actual, narrow, limits), null);
+  await assert.rejects(growingQuote(growing, limits.feeBudget, narrow), /indivisible gap operation/);
+  assert.ok(quoteRecovery(actual, max64, limits)!.fee <= extended.advance.quote.fee);
   await assert.rejects(growingQuote({ ...growing, observed: (1n << 48n) - 66n }), /unqualified catch-up horizon/);
-  await assert.rejects(growingQuote({ ...growing, observed: 0n, peakSeals: 0n }, limits.feeBudget, {
-    ...max64, executionBound: (shape) => shape.entry === 'advanceGaps' && shape.gaps === 1 ? null : max64.executionBound(shape),
+  await assert.rejects(growingQuote({ ...growing, observed: 0n, peakSeals: 0n, advancePeakSeals: 0n }, limits.feeBudget, {
+    ...max64, ranges: max64.ranges.filter(({ max }) => max.entry !== 'advanceGaps' || max.gaps !== 1),
   }), /indivisible gap operation/);
   await assert.rejects(growingQuote(growing, limits.feeBudget, {
-    ...max64, executionBound: (shape) => shape.entry === 'redeemRecovered' && shape.gaps === 1 ? null : max64.executionBound(shape),
+    ...max64, ranges: max64.ranges.filter(({ max }) => max.entry !== 'redeemRecovered' || max.gaps !== 1),
   }), /unqualified settlement suffix/);
   const quote = plan.settle;
   assert.ok(quoteRecovery(quote.shape, calibration, { ...limits, signedBytes: quote.signedBytes, gas: quote.gas }));
@@ -284,15 +308,16 @@ test('missing successor refresh is persisted and prevents authority rollback acr
   await assert.rejects(session.acquire(lagging, event, [async () => proof]), { rule: 'NoEntryForEpoch' });
   failStore = true;
   await assert.rejects(session.acquire(lagging, event, [async () => proof], async () => current), { reason: 'TrustInput' });
-  assert.equal(guard.checkpoint, lagging);
+  assert.deepEqual((await guard.checkpoint).origin, lagging.origin);
   failStore = false;
   const acquired = await session.acquire(lagging, event, [async () => proof], async (held) => {
-    assert.equal(held, lagging);
+    assert.deepEqual(held.origin, lagging.origin);
+    assert.equal(held.history.tip?.epoch, lagging.history.tip?.epoch);
     fetched++;
     return current;
   });
   assert.equal(fetched, 1);
-  assert.equal(acquired.trust, current);
+  assert.deepEqual(acquired.trust.origin, current.origin);
   assert.deepEqual(persisted.origin, current.origin);
   assert.deepEqual(persisted.bundle, await current.history.toBundle());
   const staleOrigin = full.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 10_001n });
@@ -331,4 +356,28 @@ test('recovery RPC selects the later exact event by receipt-local index', async 
   reader.receiptPath = async () => [Uint8Array.of(2)];
   const proof = decodeDepositProof(await recoveryRpcSource(reader, block.hash)(emitter, event));
   assert.equal(proof.logIndex, 1n);
+});
+
+test('authority snapshots isolate in-place history appends before a durable save', async () => {
+  const { TrustBaseBundle } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js');
+  const cfg = decodeConfig(await read('gamma.bin'), PRODUCTION_PARAMS);
+  const full = await TrustInput.fromBundle(await read('transcripts/root/utb.cbor'), cfg.rootGenesis);
+  const [genesis, successor] = full.history.entries;
+  const input = (await TrustInput.fromBundle(await TrustBaseBundle.encode([genesis]), cfg.rootGenesis))
+    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  let saving = false;
+  const guard = new RecoveryAuthority(input, async () => {
+    saving = true;
+    assert.equal((await guard.checkpoint).history.tip?.epoch, genesis.epoch);
+    throw new Error('write failed');
+  });
+  await input.history.append(successor);
+  assert.equal((await guard.checkpoint).history.tip?.epoch, genesis.epoch);
+  const external = await guard.checkpoint;
+  await external.history.append(successor);
+  assert.equal((await guard.checkpoint).history.tip?.epoch, genesis.epoch);
+  await assert.rejects(guard.accept(external, cfg), { reason: 'TrustInput' });
+  assert.ok(saving);
+  assert.equal(guard.revision, 0);
+  assert.equal((await guard.checkpoint).history.tip?.epoch, genesis.epoch);
 });

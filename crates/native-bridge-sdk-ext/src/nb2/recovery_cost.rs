@@ -46,7 +46,16 @@ pub trait RecoveryCalibration {
     fn vault_runtime_hash(&self) -> Option<[u8; 32]> {
         None
     }
-    fn execution_bound(&self, shape: &RecoveryShape) -> Option<u64>;
+    fn ranges(&self) -> &[RecoveryCalibrationRange];
+}
+
+/// A qualified envelope for the same entry, operation count and gap count.
+/// Covers the inclusive receipt interval and all smaller calldata, page and opening sizes.
+#[derive(Clone, Copy)]
+pub struct RecoveryCalibrationRange {
+    pub min_receipt_bytes: usize,
+    pub max: RecoveryShape,
+    pub execution: u64,
 }
 
 /// Effective minima over authenticated deployment, node/relay, chain and payer. Empty access lists, zero value.
@@ -75,14 +84,36 @@ pub fn quote_recovery(
     calibration: &dyn RecoveryCalibration,
     limits: &RecoveryLimits,
 ) -> Option<RecoveryQuote> {
+    quote_range(shape, shape.receipt_bytes, calibration, limits)
+}
+
+fn quote_range(
+    shape: RecoveryShape,
+    min_receipt_bytes: usize,
+    calibration: &dyn RecoveryCalibration,
+    limits: &RecoveryLimits,
+) -> Option<RecoveryQuote> {
     let n = shape.calldata_bytes;
     if !(68..=CALLDATA_BYTES.min(limits.calldata_bytes)).contains(&n) {
         return None;
     }
-    let execution = calibration.execution_bound(&shape)?;
-    if execution == 0 {
-        return None;
-    }
+    let execution = calibration
+        .ranges()
+        .iter()
+        .filter(|range| {
+            let max = range.max;
+            max.entry == shape.entry
+                && max.operations == shape.operations
+                && max.gaps == shape.gaps
+                && range.min_receipt_bytes <= min_receipt_bytes
+                && max.receipt_bytes >= shape.receipt_bytes
+                && max.calldata_bytes >= n
+                && max.pages >= shape.pages
+                && max.opening_bytes >= shape.opening_bytes
+                && range.execution > 0
+        })
+        .map(|range| range.execution)
+        .min()?;
     let reserve = if shape.entry == RecoveryEntry::RedeemRecovered {
         SEAL_RESERVE
     } else {
@@ -201,11 +232,16 @@ pub struct RecoveryBacklog {
     pub signed_start: u64,
     pub observed: u64,
     pub during_progress: u64,
+    /// Sustained peak count over elapsed_ms, for the throughput check.
     pub peak_seals: u64,
     pub elapsed_ms: u64,
     pub receipt_p99_ms: u64,
+    /// Qualified maximum arrivals, including bursts, in any receipt_p99_ms window.
+    pub advance_peak_seals: u64,
     /// Qualified time from sealing the final endpoint, including proof retrieval, through settlement inclusion.
     pub final_inclusion_ms: u64,
+    /// Qualified maximum arrivals, including bursts, in any final_inclusion_ms window.
+    pub final_peak_seals: u64,
     /// Horizon for which the peak-rate and timing bounds are qualified after lineage progress.
     pub qualified_for_ms: u64,
 }
@@ -297,7 +333,7 @@ pub fn preflight_recovery(
             if from == 0 { 0 } else { RECEIPT_BYTES },
             opening,
         )?;
-        quote_recovery(shape, ctx.calibration, ctx.limits)
+        quote_range(shape, usize::from(from != 0), ctx.calibration, ctx.limits)
     };
     if (0..spans.len()).any(|i| quoted(i, i + 1).is_none()) {
         return fail_d(Rule::CapacityPreflight, "indivisible run operation");
@@ -327,11 +363,8 @@ pub fn preflight_recovery(
     {
         return fail_d(Rule::CapacityPreflight, "unqualified backlog");
     }
-    let growth = |ms: u64| {
-        (u128::from(backlog.peak_seals) * u128::from(ms)).div_ceil(u128::from(backlog.elapsed_ms))
-    };
-    let per_advance = growth(backlog.receipt_p99_ms);
-    let final_growth = growth(backlog.final_inclusion_ms);
+    let per_advance = u128::from(backlog.advance_peak_seals);
+    let final_growth = u128::from(backlog.final_peak_seals);
     if final_growth > 1 {
         return fail_d(
             Rule::CapacityPreflight,
@@ -341,8 +374,9 @@ pub fn preflight_recovery(
     let need = last - backlog.signed_start;
     let width = gap_proof_len(cfg.k);
     let gap = |count| {
-        quote_recovery(
+        quote_range(
             gap_shape(RecoveryEntry::AdvanceGaps, count, width),
+            1,
             ctx.calibration,
             ctx.limits,
         )
@@ -359,7 +393,10 @@ pub fn preflight_recovery(
             "insufficient certified catch-up rate",
         );
     };
-    if q as u128 <= per_advance || (q as u128) / 2 < per_advance {
+    if q as u128 <= per_advance
+        || (q as u128) * u128::from(backlog.elapsed_ms) / 2
+            < u128::from(backlog.peak_seals) * u128::from(backlog.receipt_p99_ms)
+    {
         return fail_d(
             Rule::CapacityPreflight,
             "insufficient certified catch-up rate",
@@ -378,8 +415,9 @@ pub fn preflight_recovery(
     // Every suffix smaller than the advance batch may be needed at settlement.
     let mut settle: Option<RecoveryQuote> = None;
     for count in 0..q {
-        let Some(quote) = quote_recovery(
+        let Some(quote) = quote_range(
             gap_shape(RecoveryEntry::RedeemRecovered, count, width),
+            1,
             ctx.calibration,
             ctx.limits,
         ) else {

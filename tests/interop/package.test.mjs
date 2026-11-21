@@ -65,3 +65,16 @@ test('the authenticated genesis is isolated from the caller pin and returned IDs
   await p.verifyEvmUc(trust, proof.uc, cfg);
   await assert.rejects(p.verifyEvmUc(trust, proof.uc, { ...cfg, rootGenesis: otherGenesis }), { reason: 'TrustInput' });
 });
+
+test('JavaScript cold admission requires an explicit positive bigint qualification horizon', async () => {
+  const p = await import('../../packages/native-bridge-plugin/lib/nb2/index.js');
+  const backlog = {
+    signedStart: 0n, observed: 1024n, duringProgress: 0n, peakSeals: 32n, elapsedMs: 1000n,
+    receiptP99Ms: 1000n, advancePeakSeals: 32n, finalInclusionMs: 25n, finalPeakSeals: 1n,
+  };
+  const check = (input) => p.preflightRecovery(new Uint8Array(), new Uint8Array(), undefined, p.PRODUCTION_PARAMS,
+    undefined, undefined, undefined, input);
+  for (const input of [backlog, { ...backlog, qualifiedForMs: 34_025 }, { ...backlog, qualifiedForMs: 0n }]) {
+    await assert.rejects(check(input), { rule: 'CapacityPreflight', detail: 'unqualified backlog measurements' });
+  }
+});

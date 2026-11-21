@@ -29,7 +29,16 @@ export interface RecoveryCalibration {
   pins: Uint8Array;
   runtimeHash: Uint8Array;
   vaultRuntimeHash?: Uint8Array;
-  executionBound(shape: Readonly<RecoveryShape>): bigint | null;
+  ranges: readonly RecoveryCalibrationRange[];
+}
+
+/** A qualified envelope for the same entry, operation count and gap count.
+ * It covers the inclusive receipt interval and all smaller calldata, page and opening sizes for that class.
+ */
+export interface RecoveryCalibrationRange {
+  minReceiptBytes: number;
+  max: Readonly<RecoveryShape>;
+  execution: bigint;
 }
 
 /** Effective minima over the authenticated deployment, node/relay, chain and payer. Empty access lists, zero value. */
@@ -63,11 +72,22 @@ const U64_MAX = (1n << 64n) - 1n;
 const U256_MAX = (1n << 256n) - 1n;
 
 export function quoteRecovery(shape: RecoveryShape, calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote | null {
+  return quoteRange(shape, shape.receiptBytes, calibration, limits);
+}
+
+function quoteRange(shape: RecoveryShape, minReceiptBytes: number, calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote | null {
   const { calldataBytes: n } = shape;
   if (!Number.isSafeInteger(n) || !Number.isSafeInteger(limits.calldataBytes) || !Number.isSafeInteger(limits.signedBytes)
     || n < 68 || n > Math.min(CALLDATA_BYTES, limits.calldataBytes)) return null;
-  const execution = calibration.executionBound(Object.freeze({ ...shape }));
-  if (execution === null || execution <= 0n) return null;
+  let execution: bigint | null = null;
+  for (const range of calibration.ranges ?? []) {
+    const { max } = range;
+    if (max.entry === shape.entry && max.operations === shape.operations && max.gaps === shape.gaps
+      && range.minReceiptBytes <= minReceiptBytes && max.receiptBytes >= shape.receiptBytes
+      && max.calldataBytes >= n && max.pages >= shape.pages && max.openingBytes >= shape.openingBytes
+      && range.execution > 0n && (execution === null || range.execution < execution)) execution = range.execution;
+  }
+  if (execution === null) return null;
   const gas = 21_000n + 16n * BigInt(n) + (6n * execution + 4n) / 5n
     + (shape.entry === 'redeemRecovered' ? SEAL_RESERVE : 0n);
   if (gas > GAS_LIMIT || gas > limits.gas || limits.chainId <= 0n || limits.chainId > U64_MAX || limits.maxNonce < 0n || limits.maxNonce > U64_MAX
@@ -112,12 +132,16 @@ export interface RecoveryBacklog {
   observed: bigint;
   /** Upper bound on segments appended while the progress packets become certified. */
   duringProgress: bigint;
-  /** An authenticated measurement of peak seals in the same window as elapsedMs. */
+  /** Sustained peak count over elapsedMs, for the catch-up throughput check. */
   peakSeals: bigint;
   elapsedMs: bigint;
   receiptP99Ms: bigint;
+  /** Qualified maximum arrivals, including bursts, in any receiptP99Ms window. */
+  advancePeakSeals: bigint;
   /** Qualified time from sealing the final endpoint, including proof retrieval, through settlement inclusion. */
   finalInclusionMs: bigint;
+  /** Qualified maximum arrivals, including bursts, in any finalInclusionMs window. */
+  finalPeakSeals: bigint;
   /** Horizon for which the peak-rate and timing bounds are qualified after lineage progress. */
   qualifiedForMs: bigint;
 }
@@ -126,6 +150,12 @@ export interface RecoveryBacklog {
 export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, trust: TrustInput, params: Params,
   deployment: RecoveryDeployment, calibration: RecoveryCalibration, limits: RecoveryLimits, backlog: RecoveryBacklog, startingSeal?: Uint8Array,
 ): Promise<{ run: RecoveryQuote[]; advance: { quote: RecoveryQuote; calls: bigint }; settle: RecoveryQuote; settlementMaxGaps: number; totalFee: bigint }> {
+  backlog = { ...backlog };
+  const times = [backlog.elapsedMs, backlog.receiptP99Ms, backlog.finalInclusionMs, backlog.qualifiedForMs];
+  const counts = [backlog.signedStart, backlog.observed, backlog.duringProgress, backlog.peakSeals, backlog.advancePeakSeals, backlog.finalPeakSeals];
+  if (times.some((v) => typeof v !== 'bigint' || v <= 0n) || counts.some((v) => typeof v !== 'bigint' || v < 0n)) {
+    fail('CapacityPreflight', 'unqualified backlog measurements');
+  }
   const config = Uint8Array.from(gamma);
   const cfg = decodeConfig(config, params);
   if (!validRecoveryDeployment(deployment) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
@@ -159,7 +189,7 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   const quoted = (from: number, end: number): RecoveryQuote | null => {
     const opening = spans.slice(from, end).reduce((sum, op) => sum + SPARSE + op.claims * (34 + SPARSE), 0);
     const shape = runShape(spans, from, end, n, from === 0 ? 0 : RECEIPT_BYTES, opening);
-    return shape === null ? null : quoteRecovery(shape, calibration, limits);
+    return shape === null ? null : quoteRange(shape, from === 0 ? 0 : 1, calibration, limits);
   };
   // Every operation must fit alone when a cut has to be retried with a full predecessor.
   for (let i = 0; i < spans.length; i++) {
@@ -173,18 +203,15 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
     from = end;
   }
   const target = backlog.observed + backlog.duringProgress + 64n;
-  if (backlog.signedStart < 0n || backlog.observed < backlog.signedStart || backlog.duringProgress < 0n
-    || target > MAX_SEGMENT || backlog.peakSeals < 0n || backlog.elapsedMs <= 0n
-    || backlog.receiptP99Ms <= 0n || backlog.finalInclusionMs <= 0n) fail('CapacityPreflight', 'unqualified backlog');
+  if (backlog.observed < backlog.signedStart || target > MAX_SEGMENT) fail('CapacityPreflight', 'unqualified backlog');
   const ceilDiv = (n: bigint, d: bigint): bigint => (n + d - 1n) / d;
-  const growth = (ms: bigint): bigint => ceilDiv(backlog.peakSeals * ms, backlog.elapsedMs);
-  const perAdvance = growth(backlog.receiptP99Ms);
-  const finalGrowth = growth(backlog.finalInclusionMs);
+  const perAdvance = backlog.advancePeakSeals;
+  const finalGrowth = backlog.finalPeakSeals;
   // Proofs for future seals cannot be included. The vault admits the current or previous endpoint.
   if (finalGrowth > 1n) fail('CapacityPreflight', 'unqualified final inclusion window');
   const need = target - backlog.signedStart;
   const width = gapProofLen(cfg.K);
-  const gap = (count: number) => quoteRecovery(gapShape('advanceGaps', count, width), calibration, limits);
+  const gap = (count: number) => quoteRange(gapShape('advanceGaps', count, width), 1, calibration, limits);
   if (gap(1) === null) fail('CapacityPreflight', 'indivisible gap operation');
   let q = Math.min(1024, Number(need));
   let advance: RecoveryQuote | null = null;
@@ -192,7 +219,7 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
     advance = gap(q);
     if (advance !== null) break;
   }
-  if (advance === null || BigInt(q) <= perAdvance || BigInt(q) < 2n * perAdvance) {
+  if (advance === null || BigInt(q) <= perAdvance || BigInt(q) * backlog.elapsedMs < 2n * backlog.peakSeals * backlog.receiptP99Ms) {
     fail('CapacityPreflight', 'insufficient certified catch-up rate');
   }
   // Full advances are needed only while at least q proved gaps remain. Reserve for the
@@ -206,7 +233,7 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   // every possible terminal suffix: the release need not price it monotonically.
   let settle: RecoveryQuote | null = null;
   for (let count = 0; count < q; count++) {
-    const quote = quoteRecovery(gapShape('redeemRecovered', count, width), calibration, limits);
+    const quote = quoteRange(gapShape('redeemRecovered', count, width), 1, calibration, limits);
     if (quote === null) fail('CapacityPreflight', 'unqualified settlement suffix');
     if (settle === null || quote.fee > settle.fee) settle = quote;
   }

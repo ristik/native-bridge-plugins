@@ -224,9 +224,9 @@ fn prescribed_cold_calls_match_t1() {
 fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
     use native_bridge_sdk_ext::nb2::recovery_cost::{
         preflight_recovery, quote_recovery, AdmissionContext, RecoveryBacklog, RecoveryCalibration,
-        RecoveryLimits, RecoveryShape,
+        RecoveryCalibrationRange, RecoveryEntry, RecoveryLimits, RecoveryShape,
     };
-    struct Calibration([u8; 32], [u8; 32], usize, bool, bool);
+    struct Calibration([u8; 32], [u8; 32], Vec<RecoveryCalibrationRange>);
     impl RecoveryCalibration for Calibration {
         fn pins(&self) -> [u8; 32] {
             self.0
@@ -237,16 +237,30 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         fn vault_runtime_hash(&self) -> Option<[u8; 32]> {
             Some([1; 32])
         }
-        fn execution_bound(&self, s: &RecoveryShape) -> Option<u64> {
-            use native_bridge_sdk_ext::nb2::recovery_cost::RecoveryEntry;
-            if s.entry == RecoveryEntry::AdvanceGaps && (s.gaps > self.2 || self.3 && s.gaps == 1)
-                || s.entry == RecoveryEntry::RedeemRecovered && self.4 && s.gaps == 1
-            {
-                return None;
-            }
-            Some(1_000_000 + s.operations as u64 * 500_000 + s.gaps as u64 * 7_000)
+        fn ranges(&self) -> &[RecoveryCalibrationRange] {
+            &self.2
         }
     }
+    let ranges = |advance_max| {
+        let range = |entry, operations, gaps| RecoveryCalibrationRange {
+            min_receipt_bytes: usize::from(entry != RecoveryEntry::Run),
+            max: RecoveryShape {
+                entry,
+                operations,
+                gaps,
+                receipt_bytes: 65_536,
+                calldata_bytes: 393_216,
+                pages: 32,
+                opening_bytes: 393_216,
+            },
+            execution: 1_000_000 + operations as u64 * 500_000 + gaps as u64 * 7_000,
+        };
+        (1..=16)
+            .map(|n| range(RecoveryEntry::Run, n, 0))
+            .chain((1..=advance_max).map(|n| range(RecoveryEntry::AdvanceGaps, 0, n)))
+            .chain((0..1024).map(|n| range(RecoveryEntry::RedeemRecovered, 0, n)))
+            .collect::<Vec<_>>()
+    };
     let gamma = read(BASE, "gamma.bin");
     let params = production_params();
     let cfg = decode_config(&gamma, &params).unwrap();
@@ -267,7 +281,7 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         vault_runtime_hash: Some([1; 32]),
     };
     let held = read(BASE, &format!("{path}/evidence.bin"));
-    let calibration = Calibration(deployment.pins, deployment.runtime_hash, 1024, false, false);
+    let calibration = Calibration(deployment.pins, deployment.runtime_hash, ranges(1024));
     let mut limits = RecoveryLimits {
         signed_bytes: 524_288,
         calldata_bytes: 393_216,
@@ -287,7 +301,9 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         peak_seals: 1,
         elapsed_ms: 1_000,
         receipt_p99_ms: 1_000,
+        advance_peak_seals: 1,
         final_inclusion_ms: 25,
+        final_peak_seals: 1,
         qualified_for_ms: 200_000,
     };
     let quote = |limits: &RecoveryLimits| {
@@ -338,9 +354,10 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         observed: 1024,
         during_progress: 0,
         peak_seals: 32,
+        advance_peak_seals: 32,
         ..backlog
     };
-    let max64 = Calibration(deployment.pins, deployment.runtime_hash, 64, false, false);
+    let max64 = Calibration(deployment.pins, deployment.runtime_hash, ranges(64));
     let growing_quote = |bounds: &RecoveryLimits, growth: &RecoveryBacklog, model: &Calibration| {
         preflight_recovery(
             &AdmissionContext {
@@ -383,9 +400,36 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         .name()
         .contains("CapacityPreflight"));
     limits.fee_budget = limits.balance.clone();
-    growing.final_inclusion_ms = 32;
+    growing.final_peak_seals = 2;
     assert!(growing_quote(&limits, &growing, &max64).is_err());
-    growing.final_inclusion_ms = 25;
+    growing.final_peak_seals = 1;
+    growing.advance_peak_seals = 64;
+    assert!(growing_quote(&limits, &growing, &max64).is_err());
+    growing.advance_peak_seals = 32;
+    let smaller = RecoveryShape {
+        receipt_bytes: 2073,
+        calldata_bytes: 20_000,
+        ..extended.advance.shape
+    };
+    let narrow = Calibration(
+        deployment.pins,
+        deployment.runtime_hash,
+        max64
+            .ranges()
+            .iter()
+            .copied()
+            .map(|mut range| {
+                if range.max.entry == RecoveryEntry::AdvanceGaps {
+                    range.min_receipt_bytes = 65_536;
+                }
+                range
+            })
+            .collect(),
+    );
+    assert!(quote_recovery(extended.advance.shape, &narrow, &limits).is_some());
+    assert!(quote_recovery(smaller, &narrow, &limits).is_none());
+    assert!(growing_quote(&limits, &growing, &narrow).is_err());
+    assert!(quote_recovery(smaller, &max64, &limits).unwrap().fee <= extended.advance.fee);
     growing.qualified_for_ms = 34_000;
     assert!(growing_quote(&limits, &growing, &max64).is_err());
     growing.qualified_for_ms = 200_000;
@@ -393,10 +437,18 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
     assert!(growing_quote(&limits, &growing, &max64).is_err());
     growing.observed = 0;
     growing.peak_seals = 0;
-    for model in [
-        Calibration(deployment.pins, deployment.runtime_hash, 64, true, false),
-        Calibration(deployment.pins, deployment.runtime_hash, 64, false, true),
-    ] {
+    growing.advance_peak_seals = 0;
+    for entry in [RecoveryEntry::AdvanceGaps, RecoveryEntry::RedeemRecovered] {
+        let model = Calibration(
+            deployment.pins,
+            deployment.runtime_hash,
+            max64
+                .ranges()
+                .iter()
+                .copied()
+                .filter(|range| range.max.entry != entry || range.max.gaps != 1)
+                .collect(),
+        );
         let error = growing_quote(&limits, &growing, &model).err().unwrap();
         assert_eq!(error.rule().unwrap().rule, Rule::CapacityPreflight);
     }
