@@ -1556,6 +1556,9 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
         assert.equal(outcome.state, i === 0 ? 'pending' : 'needs-archive');
       }
       assert.ok(rawReads >= 3);
+      const lagging: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
+        method === 'eth_getTransactionReceipt' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
+      assert.equal((await run(await open('holder', lagging))).state, 'needs-archive', 'a reader may lose even the failure metadata');
       const missing: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getRawTransactionByBlockHashAndIndex' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
       const pruned = await open('missing-raw', missing, { seed: key('holder') });

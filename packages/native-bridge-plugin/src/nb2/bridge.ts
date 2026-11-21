@@ -1062,7 +1062,10 @@ export class NativeBridgeV2 {
       return (await this.findPaid({ ...rec, eta }, archives, true, evidence)) ?? { state: 'not-paid' };
     }
     if (rec.eta === undefined) return { state: 'not-paid' };
-    return (await this.findPaid(rec, archives, true, evidence)) ?? this.reconcileSend(rec, archives, evidence?.readOnly !== true);
+    const paid = await this.findPaid(rec, archives, true, evidence);
+    if (paid?.state === 'paid') return paid;
+    const exact = await this.reconcileSend(rec, archives, paid === undefined && evidence?.readOnly !== true);
+    return paid && exact.state !== 'paid' && exact.state !== 'needs-archive' ? paid : exact;
   }
 
   private async findPaid(rec: ReturnRecord, archives: readonly EvmReader[], persist = true, evidence?: ReturnEvidence): Promise<ReconcileResult | undefined> {

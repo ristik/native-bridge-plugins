@@ -762,7 +762,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     mined = await outcome();
   }
-  if (mined === 'missing' || mined === 'pending') {
+  const unresolved = (): RecoveryResult => {
     if (failed || pending.failureProofReads !== undefined) {
       const reads = pruned ? FAILURE_PROOF_READS : Math.min((pending.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
       if (reads !== pending.failureProofReads) {
@@ -772,7 +772,8 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     }
     if (pending.failureProofReads === FAILURE_PROOF_READS) return { state: 'needs-archive', txHash: hash };
     return { state: 'pending', txHash: hash };
-  }
+  };
+  if (mined === 'missing' || mined === 'pending') return unresolved();
   if (mined === 'failed') {
     (journal.attempts ??= []).push(pending.raw);
     delete journal.pending;
@@ -781,14 +782,14 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   }
   if (pending.cut.kind === 'settle') {
     const result = await reconcile?.();
-    return !result || result.state === 'not-paid' ? { state: 'pending', txHash: hash } : result;
+    return !result || result.state === 'not-paid' || result.state === 'pending' ? unresolved() : result;
   }
   let acquired;
   try {
     acquired = await s.acquire(w.trust, packet.event!, archive.map((r) => recoveryRpcSource(r, hash)), () => w.refreshAuthority());
   } catch (e) {
     if (e instanceof WalletError && (e.reason === 'CompanionUnknown' || e.reason === 'EvidenceMissing')) {
-      return { state: 'pending', txHash: hash };
+      return unresolved();
     }
     throw e;
   }
