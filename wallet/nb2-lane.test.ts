@@ -12,6 +12,80 @@ import { verifyReturn } from '../packages/native-bridge-plugin/src/nb2/verify.js
 import { evmAccount, key, roundNow, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { io } from './core.js';
 
+test('lane syncs the journal name and any recovered pending request before certification', async (t) => {
+  const w = await setup();
+  const bridge = await NativeBridgeV2.open(w.options('lane journal sync'));
+  const owner = localOwner(key('lane journal owner'));
+  const payer = evmAccount(w.chain, 'lane journal payer');
+  const intent = await bridge.planDeposit(21n, owner.publicKey);
+  await bridge.submitDeposit(intent, payer);
+  await bridge.collectDepositProof(intent.intent);
+  const root = await bridge.mint(intent.intent);
+
+  const dir = mkdtempSync(join(tmpdir(), 'nb2-lane-sync-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const output = join(dir, 'evidence');
+  const journal = output + '.journal';
+  const file = join(journal, 'state.json');
+  const pending = (): string | undefined => existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')).pending?.cd : undefined;
+  const parent = statSync(dir, { bigint: true });
+  const fsync = io.fsync;
+  let failParent = true;
+  let failPending = true;
+  let parentSynced = false;
+  let pendingSynced = false;
+  let attempts = 0;
+  let savedRequest: string | undefined;
+  const aggregator = { certify: async (cd: Uint8Array): Promise<Uint8Array> => {
+    attempts++;
+    assert.ok(parentSynced);
+    assert.ok(pendingSynced);
+    assert.equal(Buffer.from(cd).toString('hex'), savedRequest);
+    throw new Error('stopped at certification');
+  } };
+  const run = () => runLaneWorkload({
+    gamma: w.chain.gamma, params: TEST_PARAMS, trust: w.root.trust,
+    root, owner, aggregator, recipient: payer.address, output, history: 'depth-20',
+  });
+  io.fsync = (fd) => {
+    const target = fstatSync(fd, { bigint: true });
+    if (target.dev === parent.dev && target.ino === parent.ino) {
+      assert.ok(statSync(journal).isDirectory());
+      if (failParent) {
+        failParent = false;
+        throw new Error('journal parent sync failed');
+      }
+      fsync(fd);
+      parentSynced = true;
+      return;
+    }
+    if (target.isDirectory() && pending() !== undefined) {
+      if (failPending) {
+        failPending = false;
+        throw new Error('pending journal sync failed');
+      }
+      fsync(fd);
+      pendingSynced = true;
+      return;
+    }
+    fsync(fd);
+  };
+  try {
+    await assert.rejects(run(), /journal parent sync failed/);
+    assert.equal(attempts, 0);
+    await assert.rejects(run(), /pending journal sync failed/);
+    assert.equal(attempts, 0);
+    assert.ok(parentSynced);
+    savedRequest = pending();
+    assert.ok(savedRequest);
+    parentSynced = false;
+    await assert.rejects(run(), /stopped at certification/);
+    assert.equal(attempts, 1);
+  } finally {
+    io.fsync = fsync;
+  }
+});
+
 test('lane reloads authority for the starting seal and spends, resumes exact requests and preserves occupied output', async (t) => {
   const w = await setup();
   const bridge = await NativeBridgeV2.open(w.options('lane retry'));

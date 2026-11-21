@@ -71,9 +71,12 @@ export async function runLaneWorkload(job: Job) {
   const { transfers, splits } = workloads[job.history];
   const count = transfers + 2 * splits + 1;
   const output = resolve(job.output);
+  const parent = dirname(output);
   const dir = output + '.journal';
-  if (!statSync(dirname(output)).isDirectory()) throw new Error('lane output requires an existing parent directory');
+  if (!statSync(parent).isDirectory()) throw new Error('lane output requires an existing parent directory');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // A prior attempt may have created the journal without syncing its name.
+  fsyncDir(parent);
   lockWallet(dir);
   const file = join(dir, 'state.json');
   const staged = join(dir, 'evidence');
@@ -112,6 +115,8 @@ export async function runLaneWorkload(job: Job) {
   if (existsSync(file)) {
     state = JSON.parse(readFileSync(file, 'utf8')) as Journal;
     if (state.binding !== binding) throw new Error('lane journal belongs to a different workload');
+    // A prior write may have renamed the checkpoint but failed to sync its directory.
+    fsyncDir(dir);
   } else {
     if (lstatSync(output, { throwIfNoEntry: false })) throw new Error(`lane output already exists: ${output}`);
     const root = decodeToken(job.root);
@@ -200,7 +205,7 @@ export async function runLaneWorkload(job: Job) {
       throw new Error(`lane output already exists: ${output}`, { cause: e });
     }
   }
-  fsyncDir(dirname(output));
+  fsyncDir(parent);
   const levels = lineageOf(decodeToken(evidence)).map((level) => ({
     mintBytes: level.mintRaw.length,
     transfers: level.transfersRaw.length,
