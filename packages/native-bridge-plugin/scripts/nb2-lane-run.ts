@@ -76,7 +76,7 @@ export async function runLaneWorkload(job: Job) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   lockWallet(dir);
   const file = join(dir, 'state.json');
-  const reservation = join(dir, 'reservation');
+  const staged = join(dir, 'evidence');
   const cfg = decodeConfig(job.gamma, job.params);
   const domain = domainOf(job.gamma);
   if (job.recipient.length !== 20 || !job.recipient.some(Boolean) || eq(job.recipient, cfg.vault)) throw new Error('invalid return recipient');
@@ -113,7 +113,7 @@ export async function runLaneWorkload(job: Job) {
     state = JSON.parse(readFileSync(file, 'utf8')) as Journal;
     if (state.binding !== binding) throw new Error('lane journal belongs to a different workload');
   } else {
-    if (existsSync(output)) throw new Error(`lane output already exists: ${output}`);
+    if (lstatSync(output, { throwIfNoEntry: false })) throw new Error(`lane output already exists: ${output}`);
     const root = decodeToken(job.root);
     const held = await verify((t) => verifyHeld(cfg, domain, t, root));
     if (root.ancestors.length !== 0 || root.transfers.length !== 0 || !eq(held.owner.params, job.owner.publicKey)) {
@@ -124,21 +124,15 @@ export async function runLaneWorkload(job: Job) {
     save(state);
   }
 
-  // Create a fresh empty reservation when the destination is free. The old inode
-  // may still hold bytes someone wrote through the destination before removing it.
-  if (!existsSync(output)) {
-    writeDurable(reservation, new Uint8Array());
-    linkSync(reservation, output);
-    fsyncDir(dirname(output));
-  }
-  const reserved = existsSync(reservation) ? statSync(reservation, { bigint: true }) : undefined;
-  const checkOutput = () => {
-    const current = lstatSync(output, { bigint: true });
-    if (reserved && current.size === 0n && current.dev === reserved.dev && current.ino === reserved.ino) return true;
-    if (current.isFile() && state.step === count && eq(readFileSync(output), bytes(state.token))) return false;
+  const alreadyPublished = (): boolean => {
+    const current = lstatSync(output, { throwIfNoEntry: false });
+    if (!current) return false;
+    if (current.isFile() && state.step === count && eq(readFileSync(output), bytes(state.token))) return true;
     throw new Error(`lane output already exists: ${output}`);
   };
-  checkOutput();
+  // Open the private output before spending. The public path stays free until the
+  // completed evidence can be installed with a single no-overwrite operation.
+  if (!alreadyPublished() && !existsSync(staged)) writeDurable(staged, new Uint8Array());
 
   const owner = signaturePredicate(job.owner.publicKey);
   const seed = bytes(state.seed);
@@ -197,7 +191,16 @@ export async function runLaneWorkload(job: Job) {
 
   const evidence = bytes(state.token);
   const verdict = await verify((t) => verifyReturn(job.gamma, evidence, t, job.params));
-  if (checkOutput()) writeDurable(output, evidence);
+  if (!alreadyPublished()) {
+    writeDurable(staged, evidence);
+    try {
+      linkSync(staged, output);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      throw new Error(`lane output already exists: ${output}`, { cause: e });
+    }
+  }
+  fsyncDir(dirname(output));
   const levels = lineageOf(decodeToken(evidence)).map((level) => ({
     mintBytes: level.mintRaw.length,
     transfers: level.transfersRaw.length,

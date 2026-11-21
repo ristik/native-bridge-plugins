@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fstatSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -10,6 +10,7 @@ import { localOwner } from '../packages/native-bridge-plugin/src/nb2/tokenops.js
 import { decodeUc } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { verifyReturn } from '../packages/native-bridge-plugin/src/nb2/verify.js';
 import { evmAccount, key, roundNow, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
+import { io } from './core.js';
 
 test('lane reloads authority for the starting seal and spends, resumes exact requests and preserves occupied output', async (t) => {
   const w = await setup();
@@ -50,13 +51,17 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
   assert.equal(readFileSync(occupied, 'utf8'), 'existing');
 
   const output = join(dir, 'evidence');
-  const state = () => JSON.parse(readFileSync(join(output + '.journal', 'state.json'), 'utf8')) as { step: number; pending?: { cd: string } };
+  const journal = output + '.journal';
+  const state = () => JSON.parse(readFileSync(join(journal, 'state.json'), 'utf8')) as {
+    step: number; token: string; pending?: { cd: string };
+  };
   let attempts = 0;
   let interruptedSplit: string | undefined;
   let interruptedReturn: string | undefined;
   const aggregator = { certify: async (cd: Uint8Array) => {
     assert.ok(reloads > 1);
-    assert.equal(statSync(output).size, 0);
+    assert.equal(statSync(join(journal, 'evidence')).size, 0);
+    assert.equal(existsSync(output), false);
     const request = Buffer.from(cd).toString('hex');
     assert.equal(state().pending?.cd, request);
     const proof = await w.agg.certify(cd);
@@ -72,7 +77,7 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
     }
     if (state().step === 40) {
       assert.equal(request, interruptedReturn);
-      writeFileSync(output, 'in-place write');
+      writeFileSync(output, 'created during certification', { flag: 'wx' });
     }
     return proof;
   } };
@@ -83,13 +88,38 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
   assert.equal(state().step, 40);
   await assert.rejects(run(), /output already exists/);
   assert.equal(state().step, 41);
-  assert.equal(readFileSync(output, 'utf8'), 'in-place write');
+  assert.equal(readFileSync(output, 'utf8'), 'created during certification');
   await assert.rejects(run(), /output already exists/);
   unlinkSync(output);
   writeFileSync(output, 'replacement');
   await assert.rejects(run(), /output already exists/);
   assert.equal(readFileSync(output, 'utf8'), 'replacement');
   assert.ok(reloads >= 41, 'the initial checkpoint predates all certified spends');
+  unlinkSync(output);
+
+  const completed = state();
+  const fsync = io.fsync;
+  let raced = false;
+  io.fsync = (fd) => {
+    fsync(fd);
+    const file = fstatSync(fd);
+    if (!raced && file.isFile() && file.size === Buffer.byteLength(completed.token, 'hex')) {
+      writeFileSync(output, 'created during staging fsync', { flag: 'wx' });
+      raced = true;
+    }
+  };
+  try {
+    await assert.rejects(run(), (error: Error) => {
+      assert.equal(error.message, `lane output already exists: ${output}`);
+      assert.equal((error.cause as NodeJS.ErrnoException).code, 'EEXIST');
+      return true;
+    });
+  } finally {
+    io.fsync = fsync;
+  }
+  assert.ok(raced);
+  assert.equal(readFileSync(output, 'utf8'), 'created during staging fsync');
+  assert.deepEqual(state(), completed);
   unlinkSync(output);
   const finished = await run();
   assert.equal(finished.levels.length, 21);
