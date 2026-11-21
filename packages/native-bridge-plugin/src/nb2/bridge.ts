@@ -139,6 +139,16 @@ function redeemRefusal(e: DecodedError, detail?: string): Nb2Error {
     e.inner && redeemRefusal(e.inner));
 }
 
+// Import folds together the exact signed request, its optional terminal, and a vault Paid receipt.
+const RETURN_IMPORT = {
+  absent:           { signed: 'adopt',   terminal: 'adopt',  paid: 'adopt' },
+  planned:          { signed: 'adopt',   terminal: 'adopt',  paid: 'adopt' },
+  'burn-requested': { signed: 'certify', terminal: 'attach', paid: 'reconcile' },
+  burned:           { signed: 'keep',    terminal: 'keep',   paid: 'reconcile' },
+  submitted:        { signed: 'keep',    terminal: 'keep',   paid: 'reconcile' },
+  paid:             { signed: 'keep',    terminal: 'attach', paid: 'keep' },
+} as const;
+
 export class NativeBridgeV2 {
   public readonly cfg: Config;
   public readonly domain: Uint8Array;
@@ -802,34 +812,36 @@ export class NativeBridgeV2 {
       const verdict = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
       verified.status = 'burned';
       verified.burned = hex(burned);
-      verified.eta = hex(verdict.eta);
+      if (hex(verdict.eta) !== eta) refuse('BadInput', 'terminal disagrees with the signed redemption ID');
+      verified.eta = eta;
     }
     return this.locked(`return/${returnId.slice(2)}`, async () => {
       const existing = await this.journal.retForUpdate(returnId);
-      let selected = verified;
-      if (existing?.burnRequest !== undefined) {
-        if (existing.burnRequest !== burnRequest || existing.burnTx !== burnTx || existing.returnId !== returnId ||
+      if (existing?.burnRequest !== undefined &&
+        (existing.burnRequest !== burnRequest || existing.burnTx !== burnTx || existing.returnId !== returnId ||
           existing.source !== source || existing.amount !== amount || existing.recipient !== recipient || existing.a !== a ||
-          existing.startHead !== startHead || existing.fromBlock !== fromBlock || existing.certificationLocator !== certificationLocator) {
-          refuse('JournalConflict', 'another signed return is held');
-        }
-        if (existing.status === 'paid') return existing;
-        selected = existing;
+          existing.startHead !== startHead || existing.fromBlock !== fromBlock || existing.certificationLocator !== certificationLocator)) {
+        refuse('JournalConflict', 'another signed return is held');
       }
-      // An authenticated request already binds eta, even if the backup predates certification.
+      const row = RETURN_IMPORT[existing?.status ?? 'absent'];
+      const action = row[burned ? 'terminal' : 'signed'];
+      let selected = action === 'adopt' ? verified : existing!;
+      if (action === 'attach' && !selected.burned) {
+        selected.burned = verified.burned;
+        selected.eta = eta;
+        if (selected.status !== 'paid') selected.status = 'burned';
+        // The known payment remains authoritative when a later backup supplies the missing burn.
+        await this.journal.putReturn(selected);
+      }
+      if (row.paid === 'keep') return selected;
+      // The signed request binds eta even when the holder has yet to obtain a terminal.
       const payment = { ...selected, eta };
       if ((await this.findPaid(payment, archives, false))?.state === 'paid') {
         await this.journal.putReturn(payment);
         return payment;
       }
-      if (existing?.burnRequest && existing.status === 'burn-requested') {
-        if (burned) {
-          selected.burned = verified.burned;
-          selected.eta = verified.eta;
-          selected.status = 'burned';
-        } else {
-          await this.certifyReturn(selected);
-        }
+      if (action === 'certify') {
+        await this.certifyReturn(selected);
         // The signed request is already durable. Keep its verified result if future qualification fails.
         await this.journal.putReturn(selected);
       }
@@ -881,8 +893,9 @@ export class NativeBridgeV2 {
       rec.status = 'burn-requested';
       await this.journal.putReturn(rec);
     }
-    if (rec.status === 'burn-requested') {
-      await admission?.beforeCertification?.(structuredClone(rec));
+    if (rec.status === 'burn-requested' || (rec.status === 'paid' && !rec.burned)) {
+      if (!rec.burnRequest || !rec.burnTx) refuse('EvidenceMissing', 'the exact signed burn is unavailable');
+      if (rec.status === 'burn-requested') await admission?.beforeCertification?.(structuredClone(rec));
       await this.certifyReturn(rec);
       await this.journal.putReturn(rec);
     }
@@ -898,9 +911,10 @@ export class NativeBridgeV2 {
     const part = decodeEvidence(evidenceOf(burned));
     const v = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
     if (v.minSegment !== undec(rec.a) || v.amount !== undec(rec.amount) || !eq(v.recipient, unhex(rec.recipient))) refuse('ProviderFault', 'the certified burn is not the planned one');
+    if (rec.eta !== undefined && rec.eta !== hex(v.eta)) refuse('JournalConflict', 'certified burn does not match the journaled redemption ID');
     rec.burned = hex(burned);
     rec.eta = hex(v.eta);
-    rec.status = 'burned';
+    if (rec.status !== 'paid') rec.status = 'burned';
   }
 
   /**
@@ -1032,6 +1046,10 @@ export class NativeBridgeV2 {
   private async reconcileInner(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm]): Promise<ReconcileResult> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
+    if (rec.status === 'burn-requested') {
+      const eta = hex(await this.validatePendingReturn(rec));
+      return (await this.findPaid({ ...rec, eta }, archives)) ?? { state: 'not-paid' };
+    }
     if (rec.eta === undefined) return { state: 'not-paid' };
     return (await this.findPaid(rec, archives)) ?? this.reconcileSend(rec, archives, true);
   }

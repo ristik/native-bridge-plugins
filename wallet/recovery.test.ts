@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -60,14 +60,15 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   });
   chain.code.set(hx(cfg.verifier).slice(2), code);
   chain.code.set(hx(recovery).slice(2), recoveryCode);
-  const rpc: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+  const rpcOn = (view: FakeChain): JsonRpc => ({ call: async <T>(method: string, params: unknown[]): Promise<T> => {
     if (method === 'eth_call') {
       const { to, data } = params[0] as { to: string; data: string };
       const result = to === hx(cfg.vault) ? views.get(data) : to === hx(recovery) ? recoveryViews.get(data) : undefined;
       if (result) return result as T;
     }
-    return chain.call<T>(method, params);
-  } };
+    return view.call<T>(method, params);
+  } });
+  const rpc = rpcOn(chain);
   const manifest = join(dir, 'release.json');
   writeFileSync(manifest, JSON.stringify({
     pins: { gamma: hx(chain.gamma), build: 'test', vaultRuntimeCodeHash: hx(deployment.vaultRuntimeHash),
@@ -88,8 +89,8 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   writeFileSync(join(dir, 'trust-base.bundle.cbor'), root.bundle);
   writeFileSync(join(dir, 'trust-base.genesis.entryid'), hx(root.pin));
   const conn = connectionOf({ release: manifest, rpc: 'http://127.0.0.1:9' });
-  const open = (name: string, override: JsonRpc = rpc, opts: { aggregator?: Aggregator; trustSource?: ITrustBaseSource; origin?: string } = {}) =>
-    new Wallet(join(dir, name), key(name), { ...conn, trustOrigin: opts.origin }).open({
+  const open = (name: string, override: JsonRpc = rpc, opts: { aggregator?: Aggregator; trustSource?: ITrustBaseSource; origin?: string; seed?: Uint8Array } = {}) =>
+    new Wallet(join(dir, name), opts.seed ?? key(name), { ...conn, trustOrigin: opts.origin }).open({
       lock: false, rpc: override, aggregator: opts.aggregator ?? aggregator, gas, trustSource: opts.trustSource,
     });
   const w = await open('holder');
@@ -97,7 +98,7 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   await planDeposit(w, 'coin', 19n);
   await sendDeposit(w, 'coin');
   await mint(w, 'coin');
-  return { w, open, root, cfg, chain, deployment, aggregator, dir, rpc, views, manifest };
+  return { w, open, root, cfg, chain, deployment, aggregator, dir, rpc, rpcOn, views, manifest };
 }
 
 test('refused preflight never certifies a spend, and receive verifies the full path and owner', async (t) => {
@@ -823,16 +824,39 @@ test('restore qualifies and keeps the same checkpoint that will execute across b
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   const portable = join(dir, 'certified-complete.json');
   publishReturnBackup(w, rec, portable);
-  await restoreReturn(withPending, portable);
-  assert.equal(readFileSync(localFile(withPending), 'utf8'), pending, 'the pending packet keeps its exact predecessor');
+  await restoreReturn(withPending, original);
+  assert.equal(readFileSync(localFile(withPending), 'utf8'), pending, 'a signing backup keeps the pending packet at its exact predecessor');
 
   const release = JSON.parse(readFileSync(manifest, 'utf8'));
   release.recovery.ranges = release.recovery.ranges.filter((r: { max: { entry: string } }) => r.max.entry !== 'run');
   writeFileSync(manifest, JSON.stringify(release));
   // The local send receives certification while the relayer is down and still records it as pending.
   const raw = JSON.parse(pending).pending.raw;
+  cpSync(withPending.dir, join(dir, 'pruned-local'), { recursive: true });
   await chain.mine([unhex(raw)]);
   await chain.mine([]);
+  const receipt = (await w.bridge.evm.receipt(decodeSignedTx(unhex(raw)).hash))!;
+  const prunedReader: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
+    method === 'eth_getBlockByHash' && params[0] === receipt.blockHash ? Promise.resolve(null as T) : rpc.call<T>(method, params) };
+  const pruned = await open('pruned-local', prunedReader);
+  await assert.rejects(restoreReturn(pruned, original), { rule: 'EvidencePruned' });
+  assert.equal(readFileSync(localFile(pruned), 'utf8'), pending);
+  const staleHint = join(dir, 'complete-stale-hint.json');
+  const copy = JSON.parse(readFileSync(portable, 'utf8'));
+  copy.checkpoint.cuts[0].location.txHash = hx(key('unrelated transaction hint'));
+  writeFileSync(staleHint, JSON.stringify(copy));
+  await restoreReturn(pruned, staleHint);
+  const fromPortable = JSON.parse(readFileSync(localFile(pruned), 'utf8'));
+  assert.equal(fromPortable.pending, undefined);
+  assert.equal(fromPortable.cuts.length, 1);
+  assert.deepEqual(fromPortable.attempts, [raw]);
+  chain.fund(pruned.signer.address, 10n ** 18n);
+  chain.autoMine = false;
+  assert.equal((await recoverStep(pruned, (await pruned.bridge.journal.ret(rec.returnId))!, caps)).state, 'pending');
+  assert.equal(JSON.parse(readFileSync(localFile(pruned), 'utf8')).pending.cut.kind, 'settle');
+  chain.dropPool();
+  chain.autoMine = true;
+
   const restartedPending = await open('pending-local', rpc);
   await restoreReturn(restartedPending, original);
   const reconciled = readFileSync(localFile(restartedPending), 'utf8');
@@ -985,4 +1009,305 @@ test('holder burn resume repairs a missing token-index return ID without another
   assert.equal((await burn(certifiedOnly, 'coin', undefined, undefined, caps)).plan, null);
   assert.equal(certifiedOnly.entry('coin').returnId, signed.returnId);
   assert.ok(existsSync(join(dir, 'holder', 'tokens.json')));
+});
+
+
+test('a holder reopens its burn after learning Paid before certification', async (t) => {
+  const { chain, dir, open, aggregator } = await setup(t, true);
+  const signed = join(dir, 'holder-signing-time.json');
+  const offline = { certify: async () => { throw new Error('certifier offline'); } };
+  const holder = await open('holder', undefined, { aggregator: offline });
+  await assert.rejects(burn(holder, 'coin', undefined, undefined, caps, signed), /certifier offline/);
+  const pending = await holder.returnRecord('coin');
+  assert.equal(pending.status, 'burn-requested');
+  for (const name of ['terminal-first', 'exact-request']) cpSync(holder.dir, join(dir, name), { recursive: true });
+
+  const relayer = await open('receipt-relayer');
+  const certified = await restoreReturn(relayer, signed);
+  const terminal = join(dir, 'relayer-certified.json');
+  publishReturnBackup(relayer, certified, terminal);
+  const payer = await open('receipt-payer');
+  chain.fund(payer.signer.address, 10n ** 18n);
+  await restoreReturn(payer, terminal);
+  const payout = await resumePayout(payer, certified, caps, true);
+  assert.equal(payout.state, 'paid');
+
+  const paid = await restoreReturn(holder, signed);
+  assert.equal(paid.status, 'paid');
+  assert.equal(paid.burned, undefined);
+  assert.equal((await resumePayout(holder, paid, caps)).state, 'paid');
+  await assert.rejects(burn(holder, 'coin'), /certifier offline/);
+  assert.deepEqual(await holder.returnRecord('coin'), paid);
+  const attached = await restoreReturn(holder, terminal);
+  assert.equal(attached.burned, certified.burned);
+  assert.deepEqual(attached.paid, paid.paid);
+  assert.deepEqual(await restoreReturn(holder, terminal), attached);
+
+  const terminalFirst = await open('terminal-first', undefined, { aggregator: offline, seed: key('holder') });
+  const both = await restoreReturn(terminalFirst, terminal);
+  assert.equal(both.status, 'paid');
+  assert.equal(both.burned, certified.burned);
+  for (const device of [holder, terminalFirst]) {
+    const reopened = await burn(device, 'coin');
+    assert.equal(hx(reopened.burned), certified.burned);
+    assert.equal(device.entry('coin').note, 'paid');
+  }
+
+  const requestOnly = await open('exact-request', undefined, { seed: key('holder') });
+  await restoreReturn(requestOnly, signed);
+  const before = aggregator.calls;
+  assert.equal(hx((await burn(requestOnly, 'coin')).burned), certified.burned);
+  const recovered = await requestOnly.returnRecord('coin');
+  assert.equal(recovered.burnRequest, pending.burnRequest);
+  assert.equal(recovered.status, 'paid');
+  assert.deepEqual(recovered.paid, paid.paid);
+  await burn(requestOnly, 'coin');
+  assert.equal(aggregator.calls, before + 1);
+});
+
+test('wallet-backup reconciliation matrix, in both holder and relayer orderings', { timeout: 420_000 }, async (t) => {
+  for (const order of ['holder to relayer', 'relayer to holder'] as const) {
+    await t.test(order, async (t) => {
+      const { chain, cfg, deployment, dir, manifest, open, rpc, rpcOn } = await setup(t);
+      const release = JSON.parse(readFileSync(manifest, 'utf8'));
+      release.recovery.ranges = release.recovery.ranges.filter(({ max }: { max: { operations: number; gaps: number } }) =>
+        max.operations <= 1 && max.gaps <= 1);
+      writeFileSync(manifest, JSON.stringify(release));
+      const offline = { certify: async () => { throw new Error('certifier offline'); } };
+      const holder = await open('holder', rpc, { aggregator: offline });
+      const plan = await planReturn(holder, 'coin', undefined, undefined, caps);
+      assert.deepEqual(plan.record.recovery!.runCuts, [1, 1]);
+      assert.equal(plan.record.recovery!.advanceGaps, 1);
+      const id = hx(plan.returnId);
+      const recoveryName = `recovery-${id.slice(2)}.json`;
+      const journal = (w: Wallet) => {
+        const file = join(w.dir, recoveryName);
+        return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
+      };
+      const backup = (name: string) => join(dir, `matrix-${name}.json`);
+      const snapshot = (name: string, w: Wallet) => cpSync(w.dir, join(dir, `snapshot-${name}`), { recursive: true });
+      snapshot('planned', holder);
+      await assert.rejects(burn(holder, 'coin', undefined, undefined, caps, backup('signed')), /certifier offline/);
+      snapshot('signed', holder);
+
+      const holderFirst = order === 'holder to relayer';
+      const producer = await open(holderFirst ? 'holder' : 'matrix-relayer');
+      chain.fund(producer.signer.address, 10n ** 18n);
+      if (holderFirst) await burn(producer, 'coin');
+      else await restoreReturn(producer, backup('signed'));
+      const rec = (await producer.bridge.journal.ret(id))!;
+      publishReturnBackup(producer, rec, backup('terminal'));
+      snapshot('terminal', producer);
+
+      // Interrupt an ordinary send after its signed bytes are durable.
+      const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+        if (method === 'eth_sendRawTransaction') throw new Error('interrupted before broadcast');
+        return rpc.call<T>(method, params);
+      } };
+      const ordinary = await open('matrix-ordinary', interrupted);
+      chain.fund(ordinary.signer.address, 10n ** 18n);
+      await restoreReturn(ordinary, backup('terminal'));
+      await assert.rejects(resumePayout(ordinary, rec, caps, true), /interrupted before broadcast/);
+      assert.equal((await ordinary.bridge.journal.ret(id))!.status, 'submitted');
+      snapshot('submitted', ordinary);
+
+      const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+        new RecoveryAuthority(producer.trust, async () => undefined), TEST_PARAMS, deployment);
+      const pruned = new Set<string>();
+      const checkpoint = async (name: string, packet: Awaited<ReturnType<RecoverySession['run'] | RecoverySession['gaps']>>) => {
+        const event = packet.event!;
+        assert.equal(event.kind, name);
+        chain.coldCall = async (_vault, to, data) => {
+          if (!eq(to, deployment.recovery)) return undefined;
+          assert.deepEqual(data, packet.calldata);
+          return [{ address: deployment.recovery, topics: event.topics, data: event.data }];
+        };
+        chain.autoMine = false;
+        assert.equal((await recoverStep(producer, rec, caps)).state, 'pending');
+        snapshot(`pending-${name}`, producer);
+        const pending = journal(producer).pending;
+        chain.dropPool();
+        await chain.mine([unhex(pending.raw)]);
+        await chain.mine([]);
+        chain.autoMine = true;
+        assert.equal((await recoverStep(producer, rec, caps)).state, 'checkpoint');
+        const certified = journal(producer).cuts.at(-1);
+        pruned.add(certified.location.blockHash);
+        publishReturnBackup(producer, rec, backup(name));
+        snapshot(name, producer);
+        return { seq: BigInt(certified.seq), receipt: unhex(certified.location.proof) };
+      };
+      const progress = await checkpoint('progress', await session.run(0, 1, producer.trust));
+      const complete = await checkpoint('complete', await session.run(1, 1, producer.trust, progress));
+
+      // Create one genuine certified vault segment after the burn's signed start.
+      await planDeposit(producer, 'background', cfg.K);
+      await sendDeposit(producer, 'background');
+      const marker = key('matrix segment producer').slice(0, 20);
+      chain.coldCall = async (vault, to) => {
+        if (!eq(to, marker)) return undefined;
+        for (let i = 0n; i < cfg.K; i++) {
+          const eta = key(`matrix background-${i}`);
+          vault.redeem(eta, 0n, new Uint8Array(), { ret: verdictAbi({
+            domain: chain.domain, eta, minSegment: 0n, asset: cfg.asset, recipient: marker, amount: 1n,
+          }) });
+        }
+        return [];
+      };
+      const markerTx = await signTx(producer.signer, { chainId: cfg.chainId, nonce: await producer.bridge.evm.nonce(producer.signer.address),
+        maxFeePerGas: 15n, maxPriorityFeePerGas: 1n, gas: 2_000_000n, to: marker, value: 0n, data: new Uint8Array() });
+      await producer.bridge.evm.sendRaw(markerTx.raw);
+      const logs = await producer.bridge.evm.segmentLogs(cfg.vault, BigInt(rec.fromBlock), 0n, 1n);
+      assert.equal(logs.length, 1);
+      const seal = await producer.bridge.evm.receiptProof(markerTx.hash, cfg.vault, logs[0].topics[0], true, logs[0]);
+      const gaps = await session.certifiedGaps(producer.trust, 0n, unhex(rec.startHead), [seal.encoded]);
+      const advance = await session.gaps('advanceGaps', producer.trust, complete.receipt, { seq: complete.seq }, gaps, unhex(rec.startHead));
+      const gap = await checkpoint('gap', advance);
+      chain.autoMine = false;
+      assert.equal((await recoverStep(producer, rec, caps)).state, 'pending');
+      snapshot('pending-settle', producer);
+      const settling = journal(producer).pending;
+      chain.dropPool();
+      chain.autoMine = true;
+
+      const prunedReader = (transport: JsonRpc): JsonRpc => ({ call: <T>(method: string, params: unknown[]): Promise<T> => {
+        if (method === 'eth_getBlockByHash' && pruned.has(String(params[0]))) return Promise.resolve(null as T);
+        if (method === 'eth_sendRawTransaction') throw new Error('import must never broadcast an EVM transaction');
+        return transport.call<T>(method, params);
+      } });
+      const evidence = ['none', 'signed', 'terminal', 'progress', 'complete', 'gap'] as const;
+      // Each cell is the resulting cut count, or a safe refusal that must leave the journal intact.
+      const unpaid = {
+        absent:             [0, 0, 0, 1, 2, 3],
+        planned:            [0, 0, 0, 1, 2, 3],
+        signed:             [0, 0, 0, 1, 2, 3],
+        terminal:           [0, 0, 0, 1, 2, 3],
+        submitted:          [0, 0, 0, 1, 2, 3],
+        progress:           [1, 1, 1, 1, 2, 3],
+        complete:           [2, 2, 2, 2, 2, 3],
+        gap:                [3, 3, 3, 3, 3, 3],
+        'pending-progress': [0, 'pruned', 'pruned', 1, 2, 3],
+        'pending-complete': [1, 'pruned', 'pruned', 'pruned', 2, 3],
+        'pending-gap':      [2, 'pruned', 'pruned', 'pruned', 'pruned', 3],
+        'pending-settle':   [3, 3, 3, 3, 3, 3],
+      } as const;
+      const rows = Object.keys(unpaid) as (keyof typeof unpaid)[];
+      const localStatus: Partial<Record<keyof typeof unpaid, ReturnRecord['status']>> = {
+        planned: 'planned', signed: 'burn-requested', submitted: 'submitted',
+      };
+      const clone = async (row: string, name: string, service?: Aggregator, transport = rpc) => {
+        const from = join(dir, `snapshot-${row}`);
+        if (existsSync(from)) cpSync(from, join(dir, name), { recursive: true });
+        return open(name, prunedReader(transport), { aggregator: service, seed: key(holderFirst ? 'matrix-relayer' : 'holder') });
+      };
+
+      const bad = JSON.parse(readFileSync(backup('signed'), 'utf8'));
+      bad.pending.amount = '20';
+      writeFileSync(backup('conflict'), JSON.stringify(bad));
+      const refuseConflict = async (device: Wallet, label: string) => {
+        const before = await device.bridge.journal.ret(id);
+        const local = journal(device);
+        await assert.rejects(restoreReturn(device, backup('conflict')), { reason: 'BadInput' }, label);
+        assert.deepEqual(await device.bridge.journal.ret(id), before, label);
+        assert.deepEqual(journal(device), local, label);
+      };
+      for (const row of rows) {
+        await refuseConflict(await clone(row, `conflict-${row}`, offline), row);
+        for (const [i, proof] of evidence.entries()) {
+          const label = `${row} × ${proof}`;
+          const device = await clone(row, `unpaid-${row}-${proof}`, proof === 'signed' ? undefined : offline);
+          const before = await device.bridge.journal.ret(id);
+          const local = journal(device);
+          const expected = unpaid[row][i];
+          if (proof === 'none') {
+            assert.equal(local?.cuts.length ?? 0, expected, label);
+            assert.equal(before?.status, row === 'absent' ? undefined : localStatus[row] ?? 'burned', label);
+          } else if (expected === 'pruned') {
+            await assert.rejects(restoreReturn(device, backup(proof)), { rule: 'EvidencePruned' }, label);
+            assert.deepEqual(journal(device), local, label);
+            assert.deepEqual(await device.bridge.journal.ret(id), before, label);
+          } else {
+            const restored = await restoreReturn(device, backup(proof));
+            assert.equal(restored.status, row === 'submitted' ? 'submitted' : 'burned', label);
+            assert.equal(restored.burnRequest, rec.burnRequest, label);
+            assert.equal(journal(device)?.cuts.length ?? 0, expected, label);
+            assert.deepEqual(restored.sends, before?.sends ?? [], label);
+            const expectedAttempts = local?.pending && row !== 'pending-settle'
+              ? [...(local.attempts ?? []), local.pending.raw] : local?.attempts;
+            assert.deepEqual(journal(device)?.attempts, expectedAttempts, label);
+            assert.deepEqual(journal(device)?.pending, row === 'pending-settle' ? local.pending : undefined, label);
+            const confirmed = journal(device);
+            assert.deepEqual(await restoreReturn(device, backup(proof)), restored, label);
+            assert.deepEqual(journal(device), confirmed, label);
+          }
+        }
+      }
+
+      // Branch the simulator at the common certified history to exercise both Paid routes in each ordering.
+      const recovered = chain.fork();
+      const recoveredRpc = rpcOn(recovered);
+      const recoveryPayer = await clone('pending-settle', 'recovered-payer', offline, recoveredRpc);
+      const verdict = await verifyReturn(chain.gamma, evidenceOf(unhex(rec.burned!)), producer.trust, TEST_PARAMS);
+      const settle = await session.gaps('redeemRecovered', producer.trust, gap.receipt,
+        { seq: gap.seq, cursor: { next: advance.next, head: advance.head! } }, []);
+      recovered.coldCall = async (vault, to, data) => {
+        if (!eq(to, cfg.vault) || hx(data.subarray(0, 4)) !== selector('redeemRecovered(bytes)')) return undefined;
+        assert.deepEqual(data, settle.calldata);
+        const history = new Uint8Array(32 + gaps[0].length);
+        history.set(unhex(rec.startHead));
+        history.set(gaps[0], 32);
+        vault.redeem(verdict.eta, verdict.minSegment, history, { ret: verdictAbi(verdict) });
+        return [];
+      };
+      await recovered.mine([unhex(settling.raw)]);
+      await recovered.mine([]);
+      assert.equal((await recoverStep(recoveryPayer, rec, caps)).state, 'paid');
+      chain.coldCall = undefined;
+      assert.equal((await resumePayout(producer, rec, caps, true)).state, 'paid');
+      const payouts = [
+        { route: 'ordinary', transport: rpc, payer: producer },
+        { route: 'recovered', transport: recoveredRpc, payer: recoveryPayer },
+      ];
+      for (const { route, transport, payer } of payouts) {
+        const paid = (await payer.bridge.journal.ret(id))!.paid;
+        assert.ok(paid?.receipt);
+        for (const proof of ['signed', 'terminal'] as const) {
+          const name = `paid-${route}-${proof}`;
+          const device = await clone('signed', name, offline, transport);
+          await restoreReturn(device, backup(proof));
+          await refuseConflict(device, name);
+          snapshot(name, device);
+        }
+        for (const row of [...rows, `paid-${route}-signed`, `paid-${route}-terminal`]) {
+          for (const proof of evidence) {
+            const label = `${row} × ${route} Paid and ${proof}`;
+            const device = await clone(row, `paid-${route}-${row}-${proof}`, offline, transport);
+            const before = await device.bridge.journal.ret(id);
+            const local = journal(device);
+            if (proof === 'none' && !before?.burnRequest) {
+              if (before) assert.equal((await device.bridge.reconcile(plan.returnId)).state, 'not-paid', label);
+              assert.deepEqual(await device.bridge.journal.ret(id), before, label);
+              continue;
+            }
+            // A durable signed request binds a discovered Paid even when no portable file was supplied.
+            if (proof === 'none') {
+              assert.equal((await device.bridge.reconcile(plan.returnId)).state, 'paid', label);
+            } else {
+              await restoreReturn(device, backup(proof));
+            }
+            const restored = (await device.bridge.journal.ret(id))!;
+            assert.equal(restored.status, 'paid', label);
+            assert.deepEqual(restored.paid, paid, label);
+            assert.equal(Boolean(restored.burned), Boolean(before?.burned) || !['none', 'signed'].includes(proof), label);
+            assert.deepEqual(restored.sends, before?.sends ?? [], label);
+            assert.deepEqual(journal(device)?.cuts, local?.cuts, label);
+            if (proof !== 'none' && local?.pending) {
+              assert.equal(journal(device).pending, undefined, label);
+              assert.equal(journal(device).settled.submitted.raw, local.pending.raw, label);
+            }
+          }
+        }
+      }
+    });
+  }
 });

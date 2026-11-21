@@ -167,8 +167,8 @@ export class FakeChain implements JsonRpc {
   public coldCall?: (vault: VaultModel, to: Uint8Array, data: Uint8Array) => Promise<Log[] | undefined>;
   private pool: Uint8Array[] = [];
 
-  private constructor(public readonly root: Root, public readonly gamma: Uint8Array, private readonly cfg: Config) {
-    this.vault = new VaultModel(gamma, { address: VAULT, chainId: CHAIN_ID, verifierCodeHash: cfg.verifierCodeHash }, TEST_PARAMS);
+  private constructor(public readonly root: Root, public readonly gamma: Uint8Array, private readonly cfg: Config, vault?: VaultModel) {
+    this.vault = vault ?? new VaultModel(gamma, { address: VAULT, chainId: CHAIN_ID, verifierCodeHash: cfg.verifierCodeHash }, TEST_PARAMS);
     this.code.set(toHex(VAULT), this.vaultCode);
   }
 
@@ -177,6 +177,17 @@ export class FakeChain implements JsonRpc {
     await c.mine([]); // genesis
     await c.mine([]); // the deployment block
     return c;
+  }
+
+  /** Independent simulator view from the same certified history. */
+  public fork(): FakeChain {
+    const copy = new FakeChain(this.root, this.gamma, this.cfg, this.vault.copy());
+    copy.blocks.push(...this.blocks.map((block) => ({ ...block })));
+    for (const [address, balance] of this.balances) copy.balances.set(address, balance);
+    for (const [address, nonce] of this.nonces) copy.nonces.set(address, nonce);
+    for (const [address, code] of this.code) copy.code.set(address, code);
+    copy.certificateAuthority = this.certificateAuthority;
+    return copy;
   }
 
   public get domain(): Uint8Array {

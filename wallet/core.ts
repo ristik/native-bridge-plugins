@@ -735,8 +735,9 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
     if (r === null || r.status === 'planned') w.update(label, { spent: undefined });
     throw err;
   }
-  await retainTerminal(w, (await w.bridge.journal.ret(id))!);
-  w.update(label, { note: 'burned', spent: BURNED });
+  const confirmed = (await w.bridge.journal.ret(id))!;
+  if (confirmed.status !== 'paid') await retainTerminal(w, confirmed);
+  w.update(label, { note: confirmed.status === 'paid' ? 'paid' : 'burned', spent: BURNED });
   return { plan, burned: b.burned, eta: b.eta, evidenceBytes: evidenceOf(b.burned).length };
 }
 

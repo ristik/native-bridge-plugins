@@ -302,15 +302,35 @@ export async function restoreReturn(w: Wallet, file: string, policy?: PayerPolic
       else replacement = journal;
     }
   }, archive);
-  if (selected.status === 'paid') return selected;
+  if (selected.status === 'paid') {
+    retainPayment(w, selected, selected.paid!.txHash);
+    return selected;
+  }
   if (replacement) saveRecovery(w, selected, replacement);
   if (selected.status === 'burn-requested') {
     await w.bridge.burn(bytes(selected.returnId, 32));
     await w.bridge.reconcile(bytes(selected.returnId, 32), archive);
   }
   const confirmed = (await w.bridge.journal.ret(selected.returnId))!;
-  if (confirmed.status !== 'paid') await retainTerminal(w, confirmed);
+  if (confirmed.status === 'paid') retainPayment(w, confirmed, confirmed.paid!.txHash);
+  else await retainTerminal(w, confirmed);
   return confirmed;
+}
+
+// These transitions run only after the return is authenticated and has no certified Paid.
+const CHECKPOINT_IMPORT = {
+  start:    { none: 'keep', progress: 'ahead', complete: 'ahead', gap: 'ahead' },
+  progress: { none: 'keep', progress: 'ahead', complete: 'ahead', gap: 'ahead' },
+  complete: { none: 'keep', progress: 'keep',  complete: 'keep',  gap: 'ahead' },
+  gap:      { none: 'keep', progress: 'keep',  complete: 'keep',  gap: 'ahead' },
+  run:      { none: 'read', progress: 'prove', complete: 'prove', gap: 'prove' },
+  advance:  { none: 'read', progress: 'read',  complete: 'read',  gap: 'prove' },
+  settle:   { none: 'read', progress: 'read',  complete: 'read',  gap: 'read' },
+} as const;
+
+function cursorState(cursor?: Cursor): 'start' | 'progress' | 'complete' | 'gap' {
+  if (cursor?.gap) return cursor.gap.cursor ? 'gap' : 'complete';
+  return cursor?.prior ? 'progress' : 'start';
 }
 
 async function selectCheckpoint(w: Wallet, release: ReleaseRecovery, rec: ReturnRecord,
@@ -318,18 +338,40 @@ async function selectCheckpoint(w: Wallet, release: ReleaseRecovery, rec: Return
   if (!local && !portable) return {};
   const session = await openSession(w, release, rec);
   const localCursor = local && await replay(w, session, rec, local);
-  if (local?.pending && localCursor) {
-    await reconcilePendingPacket(w, rec, release, session, local, localCursor, archive);
-  }
   const portableCursor = portable && await replay(w, session, rec, portable);
-  // A pending signed packet must still open its exact predecessor. Revisit the portable cursor after it resolves.
-  if (!portableCursor || local?.pending || (localCursor && !advances(portableCursor, localCursor))) {
+  const candidate = cursorState(portableCursor);
+  const incoming = candidate === 'start' ? 'none' : candidate;
+  const action = CHECKPOINT_IMPORT[local?.pending?.cut.kind ?? cursorState(localCursor)][incoming];
+  if (local?.pending && localCursor) {
+    const proof = action === 'prove' && portable ? pendingProof(local, portable) : undefined;
+    await reconcilePendingPacket(w, rec, release, session, local, localCursor, archive, undefined, proof);
+  }
+  const next = CHECKPOINT_IMPORT[cursorState(localCursor)][incoming];
+  if (!portableCursor || local?.pending || next !== 'ahead' || (localCursor && !advances(portableCursor, localCursor))) {
     return { journal: local, cursor: localCursor };
   }
   return {
     journal: { ...portable!, pending: undefined, settled: local?.settled, fees: local?.fees, attempts: local?.attempts },
     cursor: portableCursor,
   };
+}
+
+/** The next portable cut is usable only at the same authenticated predecessor. */
+function pendingProof(local: RecoveryJournal, portable: RecoveryJournal): Location | undefined {
+  const next = local.cuts.length;
+  const previous = local.cuts[next - 1]?.location;
+  const parent = portable.cuts[next - 1]?.location;
+  if (previous && (!parent || previous.blockHash !== parent.blockHash || previous.blockNumber !== parent.blockNumber ||
+    previous.txIndex !== parent.txIndex || previous.logIndex !== parent.logIndex)) return;
+  const candidate = portable.cuts[next];
+  const pending = local.pending!;
+  if (!candidate || candidate.priorSeq !== pending.priorSeq) return;
+  const cut = candidate.cut;
+  const same = cut.kind === 'run'
+    ? pending.cut.kind === 'run' && pending.cut.count === cut.count
+    : pending.cut.kind === 'advance' && pending.cut.gaps.length === cut.gaps.length &&
+      pending.cut.gaps.every((gap, i) => gap === cut.gaps[i]);
+  if (same) return candidate.location;
 }
 
 function advances(candidate: Cursor, held: Cursor): boolean {
@@ -513,20 +555,21 @@ async function segmentProofs(reader: EvmReader, w: Wallet, rec: ReturnRecord, st
 export type RecoveryResult = { state: 'paid'; txHash: Uint8Array; blockNumber: bigint } |
   { state: 'pending' | 'checkpoint' | 'retry'; txHash: Uint8Array };
 
+function retainPayment(w: Wallet, rec: ReturnRecord, txHash: string): void {
+  const saved = loadRecovery(w, rec);
+  if (!saved || saved.settled) return;
+  saved.settled = { paidTx: txHash, submitted: saved.pending };
+  delete saved.pending;
+  saveRecovery(w, rec, saved);
+}
+
 /** Execute at most one new packet. Reconcile the same saved bytes after an ambiguous send. */
 export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): Promise<RecoveryResult> {
   const id = bytes(rec.returnId, 32);
   const archive = readers(w, policy);
   const reconcile = async () => {
     const result = await w.bridge.reconcile(id, archive);
-    if (result.state === 'paid') {
-      const saved = loadRecovery(w, rec);
-      if (saved && !saved.settled) {
-        saved.settled = { paidTx: hx(result.txHash), submitted: saved.pending };
-        delete saved.pending;
-        saveRecovery(w, rec, saved);
-      }
-    }
+    if (result.state === 'paid') retainPayment(w, rec, hx(result.txHash));
     return result;
   };
   const paid = await reconcile();
@@ -601,7 +644,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
 /** Reconcile a durable send without signing. Restore only reads receipts. */
 async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: ReleaseRecovery, s: RecoverySession,
   journal: RecoveryJournal, cursor: Cursor, archive: readonly EvmReader[],
-  reconcile?: () => Promise<ReconcileResult>): Promise<RecoveryResult> {
+  reconcile?: () => Promise<ReconcileResult>, portableProof?: Location): Promise<RecoveryResult> {
   const pending = journal.pending!;
   const raw = bytes(pending.raw);
   const { request, hash } = decodeSignedTx(raw);
@@ -611,6 +654,24 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     !eq(request.to, pending.cut.kind === 'settle' ? w.bridge.cfg.vault : release.deployment.recovery)) {
     throw new Error('pending transaction does not match the authenticated cut');
   }
+  const confirm = (receipt: RecoveryReceipt, txHint = hx(hash)): RecoveryResult => {
+    if (pending.cut.kind === 'settle') throw new Error('settlement requires a certified Paid receipt');
+    advanceCursor(cursor, packet, receipt.encoded);
+    journal.cuts.push({ cut: pending.cut, location: location(txHint, receipt), seq: String(cursor.prior!.seq),
+      nonce: pending.nonce, priorSeq: pending.priorSeq,
+      ...(cursor.gap?.cursor ? { endpoint: String(cursor.gap.cursor.next), head: hx(cursor.gap.cursor.head) } : {}),
+      ...('state' in packet && packet.state ? { state: hx(packet.state) } : {}) });
+    (journal.attempts ??= []).push(pending.raw);
+    delete journal.pending;
+    saveRecovery(w, rec, journal);
+    return { state: 'checkpoint', txHash: hash };
+  };
+  if (portableProof && packet.event) {
+    const event = packet.event;
+    const receipt = await withFreshAuthority(w, () => s.verifyEvent(w.trust, bytes(portableProof.proof), event));
+    return confirm(receipt, portableProof.txHash);
+  }
+  let pruned: Nb2Error | undefined;
   const outcome = async (): Promise<'missing' | 'pending' | 'success' | 'failed'> => {
     let seen = false;
     let success = false;
@@ -627,6 +688,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
         return 'failed';
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+        if (e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = e;
         // Metadata is only a hint. Try the next reader's complete proof.
       }
     }
@@ -638,7 +700,10 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     mined = await outcome();
   }
-  if (mined === 'missing' || mined === 'pending') return { state: 'pending', txHash: hash };
+  if (mined === 'missing' || mined === 'pending') {
+    if (pruned) throw pruned;
+    return { state: 'pending', txHash: hash };
+  }
   if (mined === 'failed') {
     (journal.attempts ??= []).push(pending.raw);
     delete journal.pending;
@@ -653,19 +718,12 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   try {
     acquired = await s.acquire(w.trust, packet.event!, archive.map((r) => recoveryRpcSource(r, hash)), () => w.refreshAuthority());
   } catch (e) {
-    if (e instanceof WalletError && (e.reason === 'CompanionUnknown' || e.reason === 'EvidenceMissing') ||
-      e instanceof Nb2Error && e.rule === 'EvidencePruned') return { state: 'pending', txHash: hash };
+    if (e instanceof WalletError && (e.reason === 'CompanionUnknown' || e.reason === 'EvidenceMissing')) {
+      return { state: 'pending', txHash: hash };
+    }
     throw e;
   }
-  advanceCursor(cursor, packet, acquired.receipt.encoded);
-  journal.cuts.push({ cut: pending.cut, location: location(hx(hash), acquired.receipt), seq: String(cursor.prior!.seq),
-    nonce: pending.nonce, priorSeq: pending.priorSeq,
-    ...(cursor.gap?.cursor ? { endpoint: String(cursor.gap.cursor.next), head: hx(cursor.gap.cursor.head) } : {}),
-    ...('state' in packet && packet.state ? { state: hx(packet.state) } : {}) });
-  (journal.attempts ??= []).push(pending.raw);
-  delete journal.pending;
-  saveRecovery(w, rec, journal);
-  return { state: 'checkpoint', txHash: hash };
+  return confirm(acquired.receipt);
 }
 
 export async function returnHeadroom(w: Wallet, token: Uint8Array): Promise<string> {

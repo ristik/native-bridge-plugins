@@ -120,18 +120,74 @@ nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb
   --rpc "$RPC" --payer-env RELAY_PAYER --return-policy relay-payer.json
 ```
 
-Repeat the same command if inclusion or certification is pending. Resume checks the exact
-signed request and reconstructs the session and sparse openings from the evidence. A certified
-backup can restore its burn and checkpoints locally. A signing-time backup can identify a certified
-payment from the signed request. If more work remains, it reconciles the exact request with the
-aggregator. Resume replays the local and portable checkpoints and reads the receipt of any pending
-signed packet before pricing remaining work from the resulting cursor. An ordinary return can
-adopt a certified portable recovery checkpoint for the same burn while retaining its local fees. The journal records each signed EVM transaction
-before submission and advances after the exact checkpoint event verifies. Resume checks for the
-pinned vault's certified `Paid` for the signed address and amount before pricing future packets. A provider with missing proof data can be replaced using the alternate
-archives. To restart from evidence after losing the local cuts, use the original post-sign
-backup and another private journal directory. Account for fees already spent when setting the
-new payer policy.
+Repeat the same command if inclusion or certification is pending. Supply an alternate archive
+when a reader reports `EvidencePruned` and the backup lacks the needed proof. A certified backup
+can restore its burn and checkpoints with the certifier offline. Keep the previous journal
+when moving between routes. It records this payer's signed attempts and their fee reservations.
+A fresh relayer needs a policy that accounts for any fees it already spent.
+
+### Return journal reconciliation
+
+The holder and the relayer apply the same transitions to the same signed return. Either can
+supply a backup. Only the holder can turn a local plan into a signed burn. Every import verifies
+the signed source, amount, recipient, return ID and start anchor. An invalid or conflicting
+request, terminal, or applicable checkpoint is refused. Local proofs and paid receipts survive
+an older import. An ordinary or recovered payment is accepted only from a certified `Paid` log
+from the pinned vault, bound to this return's redemption ID, recipient and amount.
+
+Read the two tables in order. The first covers the return record. Its terminal column includes
+backups with Progress, Complete or Gap. When either Paid column applies, it takes priority over
+the other columns and ends reconciliation of future packets. The second table covers the
+continuation journal for an unpaid certified burn, including when an ordinary return adopts a
+certified recovery route. With no portable checkpoint, it uses the **None** column. **Refuse**
+means the wallet keeps the unresolved signed bytes and the last authenticated progress.
+
+| Local return record | No request or payment evidence | Exact signed request | Certified terminal, with or without cuts | Certified Paid via ordinary | Certified Paid via recovery |
+| --- | --- | --- | --- | --- | --- |
+| Absent | No-op | Adopt and certify | Adopt, then check any cuts | Adopt Paid with a matching signed request, otherwise refuse | Same as ordinary Paid |
+| Planned | No-op. Holder may run `burn` | Adopt and certify | Adopt, then check any cuts | Adopt Paid with a matching signed request, otherwise refuse | Same as ordinary Paid |
+| Burn requested, signed and durable | No-op on open. `burn` can certify that exact request | Reconcile the exact request with the certifier | Attach terminal, then check any cuts | Record Paid. Attach a supplied matching terminal | Same as ordinary Paid |
+| Certified burn | Keep burn and check any local pending packet on resume | Keep burn and check any local pending packet | Keep burn and check applicable cuts | Record Paid and keep burn | Same as ordinary Paid |
+| Ordinary send signed or submitted | Retain send. Payout retry checks its certificate | Retain send and check any local pending recovery packet | Retain send. May adopt recovery with the same signed burn | Record Paid and retain send and fees | Same as ordinary Paid |
+| Paid, terminal missing | Report Paid. `burn` can retrieve the terminal for the exact request | Report Paid | Attach terminal and report Paid | Keep Paid and attach any supplied matching terminal | Same as ordinary Paid |
+| Paid, terminal present | Report Paid | Report Paid | Keep terminal and report Paid | Keep both | Keep both |
+
+If the holder invokes `burn` on a Paid record whose terminal is missing, it retrieves the
+proof using the saved signed request. If that proof is unavailable, the burn command reports
+the error and the Paid record remains usable. The holder can alternatively import a matching
+certified terminal. Both paths preserve the original signed request.
+
+| Local continuation | None (no certified cut) | Certified Progress | Certified Complete | Certified Gap | Certified Paid, either route |
+| --- | --- | --- | --- | --- | --- |
+| Absent or start (zero cuts) | Keep the start | Adopt Progress | Adopt Complete | Adopt through Gap | End the continuation |
+| Certified Progress | Keep | Adopt only if ahead | Adopt Complete | Adopt through Gap | End the continuation |
+| Certified Complete | Keep | Keep | Keep | Adopt through Gap | End the continuation |
+| Certified Gap | Keep | Keep | Keep | Adopt only if ahead | End the continuation |
+| Run signed or submitted, expecting Progress or Complete | Read exact send | Match next cut or read exact send | Match next cut or read exact send | Match next cut or read exact send | End and retain signed attempt |
+| Advance signed or submitted, expecting Gap | Read exact send | Read exact send | Read exact send | Match next cut or read exact send | End and retain signed attempt |
+| Settlement signed or submitted, expecting Paid | Read exact send | Read exact send | Read exact send | Read exact send | End and retain signed attempt |
+| Settled | No-op | No-op | No-op | No-op | No-op |
+
+**Match next cut** verifies the saved packet against its exact predecessor and authenticates
+the expected Progress, Complete or Gap event with the portable receipt. The portable
+transaction hash serves as a lookup hint. If the receipt applies, record the checkpoint and
+retain the local signed bytes for fee accounting. Then apply any later verified portable cuts.
+Otherwise **read exact send** checks the local transaction. The wallet uses the same journal
+phase from the moment signed EVM bytes are durable through submission. For each pending kind,
+the evidence about the exact local send determines the next action.
+
+| Local send | No certified outcome or only RPC metadata | Certified expected success | Certified exact failure | Proof pruned, backup has no matching proof |
+| --- | --- | --- | --- | --- |
+| Run | Keep pending | Record Progress or Complete and retain the attempt | Retain the charged attempt and allow a retry | Refuse with `EvidencePruned` |
+| Advance | Keep pending | Record Gap and retain the attempt | Retain the charged attempt and allow a retry | Refuse with `EvidencePruned` |
+| Settlement | Keep pending | Reconcile the vault's certified Paid | Retain the charged attempt and allow a retry | Keep pending if Paid is unavailable. Refuse with `EvidencePruned` for a pruned exact failure proof |
+
+Import reads receipts without broadcasting. A later payout command can send the same durable
+bytes again if the original send is missing.
+
+Pricing starts from the resulting authenticated cursor. Known Paid bypasses future pricing and
+certification. Pending signed attempts keep their fee reservations independently of which payer
+produced a portable checkpoint, and fee accounting uses locally signed transactions.
 
 Use `redeem --recover` or `resume --recover` to qualify a previously ordinary burn for
 continuation if the ordinary packet can no longer fit. `--ordinary` asks the caller's separately
