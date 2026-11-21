@@ -11,15 +11,16 @@ import { concat, eq, fromHex, toHex } from '../bytes.js';
 import { decodeBytesReturn, decodeStateReturn, SELECTOR, type RawLog, type VaultState } from './abi.js';
 import { TOPIC, encodeDepositProof, type DepositProof } from './deposit.js';
 import { WalletError, fail, refuse } from './errors.js';
-import { encodeHeader, type Header } from './header.js';
+import { bindHeader, encodeHeader, type Header } from './header.js';
 import { HE, HU } from './crypto.js';
-import { buildTrie } from './mpt.js';
+import { buildTrie, mptVerify } from './mpt.js';
 import { rlpBytes, rlpIndexKey, rlpList, rlpUintEnc } from './rlp.js';
+import type { Config } from './config.js';
 import { checkCompanion } from './rules.js';
 import { array, isBytes, isUint, scanNative, u256 } from './cbor.js';
 
 import type { RecoveryEvent, RecoveryReceiptSource } from './recovery.js';
-import { decodeUc } from './trust.js';
+import { decodeUc, verifyEvmUc, type TrustInput } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
 
@@ -242,8 +243,37 @@ export class EvmReader {
     return t.path;
   }
 
+  /** Verify a failed receipt against its certified block before abandoning a pending send. */
+  public async verifyFailedReceipt(txHash: Uint8Array, cfg: Config, trust: TrustInput, block: { header: Header; hash: Uint8Array }): Promise<void> {
+    const receipt = await this.receipt(txHash);
+    if (!receipt || qtyOf(receipt.status, 'status') !== 0n || !eq(fixedOf(receipt.blockHash, 32, 'blockHash'), block.hash)) {
+      return refuse('ProviderFault', 'failed receipt does not match the candidate block');
+    }
+    const uc = await verifyEvmUc(trust, await this.certificateOf(block.header, block.hash, true), cfg);
+    bindHeader(encodeHeader(block.header), uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
+    const idx = qtyOf(receipt.transactionIndex, 'transactionIndex');
+    const path = await this.receiptPath(block.header, block.hash, idx);
+    if (!eq(mptVerify(block.header.receiptsRoot, rlpIndexKey(idx), path), encodeReceiptJson(receipt))) {
+      refuse('ProviderFault', 'failed receipt is not committed in the certified block');
+    }
+    const body = await this.rpc.call<{ transactions?: string[] } | null>('eth_getBlockByHash', [hexOf(block.hash), false]);
+    if (!Array.isArray(body?.transactions) || BigInt(body.transactions.length) > block.header.gasLimit / 21_000n + 16n ||
+      idx >= BigInt(body.transactions.length) ||
+      !eq(fixedOf(body.transactions[Number(idx)], 32, 'transaction hash'), txHash)) {
+      return refuse('ProviderFault', 'failed receipt has no matching transaction in the block body');
+    }
+    const entries: [Uint8Array, Uint8Array][] = [];
+    for (let i = 0; i < body.transactions.length; i++) {
+      const wire = await this.rpc.call<string>('eth_getRawTransactionByBlockHashAndIndex', [hexOf(block.hash), qty(i)]);
+      const raw = bytesOf(wire, 'raw transaction');
+      if (!eq(HE(raw), fixedOf(body.transactions[i], 32, 'transaction hash'))) refuse('ProviderFault', 'raw transaction hash mismatch');
+      entries.push([rlpIndexKey(i), raw]);
+    }
+    if (!eq(buildTrie(entries, null).root, block.header.transactionsRoot)) refuse('ProviderFault', 'transactions root mismatch');
+  }
+
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: RecoveryEvent): Promise<ReceiptProof> {
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);

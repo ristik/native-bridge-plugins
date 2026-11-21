@@ -22,6 +22,8 @@ const receiptCap = 65_536;
 const hash = (label: string, ...parts: Uint8Array[]): Uint8Array => HE(HE(ascii('UNICITY/NB2/CONT/1.1/' + label)), ...parts);
 const u32 = (n: number | bigint): Uint8Array => be(n, 4);
 const blob = (data: Uint8Array): Uint8Array => concat(u32(data.length), data);
+export const recoveryGeneration = (salt: Uint8Array, domain: Uint8Array): Uint8Array => hash('GEN', salt, domain);
+
 const topics = {
   progress: HE(ascii('NB2Progress11(bytes32,uint64,bytes32)')),
   complete: HE(ascii('NB2Complete11(bytes32,uint64,bytes32,bytes32,uint64,bytes32,address,uint256)')),
@@ -255,7 +257,7 @@ export class RecoverySession {
     } while (revision !== authority.revision);
     const pages = new Pages(snapshot);
     const header = concat(version, u64(snapshot.length), pages.root);
-    const generation = hash('GEN', salt, domain);
+    const generation = recoveryGeneration(salt, domain);
     const session = hash('SESSION', version, generation, domain, cfg.vault, recovery, runtimeHash, pins, header.subarray(2));
     return new RecoverySession(cfg, deployment, pages, session, header, verdict, operations(snapshot, token, cfg, domain), authority);
   }

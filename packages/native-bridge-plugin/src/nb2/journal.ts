@@ -137,6 +137,13 @@ export interface ReturnRecord extends Base {
   status: ReturnStatus;
   burnTx?: Hex;
   burnRequest?: Hex;
+  /** SID from which the exact signed request can be reconciled. */
+  certificationLocator?: Hex;
+  /** The authenticated cold route and the admission bound used at signing. */
+  recovery?: {
+    generation: Hex; calls: Dec; totalFee: Dec; runCuts: number[]; advanceGaps: number;
+    observed: Dec; receiptP99Ms: Dec; finalInclusionMs: Dec; qualifiedForMs: Dec;
+  };
   /** The certified burned part: the redeem evidence's token. */
   burned?: Hex;
   eta?: Hex;
@@ -145,7 +152,7 @@ export interface ReturnRecord extends Base {
   payer?: Hex;
   /** The first block at which a redeem was broadcast: Paid(eta) cannot appear before it. */
   firstSendBlock?: Dec;
-  paid?: { txHash: Hex; blockNumber: Dec };
+  paid?: { txHash: Hex; blockNumber: Dec; blockHash?: Hex; receipt?: Hex; txIndex?: Dec; logIndex?: Dec };
 }
 
 export type AnyRecord = IntentsRecord | DepositRecord | SplitRecord | ReturnRecord;

@@ -27,6 +27,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
+import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
@@ -39,6 +40,7 @@ import {
 import { parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
+import { guardOrdinary, recoverStep, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -290,6 +292,18 @@ export class GatewayAggregator {
     }
   }
   public async certify(request: Uint8Array): Promise<Uint8Array> {
+    const cd = CertificationData.fromCBOR(request);
+    const sid = await StateId.fromCertificationData(cd);
+    let existing;
+    try {
+      existing = (await this.client.getInclusionProof(sid, { waitMs: 0 })).inclusionProof;
+    } catch {
+      // The exact same request can be submitted if the read is unavailable.
+    }
+    if (existing) {
+      if (!eq(existing.certificationData.toCBOR(), request)) throw new WalletError('ProviderFault', 'the aggregator certified another request for this state');
+      return existing.toCBOR();
+    }
     await this.submit(request);
     return this.proof(request);
   }
@@ -323,7 +337,16 @@ export class Wallet {
   /** A wallet in DIR with SECRET (32 bytes) on CONNECTION. Nothing is written until a step runs. */
   public constructor(public readonly dir: string, private readonly secret: Uint8Array, public readonly conn: Connection) {
     if (secret.length !== 32) throw new Error('the wallet secret is 32 bytes');
-    mkdirSync(join(dir, 'tokens'), { recursive: true, mode: 0o700 });
+    const created = mkdirSync(join(dir, 'tokens'), { recursive: true, mode: 0o700 });
+    if (created !== undefined) {
+      // Persist both directory entries before any journal or transaction can depend on them.
+      fsyncDir(join(dir, 'tokens'));
+      fsyncDir(dir);
+      for (let parent = dirname(dir);; parent = dirname(parent)) {
+        fsyncDir(parent);
+        if (parent === dirname(created) || parent === dirname(parent)) break;
+      }
+    }
     this.signer = new LocalKeySigner(secret);
     this.release = JSON.parse(readFileSync(conn.release, 'utf8'));
     this.pins = pinsOf(this.release);
@@ -385,8 +408,39 @@ export class Wallet {
    * Open the plug-in: the wallet lock, the held trust (the shipped bundle under its pin, extended by the wallet's own history), the journal,
    * the backup of the intent high-water mark, the trust refresh through the gateway's trust-base pages, and the installation check.
    */
+  private readOrigin(): AuthenticatedOrigin {
+    const origin = this.conn.trustOrigin ? JSON.parse(readFileSync(this.conn.trustOrigin, 'utf8')) :
+      (this.release.trust as { origin?: unknown } | undefined)?.origin;
+    return parseAuthenticatedOrigin(origin);
+  }
+
+  private source!: AggregatorClient;
+  private get authorityFile(): string { return join(this.dir, 'recovery-authority.json'); }
+
+  /** These entries were locally authenticated when saved. Replay them under the shipped pin on reopen. */
+  public async persistAuthority(trust: TrustInput): Promise<void> {
+    const origin = trust.origin!;
+    writeDurable(this.authorityFile, JSON.stringify({ usableEpoch: String(origin.usableEpoch), rootRound: String(origin.rootRound),
+      entries: trust.history.entries.map((entry) => hx(entry.encode())) }));
+  }
+
+  public async refreshAuthority(): Promise<TrustInput> {
+    const fresh = this.readOrigin();
+    const held = this.trust.origin!;
+    if (fresh.usableEpoch < held.usableEpoch || fresh.rootRound < held.rootRound) {
+      throw new WalletError('TrustInput', 'authenticated origin rolled back');
+    }
+    const next = (await this.trust.snapshot()).withAuthenticatedOrigin(fresh);
+    await refreshAll(next, this.source, 64, () => undefined);
+    await this.persistAuthority(next);
+    this.trust = next;
+    return next;
+  }
+
   public async open(opts: OpenOptions = {}): Promise<this> {
     if (opts.lock ?? true) lockWallet(this.dir);
+    fsyncDir(this.dir);
+    fsyncDir(dirname(this.dir));
     const pin = unhex(readFileSync(this.conn.trustPin, 'utf8'));
     const shipped = await TrustInput.fromBundle(Uint8Array.from(readFileSync(this.conn.trustBundle)), pin);
     this.trust = shipped;
@@ -395,11 +449,18 @@ export class Wallet {
       for (const e of shipped.history.entries) await held.history.append(e);
       this.trust = held;
     }
-    const origin = this.conn.trustOrigin
-      ? JSON.parse(readFileSync(this.conn.trustOrigin, 'utf8'))
-      : (JSON.parse(readFileSync(this.conn.release, 'utf8')) as { trust?: { origin?: unknown } }).trust?.origin;
-    this.trust = this.trust.withAuthenticatedOrigin(parseAuthenticatedOrigin(origin));
-    const source = new AggregatorClient(this.conn.aggregator);
+    let origin = this.readOrigin();
+    if (existsSync(this.authorityFile)) {
+      const saved = JSON.parse(readFileSync(this.authorityFile, 'utf8')) as { entries: string[] };
+      const old = parseAuthenticatedOrigin(saved);
+      if (origin.usableEpoch <= old.usableEpoch && origin.rootRound <= old.rootRound) origin = old;
+      else if (origin.usableEpoch < old.usableEpoch || origin.rootRound < old.rootRound) {
+        throw new WalletError('TrustInput', 'inconsistent authenticated origin');
+      }
+      for (const entry of saved.entries) await this.trust.history.append(RootTrustBaseV2.decode(unhex(entry)));
+    }
+    this.trust = this.trust.withAuthenticatedOrigin(origin);
+    this.source = new AggregatorClient(this.conn.aggregator);
     const http = new HttpJsonRpc(this.conn.rpc, { retries: 20, timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);
     this.bridge = await NativeBridgeV2.open({
@@ -408,7 +469,7 @@ export class Wallet {
       bridgeKey: deriveBridgeKey(sha256(concat(tag('nb2-reference-wallet/seed/'), this.secret))),
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
       backup: async (intents) => writeDurable(join(this.dir, 'backup.json'), JSON.stringify(intents)),
-      refreshTrust: async () => { await refreshAll(this.trust, source, 64, (b) => writeDurable(this.historyFile, b)); },
+      refreshTrust: () => this.refreshAuthority(),
       receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
     }, opts.check ?? true);
     return this;
@@ -609,10 +670,10 @@ export async function split(w: Wallet, from: string, owner: number, parts: { lab
  * Return, step 1: plan LABEL's return to RECIPIENT (default: the wallet's EVM address) and run the capacity preflight. Nothing is burned;
  * a refusal (CapacityPreflight, InsufficientFunds, RecipientRefused) leaves the token as it was.
  */
-export async function planReturn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void): Promise<ReturnPlan> {
+export async function planReturn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void, policy?: PayerPolicy): Promise<ReturnPlan> {
   const e = w.entry(label);
   if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
-  const plan = await retry(() => w.bridge.planReturn(w.token(label), recipient ?? w.signer.address, w.signer.address), note, 30, 2_000, NOT_YET);
+  const plan = await retry(() => w.bridge.planReturn(w.token(label), recipient ?? w.signer.address, w.signer.address, { admission: walletAdmission(w, policy) }), note, 30, 2_000, NOT_YET);
   w.update(label, { returnId: hx(plan.returnId) });
   return plan;
 }
@@ -622,19 +683,26 @@ export async function planReturn(w: Wallet, label: string, recipient?: Uint8Arra
  * (a limit measured earlier is never reused); the plug-in repeats it once more before it signs. Without RECIPIENT the burn keeps the one
  * plan-return chose. A burned return resumes.
  */
-export async function burn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void): Promise<{ plan: ReturnPlan | null; burned: Uint8Array; eta: Uint8Array; evidenceBytes: number }> {
+export async function burn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void, policy?: PayerPolicy, backup?: string): Promise<{ plan: ReturnPlan | null; burned: Uint8Array; eta: Uint8Array; evidenceBytes: number }> {
   const e = w.entry(label);
   if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
   let plan: ReturnPlan | null = null;
   const rec = e.returnId ? await w.bridge.journal.ret(e.returnId) : null;
-  if (rec === null || rec.status === 'planned') plan = await planReturn(w, label, recipient ?? (rec ? unhex(rec.recipient) : undefined), note);
+  if (rec === null || rec.status === 'planned') plan = await planReturn(w, label, recipient ?? (rec ? unhex(rec.recipient) : undefined), note, policy);
   // the token is marked before its burn request is journaled, so nothing else can spend the state the burn spends; a burn that never got
   // that far (a refused last preflight) takes the mark back
   const id = w.entry(label).returnId!;
+  const authorization = join(w.dir, `backup-${id.slice(2)}.txt`);
+  if (backup) {
+    const target = resolve(backup);
+    if (existsSync(authorization) && readFileSync(authorization, 'utf8') !== target) throw new Error('return already has an authorized backup destination');
+    writeDurable(authorization, target);
+  }
+  const authorized = existsSync(authorization) ? readFileSync(authorization, 'utf8') : undefined;
   w.update(label, { spent: BURNING });
   let b: Awaited<ReturnType<typeof w.bridge.burn>>;
   try {
-    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner)), note);
+    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized)), note);
   } catch (err) {
     const r = await w.bridge.journal.ret(id);
     if (r === null || r.status === 'planned') w.update(label, { spent: undefined });
@@ -668,7 +736,7 @@ export class RegistryLagExpired extends Error {
  * Wrapped QuorumNotMet may be seal import lag. Start retries only within REGISTRY_LAG_MS, then report RegistryLagExpired if still refused.
  * An in-flight attempt may finish later. LAG, when given, is told how long the wait took.
  */
-export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_000, note: (reason: string) => void = () => undefined, lag?: (ms: number) => void): Promise<ReconcileResult> {
+export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_000, note: (reason: string) => void = () => undefined, lag?: (ms: number) => void, policy?: PayerPolicy): Promise<ReconcileResult> {
   const id = unhex((await w.returnRecord(label)).returnId);
   const started = performance.now();
   const deadline = started + REGISTRY_LAG_MS;
@@ -681,7 +749,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
       if (performance.now() >= deadline) throw new RegistryLagExpired(label, lastRefusal);
     }
     try {
-      r = await w.bridge.submitRedeem(id, w.signer);
+      r = await w.bridge.submitRedeem(id, w.signer, policy && guardOrdinary(w, policy));
       break;
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
@@ -698,6 +766,24 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
   }
   if (r.state === 'paid') w.update(label, { note: 'paid' });
   return r;
+}
+
+/** The CLI routes a signed cold return through the durable packet runner. */
+export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false): Promise<RecoveryResult | ReconcileResult> {
+  const r = rec.recovery && !ordinary ? await recoverStep(w, rec, policy) :
+    await w.bridge.submitRedeem(unhex(rec.returnId), w.signer, guardOrdinary(w, policy));
+  return r;
+}
+
+/** Receive and verify the complete held lineage before adding it to spendable storage. */
+export async function receive(w: Wallet, label: string, token: Uint8Array, owner: number): Promise<string> {
+  w.checkNewName(label);
+  const snapshot = Uint8Array.from(token);
+  const held = await w.bridge.verifyToken(snapshot);
+  if (!held.owner || !eq(held.owner, w.ownerPub(owner))) throw new Error('the verified token belongs to another owner');
+  const headroom = await returnHeadroom(w, snapshot);
+  w.keep(label, snapshot, owner, { amount: String(held.amount) });
+  return headroom;
 }
 
 /** What to run next for a deposit or a return, by its journal status. */

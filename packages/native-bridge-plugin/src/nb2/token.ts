@@ -188,6 +188,10 @@ function decodeCD(it: Item): Certification {
   return { source, sourceHash, txHash, deadline: dl, unlock: bytesN(k[5], 65) };
 }
 
+/** Decode the exact signed transfer and its separate certification request. */
+export const parseTransfer = (raw: Uint8Array): TransferTx => decodeTransfer(scanNative(raw));
+export const parseCertification = (raw: Uint8Array): Certification => decodeCD(scanNative(raw));
+
 const MAX_PROOF_UC_BYTES = 24 << 10;
 
 function popcount(b: Uint8Array): number {

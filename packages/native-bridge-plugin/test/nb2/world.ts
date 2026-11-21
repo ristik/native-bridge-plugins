@@ -139,7 +139,7 @@ export class FakeAggregator implements Aggregator {
 
 interface Log { address: Uint8Array; topics: Uint8Array[]; data: Uint8Array }
 interface Rcpt { status: 0n | 1n; logs: Log[]; tx: Uint8Array; from: Uint8Array; revert: Uint8Array | null; gas: bigint; type: number }
-interface Block { header: Header; hash: Uint8Array; uc: Uint8Array | null; receipts: Rcpt[] }
+interface Block { header: Header; hash: Uint8Array; uc: Uint8Array | null; receipts: Rcpt[]; raws: Uint8Array[] }
 
 export interface Faults {
   /** The next N sends are included but answered with HTTP 503 (partial broadcast, #1121). */
@@ -162,6 +162,8 @@ export class FakeChain implements JsonRpc {
   public readonly vaultCode = ascii('fake vault runtime');
   public calls: string[] = [];
   public autoMine = true;
+  /** Optional cold contract stand-in for wallet journal tests. */
+  public coldCall?: (vault: VaultModel, to: Uint8Array, data: Uint8Array) => Promise<Log[] | undefined>;
   private pool: Uint8Array[] = [];
 
   private constructor(public readonly root: Root, public readonly gamma: Uint8Array, private readonly cfg: Config) {
@@ -202,7 +204,7 @@ export class FakeChain implements JsonRpc {
     const trie = buildTrie(enc.map((e, i) => [rlpIndexKey(i), e]), null);
     const header: Header = {
       parentHash: n === 0n ? new Uint8Array(32) : this.blocks[Number(n) - 1].hash, ommersHash: EMPTY_UNCLE_HASH, beneficiary: new Uint8Array(20),
-      stateRoot: sha(concat(ascii('state'), u256(n), ...raws)), transactionsRoot: sha(concat(ascii('txs'), ...raws)), receiptsRoot: trie.root,
+      stateRoot: sha(concat(ascii('state'), u256(n), ...raws)), transactionsRoot: buildTrie(raws.map((raw, i) => [rlpIndexKey(i), raw]), null).root, receiptsRoot: trie.root,
       logsBloom: new Uint8Array(256), difficulty: 0n, number: n, gasLimit: 30_000_000n, gasUsed: cum, timestamp: 1_700_000_000n + n, extraData: new Uint8Array(),
       mixHash: new Uint8Array(32), nonce: new Uint8Array(8), baseFeePerGas: 7n, withdrawalsRoot: EMPTY_TRIE_ROOT, blobGasUsed: 0n, excessBlobGas: 0n,
       parentBeaconBlockRoot: new Uint8Array(32),
@@ -210,7 +212,7 @@ export class FakeChain implements JsonRpc {
     const hash = HE(encodeHeader(header));
     const parent = this.blocks[Number(n) - 1];
     if (parent) parent.uc = await makeUc(this.root, EVM_PARTITION, parent.header.stateRoot, parent.hash, header.timestamp);
-    this.blocks.push({ header, hash, uc: null, receipts });
+    this.blocks.push({ header, hash, uc: null, receipts, raws });
   }
 
   /** The verifier inside the vault: the plug-in's own relation (the Solidity verifier is NB2-05's). */
@@ -224,10 +226,12 @@ export class FakeChain implements JsonRpc {
   }
 
   /** Run a call against a vault (the real one, or a copy for a simulation); events and the payout as effects. */
-  private async run(v: VaultModel, from: Uint8Array, to: Uint8Array, value: bigint, data: Uint8Array): Promise<{ ok: true; events: VaultEvent[] } | { ok: false; revert: Uint8Array }> {
-    if (!eq(to, VAULT)) return { ok: true, events: [] };
+  private async run(v: VaultModel, from: Uint8Array, to: Uint8Array, value: bigint, data: Uint8Array): Promise<{ ok: true; events: VaultEvent[]; extra?: Log[] } | { ok: false; revert: Uint8Array }> {
     const before = v.events.length;
     try {
+      const extra = await this.coldCall?.(v, to, data);
+      if (extra !== undefined) return { ok: true, events: v.events.slice(before), extra };
+      if (!eq(to, VAULT)) return { ok: true, events: [] };
       const sel = data.subarray(0, 4);
       const word = (i: number): Uint8Array => data.subarray(4 + 32 * i, 36 + 32 * i);
       const dyn = (i: number): Uint8Array => {
@@ -264,7 +268,7 @@ export class FakeChain implements JsonRpc {
     const r = await this.run(this.vault, from, t.to, t.value, t.data);
     if (!r.ok) return { status: 0n, logs: [], tx: hash, from, revert: r.revert, gas: t.gas, type: 2 };
     this.balances.set(toHex(from), this.balanceOf(from) - t.value);
-    const logs: Log[] = [];
+    const logs: Log[] = r.extra ?? [];
     for (const e of r.events) {
       if (e.name === 'Deposited') logs.push({ address: VAULT, topics: [TOPIC.Deposited, u256(e.n)], data: depositedData(this.domain, e.amount, e.rho, e.firstOwner) });
       else if (e.name === 'Paid') {
@@ -280,6 +284,7 @@ export class FakeChain implements JsonRpc {
   private headerJson(b: Block): Record<string, unknown> {
     const x = b.header;
     return {
+      transactions: b.receipts.map((r) => h(r.tx)),
       hash: h(b.hash), parentHash: h(x.parentHash), sha3Uncles: h(x.ommersHash), miner: h(x.beneficiary), stateRoot: h(x.stateRoot), transactionsRoot: h(x.transactionsRoot),
       receiptsRoot: h(x.receiptsRoot), logsBloom: h(x.logsBloom), difficulty: q(x.difficulty), number: q(x.number), gasLimit: q(x.gasLimit), gasUsed: q(x.gasUsed),
       timestamp: q(x.timestamp), extraData: h(x.extraData), mixHash: h(x.mixHash), nonce: h(x.nonce), baseFeePerGas: q(x.baseFeePerGas),
@@ -328,6 +333,11 @@ export class FakeChain implements JsonRpc {
         if (p.length !== 2 || p[1] !== false) throw new RpcError(400, 0, 'eth_getBlockByHash takes [hash, false]');
         const b = this.blocks.find((x) => h(x.hash) === p[0]);
         return b ? this.headerJson(b) : null;
+      }
+      case 'eth_getRawTransactionByBlockHashAndIndex': {
+        const b = this.blocks.find((x) => h(x.hash) === p[0]);
+        const raw = b?.raws[Number(BigInt(p[1]))];
+        return raw ? h(raw) : null;
       }
       case 'eth_getTransactionReceipt': {
         const f = this.findTx(p[0]);
