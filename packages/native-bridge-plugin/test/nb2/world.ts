@@ -73,7 +73,8 @@ export async function makeRoot(n = 4): Promise<Root> {
   return { signers, bundle, pin, trust: (await TrustInput.fromBundle(bundle, pin)).withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 1000000n }) };
 }
 
-const TR_HASH = sha(ascii('technical record'));
+const TECHNICAL_RECORD = cArr(cUint(1), cUint(1), C.encodeTextString('leader'), cBytes(new Uint8Array(32)), cBytes(new Uint8Array(32)));
+const TR_HASH = sha(TECHNICAL_RECORD);
 let round = 1000n;
 /** The certificate round counter (a snapshot restores it). */
 export const roundNow = (): bigint => round;
@@ -339,7 +340,7 @@ export class FakeChain implements JsonRpc {
       case 'unicity_getSealCompanionV1': {
         const i = this.blocks.findIndex((x) => h(x.hash) === p[0]);
         if (i <= 0) return { status: 'unknown' };
-        return { status: 'found', companion: { witnesses: [h(this.blocks[i - 1].uc!), h(ascii('technical record'))] } };
+        return { status: 'found', companion: { witnesses: [h(this.blocks[i - 1].uc!), h(TECHNICAL_RECORD)] } };
       }
       case 'eth_getLogs': {
         const f = p[0];

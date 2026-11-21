@@ -266,6 +266,15 @@ fn decode_receipt(v: &[u8]) -> Result<RlpItem<'_>> {
 /// (`DepositHeader`), the receipt path keyed by RLP(txIndex) (`ReceiptPath`), type and status, `logs[logIndex]` (`LogIndex`)
 /// and its address (`LogEmitter`). The caller checks its event's topics and data.
 pub fn verify_receipt_log(c: &Config, t: &TrustInput, p: &DepositProof) -> Result<ReceiptLog> {
+    verify_receipt_log_at(c, t, p, &c.vault)
+}
+
+pub(crate) fn verify_receipt_log_at(
+    c: &Config,
+    t: &TrustInput,
+    p: &DepositProof,
+    emitter: &[u8; 20],
+) -> Result<ReceiptLog> {
     let uc = verify_evm_uc(t, &p.uc, c)?;
     let header = bind_header(
         &p.header,
@@ -291,7 +300,7 @@ pub fn verify_receipt_log(c: &Config, t: &TrustInput, p: &DepositProof) -> Resul
         return fail(Rule::LogIndex);
     }
     // the emitter before the topics (section 6.2 step 5)
-    if l.kids[0].str != c.vault {
+    if l.kids[0].str != emitter {
         return fail(Rule::LogEmitter);
     }
     let mut topics = Vec::new();

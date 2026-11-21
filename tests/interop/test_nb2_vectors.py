@@ -43,7 +43,7 @@ class NB2VectorTests(unittest.TestCase):
 
 class ContinuationVectorTests(unittest.TestCase):
     def test_pinned_manifests_and_files(self):
-        self.assertEqual(check(), 283)
+        self.assertEqual(check(), 316)
 
 
 if __name__ == '__main__':

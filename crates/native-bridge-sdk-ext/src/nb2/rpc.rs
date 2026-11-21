@@ -445,6 +445,15 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
     /// The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child
     /// does not exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
     pub fn certificate_of(&self, header: &Header, hash: &[u8]) -> Result<Vec<u8>> {
+        self.certificate_of_mode(header, hash, false)
+    }
+
+    fn certificate_of_mode(
+        &self,
+        header: &Header,
+        hash: &[u8],
+        bind_technical_record: bool,
+    ) -> Result<Vec<u8>> {
         let n = header.number_u64();
         let child = call(
             &*self.rpc,
@@ -461,7 +470,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
             return refuse(WalletReason::CompanionUnknown, format!("block {n} has no child yet: its certificate is not served; retry after a round"));
         }
         let child_header = header_of_json(&child)?;
-        if child_header.parent_hash != hash {
+        if child_header.number_u64().checked_sub(1) != Some(n) || child_header.parent_hash != hash {
             return refuse(
                 WalletReason::CompanionUnknown,
                 format!("block {n} is not on this node's canonical chain"),
@@ -479,7 +488,37 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
             .or_else(|| l["witnesses"].as_array())
             .unwrap_or(&empty);
         check_companion(l["status"].as_str().unwrap_or(""), witnesses.len())?;
-        bytes_of(&witnesses[0], "companion witness 0")
+        let uc = bytes_of(&witnesses[0], "companion witness 0")?;
+        if bind_technical_record {
+            use super::cbor::{array, is_bytes, is_uint, scan_native, MAJ_TEXT};
+            let record = bytes_of(&witnesses[1], "companion witness 1")?;
+            if record.len() > 4096 {
+                return refuse(
+                    WalletReason::CompanionProvider,
+                    "technical record is oversized",
+                );
+            }
+            let item = scan_native(&record)?;
+            let fields = array(&item, 5)?;
+            let digest = super::trust::decode_uc(&uc)?.technical_record_hash;
+            if !is_uint(&fields[0])
+                || fields[0].arg == 0
+                || !is_uint(&fields[1])
+                || fields[2].major != MAJ_TEXT
+                || fields[2].arg == 0
+                || !is_bytes(&fields[3])
+                || fields[3].arg == 0
+                || !is_bytes(&fields[4])
+                || fields[4].arg == 0
+                || digest.as_deref() != Some(&super::crypto::hu(&[&record]))
+            {
+                return refuse(
+                    WalletReason::CompanionProvider,
+                    "technical record does not open the certificate commitment",
+                );
+            }
+        }
+        Ok(uc)
     }
 
     /// The root-to-leaf receipt-trie path of RLP(txIndex), from the block's receipts, whose trie must hash to the header's root.
@@ -538,6 +577,26 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         topic0: &[u8],
     ) -> Result<ReceiptProof> {
+        self.receipt_proof_mode(tx_hash, emitter, topic0, false)
+    }
+
+    /// Rebuild a recovery proof with the child companion's committed technical record.
+    pub fn recovery_receipt_proof(
+        &self,
+        tx_hash: &[u8],
+        emitter: &[u8],
+        topic0: &[u8],
+    ) -> Result<ReceiptProof> {
+        self.receipt_proof_mode(tx_hash, emitter, topic0, true)
+    }
+
+    fn receipt_proof_mode(
+        &self,
+        tx_hash: &[u8],
+        emitter: &[u8],
+        topic0: &[u8],
+        bind_technical_record: bool,
+    ) -> Result<ReceiptProof> {
         let Some(r) = self.receipt(tx_hash)? else {
             return refuse(
                 WalletReason::EvidenceMissing,
@@ -579,7 +638,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         };
         let block_hash = fixed_of(&json!(r.block_hash), 32, "blockHash")?;
         let (header, raw) = self.header_by_hash(&block_hash)?;
-        let uc = self.certificate_of(&header, &block_hash)?;
+        let uc = self.certificate_of_mode(&header, &block_hash, bind_technical_record)?;
         let tx_index = qty64(&json!(r.transaction_index), "transactionIndex")?;
         let nodes = self.receipt_path(&header, &block_hash, tx_index)?;
         let proof = DepositProof {

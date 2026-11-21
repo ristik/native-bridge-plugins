@@ -24,3 +24,7 @@ export { decodeToken, encodeToken, type Token, type LineageLevel } from './token
 export { TrustInput, verifyEvmUc, type AuthenticatedOrigin } from './trust.js';
 export { VaultModel } from './vaultmodel.js';
 export { parentLink, splitOutputCommitment, decodeSplitJustification, decodeSumProof, type SumStep } from './split.js';
+
+export * from './recovery.js';
+
+export * from './recovery-cost.js';

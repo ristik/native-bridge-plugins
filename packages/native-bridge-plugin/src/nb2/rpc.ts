@@ -12,11 +12,14 @@ import { decodeBytesReturn, decodeStateReturn, SELECTOR, type RawLog, type Vault
 import { TOPIC, encodeDepositProof, type DepositProof } from './deposit.js';
 import { WalletError, fail, refuse } from './errors.js';
 import { encodeHeader, type Header } from './header.js';
-import { HE } from './crypto.js';
+import { HE, HU } from './crypto.js';
 import { buildTrie } from './mpt.js';
 import { rlpBytes, rlpIndexKey, rlpList, rlpUintEnc } from './rlp.js';
 import { checkCompanion } from './rules.js';
-import { u256 } from './cbor.js';
+import { array, isBytes, isUint, scanNative, u256 } from './cbor.js';
+
+import type { RecoveryReceiptSource } from './recovery.js';
+import { decodeUc } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
 
@@ -198,16 +201,27 @@ export class EvmReader {
    * The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child does not
    * exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
    */
-  public async certificateOf(header: Header, hash: Uint8Array): Promise<Uint8Array> {
+  public async certificateOf(header: Header, hash: Uint8Array, bindTechnicalRecord = false): Promise<Uint8Array> {
     const child = await this.rpc.call<Record<string, unknown> | null>('eth_getBlockByNumber', [qty(header.number + 1n), false]);
     if (child === null) refuse('CompanionUnknown', `block ${header.number} has no child yet: its certificate is not served; retry after a round`);
     const childHeader = headerOfJson(child!);
-    if (!eq(childHeader.parentHash, hash)) refuse('CompanionUnknown', `block ${header.number} is not on this node's canonical chain`);
+    if (childHeader.number !== header.number + 1n || !eq(childHeader.parentHash, hash)) refuse('CompanionUnknown', `block ${header.number} is not on this node's canonical chain`);
     const childHash = HE(encodeHeader(childHeader));
     const l = await this.rpc.call<{ status: string; horizon?: unknown; companion?: { witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(childHash)]);
     const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
     checkCompanion(l.status, witnesses.length);
-    return bytesOf(witnesses[0], 'companion witness 0');
+    const uc = bytesOf(witnesses[0], 'companion witness 0');
+    if (bindTechnicalRecord) {
+      const record = bytesOf(witnesses[1], 'companion witness 1');
+      if (record.length > 4096) refuse('CompanionProvider', 'technical record is oversized');
+      const [round, epoch, leader, stat, fee] = array(scanNative(record), 5);
+      const digest = decodeUc(uc).technicalRecordHash;
+      if (!isUint(round) || round.arg === 0n || !isUint(epoch) || leader.major !== 3 || leader.arg === 0n
+        || !isBytes(stat) || stat.arg === 0n || !isBytes(fee) || fee.arg === 0n || digest === null || !eq(HU(record), digest)) {
+        refuse('CompanionProvider', 'technical record does not open the certificate commitment');
+      }
+    }
+    return uc;
   }
 
   /** The root-to-leaf receipt-trie path of RLP(txIndex), from the block's receipts, whose trie must hash to the header's root. */
@@ -229,7 +243,7 @@ export class EvmReader {
   }
 
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array): Promise<ReceiptProof> {
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);
@@ -237,7 +251,7 @@ export class EvmReader {
     if (idx < 0) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} emitted no such log from 0x${toHex(emitter)}`);
     const blockHash = fixedOf(r!.blockHash, 32, 'blockHash');
     const { header, raw } = await this.headerByHash(blockHash);
-    const uc = await this.certificateOf(header, blockHash);
+    const uc = await this.certificateOf(header, blockHash, bindTechnicalRecord);
     const txIndex = qtyOf(r!.transactionIndex, 'transactionIndex');
     const nodes = await this.receiptPath(header, blockHash, txIndex);
     const proof: DepositProof = { uc, header: raw, txIndex, logIndex: BigInt(idx), nodes };
@@ -387,3 +401,8 @@ export function revertDataOf(e: RpcError): Uint8Array | null {
 }
 
 export { WalletError, u256 };
+
+export const recoveryRpcSource = (reader: EvmReader, txHash: Uint8Array): RecoveryReceiptSource => {
+  const tx = Uint8Array.from(txHash);
+  return async (emitter, topic) => (await reader.receiptProof(tx, emitter, topic, true)).encoded;
+};
