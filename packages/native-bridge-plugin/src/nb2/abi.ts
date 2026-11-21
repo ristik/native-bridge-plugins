@@ -6,7 +6,7 @@ import { concat, eq, toHex } from '../bytes.js';
 import { ascii, beInt, u256 } from './cbor.js';
 import { HE } from './crypto.js';
 import { TOPIC } from './deposit.js';
-import { ALL_RULES, type Rule } from './errors.js';
+import { ALL_RULES, isRetryableVerifierRefusal, type Rule } from './errors.js';
 
 const sel = (sig: string): Uint8Array => HE(ascii(sig)).subarray(0, 4);
 
@@ -129,7 +129,7 @@ export type RedeemAction =
   | 'rebuild-history' // StaleEndpoint: two rollovers since the history was built; rebuild it, never change the burn
   | 'wait' // FutureIndex: the vault has not reached a (cannot arise from section 12.2)
   | 'repair-proof' // BadGapProof, ChainMismatch, BadHistoryLength: a wrong proof or start head, repairable without a new burn
-  | 'retry-later' // NoEntryForEpoch inside VerifierRefused, Reentrancy, PayoutFailed, an out-of-gas: retry with more gas or later
+  | 'retry-later' // a potentially transient verifier or payout refusal, or an out-of-gas
   | 'stop'; // the evidence or the deployment is refused: tell the user, do not resend
 
 export function classifyRedeemError(e: DecodedError | null): RedeemAction {
@@ -140,7 +140,7 @@ export function classifyRedeemError(e: DecodedError | null): RedeemAction {
     case 'FutureIndex': return 'wait';
     case 'BadGapProof': case 'ChainMismatch': case 'BadHistoryLength': return 'repair-proof';
     case 'PayoutFailed': case 'Reentrancy': return 'retry-later';
-    case 'VerifierRefused': return e.inner?.rule === 'NoEntryForEpoch' ? 'retry-later' : 'stop';
+    case 'VerifierRefused': return isRetryableVerifierRefusal(e.inner?.rule) ? 'retry-later' : 'stop';
     default: return 'stop';
   }
 }

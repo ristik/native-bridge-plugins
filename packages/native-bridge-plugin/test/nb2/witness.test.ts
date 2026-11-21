@@ -7,13 +7,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { classifyRedeemError, decodeRevert } from '../../src/nb2/abi.js';
+import { classifyRedeemError, decodeRevert, revertData } from '../../src/nb2/abi.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, setup, VAULT } from './world.js';
-import { EvmReader } from '../../src/nb2/rpc.js';
+import { EvmReader, RpcError } from '../../src/nb2/rpc.js';
 
 async function world() {
   const s = await setup();
@@ -74,6 +74,37 @@ test('a missing or substituted segment log is missing evidence, never absence', 
     return r as T;
   };
   await assert.rejects(w.buildRedeem(id), (e) => e instanceof Nb2Error && e.rule === 'SegmentLog');
+});
+
+test('a deployed quorum refusal is retryable and the same certified burn pays after import', async () => {
+  const { w, payer, burned, chain } = await world();
+  const id = await burned();
+  const rpc = chain.call.bind(chain);
+  let refusal = revertData('VerifierRefused', revertData('QuorumNotMet'));
+  let sends = 0;
+  chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') sends++;
+    if (method === 'eth_estimateGas' && refusal.length !== 0) {
+      throw new RpcError(200, 3, 'execution reverted', `0x${Buffer.from(refusal).toString('hex')}`);
+    }
+    return rpc<T>(method, params);
+  };
+
+  assert.equal(classifyRedeemError(decodeRevert(refusal)), 'retry-later');
+  await assert.rejects(w.buildRedeem(id), (e) => e instanceof Nb2Error &&
+    e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet' && e.retryable);
+  await assert.rejects(w.submitRedeem(id, payer), (e) => e instanceof Nb2Error && e.retryable);
+  assert.equal(sends, 0);
+
+  refusal = revertData('VerifierRefused', revertData('SealRoot'));
+  await assert.rejects(w.buildRedeem(id), (e) => e instanceof Nb2Error &&
+    e.rule === 'VerifierRefused' && e.inner?.rule === 'SealRoot' && !e.retryable);
+  assert.equal(new Nb2Error('QuorumNotMet').retryable, false, 'offline quorum failure is final');
+  assert.equal(sends, 0);
+
+  refusal = new Uint8Array();
+  assert.equal((await w.submitRedeem(id, payer)).state, 'paid');
+  assert.equal(sends, 1);
 });
 
 test('every vault error classifies from its recorded revert data', () => {

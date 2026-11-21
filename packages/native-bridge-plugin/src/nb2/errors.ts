@@ -25,8 +25,13 @@ export type Rule = (typeof RULES)[keyof typeof RULES][number];
 /** Every rule, in section 14 order. */
 export const ALL_RULES: readonly Rule[] = Object.values(RULES).flat() as Rule[];
 
-/** The one retryable rule: the verifier holds no trust-base entry of the seal's epoch yet. */
+/** Offline verification can retry once the trust history holds the seal's epoch. */
 export const RETRYABLE_RULES: readonly Rule[] = ['NoEntryForEpoch'];
+
+/** The deployed verifier cannot distinguish a pending seal import from an invalid quorum. */
+export function isRetryableVerifierRefusal(inner: Rule | undefined): boolean {
+  return inner === 'QuorumNotMet' || inner === 'NoEntryForEpoch';
+}
 
 /**
  * A section 14 refusal. `args` are a vault error's arguments as the vectors write them (decimal or `0x` hex); `inner` is the rule a
@@ -43,9 +48,10 @@ export class Nb2Error extends Error {
     this.name = 'Nb2Error';
   }
 
-  /** Retryable once the trust-base history holds the epoch: NoEntryForEpoch, alone or wrapped (a SealReceipt carrying it). */
+  /** Retry after trust-history refresh or, for an ambiguous on-chain refusal, after seal import. */
   public get retryable(): boolean {
-    return RETRYABLE_RULES.includes(this.rule) || (this.inner?.retryable ?? false);
+    return RETRYABLE_RULES.includes(this.rule) || (this.inner?.retryable ?? false) ||
+      (this.rule === 'VerifierRefused' && isRetryableVerifierRefusal(this.inner?.rule));
   }
 
   /** The innermost rule of a wrapper chain. */

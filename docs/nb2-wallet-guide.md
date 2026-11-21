@@ -106,7 +106,7 @@ burned back for 0x12a2094927c3be88f8858dead12f0bd6742156bb: 0.04 UCT, redemption
 next: redeem back
 
 $ nb2-wallet redeem back
-the verifier answers QuorumNotMet: the seal registry has not imported the burn's root round yet (#1125); waiting
+the verifier answers QuorumNotMet: waiting for possible seal registry lag (#1125)
 paid 0.04 UCT to 0x12a2094927c3be88f8858dead12f0bd6742156bb in block 924 (tx 0x87d5006988a76a404fb0561f679596851a15153336e0eccf440cd7e41f248350); 1 redeem transaction sent
 
 $ nb2-wallet redeem back
@@ -337,7 +337,7 @@ The table says what each error means and what your wallet does when it reaches y
 | `FutureIndex` (vault) | simulation | the vault has not reached `a` | wait; can't arise from a verified seal receipt |
 | `BadGapProof`, `ChainMismatch`, `BadHistoryLength` (vault) | simulation | a wrong proof or start head | rebuild the witness; the burn stays |
 | `PayoutFailed`, `Reentrancy` (vault) | transaction | the recipient refused the value, or re-entered | retry once; a recipient that always refuses strands the burn |
-| `VerifierRefused` with `QuorumNotMet` inside (vault) | buildRedeem's simulation, right after a burn | usually the EVM chain's seal registry has not imported the burn's root round yet (bft-core#1125), and on chain that reads as a bad quorum. The plug-in throws it, classified `stop`. | it is not a verdict yet: see [the registry lag](#the-registry-lag-right-after-a-burn) |
+| `VerifierRefused` with `QuorumNotMet` inside (vault) | buildRedeem's simulation, right after a burn | the root round may still be awaiting import (bft-core#1125). The plug-in marks the refusal retryable. | wait and rebuild the same redemption within a bounded window. See [the registry lag](#the-registry-lag-right-after-a-burn). |
 | `VerifierRefused(<other rule>)` (vault) | simulation | the token verifier refused the evidence with `<rule>` | stop and report. Retry only if the inner rule is `NoEntryForEpoch`. |
 | `VerifierBadReturn` (vault) | simulation | the verifier's answer is not a well-formed verdict | stop and report: a deployment fault |
 | `DomainMismatch`, `AssetMismatch`, `ClaimMismatch`, `BadRecipient`, `ZeroAmount`, `LiabilityUnderflow`, `SegmentCounterExhausted` (vault) | simulation | the evidence is not for this vault, or the vault is exhausted | stop and report |
@@ -356,10 +356,9 @@ does, the deployed verifier cannot find the round's seal, and it answers `Quorum
 quorum (bft-core#1125). The plug-in and the Go reference accept the same bytes. In the NB2-09 runs, the vault accepted them within a few
 seconds.
 
-The plug-in reports it from `buildRedeem`'s simulation as `Nb2Error`, with `rule` set to `VerifierRefused` and the vault's revert data in
-`args[0]`, and `classifyRedeemError` calls it `stop`. Recognise it with `isRegistryLag` (in `wallet/core.ts`): it decodes `args[0]` and
-checks for `QuorumNotMet`. Retrying is safe, because the simulation refused before anything was signed: no gas is spent and nothing can be
-sent twice.
+The plug-in reports it from `buildRedeem`'s simulation as a retryable `Nb2Error` with rule `VerifierRefused` and inner rule `QuorumNotMet`.
+It keeps the original revert argument and classifies the refusal as `retry-later`. A failed preflight spends no gas. On each retry
+`submitRedeem` reconciles earlier sends and simulates against current chain state before signing.
 
 The reference wallet waits and builds again for up to 2 minutes. After that, `redeem` stops and says that the burn is intact and to run
 `redeem` again later. A refusal that persists well past the registry's import may be a real bad quorum: report it. A wallet with its own

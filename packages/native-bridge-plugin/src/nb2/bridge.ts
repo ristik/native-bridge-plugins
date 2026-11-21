@@ -123,6 +123,11 @@ export type ReconcileResult =
 
 const hexq = (b: Uint8Array): string => `0x${toHex(b)}`;
 
+function redeemRefusal(e: DecodedError, detail?: string): Nb2Error {
+  return new Nb2Error(e.rule, detail, e.args.map((v) => typeof v === 'bigint' ? String(v) : hexq(v)),
+    e.inner && redeemRefusal(e.inner));
+}
+
 export class NativeBridgeV2 {
   public readonly cfg: Config;
   public readonly domain: Uint8Array;
@@ -726,7 +731,7 @@ export class NativeBridgeV2 {
         const action = classifyRedeemError(e);
         if (action === 'rebuild-history' && attempt < 2) continue;
         if (action === 'reconcile') refuse('AlreadyPaid', 'the vault reports AlreadyPaid: reconcile');
-        if (e !== null) throw new Nb2Error(e.rule, `simulation refused (${action})`, e.args.map((x) => (typeof x === 'bigint' ? String(x) : hexq(x))));
+        if (e !== null) throw redeemRefusal(e, `simulation refused (${action})`);
         // no rule: an RPC without simulation; the model's bound stands
       }
       if (gasLimit === null) fail('CapacityExceeded', 'the gas cannot be bounded');
@@ -767,6 +772,9 @@ export class NativeBridgeV2 {
       if (action === 'reconcile') return this.reconcileInner(returnId);
       if (action === 'rebuild-history' || action === 'repair-proof') continue;
       if (action === 'retry-later') {
+        if (e?.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet') {
+          throw redeemRefusal(e, 'simulation after reverted redeem refused (retry-later)');
+        }
         gasBump = 2n; // an out-of-gas or a transient payout failure: one retry with more gas
         continue;
       }

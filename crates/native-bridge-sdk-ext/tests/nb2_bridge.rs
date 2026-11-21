@@ -8,11 +8,13 @@ mod nb2_world;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use native_bridge_sdk_ext::nb2::abi::{decode_revert, deposit_calldata};
+use native_bridge_sdk_ext::nb2::abi::{
+    classify_redeem_error, decode_revert, deposit_calldata, revert_data, ErrArg, RedeemAction,
+};
 use native_bridge_sdk_ext::nb2::bridge::{NativeBridgeV2, ReconcileResult};
 use native_bridge_sdk_ext::nb2::crypto::{he, public_key, sign_unlock, verify_unlock};
 use native_bridge_sdk_ext::nb2::deposit::{first_owner_of, topic};
-use native_bridge_sdk_ext::nb2::errors::{Error, Result, Rule, WalletReason};
+use native_bridge_sdk_ext::nb2::errors::{Error, Nb2Error, Result, Rule, WalletReason};
 use native_bridge_sdk_ext::nb2::evm::{sign_tx, EvmSigner, LocalKeySigner, TxRequest};
 use native_bridge_sdk_ext::nb2::gas::{GasModel, RedeemShape};
 use native_bridge_sdk_ext::nb2::journal::{hex, MemoryJournalStore, JOURNAL_FORMAT};
@@ -493,6 +495,46 @@ fn history_of_zero_one_and_several_segments_one_rollover_in_flight_is_tolerated(
         sim(&x.w, &x.payer.address(), &built.calldata),
         Estimate::Gas(_)
     ));
+    assert_eq!(x.b.submit_redeem(&id, &x.payer).unwrap().state(), "paid");
+}
+
+#[test]
+fn deployed_quorum_refusal_is_retryable_until_seal_import() {
+    let x = WitnessWorld::new();
+    let id = x.burned();
+    let refusal = revert_data(
+        Rule::VerifierRefused,
+        &[ErrArg::Word(revert_data(Rule::QuorumNotMet, &[]))],
+    );
+    assert_eq!(
+        classify_redeem_error(decode_revert(&refusal).as_ref()),
+        RedeemAction::RetryLater
+    );
+    let sends = Arc::new(AtomicUsize::new(0));
+    let observed_sends = sends.clone();
+    x.w.chain
+        .set_pre(Some(Box::new(move |method, _| match method {
+            "eth_estimateGas" => Some(Err(RpcError {
+                status: 200,
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(json!(hex0x(&refusal))),
+            })),
+            "eth_sendRawTransaction" => {
+                observed_sends.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            _ => None,
+        })));
+    let refusal = x.b.submit_redeem(&id, &x.payer).unwrap_err();
+    assert!(refusal.retryable());
+    let outer = refusal.rule().unwrap();
+    assert_eq!(outer.rule, Rule::VerifierRefused);
+    assert_eq!(outer.innermost(), Rule::QuorumNotMet);
+    assert!(!Nb2Error::new(Rule::QuorumNotMet).retryable());
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
+
+    x.w.chain.set_pre(None);
     assert_eq!(x.b.submit_redeem(&id, &x.payer).unwrap().state(), "paid");
 }
 
