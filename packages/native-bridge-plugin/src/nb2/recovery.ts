@@ -37,6 +37,26 @@ const coldCall = (entry: Entry, parts: Uint8Array[]): Uint8Array => {
   return concat(HE(ascii(entry + '(bytes)')).subarray(0, 4), abiEncode([{ bytes: body }]));
 };
 
+/** Identify a visible recovered settlement using its certified Complete or Gap receipt. */
+export async function recoveredSettlementEta(cfg: Config, domain: Uint8Array, trust: TrustInput, emitter: Uint8Array,
+  calldata: Uint8Array): Promise<Uint8Array | undefined> {
+  if (!eq(calldata.subarray(0, 4), HE(ascii('redeemRecovered(bytes)')).subarray(0, 4))) return;
+  const start = 68;
+  const end = start + Number(beInt(calldata.subarray(36, start)));
+  const tag = start + 42;
+  const proofStart = tag + 5;
+  if (calldata.length > calldataCap || end > calldata.length || end < proofStart ||
+    beInt(calldata.subarray(4, 36)) !== 32n || !eq(calldata.subarray(start, start + 2), version)) return;
+  const kind = calldata[tag] === 1 ? 'complete' : calldata[tag] === 2 ? 'gap' : undefined;
+  const length = Number(beInt(calldata.subarray(tag + 1, proofStart)));
+  if (!kind || length > receiptCap || length === 0 || proofStart + length + 2 > end) return;
+  const proof = decodeDepositProof(calldata.subarray(proofStart, proofStart + length));
+  const log = await verifyReceiptLog(cfg, trust, proof, emitter);
+  if (log.topics.length !== 2 || !eq(log.topics[0], topics[kind]) ||
+    log.data.length !== (kind === 'complete' ? 224 : 288) || !eq(log.data.subarray(32, 64), domain)) return;
+  return log.data.slice(64, 96);
+}
+
 class Pages {
   private readonly tree: Uint8Array[][];
   constructor(private readonly evidence: Uint8Array) {

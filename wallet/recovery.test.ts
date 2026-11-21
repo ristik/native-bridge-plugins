@@ -1368,6 +1368,7 @@ test('local Complete wins over peer Progress and peer Complete installs no unsig
   chain.autoMine = false;
   assert.equal((await resumePayout(recipient, adopted, caps)).state, 'pending');
   assert.equal(journal(recipient).pending.cut.kind, 'settle');
+  chain.dropPool(); // Exercise the second receiver's independent quote without a visible competing settlement.
   assert.equal((await resumePayout(oldReceiver, staged, caps)).state, 'pending');
   assert.equal(journal(oldReceiver).pending.cut.kind, 'settle');
   chain.dropPool();
@@ -1561,6 +1562,12 @@ test('peer ordinary Paid crosses reader capabilities and preempts cold admission
     return rpc.call<T>(method, params);
   } };
   const holder = await open('holder', discoveryOnly);
+  for (const expected of ['pending', 'pending', 'needs-archive']) {
+    const reopened = await open('holder', discoveryOnly);
+    assert.deepEqual((await reconcileReturn(reopened, ordinary, caps, undefined, false)).result,
+      { state: expected, txHash: paid.txHash });
+  }
+  await assert.rejects(restoreReturn(holder, backup), /needs archive/);
   const result = await resumePayout(holder, ordinary, archive, false, true);
   assert.equal(result.state, 'paid');
   assert.ok(proofs > 0, 'the reader with the proof need not index the event');
@@ -1714,4 +1721,134 @@ test('exact failed sends can combine a retained header with a body-only or raw-o
       assert.ok(partial.requests() > 0);
     });
   }
+});
+
+test('a visible peer settlement stops both routes before signing, and hidden concurrent sends pay once', async (t) => {
+  const { w, chain, dir, cfg, deployment, open, rpc } = await setup(t);
+  const signing = join(dir, 'one-payer-signing.json');
+  await burn(w, 'coin', undefined, undefined, caps, signing);
+  const rec = await w.returnRecord('coin');
+  const relay = await open('settlement-peer');
+  chain.fund(relay.signer.address, 10n ** 18n);
+  const remote = await restoreReturn(relay, signing, caps);
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const packet = await session.run(0, 2, w.trust);
+  const verdict = await verifyReturn(chain.gamma, evidenceOf(unhex(rec.burned!)), w.trust, TEST_PARAMS);
+  chain.coldCall = async (vault, to, data) => {
+    if (eq(to, deployment.recovery)) return [{ address: to, topics: packet.event.topics, data: packet.event.data }];
+    if (eq(to, cfg.vault) && hx(data.subarray(0, 4)) === selector('redeemRecovered(bytes)')) {
+      vault.redeem(verdict.eta, 0n, new Uint8Array(), { ret: verdictAbi(verdict) });
+      return [];
+    }
+    return undefined;
+  };
+  assert.equal((await recoverStep(relay, remote, caps)).state, 'checkpoint');
+  chain.autoMine = false;
+  const other = await recoverStep(relay, remote, caps);
+  assert.equal(other.state, 'pending');
+  const active = join(dir, 'peer-active.json');
+  publishReturnBackup(relay, remote, active);
+  const held = await restoreReturn(w, active);
+  const saved = () => JSON.parse(readFileSync(join(w.dir, `recovery-${held.returnId.slice(2)}.json`), 'utf8'));
+  assert.ok(saved().complete);
+  assert.equal(saved().pending, undefined);
+  for (const ordinary of [false, true]) {
+    assert.deepEqual(await resumePayout(w, held, caps, ordinary), { state: 'pending', txHash: other.txHash });
+    assert.equal(saved().pending, undefined);
+    assert.equal((await w.returnRecord('coin')).executionPayer, undefined);
+    assert.deepEqual((await w.returnRecord('coin')).sends, []);
+  }
+
+  // Another gateway can keep its mempool private. This check cannot coordinate the two payers.
+  const hidden: JsonRpc = { call: async <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber' && params[0] === 'pending') return null as T;
+    const result = await rpc.call<T>(method, params);
+    if (method === 'eth_sendRawTransaction') await chain.flush();
+    return result;
+  } };
+  const holder = await open('holder', hidden);
+  assert.equal((await resumePayout(holder, held, caps, true)).state, 'paid');
+  const ordinary = (await holder.returnRecord('coin')).sends.at(-1)!;
+  const duplicate = decodeSignedTx(unhex(ordinary.raw));
+  assert.notDeepEqual(duplicate.hash, other.txHash);
+  assert.deepEqual(duplicate.from, holder.signer.address);
+  assert.equal(BigInt((await holder.bridge.evm.receipt(duplicate.hash))!.status), 0n);
+  assert.equal(chain.vault.events.filter((event) => event.name === 'Paid').length, 1);
+  const reconciled = (await reconcileReturn(holder, held, caps)).result;
+  assert.equal(reconciled.state, 'paid');
+  assert.deepEqual(reconciled.txHash, other.txHash);
+});
+
+test('a certified exact failure retires a stale remembered Paid hint on reconcile and restore', async (t) => {
+  const { w, chain, cfg, dir, open, rpc, rpcOn } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const original = join(dir, 'before-fork-payment.json');
+  publishReturnBackup(w, rec, original);
+  let raw!: Uint8Array;
+  const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_sendRawTransaction') {
+      raw = unhex(params[0] as string);
+      throw new Error('after journal before send');
+    }
+    return rpc.call<T>(method, params);
+  } };
+  await assert.rejects(resumePayout(await open('holder', interrupted), rec, caps, true), /after journal before send/);
+  const tx = decodeSignedTx(raw).hash;
+  const successful = chain.fork();
+  await successful.mine([raw]); // Receipt and log appear, but no child has certified them.
+  const speculative = await open('holder', rpcOn(successful));
+  assert.deepEqual((await reconcileReturn(speculative, rec, caps, undefined, false)).result, { state: 'pending', txHash: tx });
+  assert.equal((await speculative.returnRecord('coin')).paidProof?.reads, 1);
+  cpSync(w.dir, join(dir, 'restore-failed-branch'), { recursive: true });
+
+  chain.coldCall = async (_vault, to) => {
+    if (eq(to, cfg.vault)) throw new Nb2Error('PayoutFailed');
+    return undefined;
+  };
+  await chain.mine([raw]);
+  await chain.mine([]);
+  const failed = await open('holder', rpc);
+  assert.equal((await reconcileReturn(failed, rec, caps, undefined, false)).result.state, 'not-paid');
+  assert.equal((await failed.returnRecord('coin')).paidProof, undefined);
+  assert.equal((await failed.returnRecord('coin')).sends.at(-1)!.failed?.txHash, hx(tx));
+  const restored = await open('restore-failed-branch', rpc, { seed: key('holder') });
+  const recovered = await restoreReturn(restored, original);
+  assert.equal(recovered.paidProof, undefined);
+  assert.equal(recovered.sends.at(-1)!.failed?.txHash, hx(tx));
+  assert.equal((await reconcileReturn(restored, recovered, caps)).result.state, 'not-paid');
+});
+
+test('Paid tries every eligible child header with every available companion source', async (t) => {
+  const { w, chain, dir, open, rpc } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const backup = join(dir, 'child-branch.json');
+  publishReturnBackup(w, rec, backup);
+  const relay = await open('child-branch-payer');
+  chain.fund(relay.signer.address, 10n ** 18n);
+  await restoreReturn(relay, backup);
+  const paid = await resumePayout(relay, rec, caps, true);
+  assert.equal(paid.state, 'paid');
+  const childNumber = `0x${(paid.blockNumber + 1n).toString(16)}`;
+  const child = await rpc.call<{ hash: string }>('eth_getBlockByNumber', [childNumber, false]);
+  const asked = new Set<string>();
+  const partial = await partialProofReader(t, async (method, params) => {
+    if (method === 'eth_getBlockByNumber' && params[0] === childNumber) return child;
+    if (method !== 'unicity_getSealCompanionV1') return null;
+    asked.add(String(params[0]));
+    if (params[0] === child.hash) return rpc.call(method, params);
+    return { status: 'unknown' };
+  });
+  // The primary's child has the correct parent but a different hash and no companion.
+  const primary: JsonRpc = { call: async <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber' && params[0] === childNumber) return { ...child, extraData: '0x99' } as T;
+    if (method === 'unicity_getSealCompanionV1') return { status: 'unknown' } as T;
+    return rpc.call<T>(method, params);
+  } };
+  const holder = await open('holder', primary);
+  assert.equal((await restoreReturn(holder, backup, partial.policy)).status, 'paid');
+  assert.ok(asked.has(child.hash));
+  assert.equal(asked.size, 2, 'the archive saw both child candidates');
 });

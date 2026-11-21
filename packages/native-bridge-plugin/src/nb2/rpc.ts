@@ -235,8 +235,7 @@ export class EvmReader {
       }
       return child.hash;
     };
-    const child = sources ? await proofFrom(sources, 'the child block header', childOf) : await childOf(this);
-    const companion = async (reader: EvmReader) => {
+    const companion = async (reader: EvmReader, child: Uint8Array) => {
       const l = await reader.rpc.call<{ status: string; companion?: { witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(child)]);
       const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
       checkCompanion(l.status, witnesses.length);
@@ -254,7 +253,18 @@ export class EvmReader {
       await authenticate?.(uc);
       return uc;
     };
-    return sources ? proofFrom(sources, 'the seal companion', companion) : companion(this);
+    if (!sources) return companion(this, await childOf(this));
+    const companions = new Map<string, Promise<Uint8Array>>();
+    return proofFrom(sources, 'a child block header and its seal companion', async (reader) => {
+      const child = await childOf(reader);
+      const key = hexOf(child);
+      let candidate = companions.get(key);
+      if (!candidate) {
+        candidate = proofFrom(sources, 'the seal companion', (source) => companion(source, child));
+        companions.set(key, candidate);
+      }
+      return candidate;
+    });
   }
 
   /** The root-to-leaf receipt-trie path of RLP(txIndex), from the block's receipts, whose trie must hash to the header's root. */
@@ -430,6 +440,22 @@ export class EvmReader {
 
   public async balance(address: Uint8Array, tag: 'latest' | bigint = 'latest'): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_getBalance', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getBalance');
+  }
+
+  /** Best-effort view of calls a gateway exposes in its pending block. */
+  public async pendingCalls(to: Uint8Array): Promise<{ hash: Uint8Array; calldata: Uint8Array }[]> {
+    const block = await this.rpc.call<{ transactions?: unknown[] } | null>('eth_getBlockByNumber', ['pending', true]);
+    const calls: { hash: Uint8Array; calldata: Uint8Array }[] = [];
+    if (!Array.isArray(block?.transactions)) return calls;
+    for (const tx of block.transactions.slice(0, 1024)) {
+      if (tx === null || typeof tx !== 'object') continue;
+      const call = tx as { to?: string; hash?: string; input?: string };
+      if (typeof call.to !== 'string' || call.to.toLowerCase() !== hexOf(to) ||
+        typeof call.hash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(call.hash) ||
+        typeof call.input !== 'string' || call.input.length > 2 + 2 * 393216 || !/^0x(?:[0-9a-f]{2})*$/i.test(call.input)) continue;
+      calls.push({ hash: bytesOf(call.hash, 'pending hash'), calldata: bytesOf(call.input, 'pending calldata') });
+    }
+    return calls;
   }
 
   /** The account nonce: 'pending' counts the pool (for signing), 'latest' only mined transactions (for deciding a send is dead). */

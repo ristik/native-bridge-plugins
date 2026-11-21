@@ -339,6 +339,12 @@ export class FakeChain implements JsonRpc {
       case 'eth_blockNumber': return q(top.header.number);
       case 'eth_maxPriorityFeePerGas': return q(1n);
       case 'eth_getBlockByNumber': {
+        if (p[0] === 'pending' && p[1] === true) {
+          return { transactions: this.pool.map((raw) => {
+            const tx = decodeSignedTx(raw);
+            return { hash: h(tx.hash), to: h(tx.request.to), input: h(tx.request.data) };
+          }) };
+        }
         const b = p[0] === 'latest' ? top : this.blocks[Number(BigInt(p[0]))];
         return b ? this.headerJson(b) : null;
       }

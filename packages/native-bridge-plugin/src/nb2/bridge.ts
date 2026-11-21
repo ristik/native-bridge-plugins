@@ -14,7 +14,7 @@
  *   - the burn index comes from a verified SegmentSealed receipt (or is zero), never from a plain RPC number outside test deployments.
  */
 import { concat, eq, toHex } from '../bytes.js';
-import { classifyRedeemError, decodeDeposited, decodePaid, decodeRevert, depositCalldata, redeemCalldata, redeemCalldataLength, type DecodedError, type RedeemAction } from './abi.js';
+import { classifyRedeemError, decodeDeposited, decodePaid, decodeRevert, depositCalldata, redeemCalldata, redeemCalldataLength, SELECTOR, type DecodedError, type RedeemAction } from './abi.js';
 import { ascii, beInt, cArr, cBytes, u256 } from './cbor.js';
 import { ASSET_UCT, buildParams, decodeConfig, domainOf, log2, type Build, type Config } from './config.js';
 import { HE, HU, parseKey, verifyUnlock } from './crypto.js';
@@ -28,6 +28,7 @@ import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type R
 import {
   Journal, dec, hex, undec, unhex, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
+import { recoveredSettlementEta } from './recovery.js';
 import { burnIndex, capacityExceeded, capacityPreflight, maxProofs, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
 import { AmbiguousBroadcast, EvmReader, ProofUnavailable, RpcError, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
@@ -121,6 +122,7 @@ export interface ReturnAdmission {
 }
 
 export interface RedeemOptions {
+  recovery?: Uint8Array;
   envelope?: ReturnAdmission['ordinaryEnvelope'];
   archives?: readonly EvmReader[];
   admit?: (request: TxRequest, prior: readonly SendRecord[]) => Promise<void>;
@@ -850,6 +852,7 @@ export class NativeBridgeV2 {
       // The signed request binds eta even when the holder has yet to obtain a terminal.
       const payment = { ...selected, eta };
       const payout = await this.findPaid(payment, archives, false, evidence);
+      selected = payment;
       if (payout) {
         await this.journal.putReturn(payment);
         if (payout.state === 'needs-archive') this.requireReturnArchive(payout.txHash);
@@ -1031,6 +1034,8 @@ export class NativeBridgeV2 {
       const rtx = await this.buildRedeemInner(returnId, options.envelope);
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const fresh = await this.returnRecord(returnId);
+      const competing = await this.settlementGate(fresh, archives, options.recovery);
+      if (competing) return competing;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
         options.admit && ((request) => options.admit!(request, fresh.sends)));
       fresh.executionPayer ??= hex(signer.address);
@@ -1040,7 +1045,7 @@ export class NativeBridgeV2 {
       await this.journal.putReturn(fresh);
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
-      const outcome = await this.reconcileSend(fresh, archives, false);
+      const outcome = await this.reconcileInner(returnId, archives, { readOnly: true });
       if (outcome.state !== 'not-paid') return outcome;
       // reverted: classify by simulating the same call at the current state
       const re = await this.evm.estimateGas({ from: signer.address, to: this.cfg.vault, data: rtx.calldata });
@@ -1071,6 +1076,48 @@ export class NativeBridgeV2 {
     return this.locked(`return/${toHex(returnId)}`, () => this.reconcileInner(returnId, archives, evidence));
   }
 
+  /** A final read-only check before signing a new settlement. */
+  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array): Promise<ReconcileResult> {
+    returnId = Uint8Array.from(returnId);
+    return this.locked(`return/${toHex(returnId)}`, async () => {
+      const rec = await this.returnRecord(returnId);
+      if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
+      if (!rec.eta) return { state: 'not-paid' };
+      return (await this.settlementGate(rec, archives, recovery)) ?? { state: 'not-paid' };
+    });
+  }
+
+  private async settlementGate(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array): Promise<ReconcileResult | undefined> {
+    const paid = await this.findPaid(rec, archives);
+    if (paid) return paid;
+    const eta = unhex(rec.eta!);
+    const failed = new Set(rec.sends.filter((s) => s.failed).map((s) => s.hash));
+    for (const reader of archives) {
+      let calls;
+      try {
+        calls = await reader.pendingCalls(this.cfg.vault);
+      } catch {
+        continue; // Pending-block transactions are optional gateway data.
+      }
+      for (const { hash, calldata } of calls) {
+        if (failed.has(hex(hash))) continue;
+        let matches = eq(calldata.subarray(0, 4), SELECTOR.redeem) && eq(calldata.subarray(36, 68), eta);
+        if (!matches && recovery) {
+          try {
+            const claimed = await recoveredSettlementEta(this.cfg, this.domain, this.opts.trust, recovery, calldata);
+            matches = claimed !== undefined && eq(claimed, eta);
+          } catch {
+            // A malformed or unverified pending call supplies no evidence.
+          }
+        }
+        if (!matches) continue;
+        const proof = await this.findPaid(rec, archives, true, { settlements: [hash] });
+        if (proof) return proof;
+        if (!(await this.exactFailure(hash, archives)).failed) return { state: 'pending', txHash: hash };
+      }
+    }
+  }
+
   private async reconcileInner(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm], evidence?: ReturnEvidence): Promise<ReconcileResult> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
@@ -1092,36 +1139,37 @@ export class NativeBridgeV2 {
     }
     let available = false;
     let unavailable: unknown;
-    let pending: Uint8Array | undefined;
-    let pruned: Uint8Array | undefined;
-    const hashes = new Map<string, Uint8Array>();
+    const candidates = new Map<string, Uint8Array>();
+    const hinted = new Map<string, { tx: Uint8Array; pruned: boolean }>();
+    const addHint = (tx: Uint8Array, pruned = false) => {
+      const key = hex(tx);
+      hinted.set(key, { tx, pruned: pruned || hinted.get(key)?.pruned === true });
+    };
     if (rec.paidProof) {
-      pending = unhex(rec.paidProof.txHash);
-      hashes.set(rec.paidProof.txHash, pending);
+      const tx = unhex(rec.paidProof.txHash);
+      candidates.set(rec.paidProof.txHash, tx);
+      addHint(tx);
     }
-    for (const tx of evidence?.settlements ?? []) hashes.set(hex(tx), tx);
+    for (const tx of evidence?.settlements ?? []) candidates.set(hex(tx), tx);
     for (const send of rec.sends) {
       const { hash } = decodeSignedTx(unhex(send.raw));
-      hashes.set(hex(hash), hash);
+      candidates.set(hex(hash), hash);
     }
-    const signed = new Set(hashes.keys());
-    const searched = new Map<EvmReader, Set<string>>();
-    const read = async (reader: EvmReader, tx: Uint8Array) => {
-      let tried = searched.get(reader);
-      if (!tried) searched.set(reader, tried = new Set());
-      if (tried.has(hex(tx))) return;
-      tried.add(hex(tx));
-      const result = await this.verifiedPaid(rec, tx, reader, persist, archives);
-      if (result?.state === 'needs-archive') pruned ??= tx;
-      if (result?.state === 'pending') pending ??= tx;
-      if (result?.state === 'paid') return result;
-    };
-    for (const tx of hashes.values()) {
-      for (const reader of archives) {
-        const result = await read(reader, tx);
-        if (result) return result;
+    const searched = new Set<string>();
+    const verify = async () => {
+      for (const [hash, tx] of candidates) {
+        if (searched.has(hash)) continue;
+        searched.add(hash);
+        for (const reader of archives) {
+          const result = await this.verifiedPaid(rec, tx, reader, persist, archives);
+          if (result?.state === 'paid') return result;
+          if (result?.state === 'pending' || result?.state === 'needs-archive') addHint(tx, result.state === 'needs-archive');
+        }
       }
-    }
+    };
+    const localPaid = await verify();
+    if (localPaid) return localPaid;
+
     for (const reader of archives) {
       try {
         const logs = await reader.paid(this.cfg.vault, eta, undec(rec.fromBlock));
@@ -1129,30 +1177,47 @@ export class NativeBridgeV2 {
           const p = decodePaid(l);
           if (p === null || !eq(l.address, this.cfg.vault) || !eq(p.eta, eta) ||
             !eq(p.recipient, unhex(rec.recipient)) || p.amount !== undec(rec.amount) || l.blockNumber < undec(rec.fromBlock)) continue;
-          if (signed.has(hex(l.transactionHash))) pending ??= l.transactionHash;
-          hashes.set(hex(l.transactionHash), l.transactionHash);
+          addHint(l.transactionHash);
+          candidates.set(hex(l.transactionHash), l.transactionHash);
         }
         available = true;
       } catch (e) {
         unavailable = e;
       }
     }
-    for (const tx of hashes.values()) {
-      for (const reader of archives) {
-        const result = await read(reader, tx);
-        if (result) return result;
+    const discoveredPaid = await verify();
+    if (discoveredPaid) return discoveredPaid;
+
+    let changed = false;
+    // Indexed or remembered claims trigger proof reads. A certified failure retires only that exact claim.
+    for (const [hash, { tx }] of hinted) {
+      const send = rec.sends.find((s) => hex(decodeSignedTx(unhex(s.raw)).hash) === hash);
+      const failure = send?.failed ?? (await this.exactFailure(tx, archives)).failed;
+      if (!failure) continue;
+      if (send && !send.failed) {
+        if (send.hash !== hash) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
+        send.failed = failure;
+        delete send.failureProofReads;
+        changed = true;
       }
+      if (rec.paidProof?.txHash === hash) {
+        delete rec.paidProof;
+        changed = true;
+      }
+      hinted.delete(hash);
     }
-    const hinted = pruned ?? pending;
-    if (hinted) {
-      const txHash = hex(hinted);
-      const reads = pruned ? FAILURE_PROOF_READS : Math.min(FAILURE_PROOF_READS, (rec.paidProof?.txHash === txHash ? rec.paidProof.reads : 0) + 1);
+    const next = [...hinted.values()].find(({ pruned }) => pruned) ?? hinted.values().next().value;
+    if (next) {
+      const txHash = hex(next.tx);
+      const reads = next.pruned ? FAILURE_PROOF_READS : Math.min(FAILURE_PROOF_READS, (rec.paidProof?.txHash === txHash ? rec.paidProof.reads : 0) + 1);
       if (rec.paidProof?.txHash !== txHash || rec.paidProof.reads !== reads) {
         rec.paidProof = { txHash, reads };
-        if (persist) await this.journal.putReturn(rec);
+        changed = true;
       }
-      return { state: reads >= FAILURE_PROOF_READS ? 'needs-archive' : 'pending', txHash: hinted };
+      if (changed && persist) await this.journal.putReturn(rec);
+      return { state: reads >= FAILURE_PROOF_READS ? 'needs-archive' : 'pending', txHash: next.tx };
     }
+    if (changed && persist) await this.journal.putReturn(rec);
     if (!available && unavailable) throw unavailable;
   }
 
@@ -1167,38 +1232,14 @@ export class NativeBridgeV2 {
       if (send.failed.txHash !== hex(txHash) || unhex(send.failed.blockHash).length !== 32) refuse('BadInput', 'certified failure disagrees with its signed transaction');
       return { state: 'not-paid' };
     }
-    let seen = false;
-    let failed = false;
-    let pruned = false;
-
-    for (const reader of archives) {
-      let receipt: ReceiptJson | null;
-      try {
-        receipt = await reader.receipt(txHash);
-      } catch {
-        continue;
-      }
-      if (!receipt) continue;
-      seen = true;
-      if (BigInt(receipt.status) === 1n) {
-        const paid = await this.findPaid(rec, archives);
-        if (paid) return paid;
-        continue;
-      }
-      failed = true;
-      try {
-        await this.retryingTrust(() => reader.verifyFailedReceipt(txHash, this.cfg, this.opts.trust, receipt, archives));
-      } catch (e) {
-        if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
-        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
-        continue;
-      }
-      send.failed = { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) };
+    const { seen, pruned, attempted, failed } = await this.exactFailure(txHash, archives);
+    if (failed) {
+      send.failed = failed;
       delete send.failureProofReads;
       await this.journal.putReturn(rec);
       return { state: 'not-paid' };
     }
-    if (failed || send.failureProofReads !== undefined) {
+    if (attempted || send.failureProofReads !== undefined) {
       const reads = pruned ? FAILURE_PROOF_READS : Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
       if (reads !== send.failureProofReads) {
         send.failureProofReads = reads;
@@ -1211,6 +1252,27 @@ export class NativeBridgeV2 {
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
     return { state: 'pending', txHash };
+  }
+
+  private async exactFailure(txHash: Uint8Array, archives: readonly EvmReader[]) {
+    let seen = false;
+    let attempted = false;
+    let pruned = false;
+    for (const reader of archives) {
+      try {
+        const receipt = await reader.receipt(txHash);
+        if (!receipt) continue;
+        seen = true;
+        if (BigInt(receipt.status) !== 0n) continue;
+        attempted = true;
+        await this.retryingTrust(() => reader.verifyFailedReceipt(txHash, this.cfg, this.opts.trust, receipt, archives));
+        return { seen, attempted, pruned, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
+      } catch (e) {
+        if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
+      }
+    }
+    return { seen, attempted, pruned, failed: undefined };
   }
 
   /**

@@ -150,6 +150,7 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy
   return {
     envelope: ordinaryEnvelope(w, policy),
     archives: readers(w, policy),
+    recovery: w.release.recovery === undefined ? undefined : recoveryRelease(w).deployment.recovery,
     admit: async (req, prior) => {
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior));
@@ -798,6 +799,11 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     const nonce = await w.bridge.evm.nonce(w.signer.address);
     if (quote === null || nonce > limits.maxNonce || quote.fee > limits.feeBudget || quote.fee > limits.balance) {
       throw new Nb2Error('CapacityPreflight', 'packet exceeds the remaining payer limits');
+    }
+    if (cut.kind === 'settle') {
+      const competing = await w.bridge.checkSettlement(bytes(rec.returnId, 32), archive, release.deployment.recovery);
+      if (competing.state === 'paid') retainPayment(w, rec, hx(competing.txHash));
+      if (competing.state !== 'not-paid') return competing;
     }
     if (!current.executionPayer) {
       const durable = (await w.bridge.journal.retForUpdate(rec.returnId))!;

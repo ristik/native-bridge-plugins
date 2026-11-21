@@ -136,6 +136,13 @@ Progress, Gap and packet schedules stay in the originating journal. A backup mad
 is unresolved or a run is incomplete identifies an active payer handoff and refuses import into
 a fresh journal. Ask the active payer to resume or produce a resolved Complete or Paid backup.
 
+Before signing a settlement, both payout routes check for certified Paid and for known
+settlement transactions for the same redemption ID in the readers' pending views. A visible
+pending settlement defers signing. Wallet copies use separate journals, and a gateway may
+hide its pending transactions. Two concurrent payers can therefore sign settlements from
+the same backup. The vault pays the return once and rejects the second settlement. With two
+competing payers, the second payer can lose one transaction fee.
+
 Redeem, redeem with recovery, resume, import and restore check for certified Paid before
 qualifying or signing a payout. Import authenticates the source, return ID, recipient, amount
 and start anchor. Import and restore read EVM receipts without broadcasting transactions.
@@ -174,6 +181,13 @@ or three reads of the configured sources leave the proof unavailable, **needs ar
 the transaction that needs a complete proof. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
+
+Indexed logs and remembered hints identify transactions for proof retrieval. A matching
+certified vault receipt establishes Paid on either route. The wallet tries every eligible
+child header with the companion sources. A verified exact failure clears any older Paid hint
+for that transaction and the wallet continues looking for a certified payout on the same
+redemption ID. An indexed peer payment without available proof stays pending during bounded
+reads and then reports **needs archive** with the peer transaction hash.
 
 Use `redeem --recover` or `resume --recover` to select recovery once outstanding ordinary sends
 are resolved. Use `--ordinary` to select ordinary after any recovery send resolves. Both routes
