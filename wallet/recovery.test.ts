@@ -657,7 +657,7 @@ test('route switching refuses unresolved signed sends in either direction after 
       }
       const otherPayer = await open('holder', transport, { seed: key('different active payer') });
       assert.deepEqual(await resumePayout(otherPayer, rec, caps, active === 'ordinary'),
-        { state: 'route-blocked', route: active, txHash: hash });
+        { state: 'route-blocked', route: active, txHash: hash, payer: restarted.signer.address });
       assert.equal(sends.length, 1, 'a blocked switch neither signs nor reoffers a send');
     });
   }
@@ -940,7 +940,7 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   const cost = request.gas * request.maxFeePerGas + (1_721_000n + 16n * BigInt(settlement.calldata.length)) * caps.maxFeePerGas;
   assert.deepEqual((await restoreReturn(reopened, portable)).sends, adopted.sends);
   const localPlan = await qualifyExistingRecovery(reopened, adopted, caps);
-  assert.deepEqual(localPlan.recovery!.runCuts, []);
+  assert.equal(localPlan.recovery, undefined);
   await assert.rejects(recoverStep(reopened, localPlan, { ...caps, feeBudget: cost - 1n }), { rule: 'CapacityPreflight' });
   chain.autoMine = false;
   assert.equal((await recoverStep(reopened, localPlan, { ...caps, feeBudget: cost })).state, 'pending');
@@ -1314,6 +1314,13 @@ test('local Complete wins over peer Progress and peer Complete installs no unsig
   const split = await restoreReturn(peer, signed, caps);
   assert.deepEqual(split.recovery!.runCuts, [1, 1]);
   assert.equal((await recoverStep(peer, split, caps)).state, 'checkpoint');
+  const replacement = await open('prefix-peer', rpc, { seed: key('replacement payer after certified Progress') });
+  chain.fund(replacement.signer.address, 10n ** 18n);
+  const heldProgress = readFileSync(saved(peer), 'utf8');
+  const refusal = await resumePayout(replacement, split, caps);
+  assert.equal(refusal.state, 'route-blocked');
+  assert.deepEqual(refusal.payer, peer.signer.address);
+  assert.equal(readFileSync(saved(peer), 'utf8'), heldProgress);
   const file = join(dir, 'peer-incomplete.json');
   publishReturnBackup(peer, split, file);
   const incomplete = JSON.parse(readFileSync(file, 'utf8'));
@@ -1342,15 +1349,29 @@ test('local Complete wins over peer Progress and peer Complete installs no unsig
   assert.equal(offered.handoff, undefined);
   assert.equal(offered.pending.recovery, undefined);
   offered.pending.recovery = { ...split.recovery, runCuts: [16], advanceGaps: 1 };
-  release.recovery.ranges = release.recovery.ranges.filter(({ max }: { max: { entry: string } }) => max.entry !== 'run');
+  const stale = await open('complete-obsolete-plan');
+  chain.fund(stale.signer.address, 10n ** 18n);
+  const staged = await restoreReturn(stale, signed, caps);
+  assert.ok(staged.recovery!.advanceGaps > 1);
+  release.recovery.ranges = release.recovery.ranges.filter(({ max }: { max: { entry: string; gaps: number } }) =>
+    max.entry === 'advanceGaps' && max.gaps === 1 || max.entry === 'redeemRecovered' && max.gaps === 0);
   writeFileSync(manifest, JSON.stringify(release));
   const recipient = await open('complete-recipient');
-  chain.fund(recipient.signer.address, 10n ** 18n);
   const adopted = await importReturn(recipient, offered, caps);
-  assert.deepEqual(adopted.recovery!.runCuts, []);
-  assert.equal(adopted.recovery!.advanceGaps, original.recovery!.advanceGaps);
+  assert.equal(adopted.recovery, undefined, 'an unfunded recipient journals Complete before settlement qualification');
   assert.equal(journal(recipient).cuts.length, 0);
   assert.equal(journal(recipient).complete.seq, '2');
+  const oldReceiver = await open('complete-obsolete-plan');
+  assert.equal((await importReturn(oldReceiver, offered, caps)).recovery, undefined, 'the obsolete plan was removed');
+  assert.equal((await restoreReturn(oldReceiver, signed, caps)).recovery, undefined, 'an older backup cannot restart the lineage');
+  chain.fund(recipient.signer.address, 10n ** 18n);
+  chain.autoMine = false;
+  assert.equal((await resumePayout(recipient, adopted, caps)).state, 'pending');
+  assert.equal(journal(recipient).pending.cut.kind, 'settle');
+  assert.equal((await resumePayout(oldReceiver, staged, caps)).state, 'pending');
+  assert.equal(journal(oldReceiver).pending.cut.kind, 'settle');
+  chain.dropPool();
+  chain.autoMine = true;
   const before = readFileSync(saved(local), 'utf8');
   await importReturn(local, offered, caps);
   assert.equal(readFileSync(saved(local), 'utf8'), before, 'local Complete also wins over an equivalent terminal');
@@ -1451,6 +1472,9 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
         reconcileReturn(device, rec, caps).then(({ result }) => result);
       const submitted = await resumePayout(first, rec, caps, route === 'ordinary');
       assert.equal(submitted.state, 'pending', route);
+      const activeBackup = join(dir, 'active-return.json');
+      publishReturnBackup(first, await first.returnRecord('coin'), activeBackup);
+      const exported = JSON.parse(readFileSync(activeBackup, 'utf8'));
       await chain.mine([]);
       cpSync(first.dir, join(dir, 'missing-raw'), { recursive: true });
       let rawReads = 0;
@@ -1461,8 +1485,15 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
       } };
       for (let i = 0; i < 3; i++) {
         const restart = await open('holder', incomplete);
-        const outcome = await run(restart);
-        assert.equal(outcome.state, i === 0 ? 'pending' : 'needs-archive');
+        if (route === 'ordinary') {
+          if (i === 0) assert.equal((await restoreReturn(restart, activeBackup, caps)).sends.at(-1)!.failureProofReads, 2);
+          else if (i === 1) await assert.rejects(importReturn(restart, exported, caps), /needs archive/);
+          else await assert.rejects(restoreReturn(restart, activeBackup, caps), /needs archive/);
+          assert.equal((await restart.returnRecord('coin')).sends.at(-1)!.failureProofReads, i === 0 ? 2 : 3);
+        } else {
+          const outcome = await run(restart);
+          assert.equal(outcome.state, i === 0 ? 'pending' : 'needs-archive');
+        }
       }
       assert.ok(rawReads >= 3);
       const lagging: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
@@ -1473,7 +1504,14 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
       const pruned = await open('missing-raw', missing, { seed: key('holder') });
       assert.equal((await run(pruned)).state, 'needs-archive');
       const restored = await open('holder', archive);
-      assert.equal((await run(restored)).state, route === 'cold' ? 'retry' : 'not-paid');
+      if (route === 'ordinary') assert.ok((await restoreReturn(restored, activeBackup, caps)).sends.at(-1)!.failed);
+      else assert.equal((await run(restored)).state, 'retry');
+      const failureExport = join(dir, 'verified-failure.json');
+      publishReturnBackup(restored, await restored.returnRecord('coin'), failureExport);
+      const failed = JSON.parse(readFileSync(failureExport, 'utf8'));
+      assert.equal(failed.handoff, 'active');
+      assert.equal(failed.activePayer, hx(restored.signer.address));
+      await assert.rejects(restoreReturn(await open('premature-handoff'), failureExport), /active payer handoff is blocked.*with payer 0x/);
       if (route === 'ordinary') {
         const last = (await restored.returnRecord('coin')).sends.at(-1)!;
         assert.equal(last.failed!.txHash, hx(decodeSignedTx(unhex(last.raw)).hash));
@@ -1531,8 +1569,26 @@ test('peer ordinary Paid crosses reader capabilities and preempts cold admission
   assert.deepEqual(held.paid, (await peer.bridge.journal.ret(ordinary.returnId))!.paid);
 });
 
-test('a pruned Paid header is actionable and can come from a header-only reader on either route', async (t) => {
+async function partialProofReader(t: TestContext, read: (method: string, params: unknown[]) => Promise<unknown>) {
   const { createServer } = await import('node:http');
+  let requests = 0;
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const { id, method, params } = JSON.parse(Buffer.concat(chunks).toString());
+    requests++;
+    try {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id, result: await read(method, params) }));
+    } catch (error) {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message: String(error) } }));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return { policy: { ...caps, archives: [`http://127.0.0.1:${(server.address() as { port: number }).port}`] }, requests: () => requests };
+}
+
+test('each mined Paid proof component escalates when absent and works with split readers', async (t) => {
   for (const route of ['ordinary', 'recovery'] as const) {
     await t.test(route, async (t) => {
       const { w, chain, dir, cfg, deployment, open, rpc } = await setup(t, route === 'ordinary');
@@ -1566,40 +1622,96 @@ test('a pruned Paid header is actionable and can come from a header-only reader 
       await chain.mine([raw]);
       await chain.mine([]);
       const receipt = (await w.bridge.evm.receipt(tx))!;
-      let missingAsError = false;
-      const pruned: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
-        if (method === 'eth_getBlockByHash' && params[0] === receipt.blockHash) {
-          if (missingAsError) return Promise.reject(new RpcError(200, -32000, 'unknown block'));
-          return Promise.resolve(null as T);
-        }
-        if (method === 'eth_sendRawTransaction') throw new Error('must reconcile before sending');
-        return rpc.call<T>(method, params);
-      } };
-      for (let i = 0; i < 2; i++) {
-        missingAsError = i === 1;
-        const restarted = await open('holder', pruned);
-        assert.deepEqual(await resumePayout(restarted, rec, caps, route === 'ordinary'), { state: 'needs-archive', txHash: tx });
-        await assert.rejects(restoreReturn(restarted, backup), /needs archive for payment/);
+      const childNumber = `0x${(BigInt(receipt.blockNumber) + 1n).toString(16)}`;
+      const child = await rpc.call<{ hash: string }>('eth_getBlockByNumber', [childNumber, false]);
+      const kinds = [
+        { name: 'transaction receipt', method: 'eth_getTransactionReceipt', arg: hx(tx), hard: false },
+        { name: 'block header', method: 'eth_getBlockByHash', arg: receipt.blockHash, hard: true },
+        { name: 'child header', method: 'eth_getBlockByNumber', arg: childNumber, hard: false },
+        { name: 'seal companion', method: 'unicity_getSealCompanionV1', arg: child.hash, hard: false },
+        { name: 'block receipts', method: 'eth_getBlockReceipts', arg: receipt.blockHash, hard: true },
+      ];
+      for (const kind of kinds) {
+        await t.test(kind.name, async (t) => {
+          const name = kind.method;
+          cpSync(w.dir, join(dir, name), { recursive: true });
+          const matches = (method: string, params: unknown[]) => method === kind.method && params[0] === kind.arg;
+          const absent: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+            if (matches(method, params)) {
+              if (kind.method === 'eth_getBlockReceipts') return Promise.reject(new RpcError(413, 0, 'answer too large'));
+              if (kind.method === 'eth_getBlockByHash') return Promise.reject(new RpcError(200, -32000, 'unknown block'));
+              return Promise.resolve(null as T);
+            }
+            if (method === 'eth_sendRawTransaction') throw new Error('must reconcile before sending');
+            return rpc.call<T>(method, params);
+          } };
+          const reopened = () => open(name, absent, { seed: key('holder') });
+          for (let i = 0; i < 3; i++) {
+            const rejoined = await reopened();
+            const expected = kind.hard || i === 2 ? 'needs-archive' : 'pending';
+            assert.deepEqual(await resumePayout(rejoined, rec, caps, route === 'ordinary'), { state: expected, txHash: tx });
+            assert.equal((await rejoined.returnRecord('coin')).paidProof?.reads, kind.hard ? 3 : i + 1);
+          }
+          await assert.rejects(restoreReturn(await reopened(), backup), /needs archive/);
+          let componentReads = 0;
+          const partial = await partialProofReader(t, async (method, params) => {
+            if (!matches(method, params)) return null;
+            componentReads++;
+            return rpc.call(method, params);
+          });
+          const holder = await reopened();
+          assert.equal((await resumePayout(holder, rec, partial.policy, route === 'ordinary')).state, 'paid');
+          assert.ok(componentReads > 0);
+          assert.equal((await holder.returnRecord('coin')).paid!.txHash, hx(tx));
+          assert.equal((await holder.returnRecord('coin')).paidProof, undefined);
+        });
       }
-      let headerReads = 0;
-      const server = createServer(async (req, res) => {
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(chunk);
-        const { id, method, params } = JSON.parse(Buffer.concat(chunks).toString());
-        let result = null;
-        if (method === 'eth_getBlockByHash' && params[0] === receipt.blockHash) {
-          headerReads++;
-          result = await rpc.call(method, params);
-        }
-        res.end(JSON.stringify({ jsonrpc: '2.0', id, result }));
+    });
+  }
+});
+
+test('exact failed sends can combine a retained header with a body-only or raw-only reader', async (t) => {
+  const { w, cfg, chain, dir, open, rpc } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  chain.coldCall = async (_vault, to) => {
+    if (eq(to, cfg.vault)) throw new Nb2Error('PayoutFailed');
+    return undefined;
+  };
+  let signed!: Uint8Array;
+  const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_estimateGas') return Promise.resolve('0x1d4c0' as T);
+    if (method === 'eth_sendRawTransaction') {
+      signed = unhex(params[0] as string);
+      throw new Error('offline after signing');
+    }
+    return rpc.call<T>(method, params);
+  } };
+  await assert.rejects(resumePayout(await open('holder', interrupted), rec, caps, true), /offline after signing/);
+  const hash = decodeSignedTx(signed).hash;
+  await chain.mine([signed]);
+  await chain.mine([]);
+  const receipt = (await w.bridge.evm.receipt(hash))!;
+  for (const method of ['eth_getBlockByHash', 'eth_getRawTransactionByBlockHashAndIndex']) {
+    await t.test(method, async (t) => {
+      cpSync(w.dir, join(dir, method), { recursive: true });
+      const matches = (query: string, params: unknown[]) => query === method && params[0] === receipt.blockHash;
+      const primary: JsonRpc = { call: async <T>(query: string, params: unknown[]): Promise<T> => {
+        if (!matches(query, params)) return rpc.call<T>(query, params);
+        if (method !== 'eth_getBlockByHash') return null as T;
+        const { transactions: _body, ...header } = await rpc.call<Record<string, unknown>>(query, params);
+        return header as T;
+      } };
+      const holder = await open(method, primary, { seed: key('holder') });
+      assert.deepEqual((await reconcileReturn(holder, rec, caps)).result, { state: 'needs-archive', txHash: hash });
+      const partial = await partialProofReader(t, async (query, params) => {
+        if (!matches(query, params)) return null;
+        const value = await rpc.call(query, params);
+        return method === 'eth_getBlockByHash' ? { transactions: (value as { transactions: string[] }).transactions } : value;
       });
-      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-      t.after(() => { server.closeAllConnections(); server.close(); });
-      const policy = { ...caps, archives: [`http://127.0.0.1:${(server.address() as { port: number }).port}`] };
-      const holder = await open('holder', pruned);
-      assert.equal((await resumePayout(holder, rec, policy, route === 'ordinary')).state, 'paid');
-      assert.ok(headerReads);
-      assert.equal((await holder.returnRecord('coin')).paid!.txHash, hx(tx));
+      assert.equal((await reconcileReturn(holder, rec, partial.policy)).result.state, 'not-paid');
+      assert.ok((await holder.returnRecord('coin')).sends.at(-1)!.failed);
+      assert.ok(partial.requests() > 0);
     });
   }
 });

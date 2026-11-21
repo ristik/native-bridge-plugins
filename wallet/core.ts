@@ -41,7 +41,7 @@ import {
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
-import { qualifyExistingRecovery, reconcileReturn, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
+import { hasPeerComplete, qualifyExistingRecovery, reconcileReturn, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -801,7 +801,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
 export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false, cold = false): Promise<RecoveryResult | ReconcileResult> {
   rec = (await w.bridge.journal.ret(rec.returnId)) ?? rec;
   if (cold) rec = await qualifyExistingRecovery(w, rec, policy);
-  return rec.recovery && !ordinary ? recoverStep(w, rec, policy) : redeemOrdinary(w, rec, policy);
+  return (rec.recovery || hasPeerComplete(w, rec)) && !ordinary ? recoverStep(w, rec, policy) : redeemOrdinary(w, rec, policy);
 }
 
 /** Receive and verify the complete held lineage before adding it to spendable storage. */

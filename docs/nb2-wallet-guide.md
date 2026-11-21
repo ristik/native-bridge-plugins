@@ -129,7 +129,8 @@ A fresh relayer needs a policy that accounts for any fees it already spent.
 ### Return journal reconciliation
 
 Use one active payer per burn. Hand the initial signed backup to the selected payer before any
-EVM send. Once a payer starts, resume with its own journal and key. Hand off at certified
+EVM send. The first payout send binds the payer's address for the life of that journal.
+Resume with that key after Progress, after a certified failure and when switching resolved routes. Hand off at certified
 Complete or Paid. This lets the next payer settle a completed lineage under its own limits.
 Progress, Gap and packet schedules stay in the originating journal. A backup made while a send
 is unresolved or a run is incomplete identifies an active payer handoff and refuses import into
@@ -141,19 +142,21 @@ and start anchor. Import and restore read EVM receipts without broadcasting tran
 
 | Local state | Signed request or certified burn | Peer Progress or Gap | Certified Complete | Certified Paid, either route |
 | --- | --- | --- | --- | --- |
-| Absent or planned | Adopt matching request and certify, or attach supplied terminal | Refuse active payer handoff | Adopt terminal proof and price local settlement when requested | Adopt with matching signed request |
-| Signed burn or local recovery in progress | Reconcile the exact request and any local send | Keep local progress and reconcile its send | Reconcile local send first, then adopt Complete if still needed | Record Paid, retain local signed bytes |
+| Absent or planned | Adopt matching request and certify, or attach supplied terminal | Refuse active payer handoff | Store terminal proof independently of funding | Adopt with matching signed request |
+| Signed burn, no local execution | Reconcile the exact request | Refuse an active payer handoff and identify the original payer | Store Complete independently of funding | Record Paid |
+| Local recovery in progress | Reconcile the exact send | Keep local progress and reconcile its send | Reconcile local send first, then store Complete and clear the obsolete plan | Record Paid, retain local signed bytes |
 | Local Complete or later local Gap | Keep local checkpoint | Keep local checkpoint | Keep local checkpoint | Record Paid and close continuation |
 | Ordinary send unresolved | Keep exact send | Keep exact send | Require ordinary send resolution before activating recovery | Record Paid and keep the send and its fees |
 | Paid | Report Paid and attach a matching burn terminal if missing | Report Paid | Report Paid | Keep Paid |
 
 A Complete receipt is verified against its own burn and redemption ID. The receiver stores
-the receipt directly and qualifies the remaining gap and settlement transactions under its
-own limits. It keeps any local signed nonce obligation until reconciliation. The operator may
+the receipt directly and clears any obsolete plan. The payer qualifies remaining gap and
+settlement work from Complete and current limits when executing the next packet. It keeps any local signed nonce obligation until reconciliation. The operator may
 switch routes only after the other route's send has resolved. **Route blocked** identifies the
 transaction and route to resume with the active payer. Pool eviction alone leaves a signed
 transaction unresolved. A verified ordinary failure is recorded against the exact signed hash
-before permitting another send. Fee history survives either route.
+before permitting another send. Restore and import keep the proof-read count and report the
+same archive requirement as redeem. Fee history survives either route.
 
 | Receipt outcome | Transition |
 | --- | --- |
@@ -164,10 +167,11 @@ before permitting another send. Fee history survives either route.
 | Missing proof for mined Paid, or exact failure proof unavailable after bounded reads | Report **needs archive** with the exact transaction hash and retain signed bytes |
 
 Wallets can verify Paid from a portable receipt or by exact settlement hash. An indexed
-`Paid` log can supply a hash for discovery. The wallet tries all readers for proof, including
-an alternate reader for a pruned block header. If no reader serves the header, **needs archive**
-asks for a reader with the certified block data. For failed transactions, use a reader that
-also serves raw transactions for the certified block. A holder who learned of Paid before
+`Paid` log can supply a hash for discovery. Readers can supply individual proof components. The wallet checks the transaction receipt,
+block header, child header, seal companion and block receipts across readers. Exact failure
+also requires the certified transaction body and raw transactions. If a component is pruned,
+or three reads of the configured sources leave the proof unavailable, **needs archive** reports
+the transaction that needs a complete proof. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 

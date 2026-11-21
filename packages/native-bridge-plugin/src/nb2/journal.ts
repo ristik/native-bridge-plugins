@@ -152,6 +152,10 @@ export interface ReturnRecord extends Base {
   burned?: Hex;
   eta?: Hex;
   sends: SendRecord[];
+  /** The payer of the first durable payout send, shared by both routes. */
+  executionPayer?: Hex;
+  /** A mined payment hint whose certified proof is still being fetched. */
+  paidProof?: { txHash: Hex; reads: number };
   /** The EVM account that pays the redeem's gas (its funds are checked before the burn). */
   payer?: Hex;
   /** The first block at which a redeem was broadcast: Paid(eta) cannot appear before it. */

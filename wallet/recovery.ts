@@ -4,7 +4,7 @@ import { existsSync, linkSync, lstatSync, readFileSync, unlinkSync } from 'node:
 import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  AmbiguousBroadcast, FAILURE_PROOF_READS, EvmReader, HttpJsonRpc, Nb2Error, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
+  AmbiguousBroadcast, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryCatchUpCalls, recoveryGeneration,
   recoveryRpcSource, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
@@ -236,9 +236,8 @@ export async function qualifyExistingRecovery(w: Wallet, rec: ReturnRecord, poli
   const current = await w.bridge.journal.retForUpdate(rec.returnId);
   if (current?.status === 'paid') return current;
   if (!current?.burned) throw new WalletError('NotPending', 'certify the exact burn before choosing recovery');
-  if (current.recovery) return current;
-  const saved = loadRecovery(w, current);
-  current.recovery = saved?.complete ? await qualifySettlement(w, current, policy) : await qualifyLineage(w, current, policy);
+  if (hasPeerComplete(w, current) || current.recovery) return current;
+  current.recovery = await qualifyLineage(w, current, policy);
   await w.bridge.journal.putReturn(current);
   return current;
 }
@@ -250,23 +249,23 @@ async function qualifyLineage(w: Wallet, rec: ReturnRecord, policy: PayerPolicy)
 }
 
 /** After Complete, price only this payer's gap advances and settlement. */
-async function qualifySettlement(w: Wallet, rec: ReturnRecord, policy: PayerPolicy) {
+async function qualifySettlement(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, start: bigint) {
   const release = recoveryRelease(w);
   await checkGraph(w, release);
-  const a = uint(rec.a);
   const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
-  const observed = segment < a ? a : segment;
+  const observed = segment < start ? start : segment;
   const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address));
   const nonce = await w.bridge.evm.nonce(w.signer.address);
-  const backlog = { ...release.backlog, signedStart: a, observed, duringProgress: 0n };
-  const needed = observed - a + 64n;
+  const backlog = { ...release.backlog, signedStart: start, observed, duringProgress: 0n };
+  const needed = observed - start + 64n;
   for (let batch = Number(needed < 1024n ? needed : 1024n); batch > 0; batch--) {
     const quote = quoteRecoveryGapBatch(w.bridge.cfg.K, batch, release.calibration, limits);
     if (!quote) continue;
     // The largest quoted batch consumes the fewest gap-advance nonces.
     const calls = recoveryCatchUpCalls(batch, backlog);
+    const gapCalls = observed - start < BigInt(batch) ? 0n : calls;
     const fee = quote.advance.fee * calls + quote.settle.fee;
-    if (nonce + calls > limits.maxNonce || fee > limits.feeBudget || fee > limits.balance) continue;
+    if (nonce + gapCalls > limits.maxNonce || (gapCalls > 0n && (fee > limits.feeBudget || fee > limits.balance))) continue;
     return { generation: hx(release.generation), calls: String(calls + 1n), totalFee: String(fee),
       runCuts: [], advanceGaps: batch, observed: String(observed), receiptP99Ms: String(backlog.receiptP99Ms),
       finalInclusionMs: String(backlog.finalInclusionMs), qualifiedForMs: String(backlog.qualifiedForMs) };
@@ -276,7 +275,7 @@ async function qualifySettlement(w: Wallet, rec: ReturnRecord, policy: PayerPoli
 
 interface Backup {
   version: 1; gamma: string; vaultRuntimeHash: string; pending: ReturnRecord;
-  recover?: true; handoff?: 'active'; terminal?: string; complete?: PortableComplete;
+  recover?: true; handoff?: 'active'; activePayer?: string; terminal?: string; complete?: PortableComplete;
   checkpoint?: RecoveryJournal; paid?: ReturnRecord['paid'];
 }
 
@@ -289,9 +288,11 @@ export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string):
     recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator };
   const endpoint = saved?.complete ?? saved?.cuts.find((item) => item.cut.kind === 'run' && item.state === undefined);
   const complete = endpoint && { seq: endpoint.seq, location: endpoint.location };
-  const active = !rec.paid && (blockedOrdinary(rec) || saved?.pending || saved?.superseded?.length || (!complete && saved?.cuts.length));
+  const payer = boundPayer(rec, saved);
+  const active = !rec.paid && (blockedOrdinary(rec) || saved?.pending || saved?.superseded?.length || (!complete && payer));
   const copy: Backup = { version: 1, gamma: hx(w.pins.gamma), vaultRuntimeHash: hx(w.pins.vaultRuntimeCodeHash), pending,
-    recover: rec.recovery ? true : undefined, handoff: active ? 'active' : undefined, terminal: complete ? saved!.evidence : rec.burned, complete,
+    recover: rec.recovery ? true : undefined, handoff: active ? 'active' : undefined,
+    activePayer: active && payer ? hx(payer.address) : undefined, terminal: complete ? saved!.evidence : rec.burned, complete,
     paid: rec.paid?.receipt ? rec.paid : undefined };
   const content = JSON.stringify(copy);
   if (existsSync(file)) {
@@ -328,7 +329,8 @@ export async function reconcileReturn(w: Wallet, rec: ReturnRecord, policy?: Pay
   if (journal?.pending?.cut.kind === 'settle') settlements.push(decodeSignedTx(bytes(journal.pending.raw)).hash);
   const evidence: ReturnEvidence = { paid: incoming?.paid, settlements, readOnly: !resubmit };
   const paidResult = (record: ReturnRecord): ReconcileResult =>
-    record.paid ? { state: 'paid', txHash: bytes(record.paid.txHash, 32), blockNumber: uint(record.paid.blockNumber) } : { state: 'not-paid' };
+    record.paid ? { state: 'paid', txHash: bytes(record.paid.txHash, 32), blockNumber: uint(record.paid.blockNumber) }
+      : record.paidProof ? { state: 'pending', txHash: bytes(record.paidProof.txHash, 32) } : { state: 'not-paid' };
   let record: ReturnRecord;
   let result: ReconcileResult;
   if (incoming) {
@@ -361,12 +363,14 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
     paid: backup.paid,
     beforeCommit: async (verified, incoming) => {
       const local = loadRecovery(w, verified);
-      if (backup.handoff === 'active' && !local && !blockedOrdinary(verified)) {
-        throw new WalletError('NotPending', 'active payer handoff is blocked. Resume on the original journal or request a resolved Complete or Paid backup');
+      const payer = boundPayer(verified, local);
+      if (backup.handoff === 'active' && !payer && !local) {
+        const address = backup.activePayer ? ` ${hx(bytes(backup.activePayer, 20))}` : '';
+        throw new WalletError('NotPending', `active payer handoff is blocked. Resume on the original journal with payer${address} or request a resolved Complete or Paid backup`);
       }
       const held = local && activeRecovery(verified, local);
       let localComplete = !!local?.complete;
-      if (local && held?.recovery) {
+      if (local && held && (held.recovery || local.complete)) {
         const release = recoveryRelease(w);
         await checkGraph(w, release);
         const session = await openSession(w, release, held);
@@ -388,7 +392,6 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
         await verifyComplete(w, session, endpoint);
         if (!localComplete) {
           if (verified.sends.at(-1) && !verified.sends.at(-1)!.failed) routeRequired(blockedOrdinary(verified)!);
-          const plan = verified.recovery ?? (policy && await qualifySettlement(w, verified, policy));
           const superseded = [...(local?.superseded ?? [])];
           if (local?.pending) superseded.push(local.pending.raw);
           const journal: RecoveryJournal = {
@@ -397,19 +400,19 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
           };
           if ((await w.bridge.journal.ret(verified.returnId))?.burnRequest) saveRecovery(w, verified, journal);
           else freshCheckpoint = journal;
-          return plan;
+          return null;
         }
-        if (!verified.recovery && policy) return qualifySettlement(w, verified, policy);
-        return;
+        return local?.complete && verified.recovery ? null : undefined;
       }
       // Legacy exports may have a peer Progress or Gap. They never install a peer cursor or plan.
       if (backup.checkpoint?.cuts.length && !local) {
         throw new WalletError('NotPending', 'peer Progress cannot transfer an active payer. Resume on its original journal or request a certified Complete or Paid backup');
       }
+      if (local?.complete) return verified.recovery ? null : undefined;
       if (!verified.recovery && wantsRecovery && policy && !blockedOrdinary(verified)) return qualifyLineage(w, verified, policy);
     },
   });
-  if (selected.status === 'paid') return selected;
+  if (selected.status === 'paid' || selected.paidProof) return selected;
   if (freshCheckpoint) saveRecovery(w, selected, freshCheckpoint);
   if (selected.status === 'burn-requested') {
     await w.bridge.burn(bytes(selected.returnId, 32));
@@ -473,6 +476,10 @@ function loadRecovery(w: Wallet, rec: ReturnRecord): RecoveryJournal | undefined
   const path = pathOf(w, rec);
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
 }
+export function hasPeerComplete(w: Wallet, rec: ReturnRecord): boolean {
+  return loadRecovery(w, rec)?.complete !== undefined;
+}
+
 function saveRecovery(w: Wallet, rec: ReturnRecord, journal: RecoveryJournal): void {
   writeDurable(pathOf(w, rec), JSON.stringify(journal));
 }
@@ -540,7 +547,7 @@ async function packetOf(s: RecoverySession, trust: TrustInput, rec: ReturnRecord
 }
 
 function activeRecovery(rec: ReturnRecord, journal: RecoveryJournal): ReturnRecord {
-  return journal.complete ? { ...rec, burned: journal.evidence } : rec;
+  return journal.complete ? { ...rec, burned: journal.evidence, recovery: undefined } : rec;
 }
 
 async function verifyComplete(w: Wallet, s: RecoverySession, endpoint: PortableComplete): Promise<Cursor> {
@@ -553,7 +560,7 @@ async function verifyComplete(w: Wallet, s: RecoverySession, endpoint: PortableC
 
 async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal: RecoveryJournal): Promise<Cursor> {
   const evidence = evidenceOf(bytes(rec.burned!));
-  if (journal.version !== 1 || journal.evidenceBytes !== evidence.length || journal.session !== hx(s.id) || journal.pageRoot !== hx(s.pageRoot) || journal.generation !== rec.recovery?.generation ||
+  if (journal.version !== 1 || journal.evidenceBytes !== evidence.length || journal.session !== hx(s.id) || journal.pageRoot !== hx(s.pageRoot) || journal.generation !== hx(recoveryRelease(w).generation) ||
     journal.evidence !== hx(evidence)) throw new Error('recovery journal does not bind the certified evidence');
   if (!journal.complete) checkSchedule(rec, s.operationCount);
   const cursor = journal.complete ? await verifyComplete(w, s, journal.complete) : { from: 0 };
@@ -628,13 +635,23 @@ function retainPayment(w: Wallet, rec: ReturnRecord, txHash: string): void {
 
 type RouteBlocked = Extract<ReconcileResult, { state: 'route-blocked' }>;
 
+function boundPayer(rec: ReturnRecord, journal?: RecoveryJournal) {
+  const cold = journal?.attempts?.[0] ?? journal?.superseded?.[0] ?? journal?.pending?.raw ?? journal?.settled?.submitted?.raw;
+  const raw = rec.sends[0]?.raw ?? cold;
+  const first = raw && decodeSignedTx(bytes(raw));
+  const address = rec.executionPayer ? bytes(rec.executionPayer, 20) : first ? first.from : undefined;
+  if (address && first && !eq(address, first.from)) throw new WalletError('BadInput', 'execution payer disagrees with the first signed payout');
+  if (address) return { address, txHash: first ? first.hash : bytes(rec.returnId, 32), route: cold ? 'recovery' as const : 'ordinary' as const };
+}
+
 function blockedOrdinary(rec: ReturnRecord): RouteBlocked | undefined {
   const send = rec.sends.at(-1);
   if (send && !send.failed) return { state: 'route-blocked', route: 'ordinary', txHash: decodeSignedTx(bytes(send.raw)).hash };
 }
 
 export function routeRequired(result: RouteBlocked): never {
-  throw new WalletError('NotPending', `route blocked by ${result.route} transaction ${hx(result.txHash)}. Resume that route with its payer and reconcile the exact send before switching routes or payers`);
+  if (result.payer) throw new WalletError('NotPending', `return is bound to payer ${hx(result.payer)}. Reopen the original journal with that payer`);
+  throw new WalletError('NotPending', `route blocked by ${result.route} transaction ${hx(result.txHash)}. Resume that route with its payer and reconcile the exact send before switching routes`);
 }
 
 /** A certified event authenticates the cursor. Check nonce consumption independently. */
@@ -663,12 +680,17 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
   const first = await reconcileReturn(w, rec, policy, undefined, false);
   if (first.result.state === 'paid' || first.result.state === 'needs-archive') return first;
   rec = first.record;
+  const journal = loadRecovery(w, rec);
+  const payer = boundPayer(rec, journal);
+  if (payer && !eq(payer.address, w.signer.address)) {
+    const result: RouteBlocked = { state: 'route-blocked', route: payer.route, txHash: payer.txHash, payer: payer.address };
+    return { record: rec, result };
+  }
   const ordinary = blockedOrdinary(rec);
-  if (ordinary && (route === 'recovery' || !eq(decodeSignedTx(bytes(rec.sends.at(-1)!.raw)).from, w.signer.address))) {
+  if (ordinary && route === 'recovery') {
     return { record: rec, result: ordinary };
   }
-  const journal = loadRecovery(w, rec);
-  if (journal?.pending && (route === 'ordinary' || !eq(decodeSignedTx(bytes(journal.pending.raw)).from, w.signer.address))) {
+  if (journal?.pending && route === 'ordinary') {
     const held = activeRecovery(rec, journal);
     const release = recoveryRelease(w);
     const session = await openSession(w, release, held);
@@ -692,7 +714,8 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
     }
     return { record: rec, result: { state: 'pending', txHash: lower.hash } as const };
   }
-  return resubmit && ordinary && first.result.state === 'pending' && route === 'ordinary' && rec.sends.at(-1)?.failureProofReads === undefined
+  return resubmit && ordinary && first.result.state === 'pending' && route === 'ordinary' &&
+    !rec.paidProof && rec.sends.at(-1)?.failureProofReads === undefined
     ? reconcileReturn(w, rec, policy) : first;
 }
 
@@ -711,7 +734,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   const first = await reconcileForPayout(w, rec, 'recovery', policy);
   if (first.result.state !== 'not-paid') return first.result;
   rec = first.record;
-  if (!rec.recovery) rec = await qualifyExistingRecovery(w, rec, policy);
+  if (!rec.recovery && !hasPeerComplete(w, rec)) rec = await qualifyExistingRecovery(w, rec, policy);
   const release = recoveryRelease(w);
   await checkGraph(w, release);
   const local = loadRecovery(w, rec);
@@ -721,7 +744,11 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   const cursor = await replay(w, s, rec, journal);
 
   if (journal.pending === undefined) {
-    await qualifyRestoredSchedule(w, release, rec, journal, cursor);
+    if (journal.complete) {
+      rec = { ...rec, recovery: await qualifySettlement(w, rec, policy, cursor.gap?.cursor?.next ?? uint(rec.a)) };
+    } else {
+      await qualifyRestoredSchedule(w, release, rec, journal, cursor);
+    }
     const current = (await w.bridge.journal.ret(rec.returnId))!;
     const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, current, w.signer.address));
     let cut: Cut;
@@ -771,6 +798,11 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     const nonce = await w.bridge.evm.nonce(w.signer.address);
     if (quote === null || nonce > limits.maxNonce || quote.fee > limits.feeBudget || quote.fee > limits.balance) {
       throw new Nb2Error('CapacityPreflight', 'packet exceeds the remaining payer limits');
+    }
+    if (!current.executionPayer) {
+      const durable = (await w.bridge.journal.retForUpdate(rec.returnId))!;
+      durable.executionPayer = hx(w.signer.address);
+      await w.bridge.journal.putReturn(durable);
     }
     const tx = await signTx(w.signer, { chainId: limits.chainId, nonce, maxFeePerGas: limits.maxFeePerGas,
       maxPriorityFeePerGas: limits.maxPriorityFeePerGas, gas: quote.gas, to, value: 0n, data: calldata });
@@ -827,11 +859,11 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
           continue;
         }
         failed = true;
-        await withFreshAuthority(w, () => reader.verifyFailedReceipt(hash, w.bridge.cfg, w.trust, receipt));
+        await withFreshAuthority(w, () => reader.verifyFailedReceipt(hash, w.bridge.cfg, w.trust, receipt, archive));
         return 'failed';
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
-        if (e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
+        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
         // Metadata is only a hint. Try the next reader's complete proof.
       }
     }

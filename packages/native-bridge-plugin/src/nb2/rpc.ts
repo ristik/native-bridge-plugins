@@ -20,7 +20,7 @@ import { checkCompanion } from './rules.js';
 import { array, isBytes, isUint, scanNative, u256 } from './cbor.js';
 
 import type { RecoveryEvent, RecoveryReceiptSource } from './recovery.js';
-import { decodeUc, verifyEvmUc, type TrustInput } from './trust.js';
+import { decodeUc, SealAheadOfOrigin, verifyEvmUc, type TrustInput } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
 
@@ -35,6 +35,30 @@ export class RpcError extends Error {
     super(code !== 0 ? `rpc error ${code}: ${message}` : `gateway HTTP ${status}: ${message}`);
     this.name = 'RpcError';
   }
+}
+
+/** Readers exhausted for a component of an identified transaction's certificate. */
+export class ProofUnavailable extends Error {
+  public constructor(public readonly component: string, public readonly pruned: boolean) {
+    super(`no configured reader supplied ${component}`);
+  }
+}
+
+async function proofFrom<T>(readers: readonly EvmReader[], component: string, read: (reader: EvmReader) => Promise<T>): Promise<T> {
+  let pruned = false;
+  let refresh: Nb2Error | undefined;
+  for (const reader of readers) {
+    try {
+      return await read(reader);
+    } catch (e) {
+      if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+      if (e instanceof Nb2Error && (e.retryable || e instanceof SealAheadOfOrigin)) refresh ??= e;
+      if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned' ||
+        e instanceof RpcError && (e.status === 413 || e.code === -32601 || /unknown block|not found|pruned/i.test(e.message))) pruned = true;
+    }
+  }
+  if (refresh) throw refresh;
+  throw new ProofUnavailable(component, pruned);
 }
 
 /** An `eth_sendRawTransaction` answered with HTTP 503 ("broadcast may be partial"): the transaction may still be included. */
@@ -202,27 +226,35 @@ export class EvmReader {
    * The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child does not
    * exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
    */
-  public async certificateOf(header: Header, hash: Uint8Array, bindTechnicalRecord = false): Promise<Uint8Array> {
-    const child = await this.rpc.call<Record<string, unknown> | null>('eth_getBlockByNumber', [qty(header.number + 1n), false]);
-    if (child === null) refuse('CompanionUnknown', `block ${header.number} has no child yet: its certificate is not served; retry after a round`);
-    const childHeader = headerOfJson(child!);
-    if (childHeader.number !== header.number + 1n || !eq(childHeader.parentHash, hash)) refuse('CompanionUnknown', `block ${header.number} is not on this node's canonical chain`);
-    const childHash = HE(encodeHeader(childHeader));
-    const l = await this.rpc.call<{ status: string; horizon?: unknown; companion?: { witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(childHash)]);
-    const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
-    checkCompanion(l.status, witnesses.length);
-    const uc = bytesOf(witnesses[0], 'companion witness 0');
-    if (bindTechnicalRecord) {
-      const record = bytesOf(witnesses[1], 'companion witness 1');
-      if (record.length > 4096) refuse('CompanionProvider', 'technical record is oversized');
-      const [round, epoch, leader, stat, fee] = array(scanNative(record), 5);
-      const digest = decodeUc(uc).technicalRecordHash;
-      if (!isUint(round) || round.arg === 0n || !isUint(epoch) || leader.major !== 3 || leader.arg === 0n
-        || !isBytes(stat) || stat.arg === 0n || !isBytes(fee) || fee.arg === 0n || digest === null || !eq(HU(record), digest)) {
-        refuse('CompanionProvider', 'technical record does not open the certificate commitment');
+  public async certificateOf(header: Header, hash: Uint8Array, bindTechnicalRecord = false,
+    sources?: readonly EvmReader[], authenticate?: (uc: Uint8Array) => Promise<void>): Promise<Uint8Array> {
+    const childOf = async (reader: EvmReader) => {
+      const child = await reader.headerByNumber(header.number + 1n);
+      if (!child || child.header.number !== header.number + 1n || !eq(child.header.parentHash, hash)) {
+        refuse('CompanionUnknown', `block ${header.number} has no canonical child on this reader`);
       }
-    }
-    return uc;
+      return child.hash;
+    };
+    const child = sources ? await proofFrom(sources, 'the child block header', childOf) : await childOf(this);
+    const companion = async (reader: EvmReader) => {
+      const l = await reader.rpc.call<{ status: string; companion?: { witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(child)]);
+      const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
+      checkCompanion(l.status, witnesses.length);
+      const uc = bytesOf(witnesses[0], 'companion witness 0');
+      if (bindTechnicalRecord) {
+        const record = bytesOf(witnesses[1], 'companion witness 1');
+        if (record.length > 4096) refuse('CompanionProvider', 'technical record is oversized');
+        const [round, epoch, leader, stat, fee] = array(scanNative(record), 5);
+        const digest = decodeUc(uc).technicalRecordHash;
+        if (!isUint(round) || round.arg === 0n || !isUint(epoch) || leader.major !== 3 || leader.arg === 0n
+          || !isBytes(stat) || stat.arg === 0n || !isBytes(fee) || fee.arg === 0n || digest === null || !eq(HU(record), digest)) {
+          refuse('CompanionProvider', 'technical record does not open the certificate commitment');
+        }
+      }
+      await authenticate?.(uc);
+      return uc;
+    };
+    return sources ? proofFrom(sources, 'the seal companion', companion) : companion(this);
   }
 
   /** The root-to-leaf receipt-trie path of RLP(txIndex), from the block's receipts, whose trie must hash to the header's root. */
@@ -232,10 +264,10 @@ export class EvmReader {
       receipts = await this.rpc.call<ReceiptJson[] | null>('eth_getBlockReceipts', [hexOf(hash)]);
     } catch (e) {
       // an answer over the gateway's 8 MiB cap is not served by this gateway: use another provider for this block
-      if (e instanceof RpcError && e.status === 413) refuse('ProviderFault', `the receipts of block ${header.number} exceed this gateway's answer cap: use another provider`);
+      if (e instanceof RpcError && e.status === 413) fail('EvidencePruned', `the receipts of block ${header.number} exceed this gateway's answer cap: use another provider`);
       throw e;
     }
-    if (receipts === null) fail('EvidencePruned', `the receipts of block ${header.number} are not served`);
+    if (!receipts) fail('EvidencePruned', `the receipts of block ${header.number} are not served`);
     if (txIndex >= BigInt(receipts!.length)) refuse('ProviderFault', `block ${header.number} has ${receipts!.length} receipts, no index ${txIndex}`);
     const entries = receipts!.map((r, i) => [rlpIndexKey(i), encodeReceiptJson(r)] as [Uint8Array, Uint8Array]);
     const t = buildTrie(entries, rlpIndexKey(txIndex));
@@ -244,45 +276,46 @@ export class EvmReader {
   }
 
   /** Verify a failed receipt against its certified block before abandoning a pending send. */
-  public async verifyFailedReceipt(txHash: Uint8Array, cfg: Config, trust: TrustInput, receipt: ReceiptJson): Promise<void> {
+  public async verifyFailedReceipt(txHash: Uint8Array, cfg: Config, trust: TrustInput, receipt: ReceiptJson,
+    archives: readonly EvmReader[] = []): Promise<void> {
     if (qtyOf(receipt.status, 'status') !== 0n) return refuse('ProviderFault', 'expected a failed receipt');
     const hash = fixedOf(receipt.blockHash, 32, 'blockHash');
-    const { header, raw } = await this.headerByHash(hash);
+    const sources = [...new Set([this, ...archives])];
+    const { header, raw } = await proofFrom(sources, 'the failed transaction block header', (r) => r.headerByHash(hash));
     if (header.number !== qtyOf(receipt.blockNumber, 'blockNumber')) refuse('ProviderFault', 'failed receipt has the wrong block number');
-    const block = { header, hash };
-    const uc = await verifyEvmUc(trust, await this.certificateOf(block.header, block.hash, true), cfg);
-    bindHeader(raw, uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
+    await this.certificateOf(header, hash, true, sources, async (encoded) => {
+      const uc = await verifyEvmUc(trust, encoded, cfg);
+      bindHeader(raw, uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
+    });
     const idx = qtyOf(receipt.transactionIndex, 'transactionIndex');
-    const path = await this.receiptPath(block.header, block.hash, idx);
-    if (!eq(mptVerify(block.header.receiptsRoot, rlpIndexKey(idx), path), encodeReceiptJson(receipt))) {
+    const path = await proofFrom(sources, 'the failed transaction block receipts', (r) => r.receiptPath(header, hash, idx));
+    if (!eq(mptVerify(header.receiptsRoot, rlpIndexKey(idx), path), encodeReceiptJson(receipt))) {
       refuse('ProviderFault', 'failed receipt is not committed in the certified block');
     }
-    const body = await this.rpc.call<{ transactions?: string[] } | null>('eth_getBlockByHash', [hexOf(block.hash), false]);
-    if (!body) fail('EvidencePruned', 'the certified block body is unavailable');
-    if (!Array.isArray(body?.transactions) || BigInt(body.transactions.length) > block.header.gasLimit / 21_000n + 16n ||
-      idx >= BigInt(body.transactions.length) ||
-      !eq(fixedOf(body.transactions[Number(idx)], 32, 'transaction hash'), txHash)) {
-      return refuse('ProviderFault', 'failed receipt has no matching transaction in the block body');
-    }
-    const entries: [Uint8Array, Uint8Array][] = [];
-    for (let i = 0; i < body.transactions.length; i++) {
-      let wire: string | null;
-      try {
-        wire = await this.rpc.call<string | null>('eth_getRawTransactionByBlockHashAndIndex', [hexOf(block.hash), qty(i)]);
-      } catch (e) {
-        if (e instanceof RpcError && e.code === -32601) fail('EvidencePruned', 'the reader does not serve raw transactions');
-        throw e;
+    await proofFrom(sources, 'the failed transaction block body', async (r) => {
+      const body = await r.rpc.call<{ transactions?: string[] } | null>('eth_getBlockByHash', [hexOf(hash), false]);
+      if (!Array.isArray(body?.transactions)) fail('EvidencePruned', 'the certified block body is unavailable');
+      if (BigInt(body.transactions.length) > header.gasLimit / 21_000n + 16n || idx >= BigInt(body.transactions.length) ||
+        !eq(fixedOf(body.transactions[Number(idx)], 32, 'transaction hash'), txHash)) {
+        return refuse('ProviderFault', 'failed receipt has no matching transaction in the block body');
       }
-      if (wire === null || wire === undefined || wire === '0x') fail('EvidencePruned', 'an exact transaction in the certified block is unavailable');
-      const raw = bytesOf(wire, 'raw transaction');
-      if (!eq(HE(raw), fixedOf(body.transactions[i], 32, 'transaction hash'))) refuse('ProviderFault', 'raw transaction hash mismatch');
-      entries.push([rlpIndexKey(i), raw]);
-    }
-    if (!eq(buildTrie(entries, null).root, block.header.transactionsRoot)) refuse('ProviderFault', 'transactions root mismatch');
+      const entries: [Uint8Array, Uint8Array][] = [];
+      for (const [i, tx] of body.transactions.entries()) {
+        const raw = await proofFrom(sources, 'an exact raw transaction in the certified block', async (reader) => {
+          const wire = await reader.rpc.call<string | null>('eth_getRawTransactionByBlockHashAndIndex', [hexOf(hash), qty(i)]);
+          if (!wire || wire === '0x') fail('EvidencePruned', 'an exact transaction in the certified block is unavailable');
+          const decoded = bytesOf(wire, 'raw transaction');
+          if (!eq(HE(decoded), fixedOf(tx, 32, 'transaction hash'))) refuse('ProviderFault', 'raw transaction hash mismatch');
+          return decoded;
+        });
+        entries.push([rlpIndexKey(i), raw]);
+      }
+      if (!eq(buildTrie(entries, null).root, header.transactionsRoot)) refuse('ProviderFault', 'transactions root mismatch');
+    });
   }
 
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>, headerSources: readonly EvmReader[] = []): Promise<ReceiptProof> {
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>, archives: readonly EvmReader[] = [], authenticate?: (raw: Uint8Array, uc: Uint8Array) => Promise<void>): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);
@@ -292,24 +325,16 @@ export class EvmReader {
         && eq(bytesOf(l.data, 'log data'), expected.data))));
     if (idx < 0) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} emitted no such log from 0x${toHex(emitter)}`);
     const blockHash = fixedOf(r!.blockHash, 32, 'blockHash');
-    let held: Awaited<ReturnType<EvmReader['headerByHash']>> | undefined;
-    let failure: unknown;
-    for (const reader of new Set([this, ...headerSources])) {
-      try {
-        held = await reader.headerByHash(blockHash);
-        break;
-      } catch (e) {
-        if (failure === undefined || e instanceof Nb2Error && e.rule === 'EvidencePruned') failure = e;
-      }
-    }
-    if (!held) {
-      if (headerSources.length) fail('EvidencePruned', `no configured reader supplied block header ${hexOf(blockHash)}`);
-      throw failure;
-    }
-    const { header, raw } = held;
-    const uc = await this.certificateOf(header, blockHash, bindTechnicalRecord);
+    const sources = archives.length ? [...new Set([this, ...archives])] : undefined;
+    const { header, raw } = sources
+      ? await proofFrom(sources, 'the payment block header', (reader) => reader.headerByHash(blockHash))
+      : await this.headerByHash(blockHash);
+    const uc = await this.certificateOf(header, blockHash, bindTechnicalRecord, sources,
+      authenticate && ((encoded) => authenticate(raw, encoded)));
     const txIndex = qtyOf(r!.transactionIndex, 'transactionIndex');
-    const nodes = await this.receiptPath(header, blockHash, txIndex);
+    const nodes = sources
+      ? await proofFrom(sources, 'the payment block receipts', (reader) => reader.receiptPath(header, blockHash, txIndex))
+      : await this.receiptPath(header, blockHash, txIndex);
     const proof: DepositProof = { uc, header: raw, txIndex, logIndex: BigInt(idx), nodes };
     const l = r!.logs[idx];
     const log: RawLog = {
