@@ -267,6 +267,7 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         max_nonce: 255,
         max_fee_per_gas: 10u8.into(),
         max_priority_fee_per_gas: 1u8.into(),
+        max_transaction_fee: None,
         balance: 1_000_000_000_000_000_000u64.into(),
         fee_budget: 1_000_000_000_000_000_000u64.into(),
     };
@@ -325,6 +326,9 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
     limits.gas = admitted.settle.gas;
     limits.signed_bytes = admitted.settle.signed_bytes;
     assert!(quote_recovery(admitted.settle.shape, &calibration, &limits).is_some());
+    limits.max_transaction_fee = Some(&admitted.settle.fee - 1u8);
+    assert!(quote_recovery(admitted.settle.shape, &calibration, &limits).is_none());
+    limits.max_transaction_fee = None;
     limits.signed_bytes -= 1;
     assert!(quote_recovery(admitted.settle.shape, &calibration, &limits).is_none());
 }

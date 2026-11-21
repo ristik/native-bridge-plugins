@@ -191,6 +191,7 @@ test('cold admission prices the terminal bound, reserve, signed envelope and ref
   const quote = plan.settle;
   assert.ok(quoteRecovery(quote.shape, calibration, { ...limits, signedBytes: quote.signedBytes, gas: quote.gas }));
   assert.equal(quoteRecovery(quote.shape, calibration, { ...limits, gas: quote.gas - 1n }), null);
+  assert.equal(quoteRecovery(quote.shape, calibration, { ...limits, maxTransactionFee: quote.fee - 1n }), null);
   assert.equal(quoteRecovery(quote.shape, calibration, { ...limits, signedBytes: quote.signedBytes - 1 }), null);
 });
 

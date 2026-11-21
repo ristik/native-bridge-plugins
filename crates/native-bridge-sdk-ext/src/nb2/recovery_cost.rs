@@ -58,6 +58,7 @@ pub struct RecoveryLimits {
     pub max_nonce: u64,
     pub max_fee_per_gas: BigUint,
     pub max_priority_fee_per_gas: BigUint,
+    pub max_transaction_fee: Option<BigUint>,
     pub balance: BigUint,
     pub fee_budget: BigUint,
 }
@@ -115,11 +116,19 @@ pub fn quote_recovery(
     if signed_bytes > TX_BYTES.min(limits.signed_bytes) {
         return None;
     }
+    let fee = &limits.max_fee_per_gas * gas;
+    if limits
+        .max_transaction_fee
+        .as_ref()
+        .is_some_and(|cap| fee > *cap)
+    {
+        return None;
+    }
     Some(RecoveryQuote {
         shape,
         gas,
         signed_bytes,
-        fee: &limits.max_fee_per_gas * gas,
+        fee,
     })
 }
 

@@ -37,6 +37,7 @@ export interface RecoveryLimits {
   maxNonce: bigint;
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
+  maxTransactionFee?: bigint;
   balance: bigint;
   feeBudget: bigint;
 }
@@ -74,7 +75,9 @@ export function quoteRecovery(shape: RecoveryShape, calibration: RecoveryCalibra
     rlpUintEnc(1), rlpBytes(new Uint8Array(32)), rlpBytes(new Uint8Array(32)),
   ]).length;
   if (signedBytes > Math.min(TX_BYTES, limits.signedBytes)) return null;
-  return { shape, gas, signedBytes, fee: gas * limits.maxFeePerGas };
+  const fee = gas * limits.maxFeePerGas;
+  if (limits.maxTransactionFee !== undefined && fee > limits.maxTransactionFee) return null;
+  return { shape, gas, signedBytes, fee };
 }
 
 type Span = { start: number; end: number; claims: number };
