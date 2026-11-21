@@ -22,6 +22,8 @@ const receiptCap = 65_536;
 const hash = (label: string, ...parts: Uint8Array[]): Uint8Array => HE(HE(ascii('UNICITY/NB2/CONT/1.1/' + label)), ...parts);
 const u32 = (n: number | bigint): Uint8Array => be(n, 4);
 const blob = (data: Uint8Array): Uint8Array => concat(u32(data.length), data);
+export const recoveryGeneration = (salt: Uint8Array, domain: Uint8Array): Uint8Array => hash('GEN', salt, domain);
+
 const topics = {
   progress: HE(ascii('NB2Progress11(bytes32,uint64,bytes32)')),
   complete: HE(ascii('NB2Complete11(bytes32,uint64,bytes32,bytes32,uint64,bytes32,address,uint256)')),
@@ -34,6 +36,26 @@ const coldCall = (entry: Entry, parts: Uint8Array[]): Uint8Array => {
   if (68 + Math.ceil(body.length / 32) * 32 > calldataCap) fail('InputTooLarge', 'cold calldata');
   return concat(HE(ascii(entry + '(bytes)')).subarray(0, 4), abiEncode([{ bytes: body }]));
 };
+
+/** Identify a visible recovered settlement using its certified Complete or Gap receipt. */
+export async function recoveredSettlementEta(cfg: Config, domain: Uint8Array, trust: TrustInput, emitter: Uint8Array,
+  calldata: Uint8Array): Promise<Uint8Array | undefined> {
+  if (!eq(calldata.subarray(0, 4), HE(ascii('redeemRecovered(bytes)')).subarray(0, 4))) return;
+  const start = 68;
+  const end = start + Number(beInt(calldata.subarray(36, start)));
+  const tag = start + 42;
+  const proofStart = tag + 5;
+  if (calldata.length > calldataCap || end > calldata.length || end < proofStart ||
+    beInt(calldata.subarray(4, 36)) !== 32n || !eq(calldata.subarray(start, start + 2), version)) return;
+  const kind = calldata[tag] === 1 ? 'complete' : calldata[tag] === 2 ? 'gap' : undefined;
+  const length = Number(beInt(calldata.subarray(tag + 1, proofStart)));
+  if (!kind || length > receiptCap || length === 0 || proofStart + length + 2 > end) return;
+  const proof = decodeDepositProof(calldata.subarray(proofStart, proofStart + length));
+  const log = await verifyReceiptLog(cfg, trust, proof, emitter);
+  if (log.topics.length !== 2 || !eq(log.topics[0], topics[kind]) ||
+    log.data.length !== (kind === 'complete' ? 224 : 288) || !eq(log.data.subarray(32, 64), domain)) return;
+  return log.data.slice(64, 96);
+}
 
 class Pages {
   private readonly tree: Uint8Array[][];
@@ -255,12 +277,13 @@ export class RecoverySession {
     } while (revision !== authority.revision);
     const pages = new Pages(snapshot);
     const header = concat(version, u64(snapshot.length), pages.root);
-    const generation = hash('GEN', salt, domain);
+    const generation = recoveryGeneration(salt, domain);
     const session = hash('SESSION', version, generation, domain, cfg.vault, recovery, runtimeHash, pins, header.subarray(2));
     return new RecoverySession(cfg, deployment, pages, session, header, verdict, operations(snapshot, token, cfg, domain), authority);
   }
   get id(): Uint8Array { return this.session.slice(); }
   get pageRoot(): Uint8Array { return this.pages.root.slice(); }
+  get redemptionId(): Uint8Array { return this.verdict.eta.slice(); }
   get operationCount(): number { return this.ops.length; }
   private event(kind: Kind, data: Uint8Array): RecoveryEvent { return { kind, topics: [topics[kind].slice(), this.id], data }; }
 
@@ -331,6 +354,12 @@ export class RecoverySession {
       refuse('ProviderFault', 'recovery expectation belongs to a different session or event');
     }
     return this.event(kind, Uint8Array.from(data));
+  }
+
+  /** A certified Complete is sufficient to start settlement without the producer's run schedule. */
+  async verifyComplete(trust: TrustInput, input: Uint8Array, seq: bigint): Promise<RecoveryReceipt> {
+    if (seq <= 0n || seq >= 1n << 64n) fail('Shape', 'Complete sequence');
+    return this.verifyEvent(trust, input, this.event('complete', concat(u256(seq), verdictAbi(this.verdict))));
   }
 
   async verifyEvent(trust: TrustInput, input: Uint8Array, expected: RecoveryEvent): Promise<RecoveryReceipt> {

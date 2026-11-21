@@ -1,4 +1,4 @@
-# Native bridge v2: wallet integration guide
+# Native bridge v2 wallet integration guide
 
 The wallet opens under an authenticated B1 evaluation origin from the release's `trust.origin` or the
 `init --trust-origin FILE` override. Both forms contain decimal strings `usableEpoch` and `rootRound` from the
@@ -17,11 +17,11 @@ The rules behind each step are in bft-core
 spec; section numbers below refer to it), [`protocol/interop.md`](../protocol/interop.md) (the bytes) and [`nb2-journal.md`](nb2-journal.md)
 (the journal format).
 
-> **Fake value only.** Every deployment of this release is a test deployment. Mint admission is still open (bft-core#1039, see
-> [Limits](#limits)), and an oversized claim has no recovery path yet. Don't move real value through it.
+> **Test value only.** A release must qualify recovery capacity, peak archive growth and end-to-end payout before funding a production generation.
 
 - [What a user can do](#what-a-user-can-do)
 - [Try it: the reference wallet](#try-it-the-reference-wallet)
+- [Continuation v1.1 and relayers](#continuation-v11-and-relayers)
 - [The two flows](#the-two-flows)
 - [Using the plug-in](#using-the-plug-in)
 - [What to persist, and when](#what-to-persist-and-when)
@@ -64,7 +64,136 @@ every run.
 Every command is `npx tsx wallet/nb2-wallet.ts [--wallet DIR] COMMAND ...`, written `nb2-wallet` below. The wallet directory defaults to
 `./nb2-wallet`. It holds an **unencrypted** secret: this is a test wallet.
 
-### A deposit and a split return
+### Receive and inspect return headroom
+
+Give the sender the compressed Unicity owner key printed by `address`. Import the resulting
+flat token with `receive NAME TOKEN_FILE`. Use `--owner INDEX` when the destination key is one
+of the wallet's other local owner keys. The wallet verifies the full ancestry, selected split
+allocation and owner before storing the token. Both `receive` and `transfer` print evidence
+bytes, the ordinary history capacity by bytes, and the minimum recovery packet count by
+operation count. `plan-return` measures the current fee and capacity limits.
+
+## Continuation v1.1 and relayers
+
+Use the operator-authenticated v1.1 release and origin. The release's `recovery` object contains
+the hex `salt`, `address`, `runtimeHash` and `pins`; measured `ranges` for each funded entry point,
+operation count, gap count and supported receipt interval; and a `backlog` object. Each range has
+`minReceiptBytes`, the T5 `RecoveryShape` as `max`, and the measured upper bound `execution` as a
+decimal string. The optional `ordinaryRanges` qualify the ordinary route under the same graph.
+Each range specifies integer `maxEvidenceBytes` and `maxOperations`, plus `maxGaps` and
+`execution` as decimal strings. Its execution bound covers all smaller eligible shapes before
+the wallet adds intrinsic gas, forwarding margin and the seal reserve. The backlog has decimal strings `duringProgress`, `peakSeals`, `elapsedMs`,
+`receiptP99Ms`, `advancePeakSeals`, `finalInclusionMs`, `finalPeakSeals` and `qualifiedForMs`.
+The advance and final peaks are measured over their respective windows. The wallet reads the
+current endpoint and independently authenticates the signed start. [Continuation specification, §§7–9](https://github.com/ristik/bft-core/blob/integration/enshrined-evm/docs/design/nb2-continuation-v1.1.md)
+
+Supply a separate payer policy with `--return-policy FILE`. Use JSON integers for `signedBytes`
+and `calldataBytes`, and decimal strings for `gas`, `maxNonce`, `maxFeePerGas`,
+`maxPriorityFeePerGas`, optional `maxTransactionFee` and total `feeBudget`. Values are ceilings,
+with fees in wei. Set `archives` to an array of independent archive RPC URLs. The wallet applies
+the stricter local and release limits, checks the payer's live balance and nonce, and accounts
+for pending and completed attempts. Ordinary and recovered attempts from the same payer
+share a total fee budget in the local return journal. Use a dedicated payer account while
+this flow is active.
+
+```sh
+nb2-wallet plan-return coin --recipient "$RECIPIENT" --return-policy payer.json
+nb2-wallet burn coin --recipient "$RECIPIENT" --return-policy payer.json --backup coin.private.json
+nb2-wallet redeem coin --return-policy payer.json
+```
+
+The ordinary route is used when its measured reserve, byte and funding bounds fit. Otherwise,
+cold admission prices the bounded terminal operation, Progress, certified gap advances and
+final settlement. The wallet repeats admission before authorizing the burn. Repeat `burn` after
+an interruption to reconcile the same signed request. An authorized backup destination is
+durable before signing, and its private copy is published before submitting the request. The
+backup holds the complete provenance and signed request. Keep it private and hand it only to
+the chosen relayer before starting payout. Use `backup-return coin FILE` to save a signed return
+or a certified Complete or Paid handoff to a new path.
+
+On another device, verify the release and configure a funded relayer EVM key in `RELAY_PAYER`.
+Use a private local directory for the resumed journal. The payout address and amount come from
+the holder's signed burn.
+
+```sh
+nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb2-release.json \
+  --rpc "$RPC" --payer-env RELAY_PAYER --return-policy relay-payer.json
+```
+
+Repeat the same command if inclusion or certification is pending. Supply an alternate archive
+when a reader reports `EvidencePruned` and the backup lacks the needed proof. A certified backup
+can restore the burn and its Complete or Paid evidence with the certifier offline. Keep the journal
+when moving between routes. It records this payer's signed attempts and their fee reservations.
+A fresh relayer needs a policy that accounts for any fees it already spent.
+
+### Return journal reconciliation
+
+Use one active payer per burn. Hand the initial signed backup to the selected payer before any
+EVM send. The first payout send binds the payer's address for the life of that journal.
+Resume with that key after Progress, after a certified failure and when switching resolved routes. Hand off at certified
+Complete or Paid. This lets the next payer settle a completed lineage under its own limits.
+Progress, Gap and packet schedules stay in the originating journal. A backup made while a send
+is unresolved or a run is incomplete identifies an active payer handoff and refuses import into
+a fresh journal. Ask the active payer to resume or produce a resolved Complete or Paid backup.
+
+Before signing a settlement, both payout routes check for certified Paid and for known
+settlement transactions for the same redemption ID in the readers' pending views. A visible
+pending settlement defers signing. Wallet copies use separate journals, and a gateway may
+hide its pending transactions. Two concurrent payers can therefore sign settlements from
+the same backup. The vault pays the return once and rejects the second settlement. With two
+competing payers, the second payer can lose one transaction fee.
+
+Redeem, redeem with recovery, resume, import and restore check for certified Paid before
+qualifying or signing a payout. Import authenticates the source, return ID, recipient, amount
+and start anchor. Import and restore read EVM receipts without broadcasting transactions.
+
+| Local state | Signed request or certified burn | Peer Progress or Gap | Certified Complete | Certified Paid, either route |
+| --- | --- | --- | --- | --- |
+| Absent or planned | Adopt matching request and certify, or attach supplied terminal | Refuse active payer handoff | Store terminal proof independently of funding | Adopt with matching signed request |
+| Signed burn, no local recovery journal | Reconcile the exact request | Refuse an active payer handoff and identify the original payer | Store Complete independently of funding | Record Paid |
+| Local recovery journal, including zero cuts | Reconcile the exact send | Keep local progress and reconcile its send | Reconcile local send first, then store Complete and clear the obsolete plan | Record Paid, retain local signed bytes |
+| Local Complete or later local Gap | Keep local checkpoint | Keep local checkpoint | Keep local checkpoint | Record Paid and close continuation |
+| Ordinary send unresolved | Keep exact send | Keep exact send | Require ordinary send resolution before activating recovery | Record Paid and keep the send and its fees |
+| Paid | Report Paid and attach a matching burn terminal if missing | Report Paid | Report Paid | Keep Paid |
+
+A Complete receipt is verified against its own burn and redemption ID. The receiver stores
+the receipt directly and clears any obsolete plan. The payer qualifies remaining gap and
+settlement work from Complete and current limits when executing the next packet. It keeps any local signed nonce obligation until reconciliation. The operator may
+switch routes only after the other route's send has resolved. **Route blocked** identifies the
+transaction and route to resume with the active payer. Pool eviction alone leaves a signed
+transaction unresolved. A verified ordinary failure is recorded against the exact signed hash
+before permitting another send. Restore and import keep the proof-read count and report the
+same archive requirement as redeem. Fee history survives either route.
+
+| Receipt outcome | Transition |
+| --- | --- |
+| Send outcome unresolved | Keep the exact bytes on the active route |
+| Certified local Run or Advance | Record the local checkpoint and keep fee history |
+| Certified exact failure | Record the failure and keep fee history. The wallet can retry |
+| Certified Paid | Verify the pinned vault event, redemption ID, recipient and amount. Close both routes |
+| Missing proof for mined Paid, or exact failure proof unavailable after bounded reads | Report **needs archive** with the exact transaction hash and retain signed bytes |
+
+Wallets can verify Paid from a portable receipt or by exact settlement hash. An indexed
+`Paid` log can supply a hash for discovery. Readers can supply individual proof components. The wallet checks the transaction receipt,
+block header, child header, seal companion and block receipts across readers. Exact failure
+also requires the certified transaction body and raw transactions. If a component is pruned,
+or three reads of the configured sources leave the proof unavailable, **needs archive** reports
+the transaction that needs a complete proof. A holder who learned of Paid before
+burn certification can attach the matching burn terminal by import or retrieve it with
+`burn` using the same signed request.
+
+Indexed logs and remembered hints identify transactions for proof retrieval. A matching
+certified vault receipt establishes Paid on either route. The wallet tries every eligible
+child header with the companion sources. A verified exact failure clears any older Paid hint
+for that transaction and the wallet continues looking for a certified payout on the same
+redemption ID. An indexed peer payment without available proof stays pending during bounded
+reads and then reports **needs archive** with the peer transaction hash.
+
+Use `redeem --recover` or `resume --recover` to select recovery once outstanding ordinary sends
+are resolved. Use `--ordinary` to select ordinary after any recovery send resolves. Both routes
+settle the same redemption ID.
+
+### Earlier ordinary-only walkthrough
 
 The transcript below is the `walkthrough` stage of the bft-core testnet lane (`deploy/testnet/bridge/nb2/rehearse_nb2.py`). It comes from
 a full lane run on a throwaway four-validator package generation on the dev server, 2026-11-17, where every stage passed. The vault is the
@@ -162,7 +291,8 @@ The other commands:
   plug-in does not journal transfers, so the wallet does: it checks the new name, writes the exact request to
   `tokens/NEW.pending.json`, and only then submits it. Run it again after a crash and it certifies the same request.
 - `plan-return` and `burn` take `--recipient ADDR` to pay an address other than the wallet's own. A mixed-case address must carry its EIP-55
-  checksum. Without `--recipient`, `burn` keeps the recipient `plan-return` chose.
+  checksum. Without `--recipient`, `burn` uses the holder authorization saved by `plan-return`.
+  If that authorization is missing, provide the address explicitly before signing.
 - `deposit NAME` without an amount resumes a planned deposit. It never sends a second one, and it refuses a different amount.
 
 Every command that moves value runs the installation check again first; only `address`, `tokens` and `status` skip it. A network reset can
@@ -338,7 +468,7 @@ The table says what each error means and what your wallet does when it reaches y
 | `StateReadNotAdmitted` / `ImplausibleIndex` | planReturn with `useStateRead` | a plain `state()` read is evidence only on a deployment whose manifest says `stateReadOnly`, and only within `maxJump` | use the seal receipt (the default) |
 | `Unconfirmed` | submitDeposit, the aggregator | a send has no receipt yet, or its nonce was used by a transaction seen too recently to call the send dead; or no inclusion proof yet | call again later; it reconciles, and signs a new transaction only after the old one is dead at depth |
 | `Reverted` | submitDeposit, the aggregator | the deposit transaction was mined and reverted (the vault's own error says why), or the aggregator refused the certification request | for a deposit, read the vault error below; nothing was locked. For the aggregator, check the request; a spent state is refused for good. |
-| `CapacityExceeded` | buildRedeem | the claim grew past the limits after the burn | no recovery in this release (continuation, bft-core#1108, is deferred); tell the user |
+| `CapacityExceeded` | buildRedeem | the claim grew past the limits after the burn | requalify the signed burn with `redeem --recover` on a qualified v1.1 release |
 | `AlreadyPaid` | buildRedeem | the vault reports the identifier in a recent buffer, or the wallet found `eta` in a sealed segment while building the history | reconcile: look for `Paid(eta)`; `submitRedeem` does it first |
 | `StaleEndpoint` (vault) | simulation | two seals since the witness was built | rebuild the witness (automatic); never a new burn |
 | `FutureIndex` (vault) | simulation | the vault has not reached `a` | wait; can't arise from a verified seal receipt |
@@ -456,10 +586,9 @@ by about 2 transfers within that session. So:
 **The preflight is the safety gate.** It refuses before the burn: a refused return never burns, and the token stays spendable on Unicity.
 The lane asserts this on every boundary probe against the chain.
 
-**A history over the limit can't be returned in this release.** Splitting does not help: a part carries its parent's whole history, and
-each split level adds gas: about 57,000 for the edge itself, and about 15,000 more for every transfer above the split. Keep tokens meant for return well inside the envelope, and return them before
-their history gets near it. A claim that outgrows the limits after its burn (`CapacityExceeded`) has no recovery yet; continuation is
-deferred to bft-core#1108. The preflight exists to stop such a burn before it happens.
+**An oversized ordinary history needs continuation.** Each child carries its parent's history.
+A qualified v1.1 release can return that lineage in bounded packets. For an already-signed
+ordinary burn, use `redeem --recover` with a fresh payer policy.
 
 **Freshness of the index.** The burn index comes from the newest seal receipt the provider serves, and the endpoint estimate from its
 `state()` view. A provider that hides newer seals can't push the index into the future; it can only anchor it lower, which means more history

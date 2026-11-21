@@ -53,6 +53,8 @@ export interface RecoveryLimits {
   maxTransactionFee?: bigint;
   balance: bigint;
   feeBudget: bigint;
+  /** Size the signed envelope at maximal nonce and bid widths for portable wallet plans. */
+  worstCaseEnvelope?: boolean;
 }
 
 export interface RecoveryQuote {
@@ -101,7 +103,9 @@ function quoteRange(shape: RecoveryShape, minReceiptBytes: number, calibration: 
     || limits.maxFeePerGas <= 0n || limits.maxFeePerGas > U256_MAX || limits.maxPriorityFeePerGas < 0n
     || limits.maxPriorityFeePerGas > limits.maxFeePerGas) return null;
   const signedBytes = 1 + rlpList([
-    rlpUintEnc(limits.chainId), rlpUintEnc(limits.maxNonce), rlpUintEnc(limits.maxPriorityFeePerGas), rlpUintEnc(limits.maxFeePerGas),
+    rlpUintEnc(limits.chainId), rlpUintEnc(limits.worstCaseEnvelope ? U64_MAX : limits.maxNonce),
+    rlpUintEnc(limits.worstCaseEnvelope ? U256_MAX : limits.maxPriorityFeePerGas),
+    rlpUintEnc(limits.worstCaseEnvelope ? U256_MAX : limits.maxFeePerGas),
     rlpUintEnc(gas), rlpBytes(new Uint8Array(20)), rlpUintEnc(0), rlpBytes(new Uint8Array(n)), rlpList([]),
     rlpUintEnc(1), rlpBytes(new Uint8Array(32)), rlpBytes(new Uint8Array(32)),
   ]).length;
@@ -134,6 +138,27 @@ const gapShape = (entry: 'advanceGaps' | 'redeemRecovered', gaps: number, width:
   calldataBytes: calldataSize(42 + 1 + 4 + RECEIPT_BYTES + 2 + (gaps === 0 ? 0 : 32) + gaps * width),
 });
 
+/** Quote the exact full advance and all terminal suffixes with the widest allowed predecessor receipt. */
+export function quoteRecoveryGapBatch(K: bigint, batch: number, calibration: RecoveryCalibration, limits: RecoveryLimits):
+  { advance: RecoveryQuote; settle: RecoveryQuote } | null {
+  if (!Number.isSafeInteger(batch) || batch < 1 || batch > 1024 || !validLimits(limits)) return null;
+  const width = gapProofLen(K);
+  const advance = quoteRange(gapShape('advanceGaps', batch, width), 1, calibration, limits);
+  if (advance === null) return null;
+  const settle = quoteSettlementSuffixes(batch, width, calibration, limits);
+  return settle === null ? null : { advance, settle };
+}
+
+function quoteSettlementSuffixes(batch: number, width: number, calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote | null {
+  let settle: RecoveryQuote | null = null;
+  for (let count = 0; count < batch; count++) {
+    const quote = quoteRange(gapShape('redeemRecovered', count, width), 1, calibration, limits);
+    if (quote === null) return null;
+    if (settle === null || quote.fee > settle.fee) settle = quote;
+  }
+  return settle;
+}
+
 export interface RecoveryBacklog {
   signedStart: bigint;
   observed: bigint;
@@ -153,30 +178,42 @@ export interface RecoveryBacklog {
   qualifiedForMs: bigint;
 }
 
-/** Price the hypothetical terminal pair at its decoder cap, including its prefix, page alignment and worst later witnesses. */
-export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, trust: TrustInput, params: Params,
-  deployment: RecoveryDeployment, calibration: RecoveryCalibration, limits: RecoveryLimits, backlog: RecoveryBacklog, startingSeal?: Uint8Array,
-): Promise<{ run: RecoveryQuote[]; advance: { quote: RecoveryQuote; calls: bigint }; settle: RecoveryQuote; settlementMaxGaps: number; totalFee: bigint }> {
-  limits = { ...limits };
-  if (!validLimits(limits)) fail('CapacityPreflight', 'invalid recovery payer limits');
-  backlog = { ...backlog };
+function checkBacklogMeasurements(backlog: RecoveryBacklog): void {
   const times = [backlog.elapsedMs, backlog.receiptP99Ms, backlog.finalInclusionMs, backlog.qualifiedForMs];
   const counts = [backlog.signedStart, backlog.observed, backlog.duringProgress, backlog.peakSeals, backlog.advancePeakSeals, backlog.finalPeakSeals];
   if (times.some((v) => typeof v !== 'bigint' || v <= 0n) || counts.some((v) => typeof v !== 'bigint' || v < 0n)) {
     fail('CapacityPreflight', 'unqualified backlog measurements');
   }
-  const config = Uint8Array.from(gamma);
-  const cfg = decodeConfig(config, params);
-  if (!validRecoveryDeployment(deployment) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
-    || !eq(deployment.vaultRuntimeHash, calibration.vaultRuntimeHash) || cfg.chainId !== limits.chainId) {
-    fail('CapacityPreflight', 'unqualified recovery deployment');
+}
+
+function recoveryGapNeed(backlog: RecoveryBacklog): bigint {
+  const target = backlog.observed + backlog.duringProgress + 64n;
+  if (backlog.observed < backlog.signedStart || target > MAX_SEGMENT) fail('CapacityPreflight', 'unqualified backlog');
+  if (backlog.finalPeakSeals > 1n) fail('CapacityPreflight', 'unqualified final inclusion window');
+  return target - backlog.signedStart;
+}
+
+/** Verify that the chosen advance can reach a payable end under the qualified arrival windows. */
+export function recoveryCatchUpCalls(batch: number, backlog: RecoveryBacklog): bigint {
+  if (!Number.isSafeInteger(batch) || batch < 1 || batch > 1024) fail('CapacityPreflight', 'invalid recovery gap batch');
+  checkBacklogMeasurements(backlog);
+  const need = recoveryGapNeed(backlog);
+  const q = BigInt(batch);
+  const arriving = backlog.advancePeakSeals;
+  if (q <= arriving || q * backlog.elapsedMs < 2n * backlog.peakSeals * backlog.receiptP99Ms) {
+    fail('CapacityPreflight', 'insufficient certified catch-up rate');
   }
-  const evidence = Uint8Array.from(held);
-  const token = decodeToken(evidence);
-  const domain = domainOf(config);
-  await verifyHeld(cfg, domain, trust, token);
-  const seal = startingSeal === undefined ? null : await verifySealReceipt(cfg, domain, trust, startingSeal);
-  if (burnIndex(cfg, domain, seal).a !== backlog.signedStart) fail('CapacityPreflight', 'unauthenticated signed start');
+  const net = q - arriving;
+  const calls = (need + net - 1n) / net;
+  if (backlog.signedStart + need + calls * arriving + backlog.finalPeakSeals > MAX_SEGMENT ||
+    calls * backlog.receiptP99Ms + backlog.finalInclusionMs > backlog.qualifiedForMs) {
+    fail('CapacityPreflight', 'unqualified catch-up horizon');
+  }
+  return calls;
+}
+
+function prospectiveRunQuotes(evidence: Uint8Array, calibration: RecoveryCalibration, limits: RecoveryLimits,
+  token = decodeToken(evidence)) {
   const view = new DataView(evidence.buffer);
   const spans: Span[] = [];
   let pos = 14;
@@ -194,31 +231,64 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   }
   const n = pos + MAX_TRANSFER_PAIR + 4;
   spans.push({ start: pos, end: n, claims: 1 });
-  const run: RecoveryQuote[] = [];
   const quoted = (from: number, end: number): RecoveryQuote | null => {
     const opening = spans.slice(from, end).reduce((sum, op) => sum + SPARSE + op.claims * (34 + SPARSE), 0);
     const shape = runShape(spans, from, end, n, from === 0 ? 0 : RECEIPT_BYTES, opening);
     return shape === null ? null : quoteRange(shape, from === 0 ? 0 : 1, calibration, limits);
   };
+  return { operations: spans.length, quoted };
+}
+
+/** Price each remaining scheduled run at the same bounds used at admission. */
+export function checkRemainingRecoveryRuns(held: Uint8Array, cuts: readonly number[], confirmedCuts: number,
+  calibration: RecoveryCalibration, limits: RecoveryLimits): void {
+  const { operations, quoted } = prospectiveRunQuotes(Uint8Array.from(held), calibration, limits);
+  let from = 0;
+  for (const [index, count] of cuts.entries()) {
+    const end = from + count;
+    if (!Number.isSafeInteger(count) || count < 1 || count > 16 || end > operations) {
+      fail('CapacityPreflight', 'invalid portable run cut');
+    }
+    if (index >= confirmedCuts && quoted(from, end) === null) fail('CapacityPreflight', 'portable run cut is outside the release limits');
+    from = end;
+  }
+  if (from !== operations) fail('CapacityPreflight', 'portable run cuts do not cover the lineage');
+}
+
+/** Price the hypothetical terminal pair at its decoder cap, including its prefix, page alignment and worst later witnesses. */
+export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, trust: TrustInput, params: Params,
+  deployment: RecoveryDeployment, calibration: RecoveryCalibration, limits: RecoveryLimits, backlog: RecoveryBacklog, startingSeal?: Uint8Array,
+): Promise<{ run: RecoveryQuote[]; advance: { quote: RecoveryQuote; calls: bigint }; settle: RecoveryQuote; settlementMaxGaps: number; totalFee: bigint }> {
+  limits = { ...limits };
+  if (!validLimits(limits)) fail('CapacityPreflight', 'invalid recovery payer limits');
+  backlog = { ...backlog };
+  checkBacklogMeasurements(backlog);
+  const config = Uint8Array.from(gamma);
+  const cfg = decodeConfig(config, params);
+  if (!validRecoveryDeployment(deployment) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
+    || !eq(deployment.vaultRuntimeHash, calibration.vaultRuntimeHash) || cfg.chainId !== limits.chainId) {
+    fail('CapacityPreflight', 'unqualified recovery deployment');
+  }
+  const evidence = Uint8Array.from(held);
+  const token = decodeToken(evidence);
+  const domain = domainOf(config);
+  await verifyHeld(cfg, domain, trust, token);
+  const seal = startingSeal === undefined ? null : await verifySealReceipt(cfg, domain, trust, startingSeal);
+  if (burnIndex(cfg, domain, seal).a !== backlog.signedStart) fail('CapacityPreflight', 'unauthenticated signed start');
+  const { operations, quoted } = prospectiveRunQuotes(evidence, calibration, limits, token);
+  const run: RecoveryQuote[] = [];
   // Every operation must fit alone when a cut has to be retried with a full predecessor.
-  for (let i = 0; i < spans.length; i++) {
+  for (let i = 0; i < operations; i++) {
     if (quoted(i, i + 1) === null) fail('CapacityPreflight', 'indivisible run operation');
   }
-  for (let from = 0; from < spans.length;) {
-    let end = Math.min(from + 16, spans.length);
+  for (let from = 0; from < operations;) {
+    let end = Math.min(from + 16, operations);
     let quote: RecoveryQuote | null;
     while ((quote = quoted(from, end)) === null) end--;
     run.push(quote);
     from = end;
   }
-  const target = backlog.observed + backlog.duringProgress + 64n;
-  if (backlog.observed < backlog.signedStart || target > MAX_SEGMENT) fail('CapacityPreflight', 'unqualified backlog');
-  const ceilDiv = (n: bigint, d: bigint): bigint => (n + d - 1n) / d;
-  const perAdvance = backlog.advancePeakSeals;
-  const finalGrowth = backlog.finalPeakSeals;
-  // Proofs for future seals cannot be included. The vault admits the current or previous endpoint.
-  if (finalGrowth > 1n) fail('CapacityPreflight', 'unqualified final inclusion window');
-  const need = target - backlog.signedStart;
+  const need = recoveryGapNeed(backlog);
   const width = gapProofLen(cfg.K);
   const gap = (count: number) => quoteRange(gapShape('advanceGaps', count, width), 1, calibration, limits);
   if (gap(1) === null) fail('CapacityPreflight', 'indivisible gap operation');
@@ -228,25 +298,13 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
     advance = gap(q);
     if (advance !== null) break;
   }
-  if (advance === null || BigInt(q) <= perAdvance || BigInt(q) * backlog.elapsedMs < 2n * backlog.peakSeals * backlog.receiptP99Ms) {
-    fail('CapacityPreflight', 'insufficient certified catch-up rate');
-  }
-  // Full advances are needed only while at least q proved gaps remain. Reserve for the
-  // growing archive by charging every advance against its guaranteed net progress.
-  const calls = ceilDiv(need, BigInt(q) - perAdvance);
-  if (target + calls * perAdvance + finalGrowth > MAX_SEGMENT
-    || calls * backlog.receiptP99Ms + backlog.finalInclusionMs > backlog.qualifiedForMs) {
-    fail('CapacityPreflight', 'unqualified catch-up horizon');
-  }
+  if (advance === null) fail('CapacityPreflight', 'insufficient certified catch-up rate');
+  const calls = recoveryCatchUpCalls(q, backlog);
   // Once fewer than q gaps remain, settle against the latest proved endpoint. Price
   // every possible terminal suffix: the release need not price it monotonically.
-  let settle: RecoveryQuote | null = null;
-  for (let count = 0; count < q; count++) {
-    const quote = quoteRange(gapShape('redeemRecovered', count, width), 1, calibration, limits);
-    if (quote === null) fail('CapacityPreflight', 'unqualified settlement suffix');
-    if (settle === null || quote.fee > settle.fee) settle = quote;
-  }
-  const totalFee = run.reduce((sum, call) => sum + call.fee, 0n) + advance.fee * calls + settle!.fee;
+  const settle = quoteSettlementSuffixes(q, width, calibration, limits);
+  if (settle === null) fail('CapacityPreflight', 'unqualified settlement suffix');
+  const totalFee = run.reduce((sum, call) => sum + call.fee, 0n) + advance.fee * calls + settle.fee;
   if (totalFee > limits.feeBudget || totalFee > limits.balance) fail('CapacityPreflight', 'insufficient recovery fee budget');
-  return { run, advance: { quote: advance, calls }, settle: settle!, settlementMaxGaps: q - 1, totalFee };
+  return { run, advance: { quote: advance, calls }, settle, settlementMaxGaps: q - 1, totalFee };
 }
