@@ -1,7 +1,9 @@
 //! NB2 continuation packets built from authenticated flat evidence.
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::vec;
 use alloc::vec::Vec;
+use alloc::{rc::Rc, vec};
+use core::cell::RefCell;
 
 use super::abi::{abi_encode, AbiArg};
 use super::config::{decode_config, domain_of, Config, Params, MAX_SEGMENT};
@@ -404,6 +406,81 @@ pub struct RunPacket {
     pub event: RecoveryEvent,
 }
 
+/// One authority shared by sessions on the deployment. Restore the persisted input before reopening.
+#[derive(Clone)]
+pub struct RecoveryAuthority(Rc<AuthorityState>);
+
+type PersistAuthority = dyn Fn(&TrustInput) -> Result<()>;
+
+struct AuthorityState {
+    held: RefCell<TrustInput>,
+    persist: Box<PersistAuthority>,
+}
+
+impl RecoveryAuthority {
+    pub fn new(
+        checkpoint: TrustInput,
+        persist: impl Fn(&TrustInput) -> Result<()> + 'static,
+    ) -> Self {
+        Self(Rc::new(AuthorityState {
+            held: RefCell::new(checkpoint),
+            persist: Box::new(persist),
+        }))
+    }
+
+    pub fn checkpoint(&self) -> Result<TrustInput> {
+        self.0
+            .held
+            .try_borrow()
+            .map(|held| held.clone())
+            .map_err(|_| {
+                super::errors::wallet_err(
+                    WalletReason::TrustInput,
+                    "recovery authority persistence in progress",
+                )
+            })
+    }
+
+    pub fn accept(&self, offered: &TrustInput, cfg: &Config) -> Result<()> {
+        let mut held = self.0.held.try_borrow_mut().map_err(|_| {
+            super::errors::wallet_err(
+                WalletReason::TrustInput,
+                "recovery authority persistence in progress",
+            )
+        })?;
+        bind_trust(&held, cfg)?;
+        bind_trust(offered, cfg)?;
+        if *held == *offered {
+            return Ok(());
+        }
+        let old = held.history().entries();
+        let new = offered.history().entries();
+        let before = held.origin().unwrap();
+        let after = offered.origin().unwrap();
+        if new.len() < old.len()
+            || old
+                .iter()
+                .zip(new)
+                .any(|(a, b)| a.entry_id() != b.entry_id())
+            || after.usable_epoch < before.usable_epoch
+            || after.root_round < before.root_round
+        {
+            return refuse(
+                WalletReason::TrustInput,
+                "recovery authority rolls back the held history or origin",
+            );
+        }
+        (self.0.persist)(offered).map_err(|error| {
+            super::errors::wallet_err(
+                WalletReason::TrustInput,
+                alloc::format!("could not persist recovery authority: {}", error.name()),
+            )
+        })?;
+        *held = offered.clone();
+        Ok(())
+    }
+}
+
 pub struct RecoverySession {
     cfg: Config,
     deployment: RecoveryDeployment,
@@ -412,20 +489,21 @@ pub struct RecoverySession {
     header: Vec<u8>,
     verdict: Verdict,
     ops: Vec<Operation>,
+    authority: RecoveryAuthority,
 }
 
 impl RecoverySession {
     pub fn create(
         gamma: &[u8],
         evidence: &[u8],
-        trust: &TrustInput,
+        authority: RecoveryAuthority,
         params: &Params,
         deployment: RecoveryDeployment,
     ) -> Result<Self> {
         let cfg = decode_config(gamma, params)?;
         let domain = domain_of(gamma);
         let token = decode_token(evidence)?;
-        let verdict = verify_part(&cfg, &domain, trust, &token)?;
+        let verdict = verify_part(&cfg, &domain, &authority.checkpoint()?, &token)?;
         let pages = Pages::new(evidence);
         let header = cat(&[
             &VERSION,
@@ -455,6 +533,7 @@ impl RecoverySession {
             header,
             verdict,
             ops,
+            authority,
         })
     }
 
@@ -505,6 +584,7 @@ impl RecoverySession {
             body.extend_from_slice(&cat(&[&[1], &state, &blob(receipt)]));
             seq + 1
         } else {
+            self.authority.accept(trust, &self.cfg)?;
             body.push(0);
             1
         };
@@ -613,6 +693,16 @@ impl RecoverySession {
         fail_d(Rule::CapacityPreflight, "indivisible run operation")
     }
 
+    fn check_expectation(&self, event: &RecoveryEvent) -> Result<()> {
+        if event.topics != [event.kind.topic(), self.session] {
+            return refuse(
+                WalletReason::ProviderFault,
+                "recovery expectation belongs to a different session or event",
+            );
+        }
+        Ok(())
+    }
+
     pub fn verify_event(
         &self,
         trust: &TrustInput,
@@ -622,8 +712,11 @@ impl RecoverySession {
         if receipt.len() > RECEIPT_CAP {
             return fail_d(Rule::InputTooLarge, "cold receipt");
         }
+        self.check_expectation(expected)?;
         let proof = decode_deposit_proof(receipt)?;
-        let log = verify_receipt_log_at(&self.cfg, trust, &proof, &self.deployment.recovery)?;
+        self.authority.accept(trust, &self.cfg)?;
+        let held = self.authority.checkpoint()?;
+        let log = verify_receipt_log_at(&self.cfg, &held, &proof, &self.deployment.recovery)?;
         if log.address != self.deployment.recovery
             || log.topics.len() != 2
             || log.topics[0] != expected.kind.topic()
@@ -677,42 +770,28 @@ impl RecoverySession {
         sources: &[&ReceiptSource<'_>],
         refresh: Option<&TrustRefresh<'_>>,
     ) -> Result<(RecoveryReceipt, TrustInput)> {
-        bind_trust(trust, &self.cfg)?;
-        let mut authority = trust.clone();
+        self.check_expectation(event)?;
+        self.authority.accept(trust, &self.cfg)?;
         let mut unavailable = None;
         let mut fault = None;
         for source in sources {
             let result = (|| {
-                let proof = source(&self.deployment.recovery, &event.kind.topic())?;
+                let proof = source(&self.deployment.recovery, event)?;
+                let authority = self.authority.checkpoint()?;
                 match self.verify_event(&authority, &proof, event) {
                     Err(e)
                         if refresh.is_some()
                             && (e.retryable() || ahead_of_origin(&authority, &proof)) =>
                     {
                         let fresh = refresh.unwrap()(&authority)?;
-                        bind_trust(&fresh, &self.cfg)?;
-                        let old = authority.history().entries();
-                        let new = fresh.history().entries();
-                        let before = authority.origin().unwrap();
-                        let after = fresh.origin().unwrap();
-                        if new.len() < old.len()
-                            || old
-                                .iter()
-                                .zip(new)
-                                .any(|(a, b)| a.entry_id() != b.entry_id())
-                            || after.usable_epoch < before.usable_epoch
-                            || after.root_round < before.root_round
-                        {
-                            return refuse(WalletReason::TrustInput, "recovery authority refresh does not extend the held history and origin");
-                        }
-                        authority = fresh;
-                        self.verify_event(&authority, &proof, event)
+                        self.authority.accept(&fresh, &self.cfg)?;
+                        self.verify_event(&self.authority.checkpoint()?, &proof, event)
                     }
                     result => result,
                 }
             })();
             match result {
-                Ok(receipt) => return Ok((receipt, authority)),
+                Ok(receipt) => return Ok((receipt, self.authority.checkpoint()?)),
                 Err(e) if e.reason() == Some(WalletReason::TrustInput) => return Err(e),
                 Err(e)
                     if matches!(
@@ -749,7 +828,7 @@ fn ahead_of_origin(trust: &TrustInput, receipt: &[u8]) -> bool {
         })
 }
 
-pub type ReceiptSource<'a> = dyn Fn(&[u8; 20], &Hash) -> Result<Vec<u8>> + 'a;
+pub type ReceiptSource<'a> = dyn Fn(&[u8; 20], &RecoveryEvent) -> Result<Vec<u8>> + 'a;
 pub type TrustRefresh<'a> = dyn Fn(&TrustInput) -> Result<TrustInput> + 'a;
 pub struct RecoveryReceipt {
     pub encoded: Vec<u8>,
@@ -763,10 +842,10 @@ pub struct RecoveryReceipt {
 pub fn recovery_rpc_source<'a, R: super::rpc::JsonRpc + ?Sized>(
     reader: &'a super::rpc::EvmReader<R>,
     tx_hash: Hash,
-) -> impl Fn(&[u8; 20], &Hash) -> Result<Vec<u8>> + 'a {
-    move |emitter, topic| {
+) -> impl Fn(&[u8; 20], &RecoveryEvent) -> Result<Vec<u8>> + 'a {
+    move |emitter, event| {
         Ok(reader
-            .recovery_receipt_proof(&tx_hash, emitter, topic)?
+            .recovery_receipt_proof(&tx_hash, emitter, event)?
             .encoded)
     }
 }
@@ -810,9 +889,15 @@ impl RecoverySession {
         {
             return fail_d(Rule::Shape, "certified gap range");
         }
+        self.authority.accept(trust, &self.cfg)?;
         let mut paths = Vec::new();
         for (i, receipt) in receipts.iter().enumerate() {
-            let seal = verify_seal_receipt(&self.cfg, &self.verdict.domain, trust, receipt)?;
+            let seal = verify_seal_receipt(
+                &self.cfg,
+                &self.verdict.domain,
+                &self.authority.checkpoint()?,
+                receipt,
+            )?;
             if seal.segment.index != start + i as u64 || seal.segment.before != head {
                 return fail_d(Rule::SegmentLog, "nonconsecutive certified seals");
             }

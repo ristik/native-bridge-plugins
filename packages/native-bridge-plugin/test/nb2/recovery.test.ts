@@ -3,7 +3,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { test } from 'node:test';
 import { gunzipSync } from 'node:zlib';
 import { concat, fromHex } from '../../src/bytes.js';
-import { decodeConfig, decodeDepositProof, verifyReceiptLog, Nb2Error, PRODUCTION_PARAMS, RecoverySession, TrustInput, WalletError } from '../../src/nb2/index.js';
+import { decodeConfig, decodeDepositProof, verifyReceiptLog, Nb2Error, PRODUCTION_PARAMS, RecoveryAuthority, RecoverySession, TrustInput, WalletError } from '../../src/nb2/index.js';
 
 const fixtures = new URL('../../../../protocol/vectors/nb2-continuation-v1.1/', import.meta.url);
 const read = (file: string) => readFile(new URL(file, fixtures));
@@ -44,7 +44,7 @@ for (const name of ['root', 'transfers', 'one-split', 'depth-20', 'shared-claim'
     const c = JSON.parse(context.toString());
     const trust = (await TrustInput.fromBundle(bundle, decodeConfig(gamma, PRODUCTION_PARAMS).rootGenesis))
       .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
-    const session = await RecoverySession.create(gamma, evidence, trust, PRODUCTION_PARAMS, {
+    const session = await RecoverySession.create(gamma, evidence, new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, {
       salt, pins, recovery: fromHex(c.RecoveryAddress)!, runtimeHash: fromHex(c.RecoveryRuntimeHash)!,
     });
     assert.deepEqual(Buffer.from(session.id), Buffer.from(c.Session, 'hex'));
@@ -65,7 +65,12 @@ for (const name of ['root', 'transfers', 'one-split', 'depth-20', 'shared-claim'
     let from = 0;
     let prior: { seq: bigint; receipt: Uint8Array } | undefined;
     for (const [calldata, , state, topics, data, receipt] of trace(gunzipSync(packed))) {
-      const result = await session.run(from, opCount(calldata), trust, prior);
+      const expectedReceiptLength = prior?.receipt.length ?? 0;
+      const input = prior && { ...prior };
+      const building = session.run(from, opCount(calldata), trust, input);
+      if (input) input.receipt = new Uint8Array();
+      const result = await building;
+      assert.equal(result.shape.receiptBytes, expectedReceiptLength);
       assert.deepEqual(Buffer.from(result.calldata), calldata);
       assert.deepEqual(Buffer.from(result.state ?? []), state);
       assert.deepEqual(Buffer.from(concat(...result.event.topics)), topics);
@@ -94,7 +99,7 @@ test('recovery replays the production-verifier T1 supplement and rejects its inv
   };
   const trust = (await TrustInput.fromBundle(await load('b1-rollover/utb.cbor'), decodeConfig(gamma, PRODUCTION_PARAMS).rootGenesis))
     .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
-  const session = await RecoverySession.create(gamma, await load('b1-rollover/evidence.bin'), trust, PRODUCTION_PARAMS, deployment);
+  const session = await RecoverySession.create(gamma, await load('b1-rollover/evidence.bin'), new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, deployment);
   let from = 0;
   let prior: { seq: bigint; receipt: Uint8Array } | undefined;
   for (const [calldata, , state, topics, data, receipt] of trace(gunzipSync(await load('b1-rollover/trace.bin.gz')))) {
@@ -110,7 +115,7 @@ test('recovery replays the production-verifier T1 supplement and rejects its inv
   assert.equal(from, session.operationCount);
   for (const name of ['b1-rollover-refusals', 'cross-cut-conflict']) {
     const evidence = await load(name + '/evidence.bin');
-    await assert.rejects(RecoverySession.create(gamma, evidence, trust, PRODUCTION_PARAMS, deployment));
+    await assert.rejects(RecoverySession.create(gamma, evidence, new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, deployment));
   }
 });
 
@@ -122,7 +127,7 @@ test('cold recovery reproduces gap and settlement calls and switches proof sourc
   const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
   const trust = (await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis))
     .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
-  const session = await RecoverySession.create(gamma, await read(base + 'evidence.bin'), trust, PRODUCTION_PARAMS, {
+  const session = await RecoverySession.create(gamma, await read(base + 'evidence.bin'), new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, {
     recovery, salt: await read('generation-salt.bin'), pins: await read('pins.bin'), runtimeHash: fromHex(context.RecoveryRuntimeHash)!,
   });
   for (const name of await readdir(new URL('transcripts/cold/', fixtures))) {
@@ -140,7 +145,9 @@ test('cold recovery reproduces gap and settlement calls and switches proof sourc
     const data = Buffer.from(log.data);
     const prior = { seq: data.readBigUInt64BE(24), cursor: kind === 2 ? { next: data.readBigUInt64BE(248), head: data.subarray(256) } : undefined };
     const entry = name.startsWith('advance') ? 'advanceGaps' : 'redeemRecovered';
-    const packet = await session.gaps(entry, trust, receipt, prior, gaps, gapStart === end + 2 ? undefined : body.subarray(end + 2, gapStart));
+    const building = session.gaps(entry, trust, receipt, prior, gaps, gapStart === end + 2 ? undefined : body.subarray(end + 2, gapStart));
+    if (kind === 2) prior.cursor = undefined;
+    const packet = await building;
     assert.deepEqual(Buffer.from(packet.calldata), calldata, name);
     if (packet.event) {
       const outcome = JSON.parse(String(await read(dir + 'outcome.json')));
@@ -176,18 +183,39 @@ test('cold admission prices the terminal bound, reserve, signed envelope and ref
     signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: cfg.chainId, maxNonce: 255n,
     maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, balance: 10n ** 18n, feeBudget: 10n ** 18n,
   };
-  const backlog = { signedStart: 0n, observed: 2n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n, receiptP99Ms: 1000n };
+  const backlog = { signedStart: 0n, observed: 2n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n, receiptP99Ms: 1000n, finalInclusionMs: 25n, qualifiedForMs: 200_000n };
   const call = (changes: Partial<typeof limits> = {}, progress: Partial<typeof backlog> = {}) =>
     preflightRecovery(gamma, held, trust, PRODUCTION_PARAMS, deployment, calibration, { ...limits, ...changes }, { ...backlog, ...progress });
   const plan = await call();
   assert.equal(plan.run.reduce((total, q) => total + q.shape.operations, 0), 4);
   assert.equal(plan.advance.quote.shape.gaps, 69);
-  assert.equal(plan.advance.calls, 1n);
+  assert.equal(plan.advance.calls, 2n);
   assert.ok(plan.settle.signedBytes > plan.settle.shape.calldataBytes);
   assert.equal((await call({ feeBudget: plan.totalFee })).totalFee, plan.totalFee);
   await assert.rejects(call({ feeBudget: plan.totalFee - 1n }), { rule: 'CapacityPreflight' });
   await assert.rejects(call({}, { signedStart: 1n }), { rule: 'CapacityPreflight' });
   await assert.rejects(call({}, { peakSeals: 35n }), { rule: 'CapacityPreflight' });
+  const max64 = { ...calibration, executionBound: (shape: Parameters<typeof quoteRecovery>[0]) =>
+    shape.entry === 'advanceGaps' && shape.gaps > 64 ? null : calibration.executionBound(shape) };
+  const growing = { ...backlog, observed: 1024n, duringProgress: 0n, peakSeals: 32n };
+  const growingQuote = (changes = growing, budget = limits.feeBudget, model = max64) =>
+    preflightRecovery(gamma, held, trust, PRODUCTION_PARAMS, deployment, model, { ...limits, feeBudget: budget }, changes);
+  const extended = await growingQuote();
+  assert.equal(extended.advance.calls, 34n);
+  assert.equal(extended.settlementMaxGaps, 63);
+  assert.equal(extended.settle.shape.gaps, 63);
+  const originalSettlement = quoteRecovery({ ...extended.settle.shape, gaps: 0, calldataBytes: 65_668 }, max64, limits)!;
+  const originalBudget = extended.run.reduce((sum, step) => sum + step.fee, 17n * extended.advance.quote.fee + originalSettlement.fee);
+  await assert.rejects(growingQuote(growing, originalBudget), /insufficient recovery fee budget/);
+  await assert.rejects(growingQuote({ ...growing, qualifiedForMs: 34_000n }), /unqualified catch-up horizon/);
+  await assert.rejects(growingQuote({ ...growing, finalInclusionMs: 32n }), /unqualified final inclusion window/);
+  await assert.rejects(growingQuote({ ...growing, observed: (1n << 48n) - 66n }), /unqualified catch-up horizon/);
+  await assert.rejects(growingQuote({ ...growing, observed: 0n, peakSeals: 0n }, limits.feeBudget, {
+    ...max64, executionBound: (shape) => shape.entry === 'advanceGaps' && shape.gaps === 1 ? null : max64.executionBound(shape),
+  }), /indivisible gap operation/);
+  await assert.rejects(growingQuote(growing, limits.feeBudget, {
+    ...max64, executionBound: (shape) => shape.entry === 'redeemRecovered' && shape.gaps === 1 ? null : max64.executionBound(shape),
+  }), /unqualified settlement suffix/);
   const quote = plan.settle;
   assert.ok(quoteRecovery(quote.shape, calibration, { ...limits, signedBytes: quote.signedBytes, gas: quote.gas }));
   assert.equal(quoteRecovery(quote.shape, calibration, { ...limits, gas: quote.gas - 1n }), null);
@@ -224,4 +252,83 @@ test('recovery RPC proves the parent with the canonical child companion and its 
   wrongChild = false;
   badRecord = true;
   await assert.rejects(reader.certificateOf(block.header, block.hash, true));
+});
+
+test('missing successor refresh is persisted and prevents authority rollback across sessions', async () => {
+  const { TrustBaseBundle } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js');
+  const base = 'transcripts/root/';
+  const gamma = await read('gamma.bin');
+  const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
+  const evidence = await read(base + 'evidence.bin');
+  const c = JSON.parse(String(await read(base + 'context.json')));
+  const deployment = { salt: await read('generation-salt.bin'), pins: await read('pins.bin'),
+    recovery: fromHex(c.RecoveryAddress)!, runtimeHash: fromHex(c.RecoveryRuntimeHash)! };
+  const full = await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis);
+  const short = await TrustInput.fromBundle(await TrustBaseBundle.encode(full.history.entries.slice(0, 1)), cfg.rootGenesis);
+  const previous = short.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 10_000n });
+  const lagging = short.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const current = full.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_001n });
+  let persisted = { bundle: await previous.history.toBundle(), origin: previous.origin! };
+  let failStore = false;
+  const guard = new RecoveryAuthority(previous, async (input) => {
+    if (failStore) throw new Error('write failed');
+    persisted = { bundle: await input.history.toBundle(), origin: input.origin! };
+  });
+  const creating = RecoverySession.create(gamma, evidence, guard, PRODUCTION_PARAMS, deployment);
+  gamma.fill(0); // Buffer input can be changed while verification is awaiting historical authority.
+  const session = await creating;
+  const { event } = await session.run(0, 2, previous);
+  const [record] = trace(gunzipSync(await read(base + 'trace.bin.gz')));
+  const proof = record[5];
+  let fetched = 0;
+  await assert.rejects(session.acquire(lagging, event, [async () => proof]), { rule: 'NoEntryForEpoch' });
+  failStore = true;
+  await assert.rejects(session.acquire(lagging, event, [async () => proof], async () => current), { reason: 'TrustInput' });
+  assert.equal(guard.checkpoint, lagging);
+  failStore = false;
+  const acquired = await session.acquire(lagging, event, [async () => proof], async (held) => {
+    assert.equal(held, lagging);
+    fetched++;
+    return current;
+  });
+  assert.equal(fetched, 1);
+  assert.equal(acquired.trust, current);
+  assert.deepEqual(persisted.origin, current.origin);
+  assert.deepEqual(persisted.bundle, await current.history.toBundle());
+  const staleOrigin = full.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 10_001n });
+  const staleHistory = short.withAuthenticatedOrigin(current.origin!);
+  for (const stale of [staleOrigin, staleHistory]) {
+    await assert.rejects(session.acquire(stale, event, [async () => proof]), { reason: 'TrustInput' });
+  }
+  const restored = (await TrustInput.fromBundle(persisted.bundle, current.id)).withAuthenticatedOrigin(persisted.origin);
+  const reopened = await RecoverySession.create(await read('gamma.bin'), evidence,
+    new RecoveryAuthority(restored, async () => {}), PRODUCTION_PARAMS, deployment);
+  await assert.rejects(reopened.run(0, 2, staleHistory), { reason: 'TrustInput' });
+  await assert.rejects(reopened.verifyEvent(current, proof, { ...event, topics: [event.topics[0], new Uint8Array(32)] }), { reason: 'ProviderFault' });
+  await reopened.verifyEvent(current, proof, event);
+});
+
+test('recovery RPC selects the later exact event by receipt-local index', async () => {
+  const { EvmReader, recoveryRpcSource } = await import('../../src/nb2/rpc.js');
+  const { toHex } = await import('../../src/bytes.js');
+  const { setup } = await import('./world.js');
+  const { chain } = await setup();
+  const reader = new EvmReader(chain);
+  const emitter = new Uint8Array(20).fill(1);
+  const event = { kind: 'progress' as const, topics: [new Uint8Array(32).fill(2), new Uint8Array(32).fill(3)], data: Uint8Array.of(4) };
+  const hex = (bytes: Uint8Array): string => '0x' + toHex(bytes);
+  const block = chain.blocks[0];
+  const hash = hex(block.hash);
+  reader.receipt = async () => ({
+    status: '0x1', cumulativeGasUsed: '0x1', logsBloom: '', blockHash: hash, blockNumber: '0x0', transactionIndex: '0x0', transactionHash: hash,
+    logs: [
+      { address: hex(emitter), topics: event.topics.map(hex), data: '0x05', logIndex: '0x17' },
+      { address: hex(emitter), topics: event.topics.map(hex), data: '0x04', logIndex: '0x18' },
+    ],
+  });
+  reader.headerByHash = async () => ({ header: block.header, raw: Uint8Array.of(0) });
+  reader.certificateOf = async () => Uint8Array.of(1);
+  reader.receiptPath = async () => [Uint8Array.of(2)];
+  const proof = decodeDepositProof(await recoveryRpcSource(reader, block.hash)(emitter, event));
+  assert.equal(proof.logIndex, 1n);
 });

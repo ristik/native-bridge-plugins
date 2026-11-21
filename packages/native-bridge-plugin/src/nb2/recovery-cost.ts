@@ -10,6 +10,10 @@ import type { RecoveryDeployment } from './recovery.js';
 import type { TrustInput } from './trust.js';
 import { verifyHeld } from './verify.js';
 
+export const validRecoveryDeployment = (d: RecoveryDeployment): boolean =>
+  d.salt.length === 32 && d.recovery.length === 20 && d.runtimeHash.length === 32 && d.pins.length === 32
+  && (d.vaultRuntimeHash === undefined || d.vaultRuntimeHash.length === 32);
+
 export interface RecoveryShape {
   entry: 'run' | 'advanceGaps' | 'redeemRecovered';
   calldataBytes: number;
@@ -112,20 +116,25 @@ export interface RecoveryBacklog {
   peakSeals: bigint;
   elapsedMs: bigint;
   receiptP99Ms: bigint;
+  /** Qualified time from sealing the final endpoint, including proof retrieval, through settlement inclusion. */
+  finalInclusionMs: bigint;
+  /** Horizon for which the peak-rate and timing bounds are qualified after lineage progress. */
+  qualifiedForMs: bigint;
 }
 
 /** Price the hypothetical terminal pair at its decoder cap, including its prefix, page alignment and worst later witnesses. */
 export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, trust: TrustInput, params: Params,
   deployment: RecoveryDeployment, calibration: RecoveryCalibration, limits: RecoveryLimits, backlog: RecoveryBacklog, startingSeal?: Uint8Array,
-): Promise<{ run: RecoveryQuote[]; advance: { quote: RecoveryQuote; calls: bigint; tail: RecoveryQuote | null }; settle: RecoveryQuote; totalFee: bigint }> {
-  const cfg = decodeConfig(gamma, params);
-  if (!eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
+): Promise<{ run: RecoveryQuote[]; advance: { quote: RecoveryQuote; calls: bigint }; settle: RecoveryQuote; settlementMaxGaps: number; totalFee: bigint }> {
+  const config = Uint8Array.from(gamma);
+  const cfg = decodeConfig(config, params);
+  if (!validRecoveryDeployment(deployment) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
     || !eq(deployment.vaultRuntimeHash, calibration.vaultRuntimeHash) || cfg.chainId !== limits.chainId) {
     fail('CapacityPreflight', 'unqualified recovery deployment');
   }
   const evidence = Uint8Array.from(held);
   const token = decodeToken(evidence);
-  const domain = domainOf(gamma);
+  const domain = domainOf(config);
   await verifyHeld(cfg, domain, trust, token);
   const seal = startingSeal === undefined ? null : await verifySealReceipt(cfg, domain, trust, startingSeal);
   if (burnIndex(cfg, domain, seal).a !== backlog.signedStart) fail('CapacityPreflight', 'unauthenticated signed start');
@@ -163,27 +172,45 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
     run.push(quote);
     from = end;
   }
+  const target = backlog.observed + backlog.duringProgress + 64n;
   if (backlog.signedStart < 0n || backlog.observed < backlog.signedStart || backlog.duringProgress < 0n
-    || backlog.observed + backlog.duringProgress + 64n > MAX_SEGMENT || backlog.peakSeals < 0n
-    || backlog.elapsedMs <= 0n || backlog.receiptP99Ms <= 0n) fail('CapacityPreflight', 'unqualified backlog');
-  const need = backlog.observed - backlog.signedStart + backlog.duringProgress + 64n;
+    || target > MAX_SEGMENT || backlog.peakSeals < 0n || backlog.elapsedMs <= 0n
+    || backlog.receiptP99Ms <= 0n || backlog.finalInclusionMs <= 0n) fail('CapacityPreflight', 'unqualified backlog');
+  const ceilDiv = (n: bigint, d: bigint): bigint => (n + d - 1n) / d;
+  const growth = (ms: bigint): bigint => ceilDiv(backlog.peakSeals * ms, backlog.elapsedMs);
+  const perAdvance = growth(backlog.receiptP99Ms);
+  const finalGrowth = growth(backlog.finalInclusionMs);
+  // Proofs for future seals cannot be included. The vault admits the current or previous endpoint.
+  if (finalGrowth > 1n) fail('CapacityPreflight', 'unqualified final inclusion window');
+  const need = target - backlog.signedStart;
   const width = gapProofLen(cfg.K);
+  const gap = (count: number) => quoteRecovery(gapShape('advanceGaps', count, width), calibration, limits);
+  if (gap(1) === null) fail('CapacityPreflight', 'indivisible gap operation');
   let q = Math.min(1024, Number(need));
-  let gap: RecoveryQuote | null = null;
+  let advance: RecoveryQuote | null = null;
   for (; q > 0; q--) {
-    gap = quoteRecovery(gapShape('advanceGaps', q, width), calibration, limits);
-    if (gap !== null) break;
+    advance = gap(q);
+    if (advance !== null) break;
   }
-  if (gap === null || BigInt(q) * backlog.elapsedMs < 2n * backlog.peakSeals * backlog.receiptP99Ms) {
+  if (advance === null || BigInt(q) <= perAdvance || BigInt(q) < 2n * perAdvance) {
     fail('CapacityPreflight', 'insufficient certified catch-up rate');
   }
-  const settle = quoteRecovery(gapShape('redeemRecovered', 0, width), calibration, limits);
-  if (settle === null) fail('CapacityPreflight', 'indivisible settlement');
-  const calls = need / BigInt(q);
-  const remaining = Number(need % BigInt(q));
-  const tail = remaining === 0 ? null : quoteRecovery(gapShape('advanceGaps', remaining, width), calibration, limits);
-  if (remaining !== 0 && tail === null) fail('CapacityPreflight', 'unqualified gap remainder');
-  const totalFee = run.reduce((sum, call) => sum + call.fee, 0n) + gap.fee * calls + (tail?.fee ?? 0n) + settle.fee;
+  // Full advances are needed only while at least q proved gaps remain. Reserve for the
+  // growing archive by charging every advance against its guaranteed net progress.
+  const calls = ceilDiv(need, BigInt(q) - perAdvance);
+  if (target + calls * perAdvance + finalGrowth > MAX_SEGMENT
+    || calls * backlog.receiptP99Ms + backlog.finalInclusionMs > backlog.qualifiedForMs) {
+    fail('CapacityPreflight', 'unqualified catch-up horizon');
+  }
+  // Once fewer than q gaps remain, settle against the latest proved endpoint. Price
+  // every possible terminal suffix: the release need not price it monotonically.
+  let settle: RecoveryQuote | null = null;
+  for (let count = 0; count < q; count++) {
+    const quote = quoteRecovery(gapShape('redeemRecovered', count, width), calibration, limits);
+    if (quote === null) fail('CapacityPreflight', 'unqualified settlement suffix');
+    if (settle === null || quote.fee > settle.fee) settle = quote;
+  }
+  const totalFee = run.reduce((sum, call) => sum + call.fee, 0n) + advance.fee * calls + settle!.fee;
   if (totalFee > limits.feeBudget || totalFee > limits.balance) fail('CapacityPreflight', 'insufficient recovery fee budget');
-  return { run, advance: { quote: gap, calls, tail }, settle, totalFee };
+  return { run, advance: { quote: advance, calls }, settle: settle!, settlementMaxGaps: q - 1, totalFee };
 }

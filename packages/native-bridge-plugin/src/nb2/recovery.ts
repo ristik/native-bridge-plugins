@@ -6,7 +6,7 @@ import { decodeConfig, domainOf, MAX_SEGMENT, type Config, type Params } from '.
 import { HE, HU } from './crypto.js';
 import { decodeDepositProof, decodeReceiptBacking, encodeDepositProof, verifyReceiptLog } from './deposit.js';
 import { fail, Nb2Error, refuse, WalletError } from './errors.js';
-import { quoteRecovery, type RecoveryCalibration, type RecoveryLimits, type RecoveryQuote, type RecoveryShape } from './recovery-cost.js';
+import { quoteRecovery, validRecoveryDeployment, type RecoveryCalibration, type RecoveryLimits, type RecoveryQuote, type RecoveryShape } from './recovery-cost.js';
 import { verifySealReceipt } from './rules.js';
 import { foldHistory, gapProofLen, GapTree } from './segment.js';
 import { decodeSplitManifest, parentLink } from './split.js';
@@ -185,33 +185,80 @@ export interface RecoveryEvent { kind: Kind; topics: Uint8Array[]; data: Uint8Ar
 export interface RecoveryReceipt {
   encoded: Uint8Array; blockNumber: bigint; blockHash: Uint8Array; txIndex: bigint; logIndex: bigint;
 }
-export type RecoveryReceiptSource = (emitter: Uint8Array, topic: Uint8Array) => Promise<Uint8Array>;
+export type RecoveryReceiptSource = (emitter: Uint8Array, event: RecoveryEvent) => Promise<Uint8Array>;
 
 export interface GapPrior { seq: bigint; cursor?: { next: bigint; head: Uint8Array } }
 export interface GapPacket { shape: RecoveryShape; calldata: Uint8Array; event: RecoveryEvent | null; next: bigint; head: Uint8Array | undefined }
 export interface RunPacket { shape: RecoveryShape; calldata: Uint8Array; end: number; state: Uint8Array | null; event: RecoveryEvent }
 
+/** One authority for all sessions on a deployment. Restore the persisted checkpoint before reopening.
+ * Supply an independently decoded history for each update. The callback durably saves
+ * the authenticated origin and history before a newer checkpoint can be used.
+ */
+export class RecoveryAuthority {
+  #pending: Promise<unknown> = Promise.resolve();
+  #held: TrustInput;
+  #persistedTip: TrustInput['history']['tip'];
+  constructor(checkpoint: TrustInput, private readonly persist: (next: TrustInput) => Promise<void>) {
+    this.#held = checkpoint;
+    this.#persistedTip = checkpoint.history.tip;
+  }
+  get checkpoint(): TrustInput { return this.#held; }
+  accept(offered: TrustInput, cfg: Config): Promise<TrustInput> {
+    const next = this.#pending.then(async () => {
+      const held = this.#held;
+      bindTrust(held, cfg);
+      bindTrust(offered, cfg);
+      const tip = held.history.tip!;
+      if (held === offered && tip === this.#persistedTip) return held;
+      const prefix = offered.history.entryForEpoch(tip.epoch);
+      if (prefix === null || !eq(await prefix.entryId(), await tip.entryId())
+        || offered.origin!.rootRound < held.origin!.rootRound || offered.origin!.usableEpoch < held.origin!.usableEpoch) {
+        refuse('TrustInput', 'recovery authority rolls back the held history or origin');
+      }
+      const offeredTip = offered.history.tip;
+      if (held.history.tip !== tip) refuse('TrustInput', 'held history changed during recovery authority validation');
+      try {
+        await this.persist(offered);
+      } catch (e) {
+        throw new WalletError('TrustInput', 'could not persist recovery authority', e);
+      }
+      this.#held = offered;
+      this.#persistedTip = offeredTip;
+      return offered;
+    });
+    this.#pending = next.catch(() => {});
+    return next;
+  }
+}
+
 export class RecoverySession {
   private constructor(
     private readonly cfg: Config, private readonly deployment: RecoveryDeployment, private readonly pages: Pages,
     private readonly session: Uint8Array, private readonly header: Uint8Array, private readonly verdict: Verdict,
-    private readonly ops: Operation[],
+    private readonly ops: Operation[], private readonly authority: RecoveryAuthority,
   ) {}
-  static async create(gamma: Uint8Array, evidence: Uint8Array, trust: TrustInput, params: Params, input: RecoveryDeployment): Promise<RecoverySession> {
+  static async create(gamma: Uint8Array, evidence: Uint8Array, authority: RecoveryAuthority, params: Params, input: RecoveryDeployment): Promise<RecoverySession> {
     const deployment = { salt: Uint8Array.from(input.salt), recovery: Uint8Array.from(input.recovery), runtimeHash: Uint8Array.from(input.runtimeHash), pins: Uint8Array.from(input.pins),
       vaultRuntimeHash: input.vaultRuntimeHash && Uint8Array.from(input.vaultRuntimeHash) };
     const { salt, recovery, runtimeHash, pins } = deployment;
-    if (salt.length !== 32 || recovery.length !== 20 || runtimeHash.length !== 32 || pins.length !== 32) fail('ConfigShape');
-    const cfg = decodeConfig(gamma, params);
-    const domain = domainOf(gamma);
+    if (!validRecoveryDeployment(deployment)) fail('ConfigShape');
+    const config = Uint8Array.from(gamma);
+    const cfg = decodeConfig(config, params);
+    const domain = domainOf(config);
     const snapshot = Uint8Array.from(evidence);
     const token = decodeToken(snapshot);
-    const verdict = await verifyPart(cfg, domain, trust, token);
+    let trust: TrustInput;
+    let verdict: Verdict;
+    do {
+      trust = authority.checkpoint;
+      verdict = await verifyPart(cfg, domain, trust, token);
+    } while (trust !== authority.checkpoint);
     const pages = new Pages(snapshot);
     const header = concat(version, u64(snapshot.length), pages.root);
     const generation = hash('GEN', salt, domain);
     const session = hash('SESSION', version, generation, domain, cfg.vault, recovery, runtimeHash, pins, header.subarray(2));
-    return new RecoverySession(cfg, deployment, pages, session, header, verdict, operations(snapshot, token, cfg, domain));
+    return new RecoverySession(cfg, deployment, pages, session, header, verdict, operations(snapshot, token, cfg, domain), authority);
   }
   get id(): Uint8Array { return this.session.slice(); }
   get pageRoot(): Uint8Array { return this.pages.root.slice(); }
@@ -224,12 +271,16 @@ export class RecoverySession {
     let prefix: Uint8Array = Uint8Array.of(0);
     const seq = prior === undefined ? 1n : prior.seq + 1n;
     if (seq >= 1n << 64n || (prior && prior.seq <= 0n)) fail('Shape', 'sequence');
+    let receiptBytes = 0;
     if (prior !== undefined) {
       if (prior.receipt.length > receiptCap) fail('InputTooLarge', 'cold receipt');
       const receipt = Uint8Array.from(prior.receipt);
+      receiptBytes = receipt.length;
       const state = withSeq(this.ops[from - 1].after!, prior.seq);
       await this.verifyEvent(trust, receipt, this.event('progress', concat(u256(prior.seq), hash('STATE', this.session, state))));
       prefix = concat(Uint8Array.of(1), state, blob(receipt));
+    } else {
+      await this.authority.accept(trust, this.cfg);
     }
     const end = from + count;
     const firstPage = from === 0 ? 0 : Math.floor(this.ops[from].start / pageSize);
@@ -250,7 +301,7 @@ export class RecoverySession {
       : this.event('progress', concat(u256(seq), hash('STATE', this.session, state)));
     const calldata = coldCall('run', [this.header, prefix, Uint8Array.of(pages), ...table, Uint8Array.of(count), ...steps]);
     const shape: RecoveryShape = { entry: 'run', calldataBytes: calldata.length, operations: count, pages, gaps: 0,
-      receiptBytes: prior?.receipt.length ?? 0, openingBytes: steps.reduce((sum, step) => sum + step.length - 1, 0) };
+      receiptBytes, openingBytes: steps.reduce((sum, step) => sum + step.length - 1, 0) };
     return { shape, calldata, end, state, event };
   }
 
@@ -275,20 +326,34 @@ export class RecoverySession {
     return fail('CapacityPreflight', 'indivisible run operation');
   }
 
+  private snapshotEvent(expected: RecoveryEvent): RecoveryEvent {
+    const { kind, data } = expected;
+    if (expected.topics.length !== 2 || !eq(expected.topics[0], topics[kind]) || !eq(expected.topics[1], this.session)) {
+      refuse('ProviderFault', 'recovery expectation belongs to a different session or event');
+    }
+    return this.event(kind, Uint8Array.from(data));
+  }
+
   async verifyEvent(trust: TrustInput, input: Uint8Array, expected: RecoveryEvent): Promise<RecoveryReceipt> {
+    const event = this.snapshotEvent(expected);
     if (input.length > receiptCap) fail('InputTooLarge', 'cold receipt');
     const receipt = Uint8Array.from(input);
-    const { kind, data } = { kind: expected.kind, data: Uint8Array.from(expected.data) };
     const proof = decodeDepositProof(receipt);
-    const log = await verifyReceiptLog(this.cfg, trust, proof, this.deployment.recovery);
-    if (!eq(log.address, this.deployment.recovery) || log.topics.length !== 2 || !eq(log.topics[0], topics[kind])
-      || !eq(log.topics[1], this.session) || !eq(log.data, data)) refuse('ProviderFault', 'recovery checkpoint mismatch');
+    await this.authority.accept(trust, this.cfg);
+    let held: TrustInput;
+    let log: Awaited<ReturnType<typeof verifyReceiptLog>>;
+    do {
+      held = this.authority.checkpoint;
+      log = await verifyReceiptLog(this.cfg, held, proof, this.deployment.recovery);
+    } while (held !== this.authority.checkpoint);
+    if (log.topics.length !== 2 || !eq(log.topics[0], event.topics[0])
+      || !eq(log.topics[1], event.topics[1]) || !eq(log.data, event.data)) refuse('ProviderFault', 'recovery checkpoint mismatch');
     return { encoded: receipt, blockNumber: log.header.number, blockHash: HE(proof.header), txIndex: proof.txIndex, logIndex: proof.logIndex };
   }
 
   /** Trim only an external predecessor presentation, rechecking the actual historical quorum after each removal. */
   async trimReceipt(trust: TrustInput, receipt: Uint8Array, expected: RecoveryEvent): Promise<RecoveryReceipt> {
-    const event = this.event(expected.kind, Uint8Array.from(expected.data));
+    const event = this.snapshotEvent(expected);
     let best = await this.verifyEvent(trust, receipt, event);
     const proof = decodeDepositProof(best.encoded);
     const uc = scanNative(proof.uc).kids[0].kids;
@@ -314,30 +379,24 @@ export class RecoverySession {
   /** Try independently authenticated sources. An unknown child remains retryable; pruning is an availability failure. */
   async acquire(trust: TrustInput, expected: RecoveryEvent, sources: readonly RecoveryReceiptSource[],
     refresh?: (held: TrustInput) => Promise<TrustInput>): Promise<{ receipt: RecoveryReceipt; trust: TrustInput }> {
-    bindTrust(trust, this.cfg);
-    const event = this.event(expected.kind, Uint8Array.from(expected.data));
-    let authority = trust;
+    const event = this.snapshotEvent(expected);
+    await this.authority.accept(trust, this.cfg);
     let unavailable: unknown;
     let fault: unknown;
     for (const source of sources) {
       try {
-        const proof = await source(this.deployment.recovery.slice(), event.topics[0].slice());
+        const proof = await source(this.deployment.recovery.slice(), this.event(event.kind, event.data.slice()));
         try {
-          return { receipt: await this.verifyEvent(authority, proof, event), trust: authority };
+          const receipt = await this.verifyEvent(this.authority.checkpoint, proof, event);
+          return { receipt, trust: this.authority.checkpoint };
         } catch (e) {
           let cause = e;
           while (cause instanceof Nb2Error && cause.inner && !(cause instanceof SealAheadOfOrigin)) cause = cause.inner;
-          if (!refresh || !(cause instanceof Nb2Error && (cause.retryable || cause instanceof SealAheadOfOrigin))) throw e;
-          const fresh = await refresh(authority);
-          bindTrust(fresh, this.cfg);
-          const tip = authority.history.tip!;
-          const prefix = fresh.history.entryForEpoch(tip.epoch);
-          if (prefix === null || !eq(await prefix.entryId(), await tip.entryId())
-            || fresh.origin!.rootRound < authority.origin!.rootRound || fresh.origin!.usableEpoch < authority.origin!.usableEpoch) {
-            refuse('TrustInput', 'recovery authority refresh does not extend the held history and origin');
-          }
-          authority = fresh;
-          return { receipt: await this.verifyEvent(authority, proof, event), trust: authority };
+          if (!refresh || (!(e instanceof Nb2Error && e.retryable) && !(cause instanceof SealAheadOfOrigin))) throw e;
+          const fresh = await refresh(this.authority.checkpoint);
+          await this.authority.accept(fresh, this.cfg);
+          const receipt = await this.verifyEvent(this.authority.checkpoint, proof, event);
+          return { receipt, trust: this.authority.checkpoint };
         }
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
@@ -355,11 +414,12 @@ export class RecoverySession {
   async certifiedGaps(trust: TrustInput, start: bigint, head: Uint8Array, receipts: readonly Uint8Array[]): Promise<Uint8Array[]> {
     if (start < this.verdict.minSegment || start + BigInt(receipts.length) > MAX_SEGMENT
       || head.length !== 32 || receipts.length > 1024) fail('Shape', 'certified gap range');
+    await this.authority.accept(trust, this.cfg);
     const paths: Uint8Array[] = [];
     let next = start;
     let before: Uint8Array = Uint8Array.from(head);
     for (const receipt of receipts) {
-      const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, trust, receipt);
+      const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, this.authority.checkpoint, receipt);
       if (segment.index !== next || !eq(segment.before, before)) fail('SegmentLog', 'nonconsecutive certified seals');
       const path = GapTree.build(segment.z)!.prove(this.verdict.eta);
       if (path === null) refuse('AlreadyPaid', 'return appears in a certified sealed segment');
@@ -377,23 +437,24 @@ export class RecoverySession {
     if (input.length > receiptCap || inputGaps.length > 1024) fail('InputTooLarge', 'cold gap transport');
     const receipt = Uint8Array.from(input);
     const gaps = inputGaps.map((gap) => Uint8Array.from(gap));
-    const start = prior.cursor?.next ?? this.verdict.minSegment;
-    const head = prior.cursor ? Uint8Array.from(prior.cursor.head) : inputHead && Uint8Array.from(inputHead);
+    const cursor = prior.cursor;
+    const start = cursor?.next ?? this.verdict.minSegment;
+    const head = cursor ? Uint8Array.from(cursor.head) : inputHead && Uint8Array.from(inputHead);
     const next = start + BigInt(gaps.length);
     const seq = prior.seq;
     const advance = entry === 'advanceGaps';
     if (gaps.length > 1024 || (advance && gaps.length === 0) || seq <= 0n || seq >= 1n << 64n
       || (advance && seq + 1n >= 1n << 64n) || start < this.verdict.minSegment || next > MAX_SEGMENT
-      || (prior.cursor && (head?.length !== 32 || inputHead !== undefined))
-      || (!prior.cursor && (gaps.length === 0 ? head !== undefined : head?.length !== 32))
+      || (cursor && (head?.length !== 32 || inputHead !== undefined))
+      || (!cursor && (gaps.length === 0 ? head !== undefined : head?.length !== 32))
       || gaps.some((gap) => gap.length !== gapProofLen(this.cfg.K))) fail('Shape', 'cold gap framing');
     const v = verdictAbi(this.verdict);
-    const expected = prior.cursor ? this.event('gap', concat(u256(seq), v, u256(start), head!)) : this.event('complete', concat(u256(seq), v));
+    const expected = cursor ? this.event('gap', concat(u256(seq), v, u256(start), head!)) : this.event('complete', concat(u256(seq), v));
     await this.verifyEvent(trust, receipt, expected);
     const after = gaps.length === 0 ? head : foldHistory(this.verdict.domain, this.cfg.K, this.verdict.eta, start, head!, gaps);
     const event = advance ? this.event('gap', concat(u256(seq + 1n), v, u256(next), after!)) : null;
-    const calldata = coldCall(entry, [this.header, Uint8Array.of(prior.cursor ? 2 : 1), blob(receipt), u16(gaps.length),
-      ...(!prior.cursor && head ? [head] : []), ...gaps]);
+    const calldata = coldCall(entry, [this.header, Uint8Array.of(cursor ? 2 : 1), blob(receipt), u16(gaps.length),
+      ...(!cursor && head ? [head] : []), ...gaps]);
     const shape: RecoveryShape = { entry, calldataBytes: calldata.length, operations: 0, pages: 0,
       gaps: gaps.length, receiptBytes: receipt.length, openingBytes: 0 };
     return { shape, calldata, event, next, head: after };

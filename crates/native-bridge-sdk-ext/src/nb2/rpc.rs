@@ -577,7 +577,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         topic0: &[u8],
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, emitter, topic0, false)
+        self.receipt_proof_mode(tx_hash, emitter, topic0, None)
     }
 
     /// Rebuild a recovery proof with the child companion's committed technical record.
@@ -585,9 +585,9 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         &self,
         tx_hash: &[u8],
         emitter: &[u8],
-        topic0: &[u8],
+        event: &super::recovery::RecoveryEvent,
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, emitter, topic0, true)
+        self.receipt_proof_mode(tx_hash, emitter, &event.topics[0], Some(event))
     }
 
     fn receipt_proof_mode(
@@ -595,7 +595,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         tx_hash: &[u8],
         emitter: &[u8],
         topic0: &[u8],
-        bind_technical_record: bool,
+        event: Option<&super::recovery::RecoveryEvent>,
     ) -> Result<ReceiptProof> {
         let Some(r) = self.receipt(tx_hash)? else {
             return refuse(
@@ -615,17 +615,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
                 ),
             );
         }
-        let mut idx = None;
-        for (i, l) in r.logs.iter().enumerate() {
-            let addr = bytes_of(&json!(l.address), "address")?;
-            if addr == emitter
-                && !l.topics.is_empty()
-                && bytes_of(&json!(l.topics[0]), "topic")? == topic0
-            {
-                idx = Some(i);
-                break;
-            }
-        }
+        let idx = receipt_log_index(&r.logs, emitter, topic0, event)?;
         let Some(idx) = idx else {
             return refuse(
                 WalletReason::EvidenceMissing,
@@ -638,7 +628,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         };
         let block_hash = fixed_of(&json!(r.block_hash), 32, "blockHash")?;
         let (header, raw) = self.header_by_hash(&block_hash)?;
-        let uc = self.certificate_of_mode(&header, &block_hash, bind_technical_record)?;
+        let uc = self.certificate_of_mode(&header, &block_hash, event.is_some())?;
         let tx_index = qty64(&json!(r.transaction_index), "transactionIndex")?;
         let nodes = self.receipt_path(&header, &block_hash, tx_index)?;
         let proof = DepositProof {
@@ -957,4 +947,61 @@ pub fn revert_data_of(e: &RpcError) -> Option<Vec<u8>> {
         i += 1;
     }
     None
+}
+
+fn receipt_log_index(
+    logs: &[ReceiptLogJson],
+    emitter: &[u8],
+    topic0: &[u8],
+    event: Option<&super::recovery::RecoveryEvent>,
+) -> Result<Option<usize>> {
+    for (i, log) in logs.iter().enumerate() {
+        if bytes_of(&json!(log.address), "address")? != emitter
+            || log.topics.is_empty()
+            || bytes_of(&json!(log.topics[0]), "topic")? != topic0
+        {
+            continue;
+        }
+        if let Some(event) = event {
+            if log.topics.len() != event.topics.len()
+                || bytes_of(&json!(log.topics[1]), "topic")? != event.topics[1]
+                || bytes_of(&json!(log.data), "log data")? != event.data
+            {
+                continue;
+            }
+        }
+        return Ok(Some(i));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod recovery_receipt_tests {
+    use super::super::recovery::{EventKind, RecoveryEvent};
+    use super::*;
+
+    #[test]
+    fn recovery_selects_the_receipt_local_index_of_the_exact_event() {
+        let emitter = [1u8; 20];
+        let event = RecoveryEvent {
+            kind: EventKind::Progress,
+            topics: [[2; 32], [3; 32]],
+            data: vec![4],
+        };
+        let log = |data, log_index| ReceiptLogJson {
+            address: hex0x(&emitter),
+            topics: event.topics.iter().map(|topic| hex0x(topic)).collect(),
+            data: hex0x(&[data]),
+            log_index: Some(qty(log_index)),
+        };
+        let logs = [log(5, 23), log(4, 24)];
+        assert_eq!(
+            receipt_log_index(&logs, &emitter, &event.topics[0], Some(&event)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            receipt_log_index(&logs, &emitter, &event.topics[0], None).unwrap(),
+            Some(0)
+        );
+    }
 }

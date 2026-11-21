@@ -204,12 +204,16 @@ pub struct RecoveryBacklog {
     pub peak_seals: u64,
     pub elapsed_ms: u64,
     pub receipt_p99_ms: u64,
+    /// Qualified time from sealing the final endpoint, including proof retrieval, through settlement inclusion.
+    pub final_inclusion_ms: u64,
+    /// Horizon for which the peak-rate and timing bounds are qualified after lineage progress.
+    pub qualified_for_ms: u64,
 }
 pub struct RecoveryAdmission {
     pub run: Vec<RecoveryQuote>,
     pub advance: RecoveryQuote,
     pub advance_calls: u64,
-    pub advance_tail: Option<RecoveryQuote>,
+    pub settlement_max_gaps: usize,
     pub settle: RecoveryQuote,
     pub total_fee: BigUint,
 }
@@ -319,53 +323,75 @@ pub fn preflight_recovery(
         || last > MAX_SEGMENT
         || backlog.elapsed_ms == 0
         || backlog.receipt_p99_ms == 0
+        || backlog.final_inclusion_ms == 0
     {
         return fail_d(Rule::CapacityPreflight, "unqualified backlog");
     }
+    let growth = |ms: u64| {
+        (u128::from(backlog.peak_seals) * u128::from(ms)).div_ceil(u128::from(backlog.elapsed_ms))
+    };
+    let per_advance = growth(backlog.receipt_p99_ms);
+    let final_growth = growth(backlog.final_inclusion_ms);
+    if final_growth > 1 {
+        return fail_d(
+            Rule::CapacityPreflight,
+            "unqualified final inclusion window",
+        );
+    }
     let need = last - backlog.signed_start;
     let width = gap_proof_len(cfg.k);
-    let gap = |q| {
+    let gap = |count| {
         quote_recovery(
-            gap_shape(RecoveryEntry::AdvanceGaps, q, width),
+            gap_shape(RecoveryEntry::AdvanceGaps, count, width),
             ctx.calibration,
             ctx.limits,
         )
     };
+    if gap(1).is_none() {
+        return fail_d(Rule::CapacityPreflight, "indivisible gap operation");
+    }
     let Some((q, advance)) = (1..=need.min(1024) as usize)
         .rev()
-        .find_map(|q| gap(q).map(|quote| (q as u64, quote)))
+        .find_map(|q| gap(q).map(|quote| (q, quote)))
     else {
         return fail_d(
             Rule::CapacityPreflight,
             "insufficient certified catch-up rate",
         );
     };
-    if BigUint::from(q) * backlog.elapsed_ms
-        < BigUint::from(2u8) * backlog.peak_seals * backlog.receipt_p99_ms
-    {
+    if q as u128 <= per_advance || (q as u128) / 2 < per_advance {
         return fail_d(
             Rule::CapacityPreflight,
             "insufficient certified catch-up rate",
         );
     }
-    let Some(settle) = quote_recovery(
-        gap_shape(RecoveryEntry::RedeemRecovered, 0, width),
-        ctx.calibration,
-        ctx.limits,
-    ) else {
-        return fail_d(Rule::CapacityPreflight, "indivisible settlement");
-    };
-    let advance_calls = need / q;
-    let advance_tail = if need % q == 0 {
-        None
-    } else {
-        let Some(tail) = gap((need % q) as usize) else {
-            return fail_d(Rule::CapacityPreflight, "unqualified gap remainder");
+    // Fund full advances against net progress while the archive is growing.
+    let advance_calls = need.div_ceil(q as u64 - per_advance as u64);
+    if u128::from(last) + u128::from(advance_calls) * per_advance + final_growth
+        > u128::from(MAX_SEGMENT)
+        || u128::from(advance_calls) * u128::from(backlog.receipt_p99_ms)
+            + u128::from(backlog.final_inclusion_ms)
+            > u128::from(backlog.qualified_for_ms)
+    {
+        return fail_d(Rule::CapacityPreflight, "unqualified catch-up horizon");
+    }
+    // Every suffix smaller than the advance batch may be needed at settlement.
+    let mut settle: Option<RecoveryQuote> = None;
+    for count in 0..q {
+        let Some(quote) = quote_recovery(
+            gap_shape(RecoveryEntry::RedeemRecovered, count, width),
+            ctx.calibration,
+            ctx.limits,
+        ) else {
+            return fail_d(Rule::CapacityPreflight, "unqualified settlement suffix");
         };
-        Some(tail)
-    };
+        if settle.as_ref().map_or(true, |best| quote.fee > best.fee) {
+            settle = Some(quote);
+        }
+    }
+    let settle = settle.expect("positive gap batch");
     let mut total_fee = &settle.fee + &advance.fee * advance_calls;
-    for quote in run.iter().chain(advance_tail.iter()) {
+    for quote in &run {
         total_fee += &quote.fee;
     }
     if total_fee > ctx.limits.fee_budget || total_fee > ctx.limits.balance {
@@ -375,7 +401,7 @@ pub fn preflight_recovery(
         run,
         advance,
         advance_calls,
-        advance_tail,
+        settlement_max_gaps: q - 1,
         settle,
         total_fee,
     })

@@ -6,7 +6,10 @@ use native_bridge_sdk_ext::nb2::{
     config::{decode_config, production_params},
     deposit::{decode_deposit_proof, verify_receipt_log},
     errors::{fail, refuse},
-    recovery::{GapCursor, GapEntry, GapPredecessor, RecoveryDeployment, RecoverySession},
+    recovery::{
+        GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoveryEvent,
+        RecoverySession,
+    },
     trust::{AuthenticatedOrigin, TrustInput},
     util::{arr, from_hex},
     Rule, WalletReason,
@@ -52,7 +55,7 @@ fn load(base: &str, lineage: &str) -> (RecoverySession, TrustInput, Vec<u8>, [u8
     let session = RecoverySession::create(
         &gamma,
         &read(base, &format!("{lineage}/evidence.bin")),
-        &trust,
+        RecoveryAuthority::new(trust.clone(), |_| Ok(())),
         &params,
         RecoveryDeployment {
             salt: arr(&read(base, "generation-salt.bin")),
@@ -138,8 +141,8 @@ fn prescribed_runs_match_t1() {
             assert_eq!(run.state.as_deref().unwrap_or_default(), state, "{path}");
             assert_eq!(run.event.topics.concat(), topics);
             assert_eq!(run.event.data, data);
-            let primary = |_: &[u8; 20], _: &[u8; 32]| fail(Rule::EvidencePruned);
-            let archive = |_: &[u8; 20], _: &[u8; 32]| Ok(receipt.to_vec());
+            let primary = |_: &[u8; 20], _: &RecoveryEvent| fail(Rule::EvidencePruned);
+            let archive = |_: &[u8; 20], _: &RecoveryEvent| Ok(receipt.to_vec());
             let (proof, _) = session
                 .acquire(&trust, &run.event, &[&primary, &archive], None)
                 .unwrap();
@@ -151,7 +154,7 @@ fn prescribed_runs_match_t1() {
                     .verify_event(&trust, &trimmed.encoded, &run.event)
                     .unwrap();
             }
-            let unknown = |_: &[u8; 20], _: &[u8; 32]| {
+            let unknown = |_: &[u8; 20], _: &RecoveryEvent| {
                 refuse(WalletReason::CompanionUnknown, "child not served")
             };
             let missing = session
@@ -223,7 +226,7 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         preflight_recovery, quote_recovery, AdmissionContext, RecoveryBacklog, RecoveryCalibration,
         RecoveryLimits, RecoveryShape,
     };
-    struct Calibration([u8; 32], [u8; 32]);
+    struct Calibration([u8; 32], [u8; 32], usize, bool, bool);
     impl RecoveryCalibration for Calibration {
         fn pins(&self) -> [u8; 32] {
             self.0
@@ -235,6 +238,12 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
             Some([1; 32])
         }
         fn execution_bound(&self, s: &RecoveryShape) -> Option<u64> {
+            use native_bridge_sdk_ext::nb2::recovery_cost::RecoveryEntry;
+            if s.entry == RecoveryEntry::AdvanceGaps && (s.gaps > self.2 || self.3 && s.gaps == 1)
+                || s.entry == RecoveryEntry::RedeemRecovered && self.4 && s.gaps == 1
+            {
+                return None;
+            }
             Some(1_000_000 + s.operations as u64 * 500_000 + s.gaps as u64 * 7_000)
         }
     }
@@ -258,7 +267,7 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         vault_runtime_hash: Some([1; 32]),
     };
     let held = read(BASE, &format!("{path}/evidence.bin"));
-    let calibration = Calibration(deployment.pins, deployment.runtime_hash);
+    let calibration = Calibration(deployment.pins, deployment.runtime_hash, 1024, false, false);
     let mut limits = RecoveryLimits {
         signed_bytes: 524_288,
         calldata_bytes: 393_216,
@@ -278,6 +287,8 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         peak_seals: 1,
         elapsed_ms: 1_000,
         receipt_p99_ms: 1_000,
+        final_inclusion_ms: 25,
+        qualified_for_ms: 200_000,
     };
     let quote = |limits: &RecoveryLimits| {
         preflight_recovery(
@@ -315,7 +326,7 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         4
     );
     assert_eq!(admitted.advance.shape.gaps, 69);
-    assert_eq!(admitted.advance_calls, 1);
+    assert_eq!(admitted.advance_calls, 2);
     limits.fee_budget = admitted.total_fee.clone();
     assert_eq!(quote(&limits).unwrap().total_fee, admitted.total_fee);
     limits.fee_budget -= 1u8;
@@ -323,6 +334,72 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
         quote(&limits).err().unwrap().rule().unwrap().rule,
         Rule::CapacityPreflight
     );
+    let mut growing = RecoveryBacklog {
+        observed: 1024,
+        during_progress: 0,
+        peak_seals: 32,
+        ..backlog
+    };
+    let max64 = Calibration(deployment.pins, deployment.runtime_hash, 64, false, false);
+    let growing_quote = |bounds: &RecoveryLimits, growth: &RecoveryBacklog, model: &Calibration| {
+        preflight_recovery(
+            &AdmissionContext {
+                gamma: &gamma,
+                trust: &trust,
+                params: &params,
+                deployment: &deployment,
+                calibration: model,
+                limits: bounds,
+            },
+            &held,
+            growth,
+            None,
+        )
+    };
+    limits.fee_budget = limits.balance.clone();
+    let extended = growing_quote(&limits, &growing, &max64).unwrap();
+    assert_eq!(extended.advance_calls, 34);
+    assert_eq!(extended.settlement_max_gaps, 63);
+    assert_eq!(extended.settle.shape.gaps, 63);
+    let old_budget = extended
+        .run
+        .iter()
+        .fold(&extended.advance.fee * 17u8, |sum, q| sum + &q.fee)
+        + quote_recovery(
+            RecoveryShape {
+                gaps: 0,
+                calldata_bytes: 65_668,
+                ..extended.settle.shape
+            },
+            &max64,
+            &limits,
+        )
+        .unwrap()
+        .fee;
+    limits.fee_budget = old_budget;
+    assert!(growing_quote(&limits, &growing, &max64)
+        .err()
+        .unwrap()
+        .name()
+        .contains("CapacityPreflight"));
+    limits.fee_budget = limits.balance.clone();
+    growing.final_inclusion_ms = 32;
+    assert!(growing_quote(&limits, &growing, &max64).is_err());
+    growing.final_inclusion_ms = 25;
+    growing.qualified_for_ms = 34_000;
+    assert!(growing_quote(&limits, &growing, &max64).is_err());
+    growing.qualified_for_ms = 200_000;
+    growing.observed = (1u64 << 48) - 66;
+    assert!(growing_quote(&limits, &growing, &max64).is_err());
+    growing.observed = 0;
+    growing.peak_seals = 0;
+    for model in [
+        Calibration(deployment.pins, deployment.runtime_hash, 64, true, false),
+        Calibration(deployment.pins, deployment.runtime_hash, 64, false, true),
+    ] {
+        let error = growing_quote(&limits, &growing, &model).err().unwrap();
+        assert_eq!(error.rule().unwrap().rule, Rule::CapacityPreflight);
+    }
     limits.gas = admitted.settle.gas;
     limits.signed_bytes = admitted.settle.signed_bytes;
     assert!(quote_recovery(admitted.settle.shape, &calibration, &limits).is_some());
@@ -343,7 +420,7 @@ fn refuses_the_invalid_supplement_lineages() {
         assert!(RecoverySession::create(
             &gamma,
             &evidence,
-            &trust,
+            RecoveryAuthority::new(trust.clone(), |_| Ok(())),
             &params,
             RecoveryDeployment {
                 salt: arr(&read(EXTRA, "generation-salt.bin")),
@@ -355,4 +432,98 @@ fn refuses_the_invalid_supplement_lineages() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn authority_refresh_persists_and_reconstructed_sessions_refuse_rollbacks() {
+    use std::{cell::RefCell, rc::Rc};
+    use unicity_token::api::bft::TrustBaseHistory;
+    let path = "transcripts/root";
+    let (_, full, gamma, emitter) = load(BASE, path);
+    let params = production_params();
+    let context = json(BASE, &format!("{path}/context.json"));
+    let deployment = || RecoveryDeployment {
+        salt: arr(&read(BASE, "generation-salt.bin")),
+        recovery: emitter,
+        runtime_hash: hex(&context["RecoveryRuntimeHash"]),
+        pins: arr(&read(BASE, "pins.bin")),
+        vault_runtime_hash: None,
+    };
+    let short_bundle = TrustBaseHistory::from_trusted_chain(full.history().entries()[..1].to_vec())
+        .unwrap()
+        .to_bundle();
+    let short = TrustInput::from_bundle(&short_bundle, &full.id()).unwrap();
+    let lagging = short
+        .clone()
+        .with_authenticated_origin(full.origin().unwrap());
+    let previous = short.with_authenticated_origin(AuthenticatedOrigin {
+        usable_epoch: 1,
+        root_round: 10_000,
+    });
+    let persisted = Rc::new(RefCell::new(previous.clone()));
+    let store = persisted.clone();
+    let authority = RecoveryAuthority::new(previous.clone(), move |next| {
+        *store.borrow_mut() = next.clone();
+        Ok(())
+    });
+    let evidence = read(BASE, &format!("{path}/evidence.bin"));
+    let session =
+        RecoverySession::create(&gamma, &evidence, authority, &params, deployment()).unwrap();
+    let mut run = session.run(0, 2, &previous, None).unwrap();
+    let rec = trace(BASE, path);
+    let mut pos = 0;
+    let fields: [&[u8]; 6] = core::array::from_fn(|_| {
+        let width = u32_at(&rec, pos);
+        pos += 4;
+        let field = &rec[pos..pos + width];
+        pos += width;
+        field
+    });
+    let receipt = fields[5];
+    let source = |_: &[u8; 20], _: &RecoveryEvent| Ok(receipt.to_vec());
+    let pending = session
+        .acquire(&lagging, &run.event, &[&source], None)
+        .err()
+        .unwrap();
+    assert_eq!(pending.rule().unwrap().rule, Rule::NoEntryForEpoch);
+    let refresh = |held: &TrustInput| {
+        assert_eq!(*held, lagging);
+        Ok(full.clone())
+    };
+    session
+        .acquire(&lagging, &run.event, &[&source], Some(&refresh))
+        .unwrap();
+    assert_eq!(*persisted.borrow(), full);
+    let lower_origin = full
+        .clone()
+        .with_authenticated_origin(previous.origin().unwrap());
+    for stale in [&lagging, &lower_origin] {
+        let error = session
+            .acquire(stale, &run.event, &[&source], None)
+            .err()
+            .unwrap();
+        assert_eq!(error.reason(), Some(WalletReason::TrustInput));
+    }
+    let reopened = RecoverySession::create(
+        &gamma,
+        &evidence,
+        RecoveryAuthority::new(persisted.borrow().clone(), |_| Ok(())),
+        &params,
+        deployment(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.run(0, 2, &lagging, None).err().unwrap().reason(),
+        Some(WalletReason::TrustInput)
+    );
+    reopened.verify_event(&full, receipt, &run.event).unwrap();
+    run.event.topics[1] = [0; 32];
+    assert_eq!(
+        reopened
+            .verify_event(&full, receipt, &run.event)
+            .err()
+            .unwrap()
+            .reason(),
+        Some(WalletReason::ProviderFault)
+    );
 }

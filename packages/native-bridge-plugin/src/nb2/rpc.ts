@@ -18,7 +18,7 @@ import { rlpBytes, rlpIndexKey, rlpList, rlpUintEnc } from './rlp.js';
 import { checkCompanion } from './rules.js';
 import { array, isBytes, isUint, scanNative, u256 } from './cbor.js';
 
-import type { RecoveryReceiptSource } from './recovery.js';
+import type { RecoveryEvent, RecoveryReceiptSource } from './recovery.js';
 import { decodeUc } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
@@ -243,11 +243,14 @@ export class EvmReader {
   }
 
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false): Promise<ReceiptProof> {
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: RecoveryEvent): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);
-    const idx = r!.logs.findIndex((l) => eq(bytesOf(l.address, 'address'), emitter) && l.topics.length > 0 && eq(bytesOf(l.topics[0], 'topic'), topic0));
+    const idx = r!.logs.findIndex((l) => eq(bytesOf(l.address, 'address'), emitter) && l.topics.length > 0
+      && eq(bytesOf(l.topics[0], 'topic'), topic0) && (expected === undefined || (
+        l.topics.length === expected.topics.length && l.topics.every((topic, i) => eq(bytesOf(topic, 'topic'), expected.topics[i]))
+        && eq(bytesOf(l.data, 'log data'), expected.data))));
     if (idx < 0) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} emitted no such log from 0x${toHex(emitter)}`);
     const blockHash = fixedOf(r!.blockHash, 32, 'blockHash');
     const { header, raw } = await this.headerByHash(blockHash);
@@ -404,5 +407,5 @@ export { WalletError, u256 };
 
 export const recoveryRpcSource = (reader: EvmReader, txHash: Uint8Array): RecoveryReceiptSource => {
   const tx = Uint8Array.from(txHash);
-  return async (emitter, topic) => (await reader.receiptProof(tx, emitter, topic, true)).encoded;
+  return async (emitter, event) => (await reader.receiptProof(tx, emitter, event.topics[0], true, event)).encoded;
 };
