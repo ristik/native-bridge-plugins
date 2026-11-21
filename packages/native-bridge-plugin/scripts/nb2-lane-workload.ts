@@ -4,8 +4,7 @@ import { parseArgs } from 'node:util';
 import { parseAuthenticatedOrigin } from '../../../wallet/core.js';
 import { eq, fromHex } from '../src/bytes.js';
 import { SdkAggregator } from '../src/nb2/aggregator.js';
-import { buildParams, decodeConfig, domainOf } from '../src/nb2/config.js';
-import { burnIndex, verifySealReceipt } from '../src/nb2/rules.js';
+import { buildParams, decodeConfig } from '../src/nb2/config.js';
 import { localOwner } from '../src/nb2/tokenops.js';
 import { TrustInput } from '../src/nb2/trust.js';
 import { runLaneWorkload } from './nb2-lane-run.js';
@@ -33,7 +32,6 @@ if (!recipient || recipient.length !== 20 || !key || key.length !== 32) throw ne
 const gamma = await readFile(gammaPath);
 const params = buildParams(build);
 const cfg = decodeConfig(gamma, params);
-const domain = domainOf(gamma);
 let bundle = await readFile(utb);
 let historyTrust = await TrustInput.fromBundle(bundle, cfg.rootGenesis);
 async function refreshTrust(): Promise<TrustInput> {
@@ -46,8 +44,8 @@ async function refreshTrust(): Promise<TrustInput> {
 }
 const trust = await refreshTrust();
 const agg = new SdkAggregator(aggregator, { allowInsecure: url.protocol === 'http:' });
-const { a } = burnIndex(cfg, domain, seal ? await verifySealReceipt(cfg, domain, trust, await readFile(seal)) : null);
+const startingSeal = seal ? await readFile(seal) : undefined;
 const result = await runLaneWorkload({
-  gamma, params, trust, refreshTrust, root: await readFile(root), owner: localOwner(key), aggregator: agg, recipient, minIndex: a, output, history,
+  gamma, params, trust, refreshTrust, root: await readFile(root), owner: localOwner(key), aggregator: agg, recipient, startingSeal, output, history,
 });
 console.log(JSON.stringify(result, null, 2));

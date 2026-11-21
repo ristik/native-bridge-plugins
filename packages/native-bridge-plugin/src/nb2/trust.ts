@@ -30,7 +30,7 @@ const MAX_B1_SIGNATURES = 16;
 /** The history must be the one Γ names: its genesis EntryID is rootGenesis32 and its network Γ's. */
 export function bindTrust(t: TrustInput, c: Config): void {
   if (t.origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
-  if (!eq(t.id, c.rootGenesis) || Number(t.network.id) !== c.network) refuse('TrustInput', 'the trust-base history is not the one Γ names');
+  if (!eq(t.history.genesisPin, c.rootGenesis) || Number(t.network.id) !== c.network) refuse('TrustInput', 'the trust-base history is not the one Γ names');
 }
 
 const TAG_UC = 39001n;

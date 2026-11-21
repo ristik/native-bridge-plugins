@@ -12,6 +12,7 @@ import {
   type Aggregator, type OwnerSigner,
 } from '../src/nb2/tokenops.js';
 import { Nb2Error } from '../src/nb2/errors.js';
+import { burnIndex, verifySealReceipt } from '../src/nb2/rules.js';
 import { bindTrust, SealAheadOfOrigin, type TrustInput } from '../src/nb2/trust.js';
 import { encodeReturnData, verdictAbi, verifyCertifiedStep, verifyHeld, verifyReturn, verifySplit } from '../src/nb2/verify.js';
 
@@ -33,7 +34,7 @@ interface Job {
   owner: OwnerSigner;
   aggregator: Aggregator;
   recipient: Uint8Array;
-  minIndex: bigint;
+  startingSeal?: Uint8Array;
   output: string;
   history: History;
 }
@@ -79,7 +80,6 @@ export async function runLaneWorkload(job: Job) {
   const cfg = decodeConfig(job.gamma, job.params);
   const domain = domainOf(job.gamma);
   if (job.recipient.length !== 20 || !job.recipient.some(Boolean) || eq(job.recipient, cfg.vault)) throw new Error('invalid return recipient');
-  const binding = toHex(HU(domain, HU(job.root), job.owner.publicKey, job.recipient, u64(job.minIndex), ascii(job.history)));
   const save = (state: Journal): void => writeDurable(file, JSON.stringify(state));
   let trust = job.trust;
   bindTrust(trust, cfg);
@@ -104,6 +104,10 @@ export async function runLaneWorkload(job: Job) {
     }
   };
 
+  const { startingSeal } = job;
+  const seal = startingSeal === undefined ? null : await verify((t) => verifySealReceipt(cfg, domain, t, startingSeal));
+  const { a: minIndex } = burnIndex(cfg, domain, seal);
+  const binding = toHex(HU(domain, HU(job.root), job.owner.publicKey, job.recipient, u64(minIndex), ascii(job.history)));
   let state: Journal;
   if (existsSync(file)) {
     state = JSON.parse(readFileSync(file, 'utf8')) as Journal;
@@ -120,17 +124,17 @@ export async function runLaneWorkload(job: Job) {
     save(state);
   }
 
-  // Link a durable empty reservation into place, so a crash cannot turn a pre-existing
-  // output into an apparently owned one. The completed journal can republish the final bytes.
-  if (!existsSync(reservation)) writeDurable(reservation, new Uint8Array());
-  const reserved = statSync(reservation, { bigint: true });
+  // Create a fresh empty reservation when the destination is free. The old inode
+  // may still hold bytes someone wrote through the destination before removing it.
   if (!existsSync(output)) {
+    writeDurable(reservation, new Uint8Array());
     linkSync(reservation, output);
     fsyncDir(dirname(output));
   }
+  const reserved = existsSync(reservation) ? statSync(reservation, { bigint: true }) : undefined;
   const checkOutput = () => {
     const current = lstatSync(output, { bigint: true });
-    if (current.dev === reserved.dev && current.ino === reserved.ino) return true;
+    if (reserved && current.size === 0n && current.dev === reserved.dev && current.ino === reserved.ino) return true;
     if (current.isFile() && state.step === count && eq(readFileSync(output), bytes(state.token))) return false;
     throw new Error(`lane output already exists: ${output}`);
   };
@@ -148,7 +152,7 @@ export async function runLaneWorkload(job: Job) {
     const amount = BigInt(state.rootAmount) - BigInt(Math.max(0, splitIndex));
     if (!state.pending) {
       if (step < transfers || terminal) {
-        const data = terminal ? encodeReturnData({ d: domain, asset: cfg.asset, recipient: job.recipient, amount, minIndex: job.minIndex }) : null;
+        const data = terminal ? encodeReturnData({ d: domain, asset: cfg.asset, recipient: job.recipient, amount, minIndex }) : null;
         const request = await transferRequest(token, job.owner, {
           recipient: data === null ? owner : burnPredicate(HU(data)), mask: randomFor('transfer', step), data, deadline: null,
         });

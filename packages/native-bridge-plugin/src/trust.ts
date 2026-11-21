@@ -34,16 +34,20 @@ export class TrustInput {
   private constructor(
     /** The held history; the wallet appends newer entries to it (each verified from its predecessor), never replaces held ones. */
     public readonly history: TrustBaseHistory,
-    /** The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal. */
-    public readonly id: Uint8Array,
     public readonly origin?: AuthenticatedOrigin,
   ) {}
+
+  /** The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal. */
+  public get id(): Uint8Array {
+    return this.history.genesisPin;
+  }
 
   /**
    * Install a release bundle: complete (no continuation), contiguous from its genesis, every link witnessed by the predecessor's quorum, and
    * its genesis EntryID equal to the pin.
    */
   public static async fromBundle(bundle: Uint8Array, pin: Uint8Array): Promise<TrustInput> {
+    const expectedPin = Uint8Array.from(pin);
     let decoded: TrustBaseBundle;
     try {
       decoded = await TrustBaseBundle.decode(bundle, TRUST_BASE_BUNDLE_LIMITS);
@@ -54,14 +58,14 @@ export class TrustInput {
     const genesis = decoded.entries[0];
     if (genesis === undefined) return fail('ErrTrustBase');
     const id = await genesis.entryId();
-    if (id.length !== pin.length || id.some((b, i) => b !== pin[i])) return fail('ErrTrustBaseDigest');
+    if (id.length !== expectedPin.length || id.some((b, i) => b !== expectedPin[i])) return fail('ErrTrustBaseDigest');
     let history: TrustBaseHistory;
     try {
-      history = await TrustBaseHistory.fromBundle(decoded, pin);
+      history = await TrustBaseHistory.fromBundle(decoded, expectedPin);
     } catch {
       return fail('ErrTrustBase');
     }
-    return new TrustInput(history, pin.slice());
+    return new TrustInput(history);
   }
 
   /** Attach a checkpoint authenticated by the caller. Token evidence and UTB history do not establish this bound. */
@@ -70,7 +74,7 @@ export class TrustInput {
     const max = (1n << 64n) - 1n;
     if (typeof usableEpoch !== 'bigint' || typeof rootRound !== 'bigint'
       || usableEpoch < 0n || usableEpoch > max || rootRound <= 0n || rootRound > max) fail('ErrTrustBase');
-    return new TrustInput(this.history, this.id.slice(), Object.freeze({ usableEpoch, rootRound }));
+    return new TrustInput(this.history, Object.freeze({ usableEpoch, rootRound }));
   }
 
   public get network(): NetworkId {
