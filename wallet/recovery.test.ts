@@ -794,7 +794,7 @@ test('restore qualifies and keeps the same checkpoint that will execute across b
   const receipt = (await w.bridge.evm.receipt(decodeSignedTx(unhex(raw)).hash))!;
   const prunedReader: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
     method === 'eth_getBlockByHash' && params[0] === receipt.blockHash ? Promise.resolve(null as T) : rpc.call<T>(method, params) };
-  const pruned = await open('pruned-local', prunedReader);
+  const pruned = await open('pruned-local', prunedReader, { seed: key('pending-local') });
   await assert.rejects(restoreReturn(pruned, original), { rule: 'EvidencePruned' });
   assert.equal(readFileSync(localFile(pruned), 'utf8'), pending);
   const staleHint = join(dir, 'complete-stale-hint.json');

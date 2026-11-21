@@ -143,8 +143,8 @@ and start anchor. Import and restore read EVM receipts without broadcasting tran
 | Local state | Signed request or certified burn | Peer Progress or Gap | Certified Complete | Certified Paid, either route |
 | --- | --- | --- | --- | --- |
 | Absent or planned | Adopt matching request and certify, or attach supplied terminal | Refuse active payer handoff | Store terminal proof independently of funding | Adopt with matching signed request |
-| Signed burn, no local execution | Reconcile the exact request | Refuse an active payer handoff and identify the original payer | Store Complete independently of funding | Record Paid |
-| Local recovery in progress | Reconcile the exact send | Keep local progress and reconcile its send | Reconcile local send first, then store Complete and clear the obsolete plan | Record Paid, retain local signed bytes |
+| Signed burn, no local recovery journal | Reconcile the exact request | Refuse an active payer handoff and identify the original payer | Store Complete independently of funding | Record Paid |
+| Local recovery journal, including zero cuts | Reconcile the exact send | Keep local progress and reconcile its send | Reconcile local send first, then store Complete and clear the obsolete plan | Record Paid, retain local signed bytes |
 | Local Complete or later local Gap | Keep local checkpoint | Keep local checkpoint | Keep local checkpoint | Record Paid and close continuation |
 | Ordinary send unresolved | Keep exact send | Keep exact send | Require ordinary send resolution before activating recovery | Record Paid and keep the send and its fees |
 | Paid | Report Paid and attach a matching burn terminal if missing | Report Paid | Report Paid | Keep Paid |
