@@ -829,6 +829,19 @@ test('restore qualifies and keeps the same checkpoint that will execute across b
   const release = JSON.parse(readFileSync(manifest, 'utf8'));
   release.recovery.ranges = release.recovery.ranges.filter((r: { max: { entry: string } }) => r.max.entry !== 'run');
   writeFileSync(manifest, JSON.stringify(release));
+  // The local send receives certification while the relayer is down and still records it as pending.
+  const raw = JSON.parse(pending).pending.raw;
+  await chain.mine([unhex(raw)]);
+  await chain.mine([]);
+  const restartedPending = await open('pending-local', rpc);
+  await restoreReturn(restartedPending, original);
+  const reconciled = readFileSync(localFile(restartedPending), 'utf8');
+  assert.equal(JSON.parse(reconciled).cuts.length, 1);
+  assert.equal(JSON.parse(reconciled).pending, undefined);
+  assert.deepEqual(JSON.parse(reconciled).attempts, [raw]);
+  await restoreReturn(restartedPending, original);
+  assert.equal(readFileSync(localFile(restartedPending), 'utf8'), reconciled);
+
   const ahead = await open('holder', rpc);
   const newest = readFileSync(localFile(ahead), 'utf8');
   await restoreReturn(ahead, original);
@@ -866,12 +879,16 @@ test('restore reconciles certified Paid before qualifying future packets', async
   release.recovery.backlog.qualifiedForMs = '1';
   writeFileSync(manifest, JSON.stringify(release));
 
-  for (const [name, backup] of [['signed-relayer', original], ['paid-relayer', original], ['fresh-paid', certified]]) {
-    const device = await open(name);
+  const offline = { certify: async () => { throw new Error('certifier offline after payout'); } };
+  for (const [name, backup] of [
+    ['signed-relayer', original], ['paid-relayer', original], ['fresh-paid', certified], ['fresh-signing-time', original],
+  ]) {
+    const device = await open(name, undefined, { aggregator: offline });
     const reconciled = await restoreReturn(device, backup, caps);
     assert.equal(reconciled.status, 'paid', name);
     assert.equal(reconciled.paid!.txHash, hx(paid.txHash!), name);
     assert.ok(reconciled.paid!.receipt, name);
+    assert.equal((await resumePayout(device, reconciled, caps)).state, 'paid', name);
   }
   const noSearch: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
     if (method === 'eth_getLogs') throw new Error('archive disabled after payout');
@@ -880,6 +897,70 @@ test('restore reconciles certified Paid before qualifying future packets', async
   const reopened = await open('paid-relayer', noSearch);
   const reconciled = await restoreReturn(reopened, original);
   assert.equal((await resumePayout(reopened, reconciled, caps)).state, 'paid');
+});
+
+test('an ordinary relayer adopts a later portable Complete and keeps its own fee reservations', async (t) => {
+  const { w, chain, deployment, cfg, dir, open, rpc } = await setup(t, true);
+  const original = join(dir, 'ordinary-signing.json');
+  await burn(w, 'coin', undefined, undefined, caps, original);
+  const rec = await w.returnRecord('coin');
+  assert.equal(rec.recovery, undefined);
+  const transport: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_estimateGas') return '0x1d4c0' as T;
+    if (method === 'eth_sendRawTransaction') {
+      const raw = unhex(params[0] as string);
+      await chain.mine([raw]);
+      return hx(decodeSignedTx(raw).hash) as T;
+    }
+    return rpc.call<T>(method, params);
+  } };
+  const relay = await open('ordinary-relayer', transport);
+  chain.fund(relay.signer.address, 10n ** 18n);
+  const ordinary = await restoreReturn(relay, original);
+  chain.coldCall = async (_vault, to, data) => {
+    if (eq(to, cfg.vault) && eq(data.subarray(0, 4), SELECTOR.redeem)) throw new Nb2Error('PayoutFailed');
+    return undefined;
+  };
+  assert.equal((await resumePayout(relay, ordinary, caps)).state, 'pending');
+  await chain.mine([]);
+  const sends = (await relay.bridge.journal.ret(rec.returnId))!.sends;
+  assert.equal(sends.length, 1);
+
+  const cold = await qualifyExistingRecovery(w, rec, caps);
+  const session = await RecoverySession.create(chain.gamma, unhex(cold.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const packet = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: deployment.recovery, topics: packet.event.topics, data: packet.event.data }] : undefined;
+  const complete = await recoverStep(w, cold, caps);
+  assert.equal(complete.state, 'checkpoint');
+  const portable = join(dir, 'ordinary-later-complete.json');
+  publishReturnBackup(w, cold, portable);
+
+  const restarted = await open('ordinary-relayer', rpc);
+  const file = join(restarted.dir, `recovery-${rec.returnId.slice(2)}.json`);
+  const savedDurable = io.durable;
+  try {
+    io.durable = (path) => { if (path === file) throw new Error('power lost after staging portable Complete'); };
+    await assert.rejects(restoreReturn(restarted, portable), /power lost/);
+  } finally { io.durable = savedDurable; }
+  assert.equal((await restarted.bridge.journal.ret(rec.returnId))!.recovery, undefined);
+  const reopened = await open('ordinary-relayer', rpc);
+  const adopted = await restoreReturn(reopened, portable);
+  assert.deepEqual(adopted.recovery, cold.recovery);
+  assert.deepEqual(adopted.sends, sends);
+  const journal = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(journal.cuts.length, 1);
+  assert.equal(journal.attempts, undefined, 'the holder’s cold fees are outside the relayer’s ledger');
+  const proof = unhex(journal.cuts[0].location.proof);
+  const settlement = await session.gaps('redeemRecovered', reopened.trust, proof, { seq: 1n }, []);
+  const { request } = decodeSignedTx(unhex(sends[0].raw));
+  const cost = request.gas * request.maxFeePerGas + (1_721_000n + 16n * BigInt(settlement.calldata.length)) * caps.maxFeePerGas;
+  assert.deepEqual((await restoreReturn(reopened, portable)).sends, sends);
+  await assert.rejects(recoverStep(reopened, adopted, { ...caps, feeBudget: cost - 1n }), { rule: 'CapacityPreflight' });
+  chain.autoMine = false;
+  assert.equal((await recoverStep(reopened, adopted, { ...caps, feeBudget: cost })).state, 'pending');
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).pending.cut.kind, 'settle');
 });
 
 test('holder burn resume repairs a missing token-index return ID without another signature', async (t) => {

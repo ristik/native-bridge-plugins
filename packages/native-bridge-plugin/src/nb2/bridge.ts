@@ -36,7 +36,7 @@ import {
   appendTransfer, certifyChecked, headOf, childMint, freshMask, mintRequest, splitPlan, tokenOfChild, tokenOfMint, transferRequest, type Aggregator, type OwnerSigner,
 } from './tokenops.js';
 import { bindTrust, SealAheadOfOrigin, type TrustInput } from './trust.js';
-import { decodeEvidence, encodeReturnData, evidenceOf, verifyHeld, verifyPart, verifySplit, type Verdict } from './verify.js';
+import { burnTransitionId, decodeEvidence, encodeReturnData, evidenceOf, redemptionId, verifyHeld, verifyPart, verifySplit, type Verdict } from './verify.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
@@ -756,7 +756,7 @@ export class NativeBridgeV2 {
   }
 
   /** Authenticate the private request before a backup can submit it on another device. */
-  private async validatePendingReturn(rec: ReturnRecord): Promise<void> {
+  private async validatePendingReturn(rec: ReturnRecord): Promise<Uint8Array> {
     const src = unhex(rec.source);
     const held = await this.verifyToken(src);
     const head = headOf(decodeToken(src));
@@ -777,6 +777,7 @@ export class NativeBridgeV2 {
       refuse('BadInput', 'backup does not bind the exact signed return and authenticated start');
     }
     verifyUnlock(head.owner.params, head.state, request.txHash, request.unlock);
+    return redemptionId(this.domain, burnTransitionId(stateId(request.source, request.sourceHash), request.txHash));
   }
 
   /** Authenticate the backup and its optional terminal proof before committing a return. */
@@ -787,7 +788,7 @@ export class NativeBridgeV2 {
     const burned = terminal && Uint8Array.from(terminal);
     if (rec.domain !== hex(this.domain)) refuse('BadInput', 'return backup belongs to another deployment');
     if (!rec.burnRequest || !rec.burnTx || !rec.certificationLocator) refuse('BadInput', 'backup lacks an exact signed burn');
-    await this.validatePendingReturn(rec);
+    const eta = hex(await this.validatePendingReturn(rec));
     const { source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator, recovery } = rec;
     const verified: ReturnRecord = { ...this.journal.base(), kind: 'return', status: 'burn-requested', sends: [],
       source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator, recovery };
@@ -814,24 +815,30 @@ export class NativeBridgeV2 {
         }
         if (existing.status === 'paid') return existing;
         selected = existing;
-        if (existing.status === 'burn-requested') {
-          if (burned) {
-            selected.burned = verified.burned;
-            selected.eta = verified.eta;
-            selected.status = 'burned';
-          } else {
-            await this.certifyReturn(selected);
-          }
-          // The signed request is already durable. Keep its verified result even if future work cannot be qualified.
-          await this.journal.putReturn(selected);
-        }
       }
-      if (selected.eta !== undefined && (await this.findPaid(selected, archives, false))?.state === 'paid') {
+      // An authenticated request already binds eta, even if the backup predates certification.
+      const payment = { ...selected, eta };
+      if ((await this.findPaid(payment, archives, false))?.state === 'paid') {
+        await this.journal.putReturn(payment);
+        return payment;
+      }
+      if (existing?.burnRequest && existing.status === 'burn-requested') {
+        if (burned) {
+          selected.burned = verified.burned;
+          selected.eta = verified.eta;
+          selected.status = 'burned';
+        } else {
+          await this.certifyReturn(selected);
+        }
+        // The signed request is already durable. Keep its verified result if future qualification fails.
         await this.journal.putReturn(selected);
-        return selected;
+      }
+      // Portable recovery can extend an ordinary return for this same signed request.
+      if (selected !== verified && !selected.recovery && verified.recovery && verified.burned) {
+        selected = { ...selected, recovery: verified.recovery, burned: verified.burned, eta: verified.eta };
       }
       await beforeCommit?.(structuredClone(selected));
-      if (selected === verified) await this.journal.putReturn(selected);
+      if (selected !== existing) await this.journal.putReturn(selected);
       return selected;
     });
   }
