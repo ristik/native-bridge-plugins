@@ -144,6 +144,13 @@ fn prescribed_runs_match_t1() {
                 .acquire(&trust, &run.event, &[&primary, &archive], None)
                 .unwrap();
             assert_eq!(proof.encoded, receipt);
+            if path == "transcripts/root" {
+                let trimmed = session.trim_receipt(&trust, receipt, &run.event).unwrap();
+                assert!(trimmed.encoded.len() <= receipt.len());
+                session
+                    .verify_event(&trust, &trimmed.encoded, &run.event)
+                    .unwrap();
+            }
             let unknown = |_: &[u8; 20], _: &[u8; 32]| {
                 refuse(WalletReason::CompanionUnknown, "child not served")
             };
@@ -320,4 +327,28 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
     assert!(quote_recovery(admitted.settle.shape, &calibration, &limits).is_some());
     limits.signed_bytes -= 1;
     assert!(quote_recovery(admitted.settle.shape, &calibration, &limits).is_none());
+}
+
+#[test]
+fn refuses_the_invalid_supplement_lineages() {
+    let (_, trust, gamma, recovery) = load(EXTRA, "b1-rollover");
+    let params = production_params();
+    let deployment = json(EXTRA, "deployment.json");
+    for path in ["b1-rollover-refusals", "cross-cut-conflict"] {
+        let evidence = read(EXTRA, &format!("{path}/evidence.bin"));
+        assert!(RecoverySession::create(
+            &gamma,
+            &evidence,
+            &trust,
+            &params,
+            RecoveryDeployment {
+                salt: arr(&read(EXTRA, "generation-salt.bin")),
+                recovery,
+                runtime_hash: hex(&deployment["RecoveryRuntimeHash"]),
+                pins: hex(&deployment["Pins"]),
+                vault_runtime_hash: None,
+            },
+        )
+        .is_err());
+    }
 }
