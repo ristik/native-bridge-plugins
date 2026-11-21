@@ -302,7 +302,10 @@ export class EvmReader {
         if (failure === undefined || e instanceof Nb2Error && e.rule === 'EvidencePruned') failure = e;
       }
     }
-    if (!held) throw failure;
+    if (!held) {
+      if (headerSources.length) fail('EvidencePruned', `no configured reader supplied block header ${hexOf(blockHash)}`);
+      throw failure;
+    }
     const { header, raw } = held;
     const uc = await this.certificateOf(header, blockHash, bindTechnicalRecord);
     const txIndex = qtyOf(r!.transactionIndex, 'transactionIndex');

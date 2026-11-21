@@ -108,8 +108,8 @@ final settlement. The wallet repeats admission before authorizing the burn. Repe
 an interruption to reconcile the same signed request. An authorized backup destination is
 durable before signing, and its private copy is published before submitting the request. The
 backup holds the complete provenance and signed request. Keep it private and hand it only to
-the chosen relayer. Use `backup-return coin FILE` to export a signed return or its current set of
-certified cuts to a new path.
+the chosen relayer before starting payout. Use `backup-return coin FILE` to save a signed return
+or a certified Complete or Paid handoff to a new path.
 
 On another device, verify the release and configure a funded relayer EVM key in `RELAY_PAYER`.
 Use a private local directory for the resumed journal. The payout address and amount come from
@@ -122,7 +122,7 @@ nb2-wallet --wallet ./relay-state resume coin.private.json --release /release/nb
 
 Repeat the same command if inclusion or certification is pending. Supply an alternate archive
 when a reader reports `EvidencePruned` and the backup lacks the needed proof. A certified backup
-can restore its burn and checkpoints with the certifier offline. Keep the previous journal
+can restore the burn and its Complete or Paid evidence with the certifier offline. Keep the journal
 when moving between routes. It records this payer's signed attempts and their fee reservations.
 A fresh relayer needs a policy that accounts for any fees it already spent.
 

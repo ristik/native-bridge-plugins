@@ -1566,12 +1566,17 @@ test('a pruned Paid header is actionable and can come from a header-only reader 
       await chain.mine([raw]);
       await chain.mine([]);
       const receipt = (await w.bridge.evm.receipt(tx))!;
+      let missingAsError = false;
       const pruned: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
-        if (method === 'eth_getBlockByHash' && params[0] === receipt.blockHash) return Promise.resolve(null as T);
+        if (method === 'eth_getBlockByHash' && params[0] === receipt.blockHash) {
+          if (missingAsError) return Promise.reject(new RpcError(200, -32000, 'unknown block'));
+          return Promise.resolve(null as T);
+        }
         if (method === 'eth_sendRawTransaction') throw new Error('must reconcile before sending');
         return rpc.call<T>(method, params);
       } };
       for (let i = 0; i < 2; i++) {
+        missingAsError = i === 1;
         const restarted = await open('holder', pruned);
         assert.deepEqual(await resumePayout(restarted, rec, caps, route === 'ordinary'), { state: 'needs-archive', txHash: tx });
         await assert.rejects(restoreReturn(restarted, backup), /needs archive for payment/);
