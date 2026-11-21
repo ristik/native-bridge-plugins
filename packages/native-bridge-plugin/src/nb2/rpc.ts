@@ -10,7 +10,7 @@
 import { concat, eq, fromHex, toHex } from '../bytes.js';
 import { decodeBytesReturn, decodeStateReturn, SELECTOR, type RawLog, type VaultState } from './abi.js';
 import { TOPIC, encodeDepositProof, type DepositProof } from './deposit.js';
-import { WalletError, fail, refuse } from './errors.js';
+import { Nb2Error, WalletError, fail, refuse } from './errors.js';
 import { bindHeader, encodeHeader, type Header } from './header.js';
 import { HE, HU } from './crypto.js';
 import { buildTrie, mptVerify } from './mpt.js';
@@ -282,7 +282,7 @@ export class EvmReader {
   }
 
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>): Promise<ReceiptProof> {
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>, headerSources: readonly EvmReader[] = []): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);
@@ -292,7 +292,18 @@ export class EvmReader {
         && eq(bytesOf(l.data, 'log data'), expected.data))));
     if (idx < 0) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} emitted no such log from 0x${toHex(emitter)}`);
     const blockHash = fixedOf(r!.blockHash, 32, 'blockHash');
-    const { header, raw } = await this.headerByHash(blockHash);
+    let held: Awaited<ReturnType<EvmReader['headerByHash']>> | undefined;
+    let failure: unknown;
+    for (const reader of new Set([this, ...headerSources])) {
+      try {
+        held = await reader.headerByHash(blockHash);
+        break;
+      } catch (e) {
+        if (failure === undefined || e instanceof Nb2Error && e.rule === 'EvidencePruned') failure = e;
+      }
+    }
+    if (!held) throw failure;
+    const { header, raw } = held;
     const uc = await this.certificateOf(header, blockHash, bindTechnicalRecord);
     const txIndex = qtyOf(r!.transactionIndex, 'transactionIndex');
     const nodes = await this.receiptPath(header, blockHash, txIndex);

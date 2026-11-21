@@ -336,6 +336,12 @@ export class RecoverySession {
     return this.event(kind, Uint8Array.from(data));
   }
 
+  /** A certified Complete is sufficient to start settlement without the producer's run schedule. */
+  async verifyComplete(trust: TrustInput, input: Uint8Array, seq: bigint): Promise<RecoveryReceipt> {
+    if (seq <= 0n || seq >= 1n << 64n) fail('Shape', 'Complete sequence');
+    return this.verifyEvent(trust, input, this.event('complete', concat(u256(seq), verdictAbi(this.verdict))));
+  }
+
   async verifyEvent(trust: TrustInput, input: Uint8Array, expected: RecoveryEvent): Promise<RecoveryReceipt> {
     const event = this.snapshotEvent(expected);
     if (input.length > receiptCap) fail('InputTooLarge', 'cold receipt');

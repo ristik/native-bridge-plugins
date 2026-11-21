@@ -57,6 +57,8 @@ export interface SendRecord {
   nonceUsedAt?: Dec;
   /** Bounded attempts to obtain an exact certified failure proof. */
   failureProofReads?: number;
+  /** Certified exact failure, verified before the send became eligible for retry. */
+  failed?: { txHash: Hex; blockHash: Hex };
 }
 
 interface Base { format: typeof JOURNAL_FORMAT; version: typeof JOURNAL_VERSION; domain: Hex }
