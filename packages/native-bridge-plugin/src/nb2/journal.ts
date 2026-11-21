@@ -55,6 +55,8 @@ export interface SendRecord {
   at: Dec;
   /** The head block when a mined transaction of the account was first seen past this nonce without this send's success receipt. */
   nonceUsedAt?: Dec;
+  /** Bounded attempts to obtain an exact certified failure proof. */
+  failureProofReads?: number;
 }
 
 interface Base { format: typeof JOURNAL_FORMAT; version: typeof JOURNAL_VERSION; domain: Hex }

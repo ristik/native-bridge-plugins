@@ -130,7 +130,18 @@ export interface RedeemTx { returnId: Uint8Array; calldata: Uint8Array; gasLimit
 export type ReconcileResult =
   | { state: 'paid'; txHash: Uint8Array; blockNumber: bigint }
   | { state: 'pending'; txHash: Uint8Array }
+  | { state: 'needs-archive'; txHash: Uint8Array }
   | { state: 'not-paid'; lastFailure?: { txHash: Uint8Array; action: RedeemAction; error: DecodedError | null } };
+
+export interface ReturnEvidence {
+  /** Exact signed settlement hashes held locally. */
+  settlements?: readonly Uint8Array[];
+  /** A certified vault receipt. Its transaction hash is a lookup hint. */
+  paid?: ReturnRecord['paid'];
+  readOnly?: boolean;
+}
+
+export const FAILURE_PROOF_READS = 3;
 
 const hexq = (b: Uint8Array): string => `0x${toHex(b)}`;
 
@@ -792,8 +803,8 @@ export class NativeBridgeV2 {
 
   /** Authenticate the backup and its optional terminal proof before committing a return. */
   public async importPendingReturn(snapshot: ReturnRecord, terminal?: Uint8Array,
-    beforeCommit?: (verified: ReturnRecord) => Promise<void>,
-    archives: readonly EvmReader[] = [this.evm]): Promise<ReturnRecord> {
+    beforeCommit?: (verified: ReturnRecord, incoming: ReturnRecord) => Promise<void | 'incoming-recovery'>,
+    archives: readonly EvmReader[] = [this.evm], evidence?: ReturnEvidence): Promise<ReturnRecord> {
     const rec = structuredClone(snapshot);
     const burned = terminal && Uint8Array.from(terminal);
     if (rec.domain !== hex(this.domain)) refuse('BadInput', 'return backup belongs to another deployment');
@@ -836,7 +847,7 @@ export class NativeBridgeV2 {
       if (row.paid === 'keep') return selected;
       // The signed request binds eta even when the holder has yet to obtain a terminal.
       const payment = { ...selected, eta };
-      if ((await this.findPaid(payment, archives, false))?.state === 'paid') {
+      if ((await this.findPaid(payment, archives, false, evidence))?.state === 'paid') {
         await this.journal.putReturn(payment);
         return payment;
       }
@@ -845,11 +856,11 @@ export class NativeBridgeV2 {
         // The signed request is already durable. Keep its verified result if future qualification fails.
         await this.journal.putReturn(selected);
       }
-      // Portable recovery can extend an ordinary return for this same signed request.
-      if (selected !== verified && !selected.recovery && verified.recovery && verified.burned) {
+      const route = await beforeCommit?.(structuredClone(selected), structuredClone(verified));
+      // The wallet may choose an independently authenticated incoming session and schedule.
+      if (verified.recovery && verified.burned && (route === 'incoming-recovery' || !selected.recovery)) {
         selected = { ...selected, recovery: verified.recovery, burned: verified.burned, eta: verified.eta };
       }
-      await beforeCommit?.(structuredClone(selected));
       if (selected !== existing) await this.journal.putReturn(selected);
       return selected;
     });
@@ -998,7 +1009,7 @@ export class NativeBridgeV2 {
   private async submitRedeemInner(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
     const archives = options.archives ?? [this.evm];
     const prior = await this.reconcileInner(returnId, archives);
-    if (prior.state === 'paid' || prior.state === 'pending') return prior;
+    if (prior.state !== 'not-paid') return prior;
     let gasBump = 1n;
     for (let attempt = 0; attempt < 4; attempt++) {
       const rtx = await this.buildRedeemInner(returnId, options.envelope);
@@ -1038,42 +1049,71 @@ export class NativeBridgeV2 {
    * once its receipt is verified under the block's EVM UC (section 6.2 steps 2 to 5): a provider that invents or withholds Paid can
    * delay the wallet, never stop its redemption.
    */
-  public reconcile(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm]): Promise<ReconcileResult> {
+  public reconcile(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm], evidence?: ReturnEvidence): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
-    return this.locked(`return/${toHex(returnId)}`, () => this.reconcileInner(returnId, archives));
+    return this.locked(`return/${toHex(returnId)}`, () => this.reconcileInner(returnId, archives, evidence));
   }
 
-  private async reconcileInner(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm]): Promise<ReconcileResult> {
+  private async reconcileInner(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm], evidence?: ReturnEvidence): Promise<ReconcileResult> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
     if (rec.status === 'burn-requested') {
       const eta = hex(await this.validatePendingReturn(rec));
-      return (await this.findPaid({ ...rec, eta }, archives)) ?? { state: 'not-paid' };
+      return (await this.findPaid({ ...rec, eta }, archives, true, evidence)) ?? { state: 'not-paid' };
     }
     if (rec.eta === undefined) return { state: 'not-paid' };
-    return (await this.findPaid(rec, archives)) ?? this.reconcileSend(rec, archives, true);
+    return (await this.findPaid(rec, archives, true, evidence)) ?? this.reconcileSend(rec, archives, evidence?.readOnly !== true);
   }
 
-  private async findPaid(rec: ReturnRecord, archives: readonly EvmReader[], persist = true): Promise<ReconcileResult | undefined> {
+  private async findPaid(rec: ReturnRecord, archives: readonly EvmReader[], persist = true, evidence?: ReturnEvidence): Promise<ReconcileResult | undefined> {
     const eta = unhex(rec.eta!);
+    if (evidence?.paid?.receipt) {
+      const verified = await this.recordPaid(rec, unhex(evidence.paid.txHash), unhex(evidence.paid.receipt), persist);
+      if (!verified) refuse('BadInput', 'portable payment does not prove Paid for the signed redemption');
+      return verified;
+    }
     let available = false;
     let unavailable: unknown;
     let pending: ReconcileResult | undefined;
+    const hashes = new Map<string, Uint8Array>();
+    for (const tx of evidence?.settlements ?? []) hashes.set(hex(tx), tx);
+    for (const send of rec.sends) {
+      const { hash } = decodeSignedTx(unhex(send.raw));
+      hashes.set(hex(hash), hash);
+    }
+    const searched = new Map<EvmReader, Set<string>>();
+    const read = async (reader: EvmReader, tx: Uint8Array) => {
+      let tried = searched.get(reader);
+      if (!tried) searched.set(reader, tried = new Set());
+      if (tried.has(hex(tx))) return;
+      tried.add(hex(tx));
+      const result = await this.verifiedPaid(rec, tx, reader, persist);
+      if (result?.state === 'pending') pending = result;
+      if (result?.state === 'paid') return result;
+    };
+    for (const tx of hashes.values()) {
+      for (const reader of archives) {
+        const result = await read(reader, tx);
+        if (result) return result;
+      }
+    }
     for (const reader of archives) {
       try {
         const logs = await reader.paid(this.cfg.vault, eta, undec(rec.fromBlock));
         for (const l of logs) {
           const p = decodePaid(l);
           if (p === null || !eq(l.address, this.cfg.vault) || !eq(p.eta, eta)) continue;
-          const v = await this.verifiedPaid(rec, l.transactionHash, reader, persist);
-          if (v?.state === 'paid') return v;
-          if (v?.state === 'pending') pending = v;
+          hashes.set(hex(l.transactionHash), l.transactionHash);
         }
         available = true;
       } catch (e) {
-        if (!(e instanceof Nb2Error) && !(e instanceof WalletError) && !(e instanceof RpcError) || e instanceof WalletError &&
-          (e.reason === 'JournalConflict' || e.reason === 'JournalNotPersisted')) throw e;
         unavailable = e;
+      }
+    }
+    for (const tx of hashes.values()) {
+      for (const reader of archives) {
+        const result = await read(reader, tx);
+        if (result) return result;
       }
     }
     if (pending) return pending;
@@ -1088,6 +1128,8 @@ export class NativeBridgeV2 {
     const { hash: txHash } = decodeSignedTx(raw);
     if (hex(txHash) !== send.hash) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
     let seen = false;
+    let failed = false;
+    let pruned = false;
     for (const reader of archives) {
       let receipt: ReceiptJson | null;
       try {
@@ -1102,14 +1144,24 @@ export class NativeBridgeV2 {
         if (paid?.state === 'paid') return paid;
         continue;
       }
+      failed = true;
       try {
         await this.retryingTrust(() => reader.verifyFailedReceipt(txHash, this.cfg, this.opts.trust, receipt));
         return { state: 'not-paid' };
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+        if (e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
         // Another archive may have the certificate, receipt trie and exact transaction.
       }
     }
+    if (failed || send.failureProofReads !== undefined) {
+      const reads = pruned ? FAILURE_PROOF_READS : Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
+      if (reads !== send.failureProofReads) {
+        send.failureProofReads = reads;
+        await this.journal.putReturn(rec);
+      }
+    }
+    if (send.failureProofReads === FAILURE_PROOF_READS) return { state: 'needs-archive', txHash };
     if (!seen && resubmit) {
       try { await this.evm.sendRaw(raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
@@ -1124,26 +1176,40 @@ export class NativeBridgeV2 {
    */
   private async verifiedPaid(rec: ReturnRecord, tx: Uint8Array, reader = this.evm, persist = true): Promise<ReconcileResult | null> {
     const eta = unhex(rec.eta!);
+    let receipt: Uint8Array;
     try {
       const recipientWord = concat(new Uint8Array(12), unhex(rec.recipient));
       const rp = await reader.receiptProof(tx, this.cfg.vault, TOPIC.Paid, false, {
         topics: [TOPIC.Paid, eta, recipientWord], data: u256(undec(rec.amount)),
       });
-      const log = await this.retryingTrust(() => verifyReceiptLog(this.cfg, this.opts.trust, rp.proof));
-      if (log.topics.length !== 3 || !eq(log.topics[0], TOPIC.Paid) || !eq(log.topics[1], eta) || !eq(log.topics[2], recipientWord)
-        || log.data.length !== 32 || beInt(log.data) !== undec(rec.amount)) return null;
-      rec.paid = { txHash: hex(tx), blockNumber: dec(rp.blockNumber), blockHash: hex(rp.blockHash),
-        receipt: hex(rp.encoded), txIndex: dec(rp.proof.txIndex), logIndex: dec(rp.receiptLogIndex) };
-      rec.status = 'paid';
-      if (persist) await this.journal.putReturn(rec);
-      return { state: 'paid', txHash: tx, blockNumber: rp.blockNumber };
+      receipt = rp.encoded;
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };
-      // a lost compare-and-swap of the journal is never read as an unverified claim
-      if (e instanceof WalletError && (e.reason === 'JournalConflict' || e.reason === 'JournalNotPersisted')) throw e;
+      return null; // unavailable from this reader, with no authenticated effect
+    }
+    try {
+      return await this.recordPaid(rec, tx, receipt, persist);
+    } catch (e) {
+      // A lost compare-and-swap of the journal is never read as an unverified claim
+      if (e instanceof WalletError && (e.reason === 'JournalConflict' || e.reason === 'JournalNotPersisted' || e.reason === 'TrustInput')) throw e;
       if (e instanceof Nb2Error || e instanceof WalletError) return null;
       throw e;
     }
+  }
+
+  private async recordPaid(rec: ReturnRecord, tx: Uint8Array, receipt: Uint8Array, persist: boolean): Promise<ReconcileResult | null> {
+    if (tx.length !== 32) refuse('BadInput', 'payment transaction hint is not a hash');
+    const proof = decodeDepositProof(receipt);
+    const log = await this.retryingTrust(() => verifyReceiptLog(this.cfg, this.opts.trust, proof));
+    const recipient = concat(new Uint8Array(12), unhex(rec.recipient));
+    if (log.topics.length !== 3 || !eq(log.topics[0], TOPIC.Paid) || !eq(log.topics[1], unhex(rec.eta!)) ||
+      !eq(log.topics[2], recipient) || log.data.length !== 32 || beInt(log.data) !== undec(rec.amount) ||
+      log.header.number < undec(rec.fromBlock)) return null;
+    rec.paid = { txHash: hex(tx), blockNumber: dec(log.header.number), blockHash: hex(HE(proof.header)),
+      receipt: hex(receipt), txIndex: dec(proof.txIndex), logIndex: dec(proof.logIndex) };
+    rec.status = 'paid';
+    if (persist) await this.journal.putReturn(rec);
+    return { state: 'paid', txHash: tx, blockNumber: log.header.number };
   }
 
   // ==== status ==========================================================================================================

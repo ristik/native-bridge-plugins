@@ -263,6 +263,7 @@ export class RecoverySession {
   }
   get id(): Uint8Array { return this.session.slice(); }
   get pageRoot(): Uint8Array { return this.pages.root.slice(); }
+  get redemptionId(): Uint8Array { return this.verdict.eta.slice(); }
   get operationCount(): number { return this.ops.length; }
   private event(kind: Kind, data: Uint8Array): RecoveryEvent { return { kind, topics: [topics[kind].slice(), this.id], data }; }
 

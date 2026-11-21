@@ -41,7 +41,7 @@ import {
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
-import { ordinaryPayout, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
+import { qualifyExistingRecovery, reconcileReturn, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -767,7 +767,6 @@ export class RegistryLagExpired extends Error {
  */
 export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_000, note: (reason: string) => void = () => undefined, lag?: (ms: number) => void, policy?: PayerPolicy): Promise<ReconcileResult> {
   const rec = await w.returnRecord(label);
-  const id = unhex(rec.returnId);
   const started = performance.now();
   const deadline = started + REGISTRY_LAG_MS;
   let r: ReconcileResult;
@@ -779,7 +778,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
       if (performance.now() >= deadline) throw new RegistryLagExpired(label, lastRefusal);
     }
     try {
-      r = await w.bridge.submitRedeem(id, w.signer, policy && ordinaryPayout(w, rec, policy));
+      r = await redeemOrdinary(w, rec, policy);
       break;
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
@@ -792,18 +791,17 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
   if (lastRefusal !== undefined) lag?.(performance.now() - started);
   for (let i = 0; r.state === 'pending' && i < polls; i++) {
     await sleep(pollMs);
-    r = await w.bridge.reconcile(id);
+    r = (await reconcileReturn(w, rec, policy)).result;
   }
   if (r.state === 'paid') w.update(label, { note: 'paid' });
   return r;
 }
 
 /** The CLI routes a signed cold return through the durable packet runner. */
-export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false): Promise<RecoveryResult | ReconcileResult> {
-  if (rec.status === 'paid' && (!rec.recovery || ordinary)) return w.bridge.reconcile(unhex(rec.returnId));
-  const r = rec.recovery && !ordinary ? await recoverStep(w, rec, policy) :
-    await w.bridge.submitRedeem(unhex(rec.returnId), w.signer, ordinaryPayout(w, rec, policy));
-  return r;
+export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false, cold = false): Promise<RecoveryResult | ReconcileResult> {
+  rec = (await w.bridge.journal.ret(rec.returnId)) ?? rec;
+  if (cold) rec = await qualifyExistingRecovery(w, rec, policy);
+  return rec.recovery && !ordinary ? recoverStep(w, rec, policy) : redeemOrdinary(w, rec, policy);
 }
 
 /** Receive and verify the complete held lineage before adding it to spendable storage. */

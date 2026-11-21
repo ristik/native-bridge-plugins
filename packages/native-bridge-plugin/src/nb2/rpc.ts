@@ -258,6 +258,7 @@ export class EvmReader {
       refuse('ProviderFault', 'failed receipt is not committed in the certified block');
     }
     const body = await this.rpc.call<{ transactions?: string[] } | null>('eth_getBlockByHash', [hexOf(block.hash), false]);
+    if (!body) fail('EvidencePruned', 'the certified block body is unavailable');
     if (!Array.isArray(body?.transactions) || BigInt(body.transactions.length) > block.header.gasLimit / 21_000n + 16n ||
       idx >= BigInt(body.transactions.length) ||
       !eq(fixedOf(body.transactions[Number(idx)], 32, 'transaction hash'), txHash)) {
@@ -265,7 +266,14 @@ export class EvmReader {
     }
     const entries: [Uint8Array, Uint8Array][] = [];
     for (let i = 0; i < body.transactions.length; i++) {
-      const wire = await this.rpc.call<string>('eth_getRawTransactionByBlockHashAndIndex', [hexOf(block.hash), qty(i)]);
+      let wire: string | null;
+      try {
+        wire = await this.rpc.call<string | null>('eth_getRawTransactionByBlockHashAndIndex', [hexOf(block.hash), qty(i)]);
+      } catch (e) {
+        if (e instanceof RpcError && e.code === -32601) fail('EvidencePruned', 'the reader does not serve raw transactions');
+        throw e;
+      }
+      if (wire === null || wire === undefined || wire === '0x') fail('EvidencePruned', 'an exact transaction in the certified block is unavailable');
       const raw = bytesOf(wire, 'raw transaction');
       if (!eq(HE(raw), fixedOf(body.transactions[i], 32, 'transaction hash'))) refuse('ProviderFault', 'raw transaction hash mismatch');
       entries.push([rlpIndexKey(i), raw]);

@@ -31,7 +31,7 @@ import {
   RegistryLagExpired, Wallet, burn, connectionOf, hx, mint, parseAmount, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, split, status, transfer, uct, unhex,
   type WalletConfig,
 } from './core.js';
-import { publishReturnBackup, qualifyExistingRecovery, readPayerPolicy, restoreReturn, returnHeadroom, type PayerPolicy } from './recovery.js';
+import { archiveRequired, publishReturnBackup, reconcileReturn, readPayerPolicy, restoreReturn, returnHeadroom, type PayerPolicy } from './recovery.js';
 import type { ReturnRecord } from '../packages/native-bridge-plugin/src/nb2/journal.js';
 
 const formatAmount = (wei: bigint | string): string => `${uct(wei)} UCT`;
@@ -85,13 +85,14 @@ async function init(dir: string, args: string[]): Promise<void> {
 /** The commands that read only: every other one runs the installation check first. */
 const READ_ONLY = new Set(['address', 'tokens', 'status']);
 
-async function continueReturn(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary: boolean): Promise<void> {
+async function continueReturn(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary: boolean, cold = false): Promise<void> {
   for (;;) {
-    const result = await resumePayout(w, rec, policy, ordinary);
+    const result = await resumePayout(w, rec, policy, ordinary, cold);
     if (result.state === 'paid') {
       say(`paid ${formatAmount(rec.amount)} to ${rec.recipient} in block ${result.blockNumber}, tx ${hx(result.txHash)}`);
       return;
     }
+    if (result.state === 'needs-archive') archiveRequired(result.txHash);
     if (result.state === 'not-paid') throw new Error('no certified payment is available');
     if (result.state === 'checkpoint') {
       say(`certified recovery checkpoint ${hx(result.txHash)}`);
@@ -113,9 +114,8 @@ async function relay(dir: string, args: string[], policy: PayerPolicy, ordinary:
     trustOrigin: option(args, '--trust-origin'), aggregator: option(args, '--aggregator') });
   need(args, 1, 'resume BACKUP --release FILE --rpc URL --payer-env NAME --return-policy FILE');
   const w = await new Wallet(dir, unhex(key), conn).open();
-  let rec = await restoreReturn(w, resolve(args[0]), policy);
-  if (cold) rec = await qualifyExistingRecovery(w, rec, policy);
-  await continueReturn(w, rec, policy, ordinary);
+  const rec = await restoreReturn(w, resolve(args[0]), policy);
+  await continueReturn(w, rec, policy, ordinary, cold);
 }
 
 async function main(): Promise<void> {
@@ -230,20 +230,22 @@ async function main(): Promise<void> {
     }
     case 'redeem': {
       need(rest, 1, 'redeem NAME');
-      let ret = await w.returnRecord(rest[0]);
-      if (cold) {
-        if (!policy) throw new Error('cold continuation requires --return-policy FILE');
-        ret = await qualifyExistingRecovery(w, ret, policy);
-      }
-      if (ret.recovery || w.release.recovery !== undefined || policy) {
-        if (!policy) throw new Error('redeem requires --return-policy FILE');
-        await continueReturn(w, ret, policy, ordinary);
+      const ret = await w.returnRecord(rest[0]);
+      if (cold || ret.recovery || w.release.recovery !== undefined || policy) {
+        if (policy) await continueReturn(w, ret, policy, ordinary, cold);
+        else {
+          const { result } = await reconcileReturn(w, ret, undefined, undefined, false);
+          if (result.state === 'needs-archive') archiveRequired(result.txHash);
+          if (result.state !== 'paid') throw new Error('redeem requires --return-policy FILE');
+          say(`paid ${formatAmount(ret.amount)} to ${ret.recipient} in block ${result.blockNumber}, tx ${hx(result.txHash)}`);
+        }
         if ((await w.returnRecord(rest[0])).status === 'paid') w.update(rest[0], { note: 'paid' });
         return;
       }
       const r = await redeem(w, rest[0], 60, 3_000, (why) => say(`  ${why}; waiting`));
       const rec = await w.returnRecord(rest[0]);
       if (r.state === 'paid') say(`paid ${formatAmount(rec.amount)} to ${rec.recipient} in block ${r.blockNumber} (tx ${hx(r.txHash)}); ${rec.sends.length} redeem transaction${rec.sends.length === 1 ? '' : 's'} sent`);
+      else if (r.state === 'needs-archive') archiveRequired(r.txHash);
       else if (r.state === 'pending') say(`sent (tx ${hx(r.txHash)}), not certified yet: run redeem ${rest[0]} again to reconcile`);
       else throw new Error(`${rest[0]} is not paid${r.lastFailure ? `: ${r.lastFailure.action}, ${r.lastFailure.error?.rule ?? 'no revert data'}` : ''}. The burn is intact; see status`);
       return;
