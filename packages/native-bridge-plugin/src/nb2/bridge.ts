@@ -688,6 +688,7 @@ export class NativeBridgeV2 {
    * before certification, the certified burn before this returns; a second call resumes the same burn and never makes another.
    */
   public burn(returnId: Uint8Array, owner: OwnerSigner): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+    returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner));
   }
 
@@ -706,7 +707,8 @@ export class NativeBridgeV2 {
     if (rec.status === 'burn-requested') {
       const proof = await certifyChecked(this.opts.aggregator, unhex(rec.burnRequest!));
       const burned = appendTransfer(unhex(rec.source), unhex(rec.burnTx!), proof);
-      const v = await verifyPart(this.cfg, this.domain, this.opts.trust, decodeEvidence(evidenceOf(burned)));
+      const part = decodeEvidence(evidenceOf(burned));
+      const v = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
       if (v.minSegment !== undec(rec.a) || v.amount !== undec(rec.amount) || !eq(v.recipient, unhex(rec.recipient))) refuse('ProviderFault', 'the certified burn is not the planned one');
       rec.burned = hex(burned);
       rec.eta = hex(v.eta);
@@ -714,7 +716,8 @@ export class NativeBridgeV2 {
       await this.journal.putReturn(rec);
     }
     const burned = unhex(rec.burned!);
-    const verdict = await verifyPart(this.cfg, this.domain, this.opts.trust, decodeEvidence(evidenceOf(burned)));
+    const part = decodeEvidence(evidenceOf(burned));
+    const verdict = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
     return { burned, eta: verdict.eta, verdict };
   }
 
@@ -724,6 +727,7 @@ export class NativeBridgeV2 {
    * A missing or reordered log is missing evidence, never absence. Refuses with `CapacityExceeded` when the claim does not fit.
    */
   public buildRedeem(returnId: Uint8Array): Promise<RedeemTx> {
+    returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, () => this.buildRedeemInner(returnId));
   }
 
@@ -782,6 +786,7 @@ export class NativeBridgeV2 {
    * the burn; failures are classified by error selector.
    */
   public submitRedeem(returnId: Uint8Array, signer: EvmSigner): Promise<ReconcileResult> {
+    returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, signer));
   }
 
@@ -826,6 +831,7 @@ export class NativeBridgeV2 {
    * delay the wallet, never stop its redemption.
    */
   public reconcile(returnId: Uint8Array): Promise<ReconcileResult> {
+    returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, () => this.reconcileInner(returnId));
   }
 

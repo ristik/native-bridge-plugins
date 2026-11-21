@@ -1,5 +1,7 @@
 #![cfg(feature = "host")]
 
+mod rootfixture;
+
 use native_bridge_sdk_ext::nb2::config::{decode_config, domain_of, production_params};
 use native_bridge_sdk_ext::nb2::crypto::hu;
 use native_bridge_sdk_ext::nb2::errors::Rule;
@@ -540,5 +542,90 @@ fn receipt_and_allocation_counts_refuse_before_their_children() {
             .unwrap()
             .rule,
         Rule::SplitProofShape
+    );
+}
+
+#[test]
+fn retired_seals_require_the_authenticated_successor_on_both_certificate_routes() {
+    use native_bridge_sdk_ext::nb2::trust::{uc_check, verify_evm_uc};
+    use rootfixture::{make_root, make_uc, next_epoch, trust_input, UcSpec};
+
+    let old = make_root(1, 4, 10);
+    let fresh = next_epoch(&old, 100, 4, 30);
+    let mut cfg = decode_config(&read("gamma.bin"), &production_params()).unwrap();
+    cfg.root_genesis = old.pin;
+    let checkpoint = AuthenticatedOrigin {
+        usable_epoch: 2,
+        root_round: 150,
+    };
+    let lagging = trust_input(&old).with_authenticated_origin(checkpoint);
+    let refreshed = trust_input(&fresh).with_authenticated_origin(checkpoint);
+    for partition in [cfg.evm_partition, cfg.aggregator_partition] {
+        for round in [99, 100] {
+            let uc = make_uc(
+                &old,
+                &UcSpec {
+                    partition,
+                    conf: vec![0; 32],
+                    epoch_ir: 1,
+                    root_epoch: 1,
+                    round,
+                    timestamp: 1_700_000_000,
+                    state_hash: vec![1; 32],
+                    block_hash: Some(vec![2; 32]),
+                    signers: 4,
+                },
+            );
+            let is_evm = partition == cfg.evm_partition;
+            let check = |trust: &TrustInput| {
+                if is_evm {
+                    verify_evm_uc(trust, &uc.to_cbor(), &cfg).map(|_| ())
+                } else {
+                    uc_check(trust, &uc, partition, &cfg.evm_shard)
+                }
+            };
+            let provisional = check(&lagging).unwrap_err();
+            assert_eq!(provisional.rule().unwrap().rule, Rule::NoEntryForEpoch);
+            assert!(provisional.retryable());
+            if round == 99 {
+                check(&refreshed).unwrap();
+            } else {
+                let rule = if is_evm {
+                    Rule::DepositUC
+                } else {
+                    Rule::SealEpoch
+                };
+                assert_eq!(check(&refreshed).unwrap_err().rule().unwrap().rule, rule);
+            }
+        }
+    }
+}
+
+#[test]
+fn standalone_evm_and_receipt_verification_require_the_configured_genesis() {
+    use native_bridge_sdk_ext::nb2::deposit::{decode_receipt_backing, verify_receipt_log};
+    use native_bridge_sdk_ext::nb2::trust::verify_evm_uc;
+
+    let mut cfg = decode_config(&read("gamma.bin"), &production_params()).unwrap();
+    let trust = TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis)
+        .unwrap()
+        .with_authenticated_origin(AuthenticatedOrigin {
+            usable_epoch: 2,
+            root_round: 10_000,
+        });
+    let token = decode_token(&read("transcripts/root/evidence.bin")).unwrap();
+    let proof = decode_receipt_backing(token.mint.justification.as_deref().unwrap())
+        .unwrap()
+        .proof;
+    verify_evm_uc(&trust, &proof.uc, &cfg).unwrap();
+    verify_receipt_log(&cfg, &trust, &proof).unwrap();
+    cfg.root_genesis = [0; 32];
+    assert_eq!(
+        verify_evm_uc(&trust, &proof.uc, &cfg).unwrap_err().name(),
+        "TrustInput"
+    );
+    assert_eq!(
+        verify_receipt_log(&cfg, &trust, &proof).unwrap_err().name(),
+        "TrustInput"
     );
 }

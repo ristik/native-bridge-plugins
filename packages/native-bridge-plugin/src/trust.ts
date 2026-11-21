@@ -66,11 +66,11 @@ export class TrustInput {
 
   /** Attach a checkpoint authenticated by the caller. Token evidence and UTB history do not establish this bound. */
   public withAuthenticatedOrigin(origin: AuthenticatedOrigin): TrustInput {
+    const { usableEpoch, rootRound } = origin ?? {};
     const max = (1n << 64n) - 1n;
-    if (origin.usableEpoch < 0n || origin.usableEpoch > max || origin.rootRound <= 0n || origin.rootRound > max) fail('ErrTrustBase');
-    return new TrustInput(this.history, this.id.slice(), Object.freeze({
-      usableEpoch: origin.usableEpoch, rootRound: origin.rootRound,
-    }));
+    if (typeof usableEpoch !== 'bigint' || typeof rootRound !== 'bigint'
+      || usableEpoch < 0n || usableEpoch > max || rootRound <= 0n || rootRound > max) fail('ErrTrustBase');
+    return new TrustInput(this.history, this.id.slice(), Object.freeze({ usableEpoch, rootRound }));
   }
 
   public get network(): NetworkId {

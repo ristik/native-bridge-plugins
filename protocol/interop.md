@@ -339,7 +339,10 @@ interface INativeBridgeVerifierV2 {
 The verifier requires an authenticated B1 evaluation origin for the configured deployment and UTB history.
 Pass the origin's usable epoch and inclusive root round through the SDK trust input. They come from the trusted
 deployment or registry checkpoint channel. Each admitted seal must satisfy both bounds in addition to its
-own authenticated epoch interval. Count every supplied seal signature against the limit of 16 before signature
+own authenticated epoch interval. A seal from an epoch below the usable epoch requires that epoch's authenticated
+successor to establish the exclusive upper bound. A missing successor calls for history refresh. A history refresh
+extends the held prefix under Γ's genesis and network and retains the installed origin. Standalone EVM certificate
+and receipt verification use the same deployment binding as lineage verification. Count every supplied seal signature against the limit of 16 before signature
 verification, including witnesses with no quorum weight.
 
 The verifier authenticates each source under the network's historical authority, compares the exact certification

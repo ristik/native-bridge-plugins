@@ -428,8 +428,36 @@ impl NativeBridgeV2 {
         let t = self.trust();
         match f(&t) {
             Err(e) if e.retryable() && self.refresh_trust.is_some() => {
-                let fresh = (self.refresh_trust.as_ref().expect("checked"))(t)?;
-                *self.trust.write().expect("trust") = fresh.clone();
+                let offered = (self.refresh_trust.as_ref().expect("checked"))(t.clone())?;
+                let offered =
+                    offered.with_authenticated_origin(t.origin().expect("installed origin"));
+                bind_trust(&offered, &self.cfg)?;
+                let incoming = offered.history().entries();
+                if incoming.len() < t.history().entries().len() {
+                    return refuse(
+                        WalletReason::TrustInput,
+                        "trust refresh would roll back the held history",
+                    );
+                }
+                let fresh = {
+                    let mut held = self.trust.write().expect("trust");
+                    let entries = held.history().entries();
+                    if entries
+                        .iter()
+                        .zip(incoming)
+                        .any(|(left, right)| left.entry_id() != right.entry_id())
+                    {
+                        return refuse(
+                            WalletReason::TrustInput,
+                            "trust refresh conflicts with the held history",
+                        );
+                    }
+                    // A concurrent refresh might already have installed a longer prefix.
+                    if incoming.len() > entries.len() {
+                        *held = offered;
+                    }
+                    held.clone()
+                };
                 f(&fresh)
             }
             r => r,
@@ -1502,7 +1530,8 @@ impl NativeBridgeV2 {
                 &proof,
             )?;
             let part = decode_evidence(&evidence_of(&burned))?;
-            let v = verify_part(&self.cfg, &self.domain, &self.trust(), &part)?;
+            let v =
+                self.retrying_trust(|trust| verify_part(&self.cfg, &self.domain, trust, &part))?;
             if v.min_segment != a || v.amount != amount || v.recipient != recipient {
                 return refuse(
                     WalletReason::ProviderFault,
@@ -1515,12 +1544,9 @@ impl NativeBridgeV2 {
             self.journal.put_return(&rec)?;
         }
         let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
-        let verdict = verify_part(
-            &self.cfg,
-            &self.domain,
-            &self.trust(),
-            &decode_evidence(&evidence_of(&burned))?,
-        )?;
+        let part = decode_evidence(&evidence_of(&burned))?;
+        let verdict =
+            self.retrying_trust(|trust| verify_part(&self.cfg, &self.domain, trust, &part))?;
         Ok(Burned {
             burned,
             eta: verdict.eta,

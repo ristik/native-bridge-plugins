@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fsyncDir, lockWallet, writeDurable } from '../../../wallet/core.js';
 import { eq, fromHex, toHex } from '../src/bytes.js';
@@ -11,7 +11,8 @@ import {
   appendTransfer, certifyChecked, childMint, mintRequest, splitPlan, tokenOfChild, transferRequest,
   type Aggregator, type OwnerSigner,
 } from '../src/nb2/tokenops.js';
-import type { TrustInput } from '../src/nb2/trust.js';
+import { Nb2Error } from '../src/nb2/errors.js';
+import { bindTrust, SealAheadOfOrigin, type TrustInput } from '../src/nb2/trust.js';
 import { encodeReturnData, verdictAbi, verifyCertifiedStep, verifyHeld, verifyReturn, verifySplit } from '../src/nb2/verify.js';
 
 const workloads = {
@@ -25,6 +26,9 @@ interface Job {
   gamma: Uint8Array;
   params: Params;
   trust: TrustInput;
+  /** Reload the operator-authenticated checkpoint and held UTB bundle. */
+  refreshTrust?: () => Promise<TrustInput>;
+  originPollMs?: number;
   root: Uint8Array;
   owner: OwnerSigner;
   aggregator: Aggregator;
@@ -55,6 +59,13 @@ function bytes(hex: string): Uint8Array {
   return decoded;
 }
 
+function pendingAuthority(error: unknown): boolean {
+  for (let e = error; e instanceof Nb2Error; e = e.inner) {
+    if (e instanceof SealAheadOfOrigin || e.rule === 'NoEntryForEpoch') return true;
+  }
+  return false;
+}
+
 export async function runLaneWorkload(job: Job) {
   const { transfers, splits } = workloads[job.history];
   const count = transfers + 2 * splits + 1;
@@ -70,6 +81,28 @@ export async function runLaneWorkload(job: Job) {
   if (job.recipient.length !== 20 || !job.recipient.some(Boolean) || eq(job.recipient, cfg.vault)) throw new Error('invalid return recipient');
   const binding = toHex(HU(domain, HU(job.root), job.owner.publicKey, job.recipient, u64(job.minIndex), ascii(job.history)));
   const save = (state: Journal): void => writeDurable(file, JSON.stringify(state));
+  let trust = job.trust;
+  bindTrust(trust, cfg);
+  const verify = async <T>(check: (authority: TrustInput) => Promise<T>): Promise<T> => {
+    const deadline = Date.now() + 120_000;
+    for (;;) {
+      try {
+        return await check(trust);
+      } catch (e) {
+        if (!job.refreshTrust || !pendingAuthority(e) || Date.now() >= deadline) throw e;
+        await new Promise<void>((resolve) => setTimeout(resolve, job.originPollMs ?? 1_000));
+        const fresh = await job.refreshTrust();
+        bindTrust(fresh, cfg);
+        const tip = trust.history.tip!;
+        const prefix = fresh.history.entryForEpoch(tip.epoch);
+        if (prefix === null || !eq(await prefix.entryId(), await tip.entryId())
+          || fresh.origin!.usableEpoch < trust.origin!.usableEpoch || fresh.origin!.rootRound < trust.origin!.rootRound) {
+          throw new Error('lane authority refresh does not extend the held checkpoint and history');
+        }
+        trust = fresh;
+      }
+    }
+  };
 
   let state: Journal;
   if (existsSync(file)) {
@@ -78,7 +111,7 @@ export async function runLaneWorkload(job: Job) {
   } else {
     if (existsSync(output)) throw new Error(`lane output already exists: ${output}`);
     const root = decodeToken(job.root);
-    const held = await verifyHeld(cfg, domain, job.trust, root);
+    const held = await verify((t) => verifyHeld(cfg, domain, t, root));
     if (root.ancestors.length !== 0 || root.transfers.length !== 0 || !eq(held.owner.params, job.owner.publicKey)) {
       throw new Error('workload requires a freshly minted root held by this owner');
     }
@@ -95,11 +128,13 @@ export async function runLaneWorkload(job: Job) {
     linkSync(reservation, output);
     fsyncDir(dirname(output));
   }
-  const current = statSync(output, { bigint: true });
-  const ownsOutput = current.dev === reserved.dev && current.ino === reserved.ino;
-  if (!ownsOutput && (state.step !== count || !eq(readFileSync(output), bytes(state.token)))) {
+  const checkOutput = () => {
+    const current = lstatSync(output, { bigint: true });
+    if (current.dev === reserved.dev && current.ino === reserved.ino) return true;
+    if (current.isFile() && state.step === count && eq(readFileSync(output), bytes(state.token))) return false;
     throw new Error(`lane output already exists: ${output}`);
-  }
+  };
+  checkOutput();
 
   const owner = signaturePredicate(job.owner.publicKey);
   const seed = bytes(state.seed);
@@ -124,7 +159,7 @@ export async function runLaneWorkload(job: Job) {
           { ownerKey: job.owner.publicKey, amount: 1n, salt: randomFor('sibling', splitIndex) },
         ], cfg.ty, cfg.aid, randomFor('split', splitIndex));
         if (splitMint) {
-          const split = await verifySplit(cfg, domain, job.trust, decodeToken(token));
+          const split = await verify((t) => verifySplit(cfg, domain, t, decodeToken(token)));
           if (!eq(split.manifest, plan.tree.root)) throw new Error('certified split manifest differs from its journaled plan');
           const { mint, allocation } = childMint(split.link, plan.tree, plan.children[0]);
           const request = mintRequest(mint);
@@ -143,12 +178,12 @@ export async function runLaneWorkload(job: Job) {
       ? appendTransfer(token, tx, proof)
       : tokenOfChild(token, bytes(state.pending.allocation), tx, proof);
     if (terminal) {
-      await verifyReturn(job.gamma, certified, job.trust, job.params);
+      await verify((t) => verifyReturn(job.gamma, certified, t, job.params));
     } else {
       const part = decodeToken(certified);
-      if (step < transfers) await verifyCertifiedStep(cfg, job.trust, tx, part.proofs.at(-1)!);
-      else if (splitMint) await verifyHeld(cfg, domain, job.trust, part);
-      else await verifySplit(cfg, domain, job.trust, part);
+      if (step < transfers) await verify((t) => verifyCertifiedStep(cfg, t, tx, part.proofs.at(-1)!));
+      else if (splitMint) await verify((t) => verifyHeld(cfg, domain, t, part));
+      else await verify((t) => verifySplit(cfg, domain, t, part));
     }
     state.token = toHex(certified);
     state.step++;
@@ -157,8 +192,8 @@ export async function runLaneWorkload(job: Job) {
   }
 
   const evidence = bytes(state.token);
-  const verdict = await verifyReturn(job.gamma, evidence, job.trust, job.params);
-  if (ownsOutput) writeDurable(output, evidence);
+  const verdict = await verify((t) => verifyReturn(job.gamma, evidence, t, job.params));
+  if (checkOutput()) writeDurable(output, evidence);
   const levels = lineageOf(decodeToken(evidence)).map((level) => ({
     mintBytes: level.mintRaw.length,
     transfers: level.transfersRaw.length,

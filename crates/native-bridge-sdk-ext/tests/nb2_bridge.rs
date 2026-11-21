@@ -1664,3 +1664,92 @@ fn split_retries_the_exact_request_after_an_unusable_parent_proof_and_restart() 
     assert_eq!(requests[0], requests[1]);
     assert_eq!(owner.1.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
+    use native_bridge_sdk_ext::nb2::config::Build;
+    use native_bridge_sdk_ext::nb2::token::{decode_token, encode_token};
+    use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+    use unicity_token::api::bft::TrustBaseHistory;
+
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../protocol/vectors/nb2-continuation-v1.1/"
+    );
+    let read = |file: &str| std::fs::read(format!("{CORPUS}{file}")).unwrap();
+    let gamma = read("gamma.bin");
+    let cfg = native_bridge_sdk_ext::nb2::config::decode_config(
+        &gamma,
+        &native_bridge_sdk_ext::nb2::config::production_params(),
+    )
+    .unwrap();
+    let pin = cfg.root_genesis;
+    let bundle = read("transcripts/held-sibling-0/utb.cbor");
+    let extended = TrustInput::from_bundle(&bundle, &pin).unwrap();
+    let lagging = TrustBaseHistory::from_trusted_chain(vec![extended.history().genesis().clone()])
+        .unwrap()
+        .to_bundle();
+    let origin = AuthenticatedOrigin {
+        usable_epoch: 2,
+        root_round: 1_005,
+    };
+    let held = read("transcripts/held-sibling-0/evidence.bin");
+    let mut future = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
+    future.part.transfers.pop();
+    future.part.transfers_raw.pop();
+    future.part.proofs.pop();
+    let future = encode_token(&future);
+
+    for offers_origin in [false, true] {
+        let world = setup();
+        let foreign = world.root.trust.clone();
+        let mut opts = world.options("authenticated refresh", World::store());
+        opts.pins.gamma = gamma.clone();
+        opts.pins.build = Build::Production;
+        opts.trust = TrustInput::from_bundle(&lagging, &pin)
+            .unwrap()
+            .with_authenticated_origin(origin);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let bundle = bundle.clone();
+        opts.refresh_trust = Some(Box::new(move |current| {
+            assert_eq!(current.id(), pin);
+            assert_eq!(current.origin(), Some(origin));
+            assert_eq!(current.history().latest().epoch, 1);
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(foreign.clone());
+            }
+            let fresh = TrustInput::from_bundle(&bundle, &pin).unwrap();
+            Ok(if offers_origin {
+                fresh.with_authenticated_origin(AuthenticatedOrigin {
+                    usable_epoch: 2,
+                    root_round: 10_000,
+                })
+            } else {
+                fresh
+            })
+        }));
+        let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
+        assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
+        assert!(bridge.verify_token(&held).is_ok());
+        assert!(bridge.verify_token(&held).is_ok());
+        assert_eq!(reason(bridge.verify_token(&future)), "SealEpoch");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // The same genesis and valid bundle structure are insufficient if a refresh
+    // would remove an already held successor.
+    let world = setup();
+    let mut opts = world.options("trust rollback", World::store());
+    opts.pins.gamma = gamma;
+    opts.pins.build = Build::Production;
+    opts.trust = extended.with_authenticated_origin(AuthenticatedOrigin {
+        usable_epoch: 3,
+        root_round: 10_000,
+    });
+    let rollback = TrustInput::from_bundle(&lagging, &pin).unwrap();
+    opts.refresh_trust = Some(Box::new(move |_| Ok(rollback.clone())));
+    let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
+    assert_eq!(reason(bridge.verify_token(&future)), "TrustInput");
+    assert!(bridge.verify_token(&held).is_ok());
+}

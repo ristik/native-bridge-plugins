@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -7,9 +7,9 @@ import { runLaneWorkload } from '../packages/native-bridge-plugin/scripts/nb2-la
 import { NativeBridgeV2 } from '../packages/native-bridge-plugin/src/nb2/bridge.js';
 import { TEST_PARAMS } from '../packages/native-bridge-plugin/src/nb2/config.js';
 import { localOwner } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
-import { evmAccount, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
+import { evmAccount, key, roundNow, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 
-test('lane rejects an occupied output before certifying and resumes both an interrupted split and return', async (t) => {
+test('lane follows the authenticated origin, resumes exact requests and preserves a replaced output', async (t) => {
   const w = await setup();
   const bridge = await NativeBridgeV2.open(w.options('lane retry'));
   const owner = localOwner(key('lane owner'));
@@ -20,7 +20,13 @@ test('lane rejects an occupied output before certifying and resumes both an inte
   const root = await bridge.mint(intent.intent);
   const dir = mkdtempSync(join(tmpdir(), 'nb2-lane-test-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const opts = { gamma: w.chain.gamma, params: TEST_PARAMS, trust: w.root.trust, root, owner, recipient: payer.address, minIndex: 0n, history: 'depth-20' as const };
+  const checkpoint = () => w.root.trust.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: roundNow() });
+  const initial = checkpoint();
+  let reloads = 0;
+  const opts = {
+    gamma: w.chain.gamma, params: TEST_PARAMS, trust: initial, root, owner, recipient: payer.address, minIndex: 0n, history: 'depth-20' as const,
+    originPollMs: 0, refreshTrust: async () => { reloads++; return checkpoint(); },
+  };
   const occupied = join(dir, 'occupied');
   writeFileSync(occupied, 'existing');
   const before = w.agg.calls;
@@ -48,7 +54,11 @@ test('lane rejects an occupied output before certifying and resumes both an inte
       interruptedReturn = request;
       throw new Error('disconnected after return certification');
     }
-    if (state().step === 40) assert.equal(request, interruptedReturn);
+    if (state().step === 40) {
+      assert.equal(request, interruptedReturn);
+      unlinkSync(output);
+      writeFileSync(output, 'replacement');
+    }
     return proof;
   } };
   const run = () => runLaneWorkload({ ...opts, output, aggregator });
@@ -56,6 +66,11 @@ test('lane rejects an occupied output before certifying and resumes both an inte
   assert.equal(state().step, 0);
   await assert.rejects(run(), /after return certification/);
   assert.equal(state().step, 40);
+  await assert.rejects(run(), /output already exists/);
+  assert.equal(state().step, 41);
+  assert.equal(readFileSync(output, 'utf8'), 'replacement');
+  assert.ok(reloads >= 41, 'the initial checkpoint predates all certified spends');
+  unlinkSync(output);
   const finished = await run();
   assert.equal(finished.levels.length, 21);
   assert.equal(finished.evidenceBytes, statSync(output).size);

@@ -183,12 +183,28 @@ pub fn uc_check(
     .map_err(|e| {
         let rule = crate::trust::certificate_failure(&e).map_or(Rule::QuorumNotMet, native_to_rule);
         Error::Rule(Nb2Error::with_detail(rule, alloc::format!("{e:?}")))
-    })
+    })?;
+    // A checkpoint beyond this epoch proves it has closed. The SDK can enforce its
+    // exclusive end only after the authenticated successor is held.
+    let epoch = uc.unicity_seal.epoch;
+    if epoch < origin.usable_epoch {
+        let Some(successor) = t.history().get(epoch + 1) else {
+            return fail_d(
+                Rule::NoEntryForEpoch,
+                alloc::format!("missing authenticated successor for epoch {epoch}"),
+            );
+        };
+        if uc.unicity_seal.root_chain_round_number >= successor.epoch_start {
+            return fail_d(Rule::SealEpoch, "seal is outside its closed epoch");
+        }
+    }
+    Ok(())
 }
 
-/// A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Every failure is `DepositUC` except
-/// `NoEntryForEpoch`, which keeps its retryable name (carrying `DepositUC`, its on-chain name).
+/// A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Certificate failures are wrapped in
+/// `DepositUC`. Trust binding and retryable `NoEntryForEpoch` keep their own errors.
 pub fn verify_evm_uc(t: &TrustInput, raw: &[u8], c: &Config) -> Result<UnicityCertificate> {
+    bind_trust(t, c)?;
     let uc = decode_uc(raw).map_err(|e| wrap(Rule::DepositUC, e))?;
     if ShardId::decode(&c.evm_shard).is_err() {
         return fail_d(Rule::DepositUC, "Γ.evmShard");

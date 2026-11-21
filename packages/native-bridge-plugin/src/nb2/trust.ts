@@ -85,6 +85,11 @@ export function decodeUc(raw: Uint8Array): UnicityCertificate {
   return uc;
 }
 
+/** A valid checkpoint may advance while an aggregator request is in flight. */
+export class SealAheadOfOrigin extends Nb2Error {
+  public constructor() { super('SealEpoch', 'seal exceeds the authenticated B1 origin'); }
+}
+
 const UC_VERIFIER = new UnicityCertificateVerifier(
   new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: MAX_B1_SIGNATURES }),
 );
@@ -113,7 +118,7 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
   const origin = t.origin;
   if (origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
   if (uc.unicitySeal.epoch > origin.usableEpoch || uc.unicitySeal.rootChainRoundNumber > origin.rootRound) {
-    fail('SealEpoch', 'seal exceeds the authenticated B1 origin');
+    throw new SealAheadOfOrigin();
   }
   let r;
   try {
@@ -125,13 +130,23 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
     const reason = certificateFailure(r) ?? 'ErrQuorumNotMet';
     fail(NATIVE_TO_RULE[reason] ?? 'CertStructure', reason);
   }
+  // A checkpoint beyond this epoch proves it has closed. The SDK can enforce its
+  // exclusive end only after the authenticated successor is held.
+  const epoch = uc.unicitySeal.epoch;
+  if (epoch < origin.usableEpoch) {
+    const successor = t.history.entryForEpoch(epoch + 1n);
+    if (successor === null) fail('NoEntryForEpoch', `missing authenticated successor for epoch ${epoch}`);
+    // An asynchronous SDK verification may have started before the successor arrived.
+    if (uc.unicitySeal.rootChainRoundNumber >= successor.epochStartRound) fail('SealEpoch', 'seal is outside its closed epoch');
+  }
 }
 
 /**
- * A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Every failure is `DepositUC` except
- * `NoEntryForEpoch`, which keeps its retryable name.
+ * A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Certificate failures are wrapped in `DepositUC`.
+ * Trust binding and retryable `NoEntryForEpoch` keep their own errors.
  */
 export async function verifyEvmUc(t: TrustInput, raw: Uint8Array, c: Config): Promise<UnicityCertificate> {
+  bindTrust(t, c);
   let uc: UnicityCertificate;
   try {
     uc = decodeUc(raw);

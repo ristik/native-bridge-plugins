@@ -22,3 +22,23 @@ test('the nb2 entry is protocol 10', async () => {
   assert.equal(p.NATIVE_BRIDGE_PROTO_VERSION, 10);
   assert.equal(typeof p.NativeBridgeV2, 'function');
 });
+
+test('the JavaScript origin setter requires both limits as bigints', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const p = await import('../../packages/native-bridge-plugin/lib/nb2/index.js');
+  const vectors = new URL('../../protocol/vectors/nb2-continuation-v1.1/', import.meta.url);
+  const gamma = await readFile(new URL('gamma.bin', vectors));
+  const cfg = p.decodeConfig(gamma, p.PRODUCTION_PARAMS);
+  const history = await p.TrustInput.fromBundle(await readFile(new URL('transcripts/root/utb.cbor', vectors)), cfg.rootGenesis);
+  for (const value of [undefined, null, {}, { usableEpoch: 2n }, { rootRound: 10_000n },
+    { usableEpoch: 2, rootRound: 10_000n }, { usableEpoch: 2n, rootRound: 10_000 }]) {
+    assert.throws(() => history.withAuthenticatedOrigin(value), { reason: 'ErrTrustBase' });
+  }
+  let reads = 0;
+  const origin = history.withAuthenticatedOrigin({
+    get usableEpoch() { reads++; return 2n; },
+    get rootRound() { reads++; return 10_000n; },
+  }).origin;
+  assert.equal(reads, 2);
+  assert.deepEqual(origin, { usableEpoch: 2n, rootRound: 10_000n });
+});

@@ -151,7 +151,7 @@ fn deployments(f: &Value) -> HashMap<String, Dep> {
             )
             .unwrap()
             .with_authenticated_origin(AuthenticatedOrigin {
-                usable_epoch: 3,
+                usable_epoch: 2,
                 root_round: u64::MAX,
             });
             (
@@ -290,7 +290,18 @@ fn seal_receipts_and_the_burn_index() {
             }
             continue;
         }
-        let r = verify_seal_receipt(&cfg, &domain, &d.trust, &hx(&v["receipt"]));
+        // The legacy epoch-3 cases specifically use a usable epoch whose history has yet to arrive.
+        let trust = match v["id"].as_str() {
+            Some("seal-no-entry-for-epoch" | "seal-root-before-epoch") => d
+                .trust
+                .clone()
+                .with_authenticated_origin(AuthenticatedOrigin {
+                    usable_epoch: 3,
+                    root_round: u64::MAX,
+                }),
+            _ => d.trust.clone(),
+        };
+        let r = verify_seal_receipt(&cfg, &domain, &trust, &hx(&v["receipt"]));
         let e = r.as_ref().err();
         let inner = e
             .and_then(|e| e.rule())

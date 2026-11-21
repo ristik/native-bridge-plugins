@@ -77,7 +77,7 @@ async function dep(name: string): Promise<{ trust: TrustInput; gamma: Uint8Array
   let d = deployments.get(name);
   if (!d) {
     const v = F.deployments[name];
-    d = { trust: (await TrustInput.fromBundle(hx(v.trustBundle), hx(v.trustGenesisEntryId))).withAuthenticatedOrigin({ usableEpoch: 3n, rootRound: (1n << 64n) - 1n }), gamma: hx(v.gamma), build: v.build, dep: v };
+    d = { trust: (await TrustInput.fromBundle(hx(v.trustBundle), hx(v.trustGenesisEntryId))).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: (1n << 64n) - 1n }), gamma: hx(v.gamma), build: v.build, dep: v };
     deployments.set(name, d);
   }
   return d;
@@ -157,7 +157,10 @@ test('seal receipts: SealReceipt and the burn index', async () => {
       if (!cmpResult(resultOf(null), v.result)) failures.push(`${v.id}: burn index without a receipt`);
       continue;
     }
-    const [sr, e] = await outcome(() => verifySealReceipt(cfg, domain, d.trust, hx(v.receipt)));
+    // The legacy epoch-3 cases specifically use a usable epoch whose history has yet to arrive.
+    const trust = v.id === 'seal-no-entry-for-epoch' || v.id === 'seal-root-before-epoch'
+      ? d.trust.withAuthenticatedOrigin({ ...d.trust.origin!, usableEpoch: 3n }) : d.trust;
+    const [sr, e] = await outcome(() => verifySealReceipt(cfg, domain, trust, hx(v.receipt)));
     if (norm(expectOf(e)) !== norm(v.expect) || (e instanceof Nb2Error && e.inner?.rule !== v.innerRule)) {
       failures.push(`${v.id}: got ${norm(expectOf(e))} inner ${(e as Nb2Error)?.inner?.rule} (${String((e as Error)?.message ?? '')}), want ${norm(v.expect)} inner ${v.innerRule}`);
       continue;

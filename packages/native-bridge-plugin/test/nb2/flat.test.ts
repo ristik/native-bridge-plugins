@@ -387,3 +387,82 @@ test('transfer, split and return planning use the caller bytes captured at entry
   const { burned } = await bridge.burn(returned.returnId, alice);
   assert.equal(decodeToken(burned).ancestors.length, 1);
 });
+
+test('a retired seal requires its authenticated successor on both certificate routes', async () => {
+  const { makeRoot, makeUc, nextEpoch } = await import('../rootfixture.js');
+  const { makeConfig } = await import('./world.js');
+  const { ucCheck, verifyEvmUc } = await import('../../src/nb2/trust.js');
+  const old = await makeRoot(1, 4, 10);
+  const current = await nextEpoch(old, 100n, 4, 30);
+  const c = makeConfig(old);
+  const checkpoint = { usableEpoch: 2n, rootRound: 150n };
+  const lagging = old.trust.withAuthenticatedOrigin(checkpoint);
+  const fresh = current.trust.withAuthenticatedOrigin(checkpoint);
+  for (const partition of [c.evmPartition, c.aggregatorPartition]) {
+    for (const round of [99n, 100n]) {
+      const uc = await makeUc(old, {
+        partition, conf: new Uint8Array(32), rootEpoch: 1n, epochIr: 1n, round,
+        timestamp: 1_700_000_000n, stateHash: new Uint8Array(32).fill(1), blockHash: new Uint8Array(32).fill(2), signers: 4,
+      });
+      const isEvm = partition === c.evmPartition;
+      const check = (t: TrustInput) => isEvm ? verifyEvmUc(t, uc.toCBOR(), c) : ucCheck(t, uc, partition, c.evmShard);
+      await assert.rejects(check(lagging), { rule: 'NoEntryForEpoch' });
+      if (round === 99n) await check(fresh);
+      else await assert.rejects(check(fresh), { rule: isEvm ? 'DepositUC' : 'SealEpoch' });
+    }
+  }
+});
+
+test('standalone EVM and receipt verification require the configured genesis', async () => {
+  const { decodeReceiptBacking, verifyReceiptLog } = await import('../../src/nb2/deposit.js');
+  const { verifyEvmUc } = await import('../../src/nb2/trust.js');
+  const evidence = decodeToken(read('transcripts/root/evidence.bin'));
+  const { proof } = decodeReceiptBacking(evidence.mint.justification!);
+  const trust = (await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis))
+    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  await verifyEvmUc(trust, proof.uc, cfg);
+  await verifyReceiptLog(cfg, trust, proof);
+  const otherGenesis = { ...cfg, rootGenesis: new Uint8Array(32) };
+  await assert.rejects(verifyEvmUc(trust, proof.uc, otherGenesis), { reason: 'TrustInput' });
+  await assert.rejects(verifyReceiptLog(otherGenesis, trust, proof), { reason: 'TrustInput' });
+});
+
+test('burn and redeem submission retain the same return ID through lock and signer waits', async () => {
+  const { NativeBridgeV2 } = await import('../../src/nb2/bridge.js');
+  const { localOwner } = await import('../../src/nb2/tokenops.js');
+  const { unhex, hex } = await import('../../src/nb2/journal.js');
+  const { setup, key, evmAccount } = await import('./world.js');
+  const w = await setup();
+  const bridge = await NativeBridgeV2.open(w.options('return ID'));
+  const owner = localOwner(key('return ID owner'));
+  const payer = evmAccount(w.chain, 'return ID payer');
+  const mint = async () => {
+    const intent = await bridge.planDeposit(3n, owner.publicKey);
+    await bridge.submitDeposit(intent, payer);
+    await bridge.collectDepositProof(intent.intent);
+    return bridge.mint(intent.intent);
+  };
+  const a = await bridge.planReturn(await mint(), payer.address, payer.address);
+  const b = await bridge.planReturn(await mint(), payer.address, payer.address);
+  const id = a.returnId.slice();
+  const burning = bridge.burn(id, owner);
+  id.set(b.returnId);
+  const first = await burning;
+  assert.deepEqual(await bridge.burn(a.returnId, owner), first);
+  assert.equal((await bridge.journal.retForUpdate(hex(b.returnId)))!.status, 'planned');
+
+  await bridge.burn(b.returnId, owner);
+  const sendingId = a.returnId.slice();
+  const submitting = bridge.submitRedeem(sendingId, {
+    address: payer.address,
+    signTransaction: (tx) => {
+      sendingId.set(b.returnId);
+      return payer.signTransaction(tx);
+    },
+  });
+  assert.equal((await submitting).state, 'paid');
+  const firstRecord = (await bridge.journal.retForUpdate(hex(a.returnId)))!;
+  assert.equal(firstRecord.sends.length, 1);
+  assert.deepEqual(unhex(firstRecord.eta!), first.eta);
+  assert.equal((await bridge.journal.retForUpdate(hex(b.returnId)))!.sends.length, 0);
+});
