@@ -70,7 +70,7 @@ export async function makeRoot(n = 4): Promise<Root> {
   ));
   const pin = await RootTrustBaseV2.decode(entry).entryId();
   const bundle = await TrustBaseBundle.encode([RootTrustBaseV2.decode(entry)]);
-  return { signers, bundle, pin, trust: await TrustInput.fromBundle(bundle, pin) };
+  return { signers, bundle, pin, trust: (await TrustInput.fromBundle(bundle, pin)).withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 1000000n }) };
 }
 
 const TR_HASH = sha(ascii('technical record'));

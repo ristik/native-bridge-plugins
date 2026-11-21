@@ -280,7 +280,17 @@ export class NativeBridgeV2 {
         if (seen.length > 0) return this.adoptDeposits(rec!, seen);
       }
       const value = undec(rec!.amount);
-      const tx = await this.signed(signer, this.cfg.vault, depositCalldata(unhex(rec!.firstOwner), unhex(rec!.rho)), value, this.gas.depositGasLimit());
+      const data = depositCalldata(unhex(rec!.firstOwner), unhex(rec!.rho));
+      let gasLimit: bigint;
+      if (await this.gasApplies()) {
+        gasLimit = this.gas.depositGasLimit();
+      } else {
+        const estimate = await this.evm.estimateGas({ from: signer.address, to: this.cfg.vault, data, value });
+        if (!('gas' in estimate)) refuse('Reverted', `deposit simulation refused: ${estimate.message}`);
+        gasLimit = estimate.gas + (estimate.gas + 4n) / 5n;
+      }
+      if (gasLimit <= 0n || gasLimit > this.opts.pins.userGasLimit) fail('CapacityExceeded', 'deposit gas exceeds the user limit');
+      const tx = await this.signed(signer, this.cfg.vault, data, value, gasLimit);
       rec!.sends.push(this.sendRecord(tx));
       rec!.status = 'submitted';
       await this.journal.putDeposit(rec!);
@@ -452,12 +462,15 @@ export class NativeBridgeV2 {
 
   /** Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount, owner and spendable state. */
   public async verifyToken(token: Uint8Array): Promise<{ tokenId: Uint8Array; amount: bigint; owner: Uint8Array | null; state: Uint8Array }> {
-    const h = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token)));
+    const part = decodeToken(token);
+    const h = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, part));
     return { tokenId: h.tokenId, amount: h.amount, owner: h.owner.type === 1n ? h.owner.params : null, state: h.state };
   }
 
   /** An ordinary transfer to `toKey`; the result is verified before it is returned. */
   public async transfer(token: Uint8Array, owner: OwnerSigner, toKey: Uint8Array): Promise<Uint8Array> {
+    token = Uint8Array.from(token);
+    toKey = Uint8Array.from(toKey);
     await this.verifyToken(token);
     parseKey(toKey);
     const { tx, cd } = await transferRequest(token, owner, { recipient: signaturePredicate(toKey), mask: freshMask(), data: null, deadline: null });
@@ -471,6 +484,9 @@ export class NativeBridgeV2 {
    * exact request, the burned parent and each child as it is minted; a call with the same `splitId` resumes.
    */
   public split(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], splitId?: Uint8Array): Promise<Uint8Array[]> {
+    token = Uint8Array.from(token);
+    outputs = outputs.map(({ ownerKey, amount }) => ({ ownerKey: Uint8Array.from(ownerKey), amount }));
+    splitId = splitId === undefined ? undefined : Uint8Array.from(splitId);
     const id = splitId ?? HU(cArr(cBytes(ascii('UNICITY_NB2_WALLET_SPLIT')), cBytes(token)));
     return this.locked(`split/${toHex(id)}`, () => this.splitInner(token, owner, outputs, id));
   }
@@ -502,15 +518,32 @@ export class NativeBridgeV2 {
       rec.status = 'burn-requested';
       await this.journal.putSplit(rec);
     }
-    if (rec.status === 'burn-requested') {
+    const verifyBurn = async (burned: Uint8Array) => {
+      const split = await this.retryingTrust(() => verifySplit(this.cfg, this.domain, this.opts.trust, decodeToken(burned)));
+      if (!eq(split.manifest, plan.tree.root)) refuse('ProviderFault', 'certified split manifest differs from the plan');
+      return { burned, split };
+    };
+    const refreshBurn = async () => {
       const proof = await certifyChecked(this.opts.aggregator, unhex(rec.burnRequest!));
-      rec.burned = hex(appendTransfer(unhex(rec.source), unhex(rec.burnTx!), proof));
+      const verified = await verifyBurn(appendTransfer(unhex(rec.source), unhex(rec.burnTx!), proof));
+      rec.burned = hex(verified.burned);
       rec.status = 'burned';
       await this.journal.putSplit(rec);
+      return verified;
+    };
+    let verified;
+    if (rec.status === 'burn-requested') {
+      verified = await refreshBurn();
+    } else {
+      try {
+        verified = await verifyBurn(unhex(rec.burned!));
+      } catch (error) {
+        // A journal from the previous verifier may have recorded an unchecked proof.
+        if (rec.status !== 'burned' || rec.outputs.some((output) => output.token !== null)) throw error;
+        verified = await refreshBurn();
+      }
     }
-    const burned = unhex(rec.burned!);
-    const split = await this.retryingTrust(() => verifySplit(this.cfg, this.domain, this.opts.trust, decodeToken(burned)));
-    if (!eq(split.manifest, plan.tree.root)) refuse('ProviderFault', 'certified split manifest differs from the plan');
+    const { burned, split } = verified;
     for (let k = 0; k < rec.outputs.length; k++) {
       if (rec.outputs[k].token !== null) continue;
       const { mint, allocation } = childMint(split.link, plan.tree, plan.children[k]);
@@ -555,6 +588,10 @@ export class NativeBridgeV2 {
    * plan; nothing irreversible happens here.
    */
   public async planReturn(token: Uint8Array, recipient: Uint8Array, payer: Uint8Array, opts: { useStateRead?: boolean; verifiedIndex?: bigint } = {}): Promise<ReturnPlan> {
+    token = Uint8Array.from(token);
+    recipient = Uint8Array.from(recipient);
+    payer = Uint8Array.from(payer);
+    opts = { ...opts };
     const returnId = HU(token);
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const part = decodeToken(token);

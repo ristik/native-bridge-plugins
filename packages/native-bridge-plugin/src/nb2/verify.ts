@@ -171,6 +171,12 @@ async function checkStep(
   return { sid, txHash };
 }
 
+/** Validate a newly returned certificate for a request already matched by certifyChecked. */
+export async function verifyCertifiedStep(c: Config, t: TrustInput, tx: Uint8Array, proof: InclusionProof): Promise<void> {
+  bindTrust(t, c);
+  await checkStep(c, t, proof.cd.source, proof.cd.sourceHash, tx, proof.cd.deadline, proof, { seen: new Set(), claim: claimConsistency() });
+}
+
 /**
  * One aggregator inclusion proof: the UC (its encoding, its epoch's entry, partition `aggregatorPartition` and its own shard, the folds
  * and the quorum), the shard owning the state ID, the RSMT membership of (sid, v) under the certified state root (`InclusionProof`),

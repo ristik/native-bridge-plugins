@@ -336,3 +336,7 @@ The margin has four parts:
 - **The replayed probe and decompression counts** are checked against the verifier's code and through the lab's totals, not against the
   verifier's own counters.
 - **A zero state ID** (the tables' sentinel) has no known preimage. Both plug-ins handle it as the verifier does, but no vector reaches it.
+
+When the deployment is outside the measured artifacts, deposit estimates the actual sender, vault, calldata and
+value with `eth_estimateGas`. It adds a 20% margin and checks the wallet gas limit before signing. A wallet-supplied
+model can provide a deposit bound for its active deployment.

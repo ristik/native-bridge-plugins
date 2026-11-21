@@ -24,12 +24,19 @@ import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verifi
 import { preflightUc } from './resources.js';
 import { fail, type NativeReason } from './errors.js';
 
+/** An externally authenticated B1 evaluation origin for this history and deployment. */
+export interface AuthenticatedOrigin {
+  readonly usableEpoch: bigint;
+  readonly rootRound: bigint;
+}
+
 export class TrustInput {
   private constructor(
     /** The held history; the wallet appends newer entries to it (each verified from its predecessor), never replaces held ones. */
     public readonly history: TrustBaseHistory,
     /** The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal. */
     public readonly id: Uint8Array,
+    public readonly origin?: AuthenticatedOrigin,
   ) {}
 
   /**
@@ -55,6 +62,15 @@ export class TrustInput {
       return fail('ErrTrustBase');
     }
     return new TrustInput(history, pin.slice());
+  }
+
+  /** Attach a checkpoint authenticated by the caller. Token evidence and UTB history do not establish this bound. */
+  public withAuthenticatedOrigin(origin: AuthenticatedOrigin): TrustInput {
+    const max = (1n << 64n) - 1n;
+    if (origin.usableEpoch < 0n || origin.usableEpoch > max || origin.rootRound <= 0n || origin.rootRound > max) fail('ErrTrustBase');
+    return new TrustInput(this.history, this.id.slice(), Object.freeze({
+      usableEpoch: origin.usableEpoch, rootRound: origin.rootRound,
+    }));
   }
 
   public get network(): NetworkId {

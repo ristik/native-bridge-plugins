@@ -21,12 +21,15 @@ import type { Config } from './config.js';
 import { Nb2Error, fail, refuse, wrap, type Rule } from './errors.js';
 
 export { TrustInput };
+export type { AuthenticatedOrigin } from '../trust.js';
 
 /** The B1 bound of one certificate's bytes (b1ref.MaxUCBytes). */
 export const MAX_B1_UC_BYTES = 24_576;
+const MAX_B1_SIGNATURES = 16;
 
 /** The history must be the one Γ names: its genesis EntryID is rootGenesis32 and its network Γ's. */
 export function bindTrust(t: TrustInput, c: Config): void {
+  if (t.origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
   if (!eq(t.id, c.rootGenesis) || Number(t.network.id) !== c.network) refuse('TrustInput', 'the trust-base history is not the one Γ names');
 }
 
@@ -49,6 +52,7 @@ function scanCertificate(raw: Uint8Array): void {
   }
   const seal = uc[6].kids[0].kids;
   if (!isUint(seal[1]) || seal[1].arg === 0n || seal[1].arg > 65535n) fail('Shape', 'seal network');
+  if (seal[7].kids.length > 2 * MAX_B1_SIGNATURES) fail('InputTooLarge', 'seal signatures');
   for (let i = 1; i < seal[7].kids.length; i += 2) if (!isBytes(seal[7].kids[i])) fail('Shape', 'seal signature');
   try {
     nativeUcScan(raw, MAX_B1_UC_BYTES);
@@ -82,7 +86,7 @@ export function decodeUc(raw: Uint8Array): UnicityCertificate {
 }
 
 const UC_VERIFIER = new UnicityCertificateVerifier(
-  new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: 16 }),
+  new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: MAX_B1_SIGNATURES }),
 );
 
 const NATIVE_TO_RULE: Record<string, Rule> = {
@@ -106,6 +110,11 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
   if (uc.shardConfigurationHash.length !== 32) fail('CertStructure', 'ShardConfHash is not 32 bytes');
   if (!eq(uc.shardTreeCertificate.shard.encode(), shard)) fail('CertStructure', 'shard');
   if (BigInt(uc.unicityTreeCertificate.partitionIdentifier) !== BigInt(partition)) fail('CertStructure', 'partition');
+  const origin = t.origin;
+  if (origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
+  if (uc.unicitySeal.epoch > origin.usableEpoch || uc.unicitySeal.rootChainRoundNumber > origin.rootRound) {
+    fail('SealEpoch', 'seal exceeds the authenticated B1 origin');
+  }
   let r;
   try {
     r = await UC_VERIFIER.verifyCertificate(t.history, uc, { partitionId: uc.unicityTreeCertificate.partitionIdentifier });

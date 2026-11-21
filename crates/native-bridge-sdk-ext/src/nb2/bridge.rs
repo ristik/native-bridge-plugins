@@ -633,7 +633,19 @@ impl NativeBridgeV2 {
                 }
             }
             let value = undec(&rec.amount)?;
-            let tx = self.signed(signer, &self.cfg.vault, &deposit_calldata(&unhex(&rec.first_owner)?, &unhex(&rec.rho)?), value, self.gas.deposit_gas_limit())?;
+            let data = deposit_calldata(&unhex(&rec.first_owner)?, &unhex(&rec.rho)?);
+            let gas_limit = if self.gas_applies()? {
+                self.gas.deposit_gas_limit()
+            } else {
+                match self.evm.estimate_gas(&signer.address(), &self.cfg.vault, &data, &value)? {
+                    Estimate::Gas(gas) => gas.checked_add(gas.div_ceil(5)).unwrap_or_default(),
+                    Estimate::Revert { message, .. } => return refuse(WalletReason::Reverted, format!("deposit simulation refused: {message}")),
+                }
+            };
+            if gas_limit == 0 || gas_limit > self.pins.user_gas_limit {
+                return fail_d(Rule::CapacityExceeded, "deposit gas exceeds the user limit");
+            }
+            let tx = self.signed(signer, &self.cfg.vault, &data, value, gas_limit)?;
             rec.sends.push(self.send_record(&tx));
             rec.status = "submitted".into();
             self.journal.put_deposit(&rec)?;
@@ -1120,29 +1132,47 @@ impl NativeBridgeV2 {
             rec.status = "burn-requested".into();
             self.journal.put_split(&rec)?;
         }
-        if rec.status == "burn-requested" {
+        let verify_burn = |burned: Vec<u8>| {
+            let part = decode_token(&burned)?;
+            let split = self.retrying_trust(|t| verify_split(&self.cfg, &self.domain, t, &part))?;
+            if split.manifest != plan.tree.root() {
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "certified split manifest differs from the plan",
+                );
+            }
+            Ok((burned, split))
+        };
+        let refresh_burn = |rec: &mut SplitRecord| -> Result<_> {
             let proof = certify_checked(
                 &*self.aggregator,
                 &unhex(rec.burn_request.as_deref().unwrap_or(""))?,
             )?;
-            rec.burned = Some(hex(&append_transfer(
+            let verified = verify_burn(append_transfer(
                 &unhex(&rec.source)?,
                 &unhex(rec.burn_tx.as_deref().unwrap_or(""))?,
                 &proof,
-            )?));
+            )?)?;
+            rec.burned = Some(hex(&verified.0));
             rec.status = "burned".into();
-            self.journal.put_split(&rec)?;
-        }
-        let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
-        let burned_part = decode_token(&burned)?;
-        let split =
-            self.retrying_trust(|t| verify_split(&self.cfg, &self.domain, t, &burned_part))?;
-        if split.manifest != plan.tree.root() {
-            return refuse(
-                WalletReason::ProviderFault,
-                "certified split manifest differs from the plan",
-            );
-        }
+            self.journal.put_split(rec)?;
+            Ok(verified)
+        };
+        let (burned, split) = if rec.status == "burn-requested" {
+            refresh_burn(&mut rec)?
+        } else {
+            match verify_burn(unhex(rec.burned.as_deref().unwrap_or(""))?) {
+                Ok(verified) => verified,
+                // A journal from the previous verifier may have recorded an unchecked proof.
+                Err(_)
+                    if rec.status == "burned"
+                        && rec.outputs.iter().all(|output| output.token.is_none()) =>
+                {
+                    refresh_burn(&mut rec)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         for k in 0..rec.outputs.len() {
             if rec.outputs[k].token.is_some() {
                 continue;

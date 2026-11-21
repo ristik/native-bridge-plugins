@@ -11,7 +11,7 @@ use native_bridge_sdk_ext::nb2::token::{
     decode_token, encode_certification, encode_mint, encode_token, encode_transfer,
     signature_predicate, state_id, value_data, Token,
 };
-use native_bridge_sdk_ext::nb2::trust::TrustInput;
+use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
 use native_bridge_sdk_ext::nb2::util::{from_hex, u256};
 use native_bridge_sdk_ext::nb2::verify::{verdict_abi, verify_held, verify_return, verify_split};
 
@@ -81,7 +81,11 @@ fn independent_signed_transcripts() {
             &read(&format!("transcripts/{name}/utb.cbor")),
             &cfg.root_genesis,
         )
-        .unwrap();
+        .unwrap()
+        .with_authenticated_origin(AuthenticatedOrigin {
+            usable_epoch: 2,
+            root_round: 10_000,
+        });
         let expected = read(&format!("transcripts/{name}/verdict.bin"));
         let part = decode_token(&evidence).unwrap();
         assert_eq!(encode_token(&part), evidence, "{name}");
@@ -138,8 +142,12 @@ fn published_malformed_lineages_are_refused() {
     let gamma = read("gamma.bin");
     let params = production_params();
     let cfg = decode_config(&gamma, &params).unwrap();
-    let trust =
-        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
+    let trust = TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis)
+        .unwrap()
+        .with_authenticated_origin(AuthenticatedOrigin {
+            usable_epoch: 2,
+            root_round: 10_000,
+        });
     let cases = [
         ("continuing-transfer-data", Rule::TransferData),
         ("expired-transfer", Rule::DeadlineExpired),
@@ -175,7 +183,11 @@ fn held_siblings_require_their_allocation_and_their_certified_parent() {
         &read("transcripts/held-sibling-0/utb.cbor"),
         &cfg.root_genesis,
     )
-    .unwrap();
+    .unwrap()
+    .with_authenticated_origin(AuthenticatedOrigin {
+        usable_epoch: 2,
+        root_round: 10_000,
+    });
     let mut part = decode_token(&read("transcripts/held-sibling-0/evidence.bin")).unwrap();
     let sibling = decode_token(&read("transcripts/held-sibling-1/evidence.bin")).unwrap();
     let parent = Token {
@@ -296,7 +308,11 @@ fn equivalent_external_certificate_preserves_the_return_identity() {
     let params = production_params();
     let cfg = decode_config(&gamma, &params).unwrap();
     let trust = TrustInput::from_bundle(&read("transcripts/one-split/utb.cbor"), &cfg.root_genesis)
-        .unwrap();
+        .unwrap()
+        .with_authenticated_origin(AuthenticatedOrigin {
+            usable_epoch: 2,
+            root_round: 10_000,
+        });
     let original = read("transcripts/one-split/evidence.bin");
     let mut token = decode_token(&original).unwrap();
     let original_mint = token.mint_raw.clone();
@@ -313,5 +329,216 @@ fn equivalent_external_certificate_preserves_the_return_identity() {
     assert_eq!(
         verify_return(&gamma, &refreshed, &trust, &params).unwrap(),
         verify_return(&gamma, &original, &trust, &params).unwrap(),
+    );
+}
+
+#[test]
+fn authenticated_origin_bounds_usable_epoch_and_round() {
+    use native_bridge_sdk_ext::nb2::deposit::decode_receipt_backing;
+    use native_bridge_sdk_ext::nb2::trust::{decode_uc, shard_bytes, uc_check, verify_evm_uc};
+
+    let gamma = read("gamma.bin");
+    let cfg = decode_config(&gamma, &production_params()).unwrap();
+    let history =
+        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
+    let at = |usable_epoch, root_round| {
+        history
+            .clone()
+            .with_authenticated_origin(AuthenticatedOrigin {
+                usable_epoch,
+                root_round,
+            })
+    };
+    let root = decode_token(&read("transcripts/root/evidence.bin")).unwrap();
+    let receipt = decode_receipt_backing(root.mint.justification.as_deref().unwrap())
+        .unwrap()
+        .proof
+        .uc;
+    let round = decode_uc(&receipt)
+        .unwrap()
+        .unicity_seal
+        .root_chain_round_number;
+    assert!(verify_evm_uc(&at(2, round), &receipt, &cfg).is_ok());
+    assert!(verify_evm_uc(&at(2, round - 1), &receipt, &cfg).is_err());
+    assert!(verify_evm_uc(&history, &receipt, &cfg).is_err());
+
+    let token = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
+    let uc = token
+        .proofs
+        .iter()
+        .map(|p| decode_uc(&p.uc).unwrap())
+        .find(|uc| uc.unicity_seal.epoch == 2)
+        .unwrap();
+    assert!(history.history().get(2).is_some());
+    let round = uc.unicity_seal.root_chain_round_number;
+    let check = |epoch, round| {
+        uc_check(
+            &at(epoch, round),
+            &uc,
+            cfg.aggregator_partition,
+            &shard_bytes(&uc),
+        )
+    };
+    assert!(check(2, round).is_ok());
+    assert_eq!(
+        check(2, round - 1).unwrap_err().rule().unwrap().rule,
+        Rule::SealEpoch
+    );
+    assert_eq!(
+        check(1, 10_000).unwrap_err().rule().unwrap().rule,
+        Rule::SealEpoch
+    );
+}
+
+#[test]
+fn b1_signature_ceiling_applies_to_both_certificate_routes() {
+    use native_bridge_sdk_ext::nb2::deposit::decode_receipt_backing;
+    use native_bridge_sdk_ext::nb2::trust::{decode_uc, shard_bytes, uc_check, verify_evm_uc};
+
+    let gamma = read("gamma.bin");
+    let cfg = decode_config(&gamma, &production_params()).unwrap();
+    let trust = TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis)
+        .unwrap()
+        .with_authenticated_origin(AuthenticatedOrigin {
+            usable_epoch: 2,
+            root_round: 10_000,
+        });
+    let root = decode_token(&read("transcripts/root/evidence.bin")).unwrap();
+    let evm = decode_receipt_backing(root.mint.justification.as_deref().unwrap())
+        .unwrap()
+        .proof
+        .uc;
+    for (raw, is_evm) in [(&evm, true), (&root.mint_proof.uc, false)] {
+        let mut uc = decode_uc(raw).unwrap();
+        // Extra canonical witnesses from nonmembers contribute zero weight.
+        while uc.unicity_seal.signatures.len() < 16 {
+            let id = format!("zz-test-{:02}", uc.unicity_seal.signatures.len());
+            uc.unicity_seal.signatures.push((id, vec![0; 65]));
+        }
+        let check = |raw: &[u8]| {
+            if is_evm {
+                verify_evm_uc(&trust, raw, &cfg).map(|_| ())
+            } else {
+                let uc = decode_uc(raw)?;
+                uc_check(&trust, &uc, cfg.aggregator_partition, &shard_bytes(&uc))
+            }
+        };
+        check(&uc.to_cbor()).unwrap();
+        uc.unicity_seal
+            .signatures
+            .push(("zz-test-16".into(), vec![0; 65]));
+        assert!(check(&uc.to_cbor()).is_err());
+    }
+}
+
+#[test]
+fn receipt_and_allocation_counts_refuse_before_their_children() {
+    use native_bridge_sdk_ext::nb2::cbor::{
+        c_arr, c_arr_v, c_bytes, c_tag, c_uint, head, MAJ_ARRAY,
+    };
+    use native_bridge_sdk_ext::nb2::config::tag;
+    use native_bridge_sdk_ext::nb2::deposit::{decode_deposit_proof, decode_receipt_backing};
+    use native_bridge_sdk_ext::nb2::split::SumStep;
+
+    let receipt = |nodes: &[u8]| {
+        c_arr(&[
+            &c_uint(1),
+            &c_bytes(&[]),
+            &c_bytes(&[]),
+            &c_uint(0),
+            &c_uint(0),
+            nodes,
+        ])
+    };
+    let reason = |proof: &[u8]| {
+        c_tag(
+            tag::RECEIPT_BACKING,
+            &c_arr(&[
+                &c_uint(1),
+                &c_bytes(&[0; 32]),
+                &c_uint(1),
+                &c_bytes(&[0; 32]),
+                proof,
+            ]),
+        )
+    };
+    let nodes = vec![c_bytes(&[1]); 66];
+    for encoded in [head(MAJ_ARRAY, 66), c_arr_v(&nodes)] {
+        assert_eq!(
+            decode_deposit_proof(&receipt(&encoded))
+                .unwrap_err()
+                .rule()
+                .unwrap()
+                .rule,
+            Rule::InputTooLarge
+        );
+        assert_eq!(
+            decode_receipt_backing(&reason(&receipt(&encoded)))
+                .unwrap_err()
+                .rule()
+                .unwrap()
+                .rule,
+            Rule::InputTooLarge
+        );
+    }
+    assert_eq!(
+        decode_deposit_proof(&receipt(&c_arr_v(&nodes[1..])))
+            .unwrap()
+            .nodes
+            .len(),
+        65
+    );
+    assert_eq!(
+        decode_receipt_backing(&reason(&receipt(&c_arr_v(&nodes[1..]))))
+            .unwrap()
+            .proof
+            .nodes
+            .len(),
+        65
+    );
+    assert_eq!(
+        decode_deposit_proof(&receipt(&head(MAJ_ARRAY, 65)))
+            .unwrap_err()
+            .rule()
+            .unwrap()
+            .rule,
+        Rule::Truncated
+    );
+    let mut steps: Vec<_> = (0..=255)
+        .rev()
+        .map(|depth| SumStep {
+            depth,
+            hash: vec![0; 32],
+            sum: 1u8.into(),
+        })
+        .collect();
+    assert_eq!(
+        decode_sum_proof(&encode_sum_proof(&steps)).unwrap().len(),
+        256
+    );
+    assert_eq!(
+        decode_sum_proof(&head(MAJ_ARRAY, 256))
+            .unwrap_err()
+            .rule()
+            .unwrap()
+            .rule,
+        Rule::Truncated
+    );
+    assert_eq!(
+        decode_sum_proof(&head(MAJ_ARRAY, 257))
+            .unwrap_err()
+            .rule()
+            .unwrap()
+            .rule,
+        Rule::SplitProofShape
+    );
+    steps.push(steps[0].clone());
+    assert_eq!(
+        decode_sum_proof(&encode_sum_proof(&steps))
+            .unwrap_err()
+            .rule()
+            .unwrap()
+            .rule,
+        Rule::SplitProofShape
     );
 }

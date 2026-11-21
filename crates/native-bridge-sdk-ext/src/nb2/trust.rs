@@ -12,13 +12,20 @@ use super::cbor::{array, is_bytes, is_uint, scan_native, tag_content};
 use super::config::Config;
 use super::errors::{fail, fail_d, refuse, wrap, Error, Nb2Error, Result, Rule, WalletReason};
 use crate::error::NativeError;
-pub use crate::trust::TrustInput;
+pub use crate::trust::{AuthenticatedOrigin, TrustInput};
 
 /// The B1 bound of one certificate's bytes (b1ref.MaxUCBytes).
 pub const MAX_B1_UC_BYTES: usize = 24_576;
+const MAX_B1_SIGNATURES: usize = 16;
 
 /// The history must be the one Γ names: its genesis EntryID is rootGenesis32 and its network Γ's.
 pub fn bind_trust(t: &TrustInput, c: &Config) -> Result<()> {
+    if !t.origin().is_some_and(|origin| origin.root_round > 0) {
+        return refuse(
+            WalletReason::TrustInput,
+            "an authenticated B1 origin is required",
+        );
+    }
     if t.id() != c.root_genesis || t.network_id().id() != c.network {
         return refuse(
             WalletReason::TrustInput,
@@ -88,6 +95,9 @@ fn scan_certificate(raw: &[u8]) -> Result<()> {
         return fail_d(Rule::Shape, "seal network");
     }
     let sigs = &seal[7].kids;
+    if sigs.len() > 2 * MAX_B1_SIGNATURES {
+        return fail_d(Rule::InputTooLarge, "seal signatures");
+    }
     let mut i = 1;
     while i < sigs.len() {
         if !is_bytes(&sigs[i]) {
@@ -148,6 +158,20 @@ pub fn uc_check(
     }
     if uc.unicity_tree_certificate.partition_identifier != partition {
         return fail_d(Rule::CertStructure, "partition");
+    }
+    if uc.unicity_seal.signatures.len() > MAX_B1_SIGNATURES {
+        return fail(Rule::UnsupportedCertificateEncoding);
+    }
+    let Some(origin) = t.origin().filter(|origin| origin.root_round > 0) else {
+        return refuse(
+            WalletReason::TrustInput,
+            "an authenticated B1 origin is required",
+        );
+    };
+    if uc.unicity_seal.epoch > origin.usable_epoch
+        || uc.unicity_seal.root_chain_round_number > origin.root_round
+    {
+        return fail_d(Rule::SealEpoch, "seal exceeds the authenticated B1 origin");
     }
     let mut session = SealSession::new(t.history());
     verify_certificate_of_partition(

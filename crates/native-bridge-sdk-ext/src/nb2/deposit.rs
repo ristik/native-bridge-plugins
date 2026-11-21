@@ -147,7 +147,7 @@ pub fn decode_receipt_backing(b: &[u8]) -> Result<ReceiptBacking> {
     if b.len() > limits::JUSTIFICATION_BYTES {
         return fail(Rule::InputTooLarge);
     }
-    let it = scan_one(b)?;
+    let it = scan_bounded_array(b, &[0, 4, 5], limits::RECEIPT_NODES, Rule::InputTooLarge)?;
     let k = array(tag_content(&it, tag::RECEIPT_BACKING)?, 5)?;
     version(&k[0], V2_VERSION)?;
     let d = super::util::arr(bytes_n(&k[1], 32)?);
@@ -169,7 +169,12 @@ pub fn decode_deposit_proof(b: &[u8]) -> Result<DepositProof> {
     if b.first().is_some_and(|head| head >> 5 != MAJ_ARRAY) {
         return fail(Rule::Shape);
     }
-    decode_deposit_proof_item(&scan_one(b)?)
+    decode_deposit_proof_item(&scan_bounded_array(
+        b,
+        &[5],
+        limits::RECEIPT_NODES,
+        Rule::InputTooLarge,
+    )?)
 }
 
 fn decode_deposit_proof_item(it: &Item<'_>) -> Result<DepositProof> {
@@ -188,9 +193,6 @@ fn decode_deposit_proof_item(it: &Item<'_>) -> Result<DepositProof> {
     let log_index = uint_in(&k[4], 0, MAX_INDEX)?;
     if k[5].major != MAJ_ARRAY {
         return fail(Rule::Shape);
-    }
-    if k[5].kids.len() > limits::RECEIPT_NODES {
-        return fail(Rule::InputTooLarge);
     }
     let last = k[5].kids.len().wrapping_sub(1);
     let mut nodes = Vec::with_capacity(k[5].kids.len());

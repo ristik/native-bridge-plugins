@@ -15,7 +15,7 @@ import { HE } from '../../src/nb2/crypto.js';
 import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
 import { decodeToken, encodeProof, signaturePredicate } from '../../src/nb2/token.js';
 import { localOwner, mintRequest } from '../../src/nb2/tokenops.js';
-import { evmAccount, key, setup, VAULT } from './world.js';
+import { evmAccount, key, setup, FakeChain, VAULT } from './world.js';
 import type { GasModel } from '../../src/nb2/gas.js';
 import { ProvisionalGasModel } from '../../src/nb2/gas.js';
 
@@ -65,9 +65,10 @@ test('preflight: an oversized token, unfundable gas and an unboundable gas cost 
 });
 
 test('the default gas estimate is refused for a verifier it is not calibrated for: the stand-in verifier code is not Γ\'s', async () => {
-  const s = await minted({ gas: undefined });
-  assert.equal(s.w.gas.name, 'estimate-nb2-1179');
-  assert.equal(await outcome(s.w.planReturn(s.token, r, s.payer.address)), 'BadDeployment');
+  const s = await minted();
+  const bridge = await NativeBridgeV2.open({ ...s.options('default gas'), gas: undefined });
+  assert.equal(bridge.gas.name, 'estimate-nb2-1179');
+  assert.equal(await outcome(bridge.planReturn(s.token, r, s.payer.address)), 'BadDeployment');
   // the world's own tests supply the model as a wallet supplies its own (world.ts WORLD_GAS): no build check, the bound as computed
 });
 
@@ -123,4 +124,25 @@ test('unlock recovery IDs 2 and 3 are refused (astra delta ruling): such a linea
     bad[64] = id;
     assert.throws(() => verifyUnlock(secp256k1.getPublicKey(k, true), src, tx, bad), (e) => e instanceof Nb2Error && e.rule === 'UnlockRecovery');
   }
+});
+
+test('deposit estimates the pinned protocol 10 deployment and checks its gas limit before signing', async () => {
+  const s = await setup();
+  const code = Buffer.from('verifier code');
+  const chain = await FakeChain.create(s.root, { ...s.cfg, verifierCodeHash: HE(code) });
+  const payer = evmAccount(chain, 'estimate payer');
+  const owner = localOwner(key('estimate owner'));
+  chain.code.set(Buffer.from(s.cfg.verifier).toString('hex'), code);
+  const pins = { ...s.pins, gamma: chain.gamma };
+  const options = s.options('estimated deposit');
+  const bridge = await NativeBridgeV2.open({ ...options, pins, rpc: chain, gas: undefined });
+  const plan = await bridge.planDeposit(3n, owner.publicKey);
+  await bridge.submitDeposit(plan, payer);
+  assert.equal((await bridge.journal.depositForUpdate(plan.intent))!.sends[0].gas, '144000');
+  assert.ok(chain.calls.includes('eth_estimateGas'));
+
+  const limited = await NativeBridgeV2.open({ ...s.options('limited deposit'), gas: undefined, rpc: chain, pins: { ...pins, userGasLimit: 143_999n } });
+  const denied = await limited.planDeposit(3n, owner.publicKey);
+  assert.equal(await outcome(limited.submitDeposit(denied, payer)), 'CapacityExceeded');
+  assert.equal((await limited.journal.depositForUpdate(denied.intent))!.sends.length, 0);
 });

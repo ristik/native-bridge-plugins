@@ -24,12 +24,12 @@ use native_bridge_sdk_ext::nb2::rules::{
 use native_bridge_sdk_ext::nb2::segment::{
     check_segment_log, fold_history, gap_proof_len, gap_root, segment_sealed_data,
 };
+use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
 use native_bridge_sdk_ext::nb2::util::{arr, from_hex, hex0x, u256, u256_64};
 use native_bridge_sdk_ext::nb2::vaultmodel::{
     RecipientBehaviour, VaultEvent, VaultModel, VerifierAnswer,
 };
 use native_bridge_sdk_ext::nb2::verify::decode_evidence;
-use native_bridge_sdk_ext::trust::TrustInput;
 use num_bigint::BigUint;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -149,7 +149,11 @@ fn deployments(f: &Value) -> HashMap<String, Dep> {
                 &hx(&v["trustBundle"]),
                 &arr(&hx(&v["trustGenesisEntryId"])),
             )
-            .unwrap();
+            .unwrap()
+            .with_authenticated_origin(AuthenticatedOrigin {
+                usable_epoch: 3,
+                root_round: u64::MAX,
+            });
             (
                 name.clone(),
                 Dep {

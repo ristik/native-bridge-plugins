@@ -51,7 +51,7 @@ async function world(opts: { badCodeHash?: boolean } = {}) {
     gamma: hex(s.pins.gamma), build: 'test', vaultRuntimeCodeHash: opts.badCodeHash ? `0x${'11'.repeat(32)}` : hex(s.pins.vaultRuntimeCodeHash),
     maxEncodedTxBytes: 524288, userGasLimit: '60000000', gasReserve: '500000', returnReserveSegments: 64, deploymentBlock: 1, stateReadOnly: false,
   };
-  writeFileSync(join(pub, 'nb2-release.json'), JSON.stringify({ pins, trust: { bundle: 'trust-base.bundle.cbor' } }));
+  writeFileSync(join(pub, 'nb2-release.json'), JSON.stringify({ pins, trust: { bundle: 'trust-base.bundle.cbor', origin: { usableEpoch: '1', rootRound: '1000000' } } }));
   writeFileSync(join(pub, 'trust-base.bundle.cbor'), s.root.bundle);
   writeFileSync(join(pub, 'trust-base.genesis.entryid'), `${hex(s.root.pin)}\n`);
   const config: WalletConfig = connectionOf({ release: join(pub, 'nb2-release.json'), rpc: 'http://127.0.0.1:9/unused' });

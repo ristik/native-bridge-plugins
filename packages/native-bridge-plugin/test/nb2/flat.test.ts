@@ -55,7 +55,7 @@ for (const name of scenarios) {
   test(`T1 flat transcript ${name}`, async () => {
     const path = `transcripts/${name}/`;
     const evidence = read(path + 'evidence.bin');
-    const trust = await TrustInput.fromBundle(read(path + 'utb.cbor'), cfg.rootGenesis);
+    const trust = (await TrustInput.fromBundle(read(path + 'utb.cbor'), cfg.rootGenesis)).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
     const expected = read(path + 'verdict.bin');
     const context = JSON.parse(new TextDecoder().decode(read(path + 'context.json'))) as { PageRoot: string };
     assert.equal(Buffer.from(pageRoot(evidence)).toString('hex'), context.PageRoot);
@@ -98,7 +98,7 @@ test('published alternate certificate preserves the shared claim return', () => 
 });
 
 test('published malformed lineages are refused', async () => {
-  const trust = await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis);
+  const trust = (await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis)).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
   const cases = {
     'continuing-transfer-data': 'TransferData', 'expired-transfer': 'DeadlineExpired',
     'recursive-reason': 'InputTooLarge', 'repeated-mint-sid': 'RepeatedSID',
@@ -114,7 +114,7 @@ test('published malformed lineages are refused', async () => {
 
 test('held siblings require their own allocation and a verified parent spend', async () => {
   const dir = 'transcripts/held-sibling-0/';
-  const trust = await TrustInput.fromBundle(read(dir + 'utb.cbor'), cfg.rootGenesis);
+  const trust = (await TrustInput.fromBundle(read(dir + 'utb.cbor'), cfg.rootGenesis)).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
   const part = decodeToken(read(dir + 'evidence.bin'));
   const sibling = decodeToken(read('transcripts/held-sibling-1/evidence.bin'));
   const parent = { ...part.ancestors[0], ancestors: [] };
@@ -238,4 +238,152 @@ test('a valid allocation root with the wrong total cannot authorize a child', as
   const req = mintRequest(child.mint);
   const token = tokenOfChild(parent, child.allocation, req.tx, await certifyChecked(w.agg, req.cd));
   await assert.rejects(bridge.verifyToken(token), { rule: 'SplitSum' });
+});
+
+test('the authenticated origin bounds both round and usable epoch', async () => {
+  const { decodeUc, ucCheck, verifyEvmUc } = await import('../../src/nb2/trust.js');
+  const { decodeReceiptBacking } = await import('../../src/nb2/deposit.js');
+  const history = await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis);
+  const root = decodeToken(read('transcripts/root/evidence.bin'));
+  const receipt = decodeReceiptBacking(root.mint.justification!).proof.uc;
+  const round = decodeUc(receipt).unicitySeal.rootChainRoundNumber;
+  await verifyEvmUc(history.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: round }), receipt, cfg);
+  await assert.rejects(verifyEvmUc(history.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: round - 1n }), receipt, cfg), { rule: 'DepositUC' });
+  await assert.rejects(verifyEvmUc(history, receipt, cfg));
+
+  const rotated = lineageOf(decodeToken(read('transcripts/transfers/evidence.bin')))
+    .flatMap((level) => [level.mintProof, ...level.proofs]).map((proof) => decodeUc(proof.uc))
+    .find((uc) => uc.unicitySeal.epoch === 2n)!;
+  assert.ok(history.history.entryForEpoch(2n));
+  const check = (epoch: bigint, rootRound: bigint) => ucCheck(history.withAuthenticatedOrigin({ usableEpoch: epoch, rootRound }),
+    rotated, cfg.aggregatorPartition, rotated.shardTreeCertificate.shard.encode());
+  await check(2n, rotated.unicitySeal.rootChainRoundNumber);
+  await assert.rejects(check(2n, rotated.unicitySeal.rootChainRoundNumber - 1n), { rule: 'SealEpoch' });
+  await assert.rejects(check(1n, 10_000n), { rule: 'SealEpoch' });
+});
+
+test('the B1 seal signature ceiling applies to both certificate routes', async () => {
+  const { decodeUc, ucCheck, verifyEvmUc } = await import('../../src/nb2/trust.js');
+  const { makeRoot, makeConfig, makeUc } = await import('./world.js');
+  const root = await makeRoot(17);
+  const c = makeConfig(root);
+  for (const partition of [c.evmPartition, c.aggregatorPartition]) {
+    const check = async (n: number) => {
+      const uc = await makeUc({ ...root, signers: root.signers.slice(0, n) }, partition, new Uint8Array(32).fill(1),
+        new Uint8Array(32).fill(2), 1_700_000_000n);
+      if (partition === c.evmPartition) await verifyEvmUc(root.trust, uc, c);
+      else await ucCheck(root.trust, decodeUc(uc), partition, c.evmShard);
+    };
+    await check(16);
+    await assert.rejects(check(17), { rule: partition === c.evmPartition ? 'DepositUC' : 'UnsupportedCertificateEncoding' });
+  }
+});
+
+test('declared receipt and allocation counts refuse before visiting children', async () => {
+  const { cArr, cBytes, cTag, cUint, head, MAJ_ARRAY } = await import('../../src/nb2/cbor.js');
+  const { decodeDepositProof, decodeReceiptBacking } = await import('../../src/nb2/deposit.js');
+  const { TAG } = await import('../../src/nb2/config.js');
+  const receipt = (nodes: Uint8Array) => cArr(cUint(1), cBytes(new Uint8Array()), cBytes(new Uint8Array()), cUint(0), cUint(0), nodes);
+  const reason = (proof: Uint8Array) => cTag(TAG.receiptBacking, cArr(cUint(1), cBytes(domain), cUint(1), cBytes(domain), proof));
+  const nodes = Array.from({ length: 66 }, () => cBytes(Uint8Array.of(1)));
+  for (const encoded of [head(MAJ_ARRAY, 66), cArr(...nodes)]) {
+    assert.throws(() => decodeDepositProof(receipt(encoded)), { rule: 'InputTooLarge' });
+    assert.throws(() => decodeReceiptBacking(reason(receipt(encoded))), { rule: 'InputTooLarge' });
+  }
+  assert.equal(decodeDepositProof(receipt(cArr(...nodes.slice(1)))).nodes.length, 65);
+  assert.equal(decodeReceiptBacking(reason(receipt(cArr(...nodes.slice(1))))).proof.nodes.length, 65);
+  assert.throws(() => decodeDepositProof(receipt(head(MAJ_ARRAY, 65))), { rule: 'Truncated' });
+  const steps = Array.from({ length: 256 }, (_, i) => ({ depth: 255 - i, hash: domain, sum: 1n }));
+  assert.equal(decodeSumProof(encodeSumProof(steps)).length, 256);
+  assert.throws(() => decodeSumProof(head(MAJ_ARRAY, 256)), { rule: 'Truncated' });
+  assert.throws(() => decodeSumProof(head(MAJ_ARRAY, 257)), { rule: 'SplitProofShape' });
+  assert.throws(() => decodeSumProof(encodeSumProof([...steps, steps[0]])), { rule: 'SplitProofShape' });
+});
+
+test('split retries the exact request after an unusable parent proof and restart', async () => {
+  const { NativeBridgeV2 } = await import('../../src/nb2/bridge.js');
+  const { array, cArr, cTag, cUint, raw, scanNative, tagContent } = await import('../../src/nb2/cbor.js');
+  const { TAG } = await import('../../src/nb2/config.js');
+  const { localOwner } = await import('../../src/nb2/tokenops.js');
+  const { setup, key, evmAccount } = await import('./world.js');
+  const w = await setup();
+  const opts = w.options('split retry');
+  const bridge = await NativeBridgeV2.open(opts);
+  const owner = localOwner(key('split retry owner'));
+  const payer = evmAccount(w.chain, 'split retry payer');
+  const plan = await bridge.planDeposit(3n, owner.publicKey);
+  await bridge.submitDeposit(plan, payer);
+  await bridge.collectDepositProof(plan.intent);
+  const root = await bridge.mint(plan.intent);
+  const splitId = key('retry split ID');
+  const outputs = [{ ownerKey: owner.publicKey, amount: 3n }];
+  let signatureCount = 0;
+  const signer = { publicKey: owner.publicKey, signUnlock: async (digest: Uint8Array) => {
+    signatureCount++;
+    return owner.signUnlock(digest);
+  } };
+  let request: Uint8Array | undefined;
+  const broken = await NativeBridgeV2.open({ ...opts, aggregator: { certify: async (cd) => {
+    request = cd.slice();
+    const proof = await w.agg.certify(cd);
+    const items = array(tagContent(scanNative(proof), TAG.inclusion), 5);
+    return cTag(TAG.inclusion, cArr(raw(proof, items[0]), raw(proof, items[1]), cUint(items[2].arg + 1n), raw(proof, items[3]), raw(proof, items[4])));
+  } } });
+  await assert.rejects(broken.split(root, signer, outputs, splitId), { rule: 'InclusionProof' });
+  const pending = await bridge.journal.splitForUpdate(`0x${Buffer.from(splitId).toString('hex')}`);
+  assert.equal(pending?.status, 'burn-requested');
+  assert.equal(pending?.burned, undefined);
+
+  let replayed: Uint8Array | undefined;
+  const resumed = await NativeBridgeV2.open({ ...opts, aggregator: { certify: async (cd) => {
+    replayed ??= cd.slice();
+    return w.agg.certify(cd);
+  } } });
+  const [child] = await resumed.split(root, signer, outputs, splitId);
+  assert.deepEqual(replayed, request);
+  assert.equal(signatureCount, 1);
+  assert.equal((await resumed.verifyToken(child)).amount, 3n);
+});
+
+test('transfer, split and return planning use the caller bytes captured at entry', async () => {
+  const { NativeBridgeV2 } = await import('../../src/nb2/bridge.js');
+  const { localOwner } = await import('../../src/nb2/tokenops.js');
+  const { setup, key, evmAccount } = await import('./world.js');
+  const w = await setup();
+  const bridge = await NativeBridgeV2.open(w.options('snapshot'));
+  const alice = localOwner(key('snapshot alice'));
+  const bob = localOwner(key('snapshot bob'));
+  const payer = evmAccount(w.chain, 'snapshot payer');
+  const intent = await bridge.planDeposit(3n, alice.publicKey);
+  await bridge.submitDeposit(intent, payer);
+  await bridge.collectDepositProof(intent.intent);
+  const root = await bridge.mint(intent.intent);
+
+  const to = bob.publicKey.slice();
+  const source = root.slice();
+  const transferring = bridge.transfer(source, alice, to);
+  source.fill(0);
+  to.fill(0);
+  const transferred = await transferring;
+  assert.deepEqual((await bridge.verifyToken(transferred)).owner, bob.publicKey);
+
+  const splitSource = transferred.slice();
+  const output = { ownerKey: alice.publicKey.slice(), amount: 3n };
+  const splitting = bridge.split(splitSource, bob, [output]);
+  splitSource.fill(0);
+  output.ownerKey.fill(0);
+  output.amount = 1n;
+  const [child] = await splitting;
+  assert.deepEqual((await bridge.verifyToken(child)).owner, alice.publicKey);
+
+  const returnSource = child.slice();
+  const recipient = payer.address.slice();
+  const planning = bridge.planReturn(returnSource, recipient, payer.address);
+  returnSource.fill(0);
+  recipient.fill(0);
+  const returned = await planning;
+  assert.deepEqual(returned.recipient, payer.address);
+  assert.deepEqual(returned.returnId, HU(child));
+  const { burned } = await bridge.burn(returned.returnId, alice);
+  assert.equal(decodeToken(burned).ancestors.length, 1);
 });

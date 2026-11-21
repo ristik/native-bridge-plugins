@@ -1,5 +1,5 @@
 import { eq } from '../bytes.js';
-import { amount, array, ascii, bytesN, cAmount, cArr, cBytes, cDeadline, cTag, cUint, scanOne, tagContent, u256, uintIn, type Item } from './cbor.js';
+import { amount, array, ascii, bytesN, cAmount, cArr, cBytes, cDeadline, cTag, cUint, scanBoundedArray, scanOne, tagContent, u256, uintIn, type Item } from './cbor.js';
 import { DOMAIN, TAG } from './config.js';
 import { HU } from './crypto.js';
 import { Nb2Error, fail } from './errors.js';
@@ -28,8 +28,8 @@ export interface SumStep { depth: number; hash: Uint8Array; sum: bigint }
 export const encodeSumProof = (p: SumStep[]): Uint8Array => cArr(...p.map((s) => cArr(cUint(s.depth), cBytes(s.hash), cAmount(s.sum))));
 
 export function decodeSumProof(bytes: Uint8Array): SumStep[] {
-  const it = scanOne(bytes);
-  if (it.major !== 4 || it.kids.length > MAX_SUM_PROOF_STEPS) fail('SplitProofShape');
+  const it = scanBoundedArray(bytes, [], MAX_SUM_PROOF_STEPS, 'SplitProofShape');
+  if (it.major !== 4) fail('SplitProofShape');
   const p: SumStep[] = [];
   let prev = 256;
   for (const k of it.kids) {

@@ -59,8 +59,8 @@ pub fn encode_sum_proof(p: &[SumStep]) -> Vec<u8> {
 }
 
 pub fn decode_sum_proof(bytes: &[u8]) -> Result<Vec<SumStep>> {
-    let it = scan_one(bytes)?;
-    if it.major != MAJ_ARRAY || it.kids.len() > MAX_SUM_PROOF_STEPS {
+    let it = scan_bounded_array(bytes, &[], MAX_SUM_PROOF_STEPS, Rule::SplitProofShape)?;
+    if it.major != MAJ_ARRAY {
         return fail(Rule::SplitProofShape);
     }
     let mut p = Vec::new();

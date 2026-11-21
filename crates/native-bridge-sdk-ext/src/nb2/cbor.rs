@@ -158,7 +158,7 @@ impl<'a> Scanner<'a> {
         Ok((major, arg))
     }
 
-    fn item(&mut self, depth: usize) -> Result<Item<'a>> {
+    fn item(&mut self, depth: usize, limit: Option<(&[usize], u64, Rule)>) -> Result<Item<'a>> {
         let b = self.b;
         let start = self.pos;
         self.tokens += 1;
@@ -175,6 +175,11 @@ impl<'a> Scanner<'a> {
             }
         }
         let (major, arg) = self.head()?;
+        if let Some(([], max, rule)) = limit {
+            if major == MAJ_ARRAY && arg > max {
+                return fail(rule);
+            }
+        }
         let mut it = Item {
             major,
             arg,
@@ -211,8 +216,12 @@ impl<'a> Scanner<'a> {
                 } else {
                     arg
                 };
-                for _ in 0..n {
-                    let k = self.item(depth + 1)?;
+                for index in 0..n {
+                    let child_limit = limit.and_then(|(path, max, rule)| {
+                        let (&first, rest) = path.split_first()?;
+                        (first as u64 == index).then_some((rest, max, rule))
+                    });
+                    let k = self.item(depth + 1, child_limit)?;
                     it.kids.push(k);
                 }
             }
@@ -224,14 +233,18 @@ impl<'a> Scanner<'a> {
     }
 }
 
-fn scan_with(b: &[u8], native: bool) -> Result<Item<'_>> {
+fn scan_with<'a>(
+    b: &'a [u8],
+    native: bool,
+    limit: Option<(&[usize], u64, Rule)>,
+) -> Result<Item<'a>> {
     let mut s = Scanner {
         b,
         pos: 0,
         tokens: 0,
         native,
     };
-    let it = s.item(0)?;
+    let it = s.item(0, limit)?;
     if s.pos != b.len() {
         return fail(Rule::Trailing);
     }
@@ -239,13 +252,23 @@ fn scan_with(b: &[u8], native: bool) -> Result<Item<'_>> {
 }
 
 /// Exactly one strict item spanning all of `b`.
+/// Apply a count bound to one array by its child indices, counting a tag's child as index zero.
+pub fn scan_bounded_array<'a>(
+    b: &'a [u8],
+    path: &[usize],
+    max: usize,
+    rule: Rule,
+) -> Result<Item<'a>> {
+    scan_with(b, false, Some((path, max as u64, rule)))
+}
+
 pub fn scan_one(b: &[u8]) -> Result<Item<'_>> {
-    scan_with(b, false)
+    scan_with(b, false, None)
 }
 
 /// One item that may embed a native certificate (text strings and maps admitted).
 pub fn scan_native(b: &[u8]) -> Result<Item<'_>> {
-    scan_with(b, true)
+    scan_with(b, true, None)
 }
 
 /// The tag number at the head of `b`, without scanning further; None when it is not a well-formed tag head.

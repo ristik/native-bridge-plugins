@@ -77,7 +77,7 @@ async function dep(name: string): Promise<{ trust: TrustInput; gamma: Uint8Array
   let d = deployments.get(name);
   if (!d) {
     const v = F.deployments[name];
-    d = { trust: await TrustInput.fromBundle(hx(v.trustBundle), hx(v.trustGenesisEntryId)), gamma: hx(v.gamma), build: v.build, dep: v };
+    d = { trust: (await TrustInput.fromBundle(hx(v.trustBundle), hx(v.trustGenesisEntryId))).withAuthenticatedOrigin({ usableEpoch: 3n, rootRound: (1n << 64n) - 1n }), gamma: hx(v.gamma), build: v.build, dep: v };
     deployments.set(name, d);
   }
   return d;

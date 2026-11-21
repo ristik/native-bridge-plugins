@@ -691,11 +691,11 @@ fn the_default_gas_bound_is_refused_for_a_verifier_it_is_not_calibrated_for() {
     let w = setup();
     let payer = w.evm_account("p");
     let owner = local_owner(&key("o"));
+    let t = minted(&open(&w, "prefund", World::store()), &payer, &owner, 3);
     let mut o = w.options("w", World::store());
     o.gas = None;
     let b = NativeBridgeV2::open(o).unwrap();
     assert_eq!(b.gas.name(), "estimate-nb2-1179");
-    let t = minted(&b, &payer, &owner, 3);
     assert_eq!(
         reason(b.plan_return(&t, &recipient("recipient"), &payer.address(), None)),
         "BadDeployment"
@@ -1544,4 +1544,123 @@ mod sdk_aggregator {
             Some(WalletReason::Unconfirmed)
         );
     }
+}
+
+#[test]
+fn deposit_estimates_the_pinned_protocol_10_deployment_and_checks_the_user_limit() {
+    let mut w = setup();
+    let code = b"verifier code";
+    w.cfg.verifier_code_hash = he(&[code]);
+    w.chain = FakeChain::create(w.root.clone(), w.cfg.clone());
+    w.pins = pins_of(&w.chain);
+    let payer = w.evm_account("estimate payer");
+    let owner = local_owner(&key("estimate owner"));
+    w.chain
+        .with(|s| s.code.insert(w.cfg.verifier, b"verifier code".to_vec()));
+    let mut opts = w.options("estimated deposit", World::store());
+    opts.gas = None;
+    let bridge = NativeBridgeV2::open(opts).unwrap();
+    let plan = bridge.plan_deposit(&big(3), &owner.public_key()).unwrap();
+    bridge.submit_deposit(&plan, &payer).unwrap();
+    assert_eq!(
+        bridge.journal.deposit(plan.intent).unwrap().unwrap().sends[0].gas,
+        "144000"
+    );
+
+    let mut opts = w.options("limited deposit", World::store());
+    opts.gas = None;
+    opts.pins.user_gas_limit = 143_999;
+    let bridge = NativeBridgeV2::open(opts).unwrap();
+    let plan = bridge.plan_deposit(&big(3), &owner.public_key()).unwrap();
+    assert_eq!(
+        reason(bridge.submit_deposit(&plan, &payer)),
+        "CapacityExceeded"
+    );
+    assert!(bridge
+        .journal
+        .deposit(plan.intent)
+        .unwrap()
+        .unwrap()
+        .sends
+        .is_empty());
+}
+
+#[test]
+fn split_retries_the_exact_request_after_an_unusable_parent_proof_and_restart() {
+    use native_bridge_sdk_ext::nb2::cbor::{
+        array, c_arr, c_tag, c_uint, raw, scan_native, tag_content,
+    };
+    use native_bridge_sdk_ext::nb2::config::tag;
+    use native_bridge_sdk_ext::nb2::tokenops::Aggregator;
+    use std::sync::Mutex;
+
+    struct OnceCorrupt {
+        inner: Arc<FakeAggregator>,
+        requests: Mutex<Vec<Vec<u8>>>,
+    }
+    impl Aggregator for OnceCorrupt {
+        fn certify(&self, cd: &[u8]) -> Result<Vec<u8>> {
+            let proof = self.inner.certify(cd)?;
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(cd.to_vec());
+            if requests.len() != 1 {
+                return Ok(proof);
+            }
+            let item = scan_native(&proof)?;
+            let p = array(tag_content(&item, tag::INCLUSION)?, 5)?;
+            Ok(c_tag(
+                tag::INCLUSION,
+                &c_arr(&[
+                    raw(&proof, &p[0]),
+                    raw(&proof, &p[1]),
+                    &c_uint(p[2].arg + 1),
+                    raw(&proof, &p[3]),
+                    raw(&proof, &p[4]),
+                ]),
+            ))
+        }
+    }
+    struct CountSigner(LocalOwner, AtomicUsize);
+    impl OwnerSigner for CountSigner {
+        fn public_key(&self) -> [u8; 33] {
+            self.0.public_key()
+        }
+        fn sign_unlock(&self, digest: &[u8; 32]) -> core::result::Result<[u8; 65], String> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.sign_unlock(digest)
+        }
+    }
+    let w = setup();
+    let store = World::store();
+    let payer = w.evm_account("split retry payer");
+    let owner = CountSigner(local_owner(&key("split retry owner")), AtomicUsize::new(0));
+    let root = minted(&open(&w, "split retry", store.clone()), &payer, &owner.0, 3);
+    let aggregator = Arc::new(OnceCorrupt {
+        inner: w.agg.clone(),
+        requests: Mutex::new(Vec::new()),
+    });
+    let options = || {
+        let mut o = w.options("split retry", store.clone());
+        o.aggregator = aggregator.clone();
+        o
+    };
+    let split_id = key("split retry id");
+    let outputs = [(owner.public_key().to_vec(), big(3))];
+    let bridge = NativeBridgeV2::open(options()).unwrap();
+    assert_eq!(
+        reason(bridge.split(&root, &owner, &outputs, Some(split_id))),
+        "InclusionProof"
+    );
+    let pending = bridge.journal.split(&hex(&split_id)).unwrap().unwrap();
+    assert_eq!(pending.status, "burn-requested");
+    assert!(pending.burned.is_none());
+
+    let restarted = NativeBridgeV2::open(options()).unwrap();
+    let children = restarted
+        .split(&root, &owner, &outputs, Some(split_id))
+        .unwrap();
+    assert_eq!(restarted.verify_token(&children[0]).unwrap().amount, big(3));
+    let requests = aggregator.requests.lock().unwrap();
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(owner.1.load(Ordering::SeqCst), 1);
 }

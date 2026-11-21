@@ -38,7 +38,7 @@ import {
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
-import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
+import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -86,9 +86,22 @@ export interface Connection {
   /** the trust-base bundle and its genesis EntryID pin, published beside the manifest */
   trustBundle: string;
   trustPin: string;
+  /** Operator-authenticated evaluation checkpoint file. Defaults to trust.origin in the release. */
+  trustOrigin?: string;
   /** the gateway's JSON-RPC URL and its aggregator route */
   rpc: string;
   aggregator: string;
+}
+
+/** Parse an origin supplied through the trusted deployment channel. */
+export function parseAuthenticatedOrigin(document: unknown): AuthenticatedOrigin {
+  const origin = document as { usableEpoch?: unknown; rootRound?: unknown } | null | undefined;
+  const uint = /^(0|[1-9][0-9]*)$/;
+  if (!origin || typeof origin.usableEpoch !== 'string' || !uint.test(origin.usableEpoch)
+    || typeof origin.rootRound !== 'string' || !uint.test(origin.rootRound)) {
+    throw new Error('the authenticated B1 origin requires decimal strings usableEpoch and rootRound');
+  }
+  return { usableEpoch: BigInt(origin.usableEpoch), rootRound: BigInt(origin.rootRound) };
 }
 
 /** config.json of a wallet directory: the connection, and where the secret comes from. */
@@ -98,7 +111,7 @@ export interface WalletConfig extends Connection {
 }
 
 /** A connection with the manifest's neighbours as defaults: the bundle and pin the manifest names, the gateway's /aggregator route. */
-export function connectionOf(o: { release: string; rpc: string; trustBundle?: string; trustPin?: string; aggregator?: string }): Connection {
+export function connectionOf(o: { release: string; rpc: string; trustBundle?: string; trustPin?: string; trustOrigin?: string; aggregator?: string }): Connection {
   const release = resolve(o.release);
   const m = JSON.parse(readFileSync(release, 'utf8')) as { trust?: { bundle?: string } };
   const here = dirname(release);
@@ -106,6 +119,7 @@ export function connectionOf(o: { release: string; rpc: string; trustBundle?: st
     release,
     trustBundle: resolve(o.trustBundle ?? join(here, m.trust?.bundle ?? 'trust-base.bundle.cbor')),
     trustPin: resolve(o.trustPin ?? join(here, 'trust-base.genesis.entryid')),
+    ...(o.trustOrigin ? { trustOrigin: resolve(o.trustOrigin) } : {}),
     rpc: o.rpc,
     aggregator: o.aggregator ?? `${o.rpc.replace(/\/+$/, '')}/aggregator`,
   };
@@ -119,7 +133,7 @@ export const io = {
   durable: (_file: string, _data: string | Uint8Array | null): void => undefined,
 };
 
-function fsyncDir(dir: string): void {
+export function fsyncDir(dir: string): void {
   const fd = openSync(dir, 'r');
   try {
     io.fsync(fd);
@@ -381,6 +395,10 @@ export class Wallet {
       for (const e of shipped.history.entries) await held.history.append(e);
       this.trust = held;
     }
+    const origin = this.conn.trustOrigin
+      ? JSON.parse(readFileSync(this.conn.trustOrigin, 'utf8'))
+      : (JSON.parse(readFileSync(this.conn.release, 'utf8')) as { trust?: { origin?: unknown } }).trust?.origin;
+    this.trust = this.trust.withAuthenticatedOrigin(parseAuthenticatedOrigin(origin));
     const source = new AggregatorClient(this.conn.aggregator);
     const http = new HttpJsonRpc(this.conn.rpc, { retries: 20, timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);

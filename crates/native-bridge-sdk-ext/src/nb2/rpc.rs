@@ -835,9 +835,9 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         from: &[u8],
         to: &[u8],
         data: &[u8],
-        value: u64,
+        value: impl core::fmt::LowerHex,
     ) -> Result<Estimate> {
-        let params = json!([{"from": hex0x(from), "to": hex0x(to), "data": hex0x(data), "value": qty(value)}]);
+        let params = json!([{"from": hex0x(from), "to": hex0x(to), "data": hex0x(data), "value": format!("0x{value:x}")}]);
         match self.rpc.call("eth_estimateGas", params) {
             Ok(g) => Ok(Estimate::Gas(qty64(&g, "eth_estimateGas")?)),
             Err(e) if e.code != 0 => Ok(Estimate::Revert {

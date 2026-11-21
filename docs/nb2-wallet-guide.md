@@ -1,5 +1,12 @@
 # Native bridge v2: wallet integration guide
 
+The wallet opens under an authenticated B1 evaluation origin from the release's `trust.origin` or the
+`init --trust-origin FILE` override. Both forms contain decimal strings `usableEpoch` and `rootRound` from the
+trusted deployment or registry checkpoint channel. Unlocking and proving lineage use this origin for every
+certificate. For a moving deployment, update the origin file with a newer authenticated checkpoint and reopen
+the wallet. UTB refresh updates the held history. A new origin requires its own authenticated checkpoint.
+
+
 This guide is for a wallet developer. It shows how to move native UCT between the EVM chain and Unicity with the TypeScript plug-in
 (`packages/native-bridge-plugin`, entry point `./nb2`). You don't handle segments, gap proofs or receipt tries yourself: the plug-in builds and
 checks them. The guide walks through the reference command-line wallet in [`wallet/`](../wallet), which runs every step, and you can follow it
@@ -217,7 +224,7 @@ import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySi
 
 const bridge = await NativeBridgeV2.open({
   pins,                                  // the manifest's pins (nb2-release.json "pins"; wallet/core.ts pinsOf reads them)
-  trust,                                 // the network's trust-base history (TrustInput.fromBundle(bundle, pin))
+  trust,                                 // the pinned UTB history with an authenticated B1 origin
   rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway: nothing bridge-specific
   aggregator: new SdkAggregator(`${gatewayUrl}/aggregator`),
   journal: store,                        // your key-value store; its putIf MUST be atomic and durable (nb2-journal.md)
@@ -312,7 +319,7 @@ The table says what each error means and what your wallet does when it reaches y
 | Error | Where | Meaning | What the wallet does |
 |---|---|---|---|
 | `BadDeployment` | `NativeBridgeV2.open` (the installation check) | the RPC serves another chain, the vault's `config()` is not the pinned Γ, or its runtime code hash is not the pinned one | stop: the manifest and the node are not the same deployment (a reset network, a wrong URL or a stale manifest). Send nothing. |
-| `TrustInput` | `NativeBridgeV2.open` | the trust-base history is not the one Γ names (another genesis entry) | use the bundle and pin published with the manifest |
+| `TrustInput` | `NativeBridgeV2.open` | the trust-base history or authenticated B1 origin required by Γ is missing or mismatched | use the authenticated bundle, genesis pin and origin checkpoint for the deployment |
 | `BadInput` | any call | an argument outside the API's contract (a malformed key or address, a zero amount, a split with one output, a `k_w` that is not 32 bytes) | fix the call; nothing happened |
 | `NotPending` | mint, collectDepositProof, burn, buildRedeem, planReturn | the step doesn't apply to the record's state: minting a deposit that has not landed, burning or redeeming out of order, planning a part that is already burned | run the step the journal is at (`status`); not retryable as is |
 | `JournalNotPersisted` | submitDeposit | the plan or its backup is not durable | write and back up, then retry; nothing was sent |

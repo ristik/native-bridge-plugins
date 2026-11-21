@@ -21,6 +21,6 @@ export {
   verifyDepositEvidence, verifyReceiptLog, type DepositProof, type ReceiptBacking,
 } from './deposit.js';
 export { decodeToken, encodeToken, type Token, type LineageLevel } from './token.js';
-export { TrustInput, verifyEvmUc } from './trust.js';
+export { TrustInput, verifyEvmUc, type AuthenticatedOrigin } from './trust.js';
 export { VaultModel } from './vaultmodel.js';
 export { parentLink, splitOutputCommitment, decodeSplitJustification, decodeSumProof, type SumStep } from './split.js';

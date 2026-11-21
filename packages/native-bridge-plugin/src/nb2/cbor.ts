@@ -5,7 +5,7 @@
  * one place text strings and maps are admitted (`scanNative`); its canonical form is the certificate decoder's concern.
  */
 import { concat } from '../bytes.js';
-import { fail } from './errors.js';
+import { fail, type Rule } from './errors.js';
 
 export const MAX_CBOR_DEPTH = 16;
 const MAX_CBOR_ITEMS = 1 << 20;
@@ -81,6 +81,12 @@ export interface Item {
   isNull: boolean;
 }
 
+interface ArrayLimit {
+  path: readonly number[];
+  max: bigint;
+  rule: Rule;
+}
+
 class Scanner {
   public pos = 0;
   private tokens = 0;
@@ -105,7 +111,7 @@ class Scanner {
     return { major, arg };
   }
 
-  public item(depth: number): Item {
+  public item(depth: number, limit?: ArrayLimit): Item {
     const b = this.b;
     const start = this.pos;
     if (++this.tokens > MAX_CBOR_ITEMS) fail('InputTooLarge');
@@ -114,6 +120,7 @@ class Scanner {
       if (mj === 1 || (!this.native && (mj === MAJ_TEXT || mj === MAJ_MAP)) || (mj === MAJ_SIMPLE && b[this.pos] !== 0xf6)) fail('NonCanonical');
     }
     const { major, arg } = this.head();
+    if (major === MAJ_ARRAY && limit?.path.length === 0 && arg > limit.max) fail(limit.rule);
     const it: Item = { major, arg, start, end: 0, kids: [], isNull: false };
     const rest = BigInt(b.length - this.pos);
     switch (major) {
@@ -136,7 +143,10 @@ class Scanner {
           n = 2n * arg;
           if (n > rest) fail('Truncated');
         }
-        for (let i = 0n; i < n; i++) it.kids.push(this.item(depth + 1));
+        for (let i = 0; i < Number(n); i++) {
+          const childLimit = limit?.path[0] === i ? { ...limit, path: limit.path.slice(1) } : undefined;
+          it.kids.push(this.item(depth + 1, childLimit));
+        }
         break;
       }
       case MAJ_SIMPLE:
@@ -150,15 +160,20 @@ class Scanner {
   }
 }
 
-function scanWith(b: Uint8Array, native: boolean): Item {
+function scanWith(b: Uint8Array, native: boolean, limit?: ArrayLimit): Item {
   const s = new Scanner(b, native);
-  const it = s.item(0);
+  const it = s.item(0, limit);
   if (s.pos !== b.length) fail('Trailing');
   return it;
 }
 
 /** Exactly one strict item spanning all of `b`. */
 export const scanOne = (b: Uint8Array): Item => scanWith(b, false);
+
+/** Apply a count bound to one array by its child indices, counting a tag's child as index zero. */
+export const scanBoundedArray = (b: Uint8Array, path: readonly number[], max: number, rule: Rule): Item =>
+  scanWith(b, false, { path, max: BigInt(max), rule });
+
 /** One item that may embed a native certificate (text strings and maps admitted). */
 export const scanNative = (b: Uint8Array): Item => scanWith(b, true);
 

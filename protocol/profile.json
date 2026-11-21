@@ -102,7 +102,8 @@
     "allocationSteps": 256,
     "mintProofWithTransferCountBytes": 40960,
     "transferPairBytes": 40960,
-    "rsmtPathBytes": 8224
+    "rsmtPathBytes": 8224,
+    "sealSignatures": 16
   },
   "parameters": {
     "note": "K, B, the recent-buffer layout, the segment commitment and gasReserve are fixed by bft-core#1098 (measured, ristik/unicity-pos-contracts#80 bench/nb2/RESULTS.md); the rest are deployment values.",
@@ -184,7 +185,8 @@
     "scope": "unicity-trust-base-history",
     "document": "protocol/trust-base.md",
     "sealRule": "upstream: each signature judged alone; exactly 65 bytes r||s||v recovering to the member counts its weight, anything else counts zero; floor(2W/3)+1 of the seal epoch's entry",
-    "missingEpoch": "NoEntryForEpoch, retryable once the history holds the epoch"
+    "missingEpoch": "NoEntryForEpoch, retryable once the history holds the epoch",
+    "evaluationOrigin": "externally authenticated B1 usable epoch and inclusive root round for the configured deployment"
   },
   "normativeArtifacts": [
     "protocol/interop.md",
@@ -192,7 +194,7 @@
     "protocol/trust-base.md"
   ],
   "normativeArtifactSha256": {
-    "protocol/interop.md": "a9476366d7b9844a06f94da08e6677c4b28d234be4f6975e1cd05584c6d7e6e3",
+    "protocol/interop.md": "3f6ded81be282d786a7a94e7e0b47def9ec819e348136fb74112b50828190a84",
     "protocol/abi.json": "f5b830d0a2687a73ed11fe9ee4ce2c4cb0ce73bea193bde3541bcaa5fd36b606",
     "protocol/trust-base.md": "4824915c6c47223dda3db9c943c602eec9664b883d60fde842aba8bb37e8f6ef"
   },

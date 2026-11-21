@@ -336,6 +336,12 @@ interface INativeBridgeVerifierV2 {
 }
 ```
 
+The verifier requires an authenticated B1 evaluation origin for the configured deployment and UTB history.
+Pass the origin's usable epoch and inclusive root round through the SDK trust input. They come from the trusted
+deployment or registry checkpoint channel. Each admitted seal must satisfy both bounds in addition to its
+own authenticated epoch interval. Count every supplied seal signature against the limit of 16 before signature
+verification, including witnesses with no quorum weight.
+
 The verifier authenticates each source under the network's historical authority, compares the exact certification
 data and unlock, enforces the nullable deadline, checks RSMT membership and records the SID across the entire
 lineage. The claim map covers the deposit UC and every aggregator UC. Uses with the same complete canonical seal,
