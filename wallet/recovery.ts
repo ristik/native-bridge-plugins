@@ -1,6 +1,6 @@
 /** Durable, key-independent NB2-C return continuation for the reference wallet. */
 import { randomBytes } from 'node:crypto';
-import { existsSync, linkSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
@@ -219,7 +219,10 @@ export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string):
   const copy: Backup = { version: 1, gamma: hx(w.pins.gamma), vaultRuntimeHash: hx(w.pins.vaultRuntimeCodeHash), pending, checkpoint };
   const content = JSON.stringify(copy);
   if (existsSync(file)) {
-    if (readFileSync(file, 'utf8') !== content) throw new Error('backup destination is already occupied');
+    const existing = lstatSync(file);
+    if (!existing.isFile() || (existing.mode & 0o077) !== 0 || readFileSync(file, 'utf8') !== content) {
+      throw new Error('backup destination is already occupied');
+    }
     fsyncDir(dirname(file));
     return;
   }
@@ -247,12 +250,14 @@ export async function restoreReturn(w: Wallet, file: string): Promise<ReturnReco
   await w.bridge.importPendingReturn(rec);
   await w.bridge.burn(bytes(rec.returnId, 32));
   const confirmed = (await w.bridge.journal.ret(rec.returnId))!;
-  if (rec.recovery && backup.checkpoint && !loadRecovery(w, confirmed)) {
+  if (rec.recovery) {
     const release = recoveryRelease(w);
     const session = await openSession(w, release, confirmed);
-    // Authenticate every portable cut before writing any local checkpoint.
-    await replay(w.trust, session, confirmed, backup.checkpoint);
-    saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, fees: '0' });
+    if (backup.checkpoint && !loadRecovery(w, confirmed)) {
+      // Authenticate every portable cut before writing any local checkpoint.
+      await replay(w.trust, session, confirmed, backup.checkpoint);
+      saveRecovery(w, confirmed, { ...backup.checkpoint, pending: undefined, settled: undefined, fees: '0' });
+    }
   }
   return confirmed;
 }
@@ -286,9 +291,18 @@ async function openSession(w: Wallet, release: ReleaseRecovery, rec: ReturnRecor
   if (rec.recovery?.generation !== generation || !rec.burned) throw new WalletError('BadDeployment', 'return belongs to another generation or is uncertified');
   const cached = sessions.get(w);
   const trust = w.trust;
-  if (cached?.burned === rec.burned && cached.generation === generation && cached.trust === trust) return cached.session;
-  const authority = new RecoveryAuthority(trust, async (next) => w.persistAuthority(next));
-  const session = await RecoverySession.create(w.pins.gamma, evidenceOf(bytes(rec.burned)), authority, buildParams(w.pins.build), release.deployment);
+  let session = cached?.burned === rec.burned && cached.generation === generation && cached.trust === trust ? cached.session : undefined;
+  if (session === undefined) {
+    const authority = new RecoveryAuthority(trust, async (next) => w.persistAuthority(next));
+    session = await RecoverySession.create(w.pins.gamma, evidenceOf(bytes(rec.burned)), authority, buildParams(w.pins.build), release.deployment);
+  }
+  const { runCuts, advanceGaps } = rec.recovery;
+  if (!Array.isArray(runCuts) || runCuts.length > session.operationCount ||
+    runCuts.some((count) => !Number.isSafeInteger(count) || count < 1 || count > 16) ||
+    runCuts.reduce((sum, count) => sum + count, 0) !== session.operationCount ||
+    !Number.isSafeInteger(advanceGaps) || advanceGaps < 1 || advanceGaps > 1024) {
+    throw new Error('admitted schedule does not cover the certified lineage');
+  }
   sessions.set(w, { burned: rec.burned, generation, trust, session });
   return session;
 }

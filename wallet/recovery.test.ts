@@ -337,8 +337,13 @@ test('a certified alternate archive carries a recovered payment through a pruned
   assert.equal((await recoverStep(relay, rec, alternate)).state, 'retry');
   assert.equal((await recoverStep(relay, rec, alternate)).state, 'checkpoint');
   assert.ok(alternateReads > 0);
+  const portable = join(dir, 'certified-cut.private.json');
+  publishReturnBackup(relay, rec, portable);
+  const other = await open('archive-relay-device-two', primary);
+  chain.fund(other.signer.address, 10n ** 18n);
+  const restored = await restoreReturn(other, portable);
   const balance = chain.balanceOf(w.signer.address);
-  assert.equal((await recoverStep(relay, rec, alternate)).state, 'paid');
+  assert.equal((await recoverStep(other, restored, alternate)).state, 'paid');
   assert.equal(chain.balanceOf(w.signer.address) - balance, 19n);
   assert.equal(chain.vault.q, 0n);
   assert.equal((await recoverStep(relay, rec, alternate)).state, 'paid');
