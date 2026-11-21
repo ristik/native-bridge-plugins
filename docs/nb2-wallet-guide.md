@@ -236,7 +236,8 @@ The other commands:
   plug-in does not journal transfers, so the wallet does: it checks the new name, writes the exact request to
   `tokens/NEW.pending.json`, and only then submits it. Run it again after a crash and it certifies the same request.
 - `plan-return` and `burn` take `--recipient ADDR` to pay an address other than the wallet's own. A mixed-case address must carry its EIP-55
-  checksum. Without `--recipient`, `burn` keeps the recipient `plan-return` chose.
+  checksum. Without `--recipient`, `burn` uses the holder authorization saved by `plan-return`.
+  If that authorization is missing, provide the address explicitly before signing.
 - `deposit NAME` without an amount resumes a planned deposit. It never sends a second one, and it refuses a different amount.
 
 Every command that moves value runs the installation check again first; only `address`, `tokens` and `status` skip it. A network reset can

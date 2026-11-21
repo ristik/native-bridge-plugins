@@ -38,7 +38,7 @@ import {
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
   type ReturnRecord,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
-import { parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
+import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
 import { ordinaryPayout, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
@@ -249,7 +249,7 @@ export class FileJournalStore implements JournalStore {
 }
 
 /** A token the wallet holds, by the name the user gave it. `spent` says why it is no longer held (split, transferred, burned, sent). */
-export interface TokenEntry { file: string; owner: number; amount: string; intent?: string; returnId?: string; note?: string; spent?: string; splitInto?: string[] }
+export interface TokenEntry { file: string; owner: number; amount: string; intent?: string; returnId?: string; authorizedRecipient?: string; note?: string; spent?: string; splitInto?: string[] }
 
 /** A transfer between its request and its saved result: tokens/<to>.pending.json. */
 interface PendingTransfer { from: string; to: string; owner: number; toKey?: string; tx: string; cd: string }
@@ -681,8 +681,9 @@ export async function split(w: Wallet, from: string, owner: number, parts: { lab
 export async function planReturn(w: Wallet, label: string, recipient?: Uint8Array, note?: (reason: string) => void, policy?: PayerPolicy): Promise<ReturnPlan> {
   const e = w.entry(label);
   if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
-  const plan = await retry(() => w.bridge.planReturn(w.token(label), recipient ?? w.signer.address, w.signer.address, { admission: walletAdmission(w, policy) }), note, 30, 2_000, NOT_YET);
-  w.update(label, { returnId: hx(plan.returnId) });
+  const target = Uint8Array.from(recipient ?? w.signer.address);
+  const plan = await retry(() => w.bridge.planReturn(w.token(label), target, w.signer.address, { admission: walletAdmission(w, policy) }), note, 30, 2_000, NOT_YET);
+  w.update(label, { returnId: hx(plan.returnId), authorizedRecipient: hx(target) });
   return plan;
 }
 
@@ -695,8 +696,19 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
   const e = w.entry(label);
   if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
   let plan: ReturnPlan | null = null;
-  const rec = e.returnId ? await w.bridge.journal.ret(e.returnId) : null;
-  if (rec === null || rec.status === 'planned') plan = await planReturn(w, label, recipient ?? (rec ? unhex(rec.recipient) : undefined), note, policy);
+  const rec = await w.bridge.journal.ret(e.returnId ?? hx(HU(w.token(label))));
+  let expectedRecipient: Uint8Array | undefined;
+  if (rec === null || rec.status === 'planned') {
+    if (recipient === undefined && (e.returnId || rec) && !e.authorizedRecipient) {
+      throw new WalletError('BadInput', 'resume requires the holder to authorize the recipient explicitly');
+    }
+    const held = e.authorizedRecipient && unhex(e.authorizedRecipient);
+    if (recipient === undefined && rec && held && !eq(unhex(rec.recipient), held)) {
+      throw new WalletError('BadInput', 'planned recipient differs from the saved holder authorization');
+    }
+    expectedRecipient = Uint8Array.from(recipient ?? (held || w.signer.address));
+    plan = await planReturn(w, label, expectedRecipient, note, policy);
+  }
   // the token is marked before its burn request is journaled, so nothing else can spend the state the burn spends; a burn that never got
   // that far (a refused last preflight) takes the mark back
   const id = w.entry(label).returnId!;
@@ -710,7 +722,7 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
   w.update(label, { spent: BURNING });
   let b: Awaited<ReturnType<typeof w.bridge.burn>>;
   try {
-    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized), plan?.recipient ?? recipient), note);
+    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized), expectedRecipient), note);
   } catch (err) {
     const r = await w.bridge.journal.ret(id);
     if (r === null || r.status === 'planned') w.update(label, { spent: undefined });

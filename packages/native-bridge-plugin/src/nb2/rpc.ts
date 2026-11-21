@@ -381,13 +381,13 @@ export class EvmReader {
     return bytesOf(await this.rpc.call('eth_getCode', [hexOf(address), 'latest']), 'eth_getCode');
   }
 
-  public async balance(address: Uint8Array): Promise<bigint> {
-    return qtyOf(await this.rpc.call('eth_getBalance', [hexOf(address), 'latest']), 'eth_getBalance');
+  public async balance(address: Uint8Array, tag: 'latest' | bigint = 'latest'): Promise<bigint> {
+    return qtyOf(await this.rpc.call('eth_getBalance', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getBalance');
   }
 
   /** The account nonce: 'pending' counts the pool (for signing), 'latest' only mined transactions (for deciding a send is dead). */
-  public async nonce(address: Uint8Array, tag: 'pending' | 'latest' = 'pending'): Promise<bigint> {
-    return qtyOf(await this.rpc.call('eth_getTransactionCount', [hexOf(address), tag]), 'eth_getTransactionCount');
+  public async nonce(address: Uint8Array, tag: 'pending' | 'latest' | bigint = 'pending'): Promise<bigint> {
+    return qtyOf(await this.rpc.call('eth_getTransactionCount', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getTransactionCount');
   }
 
   /** The base fee of the latest block and a priority fee. */

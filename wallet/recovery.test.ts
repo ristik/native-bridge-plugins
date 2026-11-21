@@ -9,11 +9,11 @@ import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/t
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   EvmReader, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, appendTransfer, buildHistory, decodeSignedTx,
-  evidenceOf, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
+  evidenceOf, quoteRecoveryGapBatch, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
-import { ascii } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
+import { ascii, u256 } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
@@ -198,6 +198,28 @@ test('the signing gate binds the source, amount, IDs and authorized recipient on
     }
     assert.equal(signatures, 0);
     assert.equal(aggregator.calls, certifications);
+  }
+});
+
+test('a reopened wallet refuses an altered planned recipient and keeps the original authorization', async (t) => {
+  for (const ordinary of [true, false]) {
+    const { w, open, aggregator } = await setup(t, ordinary);
+    const address = key('original holder authorization').slice(0, 20);
+    const plan = await planReturn(w, 'coin', address, undefined, caps);
+    assert.equal(plan.record.recovery === undefined, ordinary);
+    const path = `${w.bridge.journal.prefix}return/${plan.record.returnId.slice(2)}`;
+    const store = w.bridge.journal.store;
+    const original = (await store.get(path))!;
+    const altered = JSON.stringify({ ...JSON.parse(original), recipient: hx(key('recipient substitution').slice(0, 20)) });
+    assert.ok(await store.putIf(path, original, altered));
+    const reopened = await open('holder');
+    const certifications = aggregator.calls;
+    await assert.rejects(burn(reopened, 'coin', undefined, undefined, caps), /saved holder authorization/);
+    assert.equal(aggregator.calls, certifications);
+    assert.equal(reopened.entry('coin').spent, undefined);
+    assert.ok(await store.putIf(path, altered, original));
+    await burn(reopened, 'coin', undefined, undefined, caps);
+    assert.equal((await reopened.returnRecord('coin')).recipient, hx(address));
   }
 });
 
@@ -393,7 +415,7 @@ test('large lineage relays exact pending bytes across submission and checkpoint 
 
 test('a certified alternate archive carries a recovered payment through a pruned primary', async (t) => {
   const { createServer } = await import('node:http');
-  const { w, open, chain, dir, deployment, cfg, rpc } = await setup(t);
+  const { w, open, chain, dir, deployment, cfg, rpc, manifest } = await setup(t);
   const backup = join(dir, 'alternate-private.json');
   await burn(w, 'coin', undefined, undefined, caps, backup);
   let preferred: string | undefined;
@@ -457,6 +479,10 @@ test('a certified alternate archive carries a recovered payment through a pruned
   const portable = join(dir, 'certified-cut.private.json');
   publishReturnBackup(relay, rec, portable);
   const offline = { certify: async () => { throw new Error('certification service offline'); } };
+  // The certified Complete remains usable even if its old run class is no longer priced.
+  const release = JSON.parse(readFileSync(manifest, 'utf8'));
+  release.recovery.ranges = release.recovery.ranges.filter((r: { max: { entry: string } }) => r.max.entry !== 'run');
+  writeFileSync(manifest, JSON.stringify(release));
   const other = await open('archive-relay-device-two', primary, { aggregator: offline });
   const broken = join(dir, 'bad-certified-cut.json');
   const doc = JSON.parse(readFileSync(portable, 'utf8'));
@@ -509,6 +535,69 @@ test('restore checks full gap batches and every settlement suffix against the re
     await assert.rejects(restoreReturn(relay, invalid), { rule: 'CapacityPreflight' });
     assert.equal(await relay.bridge.journal.ret(rec.returnId), null);
   }
+  assert.deepEqual((await restoreReturn(relay, correct)).recovery, rec.recovery);
+});
+
+test('admission and restore use the same maximum-width signed envelope at a tight byte cap', async (t) => {
+  const { w, dir, manifest, open, deployment, cfg, rpc } = await setup(t);
+  const doc = JSON.parse(readFileSync(manifest, 'utf8'));
+  for (const entry of ['advanceGaps', 'redeemRecovered']) {
+    const template = doc.recovery.ranges.find((range: { max: { entry: string } }) => range.max.entry === entry);
+    for (let gaps = entry === 'advanceGaps' ? 66 : 65; gaps <= 1024; gaps++) {
+      doc.recovery.ranges.push({ ...template, max: { ...template.max, gaps } });
+    }
+  }
+  const calibration = {
+    pins: deployment.pins, runtimeHash: deployment.runtimeHash, vaultRuntimeHash: deployment.vaultRuntimeHash,
+    ranges: doc.recovery.ranges.map((range: { execution: string }) => ({ ...range, execution: BigInt(range.execution) })),
+  };
+  const limits = { ...caps, chainId: cfg.chainId, balance: 10n ** 18n };
+  const narrow = quoteRecoveryGapBatch(cfg.K, 1024, calibration, limits)!;
+  const wide = quoteRecoveryGapBatch(cfg.K, 1024, calibration, { ...limits, worstCaseEnvelope: true })!;
+  assert.ok(narrow.advance.signedBytes < wide.advance.signedBytes);
+  doc.pins.maxEncodedTxBytes = narrow.advance.signedBytes;
+  writeFileSync(manifest, JSON.stringify(doc));
+  // The wallet prices the observed backlog even when the latest certified start is zero.
+  const backlog: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    const result = await rpc.call<T>(method, params);
+    if (method !== 'eth_call' || (params[0] as { data: string }).data !== hx(SELECTOR.state)) return result;
+    const state = unhex(result as string);
+    state.set(u256(960n), 32);
+    return hx(state) as T;
+  } };
+  const holder = await open('holder', backlog);
+  const { plan } = await burn(holder, 'coin', undefined, undefined, caps);
+  assert.equal(plan!.record.recovery!.advanceGaps, 1023, 'the next smaller batch fits the portable envelope');
+  const file = join(dir, 'width-boundary.json');
+  const rec = await holder.returnRecord('coin');
+  publishReturnBackup(holder, rec, file);
+  assert.deepEqual((await restoreReturn(await open('width-relayer', backlog), file)).recovery, rec.recovery);
+  assert.equal(w.pins.maxEncodedTxBytes, 524_288n);
+});
+
+test('restore refuses an unfunded remaining run class and a fully quoted zero-progress batch', async (t) => {
+  const { w, dir, manifest, open } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const correct = join(dir, 'completable.json');
+  publishReturnBackup(w, rec, correct);
+  const backup = JSON.parse(readFileSync(correct, 'utf8'));
+  const release = JSON.parse(readFileSync(manifest, 'utf8'));
+  release.recovery.ranges = release.recovery.ranges.filter((r: { max: { entry: string; operations: number } }) =>
+    r.max.entry !== 'run' || r.max.operations !== 1);
+  release.recovery.backlog.advancePeakSeals = '1';
+  writeFileSync(manifest, JSON.stringify(release));
+  const relay = await open('portable-completion');
+  const invalid = join(dir, 'incomplete.json');
+  const missingRun = structuredClone(backup);
+  missingRun.pending.recovery.runCuts = [1, 1];
+  writeFileSync(invalid, JSON.stringify(missingRun));
+  await assert.rejects(restoreReturn(relay, invalid), { rule: 'CapacityPreflight', detail: 'portable run cut is outside the release limits' });
+  assert.equal(await relay.bridge.journal.ret(rec.returnId), null);
+  backup.pending.recovery.advanceGaps = 1;
+  writeFileSync(invalid, JSON.stringify(backup));
+  await assert.rejects(restoreReturn(relay, invalid), { rule: 'CapacityPreflight', detail: 'insufficient certified catch-up rate' });
+  assert.equal(await relay.bridge.journal.ret(rec.returnId), null);
   assert.deepEqual((await restoreReturn(relay, correct)).recovery, rec.recovery);
 });
 
@@ -577,8 +666,8 @@ test('portable replay refreshes for later certified cuts and reopening preserves
   assert.equal((await open('epoch-relay', rpc, { aggregator: offline })).trust.history.tip?.epoch, 2n);
 });
 
-test('the shared payer budget counts an outstanding cold send before an ordinary attempt', async (t) => {
-  const { w, chain } = await setup(t);
+test('an outstanding cold send uses one pinned nonce and balance snapshot before an ordinary attempt', async (t) => {
+  const { w, chain, rpc, open } = await setup(t);
   await burn(w, 'coin', undefined, undefined, caps);
   const rec = await w.returnRecord('coin');
   chain.autoMine = false;
@@ -594,13 +683,27 @@ test('the shared payer budget counts an outstanding cold send before an ordinary
   assert.equal((await w.bridge.journal.ret(rec.returnId))!.sends.length, 0);
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).pending.raw, raw);
   chain.balances.set(hx(w.signer.address).slice(2), combined - 1n);
-  await assert.rejects(resumePayout(w, rec, caps, true), { rule: 'CapacityPreflight' });
-  assert.equal((await w.bridge.journal.ret(rec.returnId))!.sends.length, 0);
+  const tags: unknown[] = [];
+  let allowSend = false;
+  const mixed: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_getTransactionCount' && params[1] === 'latest') {
+      // The independent latest nonce comes from a node that already advanced past the cold attempt.
+      return `0x${(request.nonce + 1n).toString(16)}` as T;
+    }
+    if (method === 'eth_getBalance' || (method === 'eth_getTransactionCount' && params[1] !== 'pending')) tags.push(params[1]);
+    if (method === 'eth_sendRawTransaction' && !allowSend) throw new Error('signing from mismatched block states');
+    return rpc.call<T>(method, params);
+  } };
+  const reopened = await open('holder', mixed);
+  const block = `0x${(await w.bridge.evm.blockNumber()).toString(16)}`;
+  await assert.rejects(resumePayout(reopened, rec, caps, true), { rule: 'CapacityPreflight' });
+  assert.deepEqual(tags, [block, block]);
+  assert.equal((await reopened.bridge.journal.ret(rec.returnId))!.sends.length, 0);
   chain.balances.set(hx(w.signer.address).slice(2), combined);
-  // Mine the ordinary attempt while the previous signed cold packet is still accounted for.
   chain.dropPool();
   chain.autoMine = true;
-  assert.equal((await resumePayout(w, rec, caps, true)).state, 'paid');
+  allowSend = true;
+  assert.equal((await resumePayout(reopened, rec, caps, true)).state, 'paid');
 });
 
 test('ordinary settlement refuses to re-sign a failed receipt until its exact transaction is certified', async (t) => {
