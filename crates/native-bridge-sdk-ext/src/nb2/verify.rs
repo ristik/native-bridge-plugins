@@ -1,32 +1,21 @@
-//! The token verifier relation (section 11.2; `verify.ts`): `verify_return(Γ, evidence)` under the trust-base history, in the
-//! frozen order of bft-core `nb2ref/verify.go`, so a multi-fault input classifies the same way in every implementation:
-//!
-//!  1. Γ (`ConfigShape`).
-//!  2. evidence = C(1, Token): the outer pair is `EvidenceShape`; the token and every nested item fail with the 14.1 rules.
-//!  3. The walk from the returned part to the root (39044 split reasons; 39051 ends it; anything else `MintReason`).
-//!  4. The root's J (section 6.2, in its order).
-//!  5. Root first, every token of the walk: mint fields, `NoTransfers`, the mint and each transfer with its inclusion proof,
-//!     the intermediate transfers, a parent's split burn, each child's allocation edge.
-//!  6. The part's terminal burn.
-//!  7. btid and eta.
-
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use num_bigint::BigUint;
 
 use super::cbor::*;
 use super::config::{
-    asset_uct, decode_config, domain, domain_of, tag, Config, Params, MAX_SEGMENT, V2_VERSION,
+    asset_uct, decode_config, derive_coin, derive_type, domain, domain_of, tag, Config, Params,
+    MAX_SEGMENT, V2_VERSION,
 };
-use super::crypto::{hu, minter_key, parse_key, verify_unlock};
+use super::crypto::{hu, minter_key, minter_scalar, minter_scalar_valid, parse_key, verify_unlock};
 use super::deposit::verify_root_mint;
 use super::errors::{fail, fail_d, rule_err, wrap, Error, Result, Rule};
 use super::split::{
-    decode_split_justification, decode_split_manifest, split_output_commitment, verify_sum_proof,
-    SplitJustification,
+    decode_split_justification, decode_split_manifest, decode_sum_proof, parent_link,
+    split_output_commitment, verify_sum_proof,
 };
 use super::token::*;
-use super::trust::{bind_trust, decode_uc, in_shard, uc_check, TrustInput};
+use super::trust::{bind_trust, decode_uc, in_shard, uc_check, ClaimConsistency, TrustInput};
 use super::util::{arr, cat, u256, u256_64};
 
 /// The authenticated return tuple.
@@ -95,42 +84,43 @@ pub fn encode_return_data(r: &ReturnData) -> Vec<u8> {
     )
 }
 
-/// evidence = C(1, Token).
+/// The exported token is the flat evidence, including its exact signed records.
 pub fn evidence_of(token: &[u8]) -> Vec<u8> {
-    cat(&[&head(MAJ_ARRAY, 2), &c_uint(V2_VERSION), token])
+    token.to_vec()
 }
 
-/// The verifier: the verdict, or the rule that refuses the evidence.
+pub use super::token::decode_token as decode_evidence;
+
 pub fn verify_return(gamma: &[u8], evidence: &[u8], t: &TrustInput, p: &Params) -> Result<Verdict> {
     let c = decode_config(gamma, p)?;
-    bind_trust(t, &c)?;
-    let part = decode_evidence(evidence)?;
-    verify_part(&c, &domain_of(gamma), t, &part)
+    verify_part(&c, &domain_of(gamma), t, &decode_evidence(evidence)?)
 }
 
-pub fn decode_evidence(b: &[u8]) -> Result<Token> {
-    let it = scan_native(b)?;
-    if it.major != MAJ_ARRAY || it.kids.len() != 2 || it.kids[1].major != MAJ_TAG {
-        return fail(Rule::EvidenceShape);
-    }
-    if !is_uint(&it.kids[0]) || it.kids[0].arg != V2_VERSION {
-        return fail(Rule::EvidenceShape);
-    }
-    decode_token_item(&it.kids[1], b)
-}
-
-#[derive(Debug, Clone)]
 struct Level {
     id: [u8; 32],
     amount: BigUint,
-    manifest: Option<[u8; 32]>,
     last_sid: [u8; 32],
     last_tx: [u8; 32],
+    owner: Predicate,
+    state: [u8; 32],
+}
+
+pub struct VerifiedSplit {
+    pub manifest: [u8; 32],
+    pub link: [u8; 32],
+    id: [u8; 32],
+    amount: BigUint,
+}
+
+#[derive(Default)]
+struct LineageChecks {
+    seen: BTreeSet<[u8; 32]>,
+    claims: ClaimConsistency,
 }
 
 pub fn verify_part(c: &Config, d: &[u8; 32], t: &TrustInput, part: &Token) -> Result<Verdict> {
-    let (lv, r) = walk(c, d, t, part, false)?;
-    let r = r.expect("a return");
+    let lv = walk(c, d, t, part, false)?;
+    let r = check_return(c, d, part, &lv)?;
     let btid = burn_transition_id(&lv.last_sid, &lv.last_tx);
     Ok(Verdict {
         domain: *d,
@@ -142,78 +132,72 @@ pub fn verify_part(c: &Config, d: &[u8; 32], t: &TrustInput, part: &Token) -> Re
     })
 }
 
-/// A held (not burned) part: the same walk and every check of steps 3 to 5; its own transfers all go to signature owners with
-/// null data.
 #[derive(Debug, Clone)]
 pub struct Held {
     pub token_id: [u8; 32],
     pub amount: BigUint,
     pub owner: Predicate,
+    pub state: [u8; 32],
 }
 
 pub fn verify_held(c: &Config, d: &[u8; 32], t: &TrustInput, part: &Token) -> Result<Held> {
-    let (lv, _) = walk(c, d, t, part, true)?;
-    let owner = part
-        .transfers
-        .last()
-        .map_or_else(|| part.mint.recipient.clone(), |x| x.recipient.clone());
+    let lv = walk(c, d, t, part, true)?;
     Ok(Held {
         token_id: lv.id,
         amount: lv.amount,
-        owner,
+        owner: lv.owner,
+        state: lv.state,
     })
 }
 
-fn walk(
+/// Authenticate every level and the split spend before deriving a link for child signing.
+pub fn verify_split(
     c: &Config,
     d: &[u8; 32],
     t: &TrustInput,
     part: &Token,
-    held: bool,
-) -> Result<(Level, Option<ReturnData>)> {
-    // 3. The walk, part first.
-    let mut chain: Vec<Token> = alloc::vec![part.clone()];
-    let mut just: Vec<SplitJustification> = Vec::new();
-    loop {
-        let cur = chain.last().expect("nonempty");
-        let tg = cur.mint.justification.as_deref().and_then(head_tag);
-        if tg == Some(tag::RECEIPT_BACKING) {
-            break;
-        }
-        if tg != Some(tag::SPLIT_JUSTIFICATION) {
-            return fail(Rule::MintReason);
-        }
-        let sj = decode_split_justification(cur.mint.justification.as_deref().expect("tagged"))?;
-        let parent = sj.parent.clone();
-        just.push(sj);
-        chain.push(parent);
+) -> Result<VerifiedSplit> {
+    let lv = walk(c, d, t, part, false)?;
+    check_split_burn(d, part, &lv)
+}
+
+fn walk(c: &Config, d: &[u8; 32], t: &TrustInput, part: &Token, held: bool) -> Result<Level> {
+    bind_trust(t, c)?;
+    if c.asset != asset_uct()
+        || c.ty != derive_type(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id)
+        || c.aid != derive_coin(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id)
+    {
+        return fail(Rule::ConfigShape);
     }
-    // 4. The root's J.
-    let top = chain.len() - 1;
-    verify_root_mint(c, d, t, &chain[top].mint)?;
-    // 5. Root first.
-    let mut seen = BTreeSet::new();
-    let mut parent: Option<Level> = None;
-    let mut part_level: Option<Level> = None;
-    for i in (0..=top).rev() {
-        let mut lv = verify_level(c, t, &chain[i], &mut seen, held && i == 0)?;
-        if i < top {
-            check_split_edge(parent.as_ref().expect("parent"), &lv, &chain[i], &just[i])?;
-        }
-        if i > 0 {
-            check_split_burn(&chain[i], &mut lv)?;
-        }
-        parent = Some(lv.clone());
-        part_level = Some(lv);
+    let mut checks = LineageChecks::default();
+    let mut parent = None;
+    for tok in &part.ancestors {
+        check_origin(c, d, t, tok, parent.as_ref(), &mut checks)?;
+        let lv = verify_level(c, t, tok, &mut checks, false)?;
+        parent = Some(check_split_burn(d, tok, &lv)?);
     }
-    let lv = part_level.expect("a level");
-    // 6. The terminal return burn (7, the identifiers, is the caller's).
-    let r = if held {
-        None
-    } else {
-        Some(check_return(c, d, part, &lv)?)
-    };
-    Ok((lv, r))
+    check_origin(c, d, t, part, parent.as_ref(), &mut checks)?;
+    verify_level(c, t, part, &mut checks, held)
+}
+
+fn check_origin(
+    c: &Config,
+    d: &[u8; 32],
+    t: &TrustInput,
+    tok: &LineageLevel,
+    parent: Option<&VerifiedSplit>,
+    checks: &mut LineageChecks,
+) -> Result<()> {
+    if let Some(parent) = parent {
+        return check_split_edge(c, parent, tok);
+    }
+    if !tok.allocation.is_empty() {
+        return fail(Rule::SplitProofShape);
+    }
+    let (reason, _) = verify_root_mint(c, d, t, &tok.mint)?;
+    checks
+        .claims
+        .check(&decode_uc(&reason.proof.uc)?, &reason.proof.uc)
 }
 
 fn parse_mint_data(c: &Config, data: Option<&[u8]>) -> Result<BigUint> {
@@ -243,11 +227,17 @@ fn parse_mint_data(c: &Config, data: Option<&[u8]>) -> Result<BigUint> {
 fn verify_level(
     c: &Config,
     t: &TrustInput,
-    tok: &Token,
-    seen: &mut BTreeSet<[u8; 32]>,
+    tok: &LineageLevel,
+    checks: &mut LineageChecks,
     held: bool,
 ) -> Result<Level> {
     let m = &tok.mint;
+    if encode_mint(m) != tok.mint_raw
+        || tok.transfers.len() != tok.transfers_raw.len()
+        || tok.transfers.len() != tok.proofs.len()
+    {
+        return fail(Rule::CDMismatch);
+    }
     if m.network != c.network || m.recipient.ty != PRED_SIGNATURE {
         return fail(Rule::MintShape);
     }
@@ -262,11 +252,15 @@ fn verify_level(
     let mut lv = Level {
         id,
         amount: amt,
-        manifest: None,
+        owner: m.recipient.clone(),
+        state: [0; 32],
         last_sid: [0; 32],
         last_tx: [0; 32],
     };
     let h0 = mint_source_hash(&id);
+    if !minter_scalar_valid(&minter_scalar(&id)) {
+        return fail(Rule::MintShape);
+    }
     check_step(
         c,
         t,
@@ -275,11 +269,14 @@ fn verify_level(
         &tok.mint_raw,
         m.deadline,
         &tok.mint_proof,
-        seen,
+        checks,
     )?;
     let mut state = result_state(&h0, &id);
     let mut owner = m.recipient.clone();
     for (i, tr) in tok.transfers.iter().enumerate() {
+        if encode_transfer(tr) != tok.transfers_raw[i] {
+            return fail(Rule::CDMismatch);
+        }
         let (sid, tx_hash) = check_step(
             c,
             t,
@@ -288,7 +285,7 @@ fn verify_level(
             &tok.transfers_raw[i],
             tr.deadline,
             &tok.proofs[i],
-            seen,
+            checks,
         )?;
         lv.last_sid = sid;
         lv.last_tx = tx_hash;
@@ -303,6 +300,8 @@ fn verify_level(
         state = result_state(&state, &tr.mask);
         owner = tr.recipient.clone();
     }
+    lv.owner = owner;
+    lv.state = state;
     Ok(lv)
 }
 
@@ -315,7 +314,7 @@ fn check_step(
     tx_raw: &[u8],
     e: Deadline,
     p: &InclusionProof,
-    seen: &mut BTreeSet<[u8; 32]>,
+    checks: &mut LineageChecks,
 ) -> Result<([u8; 32], [u8; 32])> {
     let cd = &p.cd;
     let tx_hash = hu(&[tx_raw]);
@@ -341,10 +340,17 @@ fn check_step(
         }
     }
     let sid = state_id(source, source_hash);
-    if !seen.insert(sid) {
+    if !checks.seen.insert(sid) {
         return fail(Rule::RepeatedSID);
     }
-    verify_inclusion(c, t, &sid, &leaf_value(&tx_hash, p.t), p)?;
+    verify_inclusion(
+        c,
+        t,
+        &sid,
+        &leaf_value(&tx_hash, p.t),
+        p,
+        &mut checks.claims,
+    )?;
     Ok((sid, tx_hash))
 }
 
@@ -357,10 +363,12 @@ fn verify_inclusion(
     sid: &[u8; 32],
     value: &[u8; 32],
     p: &InclusionProof,
+    claims: &mut ClaimConsistency,
 ) -> Result<()> {
     let uc = decode_uc(&p.uc)?;
     let shard = uc.shard_tree_certificate.shard.clone();
     uc_check(t, &uc, c.aggregator_partition, &shard.encode())?;
+    claims.check(&uc, &p.uc)?;
     if !in_shard(&shard, sid) {
         return fail_d(
             Rule::InclusionProof,
@@ -434,7 +442,7 @@ pub fn rsmt_member(
 }
 
 /// A parent's terminal transfer burns exactly its manifest; a return burn fails here, so a token cannot both split and return.
-fn check_split_burn(tok: &Token, lv: &mut Level) -> Result<()> {
+fn check_split_burn(d: &[u8; 32], tok: &LineageLevel, lv: &Level) -> Result<VerifiedSplit> {
     let last = tok.transfers.last().expect("a split parent has transfers");
     let Some(data) = last
         .data
@@ -443,24 +451,33 @@ fn check_split_burn(tok: &Token, lv: &mut Level) -> Result<()> {
     else {
         return fail(Rule::SplitBurn);
     };
-    let root = decode_split_manifest(data)?;
-    let manifest = c_tag(tag::SPLIT_MANIFEST, &c_arr(&[&c_bytes(&root)]));
-    if last.recipient.params != hu(&[&manifest]) {
+    let manifest = decode_split_manifest(data)?;
+    if last.recipient.params != hu(&[data]) {
         return fail(Rule::SplitBurn);
     }
-    lv.manifest = Some(root);
-    Ok(())
+    let link = parent_link(d, &lv.id, &lv.last_sid, &lv.last_tx, &manifest, &lv.amount);
+    Ok(VerifiedSplit {
+        manifest,
+        link,
+        id: lv.id,
+        amount: lv.amount.clone(),
+    })
 }
 
-fn check_split_edge(
-    parent: &Level,
-    child: &Level,
-    tok: &Token,
-    sj: &SplitJustification,
-) -> Result<()> {
+fn check_split_edge(c: &Config, parent: &VerifiedSplit, tok: &LineageLevel) -> Result<()> {
+    let reason = tok
+        .mint
+        .justification
+        .as_deref()
+        .ok_or_else(|| rule_err(Rule::SplitJustif))?;
+    if decode_split_justification(reason)? != parent.link {
+        return fail(Rule::SplitJustif);
+    }
+    let id = token_id_of(&tok.mint.salt, tok.mint.network);
+    let amount = parse_mint_data(c, tok.mint.data.as_deref())?;
     let data = split_output_commitment(&parent.id, &tok.mint);
-    let manifest = parent.manifest.expect("a parent's manifest");
-    let Some(sum) = verify_sum_proof(&sj.proof, &child.id, &data, &child.amount, &manifest) else {
+    let proof = decode_sum_proof(&tok.allocation)?;
+    let Some(sum) = verify_sum_proof(&proof, &id, &data, &amount, &parent.manifest) else {
         return fail(Rule::SplitProof);
     };
     if sum != parent.amount {
@@ -469,7 +486,7 @@ fn check_split_edge(
     Ok(())
 }
 
-fn check_return(c: &Config, d: &[u8; 32], part: &Token, lv: &Level) -> Result<ReturnData> {
+fn check_return(c: &Config, d: &[u8; 32], part: &LineageLevel, lv: &Level) -> Result<ReturnData> {
     let last = part.transfers.last().expect("NoTransfers checked");
     if last.recipient.ty != PRED_BURN {
         return fail(Rule::NotBurn);

@@ -31,8 +31,8 @@ use super::abi::{
     classify_redeem_error, decode_deposited, decode_paid, decode_revert, deposit_calldata,
     redeem_calldata, redeem_calldata_length, DecodedError, ErrArg, RedeemAction,
 };
-use super::cbor::{c_arr, c_bytes, head_tag};
-use super::config::{asset_uct, build_params, decode_config, domain_of, tag, Build, Config};
+use super::cbor::{c_arr, c_bytes};
+use super::config::{asset_uct, build_params, decode_config, domain_of, Build, Config};
 use super::crypto::{he, hmac_sha256, hu, parse_key};
 use super::deposit::{
     decode_receipt_backing, deposit_intent_secret, deposit_salt, encode_receipt_backing,
@@ -50,19 +50,19 @@ use super::rules::{
     verify_seal_receipt, Preflight, PreflightResult, SealReceipt,
 };
 use super::segment::{build_history, check_segment_log, genesis_head, Segment};
-use super::split::decode_split_justification;
 use super::token::{
-    burn_predicate, decode_token, signature_predicate, value_data, MintTx, Token, TransferTx,
-    PRED_SIGNATURE,
+    burn_predicate, decode_token, signature_predicate, value_data, LineageLevel, MintTx, Token,
+    TransferTx, PRED_SIGNATURE,
 };
 use super::tokenops::{
     append_transfer, certify_checked, child_mint, fresh_mask, mint_request, split_plan,
-    token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
+    token_of_child, token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
 };
 use super::trust::{bind_trust, TrustInput};
 use super::util::{arr, be_int, cat};
 use super::verify::{
-    decode_evidence, encode_return_data, evidence_of, verify_held, verify_part, ReturnData, Verdict,
+    decode_evidence, encode_return_data, evidence_of, verify_held, verify_part, verify_split,
+    ReturnData, Verdict,
 };
 
 /// The deployment manifest pins outside D (section 4.3).
@@ -271,6 +271,7 @@ pub struct HeldToken {
     pub token_id: [u8; 32],
     pub amount: BigUint,
     pub owner: Option<Vec<u8>>,
+    pub state: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -427,8 +428,36 @@ impl NativeBridgeV2 {
         let t = self.trust();
         match f(&t) {
             Err(e) if e.retryable() && self.refresh_trust.is_some() => {
-                let fresh = (self.refresh_trust.as_ref().expect("checked"))(t)?;
-                *self.trust.write().expect("trust") = fresh.clone();
+                let offered = (self.refresh_trust.as_ref().expect("checked"))(t.clone())?;
+                let offered =
+                    offered.with_authenticated_origin(t.origin().expect("installed origin"));
+                bind_trust(&offered, &self.cfg)?;
+                let incoming = offered.history().entries();
+                if incoming.len() < t.history().entries().len() {
+                    return refuse(
+                        WalletReason::TrustInput,
+                        "trust refresh would roll back the held history",
+                    );
+                }
+                let fresh = {
+                    let mut held = self.trust.write().expect("trust");
+                    let entries = held.history().entries();
+                    if entries
+                        .iter()
+                        .zip(incoming)
+                        .any(|(left, right)| left.entry_id() != right.entry_id())
+                    {
+                        return refuse(
+                            WalletReason::TrustInput,
+                            "trust refresh conflicts with the held history",
+                        );
+                    }
+                    // A concurrent refresh might already have installed a longer prefix.
+                    if incoming.len() > entries.len() {
+                        *held = offered;
+                    }
+                    held.clone()
+                };
                 f(&fresh)
             }
             r => r,
@@ -632,7 +661,19 @@ impl NativeBridgeV2 {
                 }
             }
             let value = undec(&rec.amount)?;
-            let tx = self.signed(signer, &self.cfg.vault, &deposit_calldata(&unhex(&rec.first_owner)?, &unhex(&rec.rho)?), value, self.gas.deposit_gas_limit())?;
+            let data = deposit_calldata(&unhex(&rec.first_owner)?, &unhex(&rec.rho)?);
+            let gas_limit = if self.gas_applies()? {
+                self.gas.deposit_gas_limit()
+            } else {
+                match self.evm.estimate_gas(&signer.address(), &self.cfg.vault, &data, &value)? {
+                    Estimate::Gas(gas) => gas.checked_add(gas.div_ceil(5)).unwrap_or_default(),
+                    Estimate::Revert { message, .. } => return refuse(WalletReason::Reverted, format!("deposit simulation refused: {message}")),
+                }
+            };
+            if gas_limit == 0 || gas_limit > self.pins.user_gas_limit {
+                return fail_d(Rule::CapacityExceeded, "deposit gas exceeds the user limit");
+            }
+            let tx = self.signed(signer, &self.cfg.vault, &data, value, gas_limit)?;
             rec.sends.push(self.send_record(&tx));
             rec.status = "submitted".into();
             self.journal.put_deposit(&rec)?;
@@ -975,7 +1016,7 @@ impl NativeBridgeV2 {
 
     // ==== circulation =====================================================================================================
 
-    /// Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount and owner.
+    /// Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount, owner and spendable state.
     pub fn verify_token(&self, token: &[u8]) -> Result<HeldToken> {
         let t = decode_token(token)?;
         let h = self.retrying_trust(|tr| verify_held(&self.cfg, &self.domain, tr, &t))?;
@@ -983,6 +1024,7 @@ impl NativeBridgeV2 {
             token_id: h.token_id,
             amount: h.amount,
             owner: (h.owner.ty == PRED_SIGNATURE).then_some(h.owner.params),
+            state: h.state,
         })
     }
 
@@ -1022,7 +1064,7 @@ impl NativeBridgeV2 {
         ])])
     }
 
-    /// Split a held token into whole parts (burn-and-mint with the protocol 6 lineage formats). The plan is journaled first, then
+    /// Split a held token into whole parts. The plan is journaled first, then
     /// the burn's exact request, the burned parent and each child as it is minted; a call with the same `split_id` resumes.
     pub fn split(
         &self,
@@ -1048,8 +1090,8 @@ impl NativeBridgeV2 {
             Some(r) => r,
             None => {
                 let held = self.verify_token(token)?;
-                if outputs.len() < 2 {
-                    return refuse(WalletReason::BadInput, "a split has at least two outputs");
+                if outputs.is_empty() {
+                    return refuse(WalletReason::BadInput, "a split requires an output");
                 }
                 let mut sum = BigUint::default();
                 for (k, a) in outputs {
@@ -1099,6 +1141,7 @@ impl NativeBridgeV2 {
                     owner_key: unhex(&o.owner_key)?,
                     amount: undec(&o.amount)?,
                     salt: unhex(&o.salt)?,
+                    deadline: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1117,27 +1160,59 @@ impl NativeBridgeV2 {
             rec.status = "burn-requested".into();
             self.journal.put_split(&rec)?;
         }
-        if rec.status == "burn-requested" {
+        let verify_burn = |burned: Vec<u8>| {
+            let part = decode_token(&burned)?;
+            let split = self.retrying_trust(|t| verify_split(&self.cfg, &self.domain, t, &part))?;
+            if split.manifest != plan.tree.root() {
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "certified split manifest differs from the plan",
+                );
+            }
+            Ok((burned, split))
+        };
+        let refresh_burn = |rec: &mut SplitRecord| -> Result<_> {
             let proof = certify_checked(
                 &*self.aggregator,
                 &unhex(rec.burn_request.as_deref().unwrap_or(""))?,
             )?;
-            rec.burned = Some(hex(&append_transfer(
+            let verified = verify_burn(append_transfer(
                 &unhex(&rec.source)?,
                 &unhex(rec.burn_tx.as_deref().unwrap_or(""))?,
                 &proof,
-            )?));
+            )?)?;
+            rec.burned = Some(hex(&verified.0));
             rec.status = "burned".into();
-            self.journal.put_split(&rec)?;
-        }
-        let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
+            self.journal.put_split(rec)?;
+            Ok(verified)
+        };
+        let (burned, split) = if rec.status == "burn-requested" {
+            refresh_burn(&mut rec)?
+        } else {
+            match verify_burn(unhex(rec.burned.as_deref().unwrap_or(""))?) {
+                Ok(verified) => verified,
+                // A journal from the previous verifier may have recorded an unchecked proof.
+                Err(_)
+                    if rec.status == "burned"
+                        && rec.outputs.iter().all(|output| output.token.is_none()) =>
+                {
+                    refresh_burn(&mut rec)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         for k in 0..rec.outputs.len() {
             if rec.outputs[k].token.is_some() {
                 continue;
             }
-            let m = child_mint(&burned, &plan.tree, &plan.children[k])?;
+            let (m, allocation) = child_mint(&split.link, &plan.tree, &plan.children[k])?;
             let req = mint_request(&m)?;
-            let child = token_of_mint(&req.tx, &certify_checked(&*self.aggregator, &req.cd)?);
+            let child = token_of_child(
+                &burned,
+                &allocation,
+                &req.tx,
+                &certify_checked(&*self.aggregator, &req.cd)?,
+            )?;
             let v = self.verify_token(&child)?;
             if v.amount != undec(&rec.outputs[k].amount)? {
                 return refuse(
@@ -1353,7 +1428,7 @@ impl NativeBridgeV2 {
         });
         let l_t = (evidence_of(token).len() + burn_pair_bound(r.len())) as u64;
         let l_o = other_bytes(l_t as usize) as u64;
-        let lineage = lineage_of(&decode_token(token)?)?;
+        let lineage = lineage_of(&decode_token(token)?);
         let gas_at = |p: u64| {
             self.gas.redeem_gas_limit(&RedeemShape {
                 evidence_bytes: l_t as usize,
@@ -1455,7 +1530,8 @@ impl NativeBridgeV2 {
                 &proof,
             )?;
             let part = decode_evidence(&evidence_of(&burned))?;
-            let v = verify_part(&self.cfg, &self.domain, &self.trust(), &part)?;
+            let v =
+                self.retrying_trust(|trust| verify_part(&self.cfg, &self.domain, trust, &part))?;
             if v.min_segment != a || v.amount != amount || v.recipient != recipient {
                 return refuse(
                     WalletReason::ProviderFault,
@@ -1468,12 +1544,9 @@ impl NativeBridgeV2 {
             self.journal.put_return(&rec)?;
         }
         let burned = unhex(rec.burned.as_deref().unwrap_or(""))?;
-        let verdict = verify_part(
-            &self.cfg,
-            &self.domain,
-            &self.trust(),
-            &decode_evidence(&evidence_of(&burned))?,
-        )?;
+        let part = decode_evidence(&evidence_of(&burned))?;
+        let verdict =
+            self.retrying_trust(|trust| verify_part(&self.cfg, &self.domain, trust, &part))?;
         Ok(Burned {
             burned,
             eta: verdict.eta,
@@ -1553,7 +1626,7 @@ impl NativeBridgeV2 {
             let p = st.segment - a;
             let calldata = redeem_calldata(&evidence, &eta, a, &h.history);
             let l_o = other_bytes(evidence.len()) as u64;
-            let lineage = lineage_of(&decode_token(&burned)?)?;
+            let lineage = lineage_of(&decode_token(&burned)?);
             // the model only where it applies; the simulation, when the RPC has one, sets the limit
             let mut gas_limit = if self.gas_applies()? {
                 self.gas.redeem_gas_limit(&RedeemShape {
@@ -2025,22 +2098,8 @@ fn merge_seen(rec: &mut DepositRecord, entries: Vec<SeenDeposit>) -> Result<()> 
 }
 
 /// The lineage of a part, root first.
-pub fn lineage_of(part: &Token) -> Result<Vec<Token>> {
-    let mut chain = vec![part.clone()];
-    loop {
-        let cur = &chain[0];
-        let Some(j) = cur
-            .mint
-            .justification
-            .as_deref()
-            .filter(|j| head_tag(j) == Some(tag::SPLIT_JUSTIFICATION))
-        else {
-            break;
-        };
-        let parent = decode_split_justification(j)?.parent;
-        chain.insert(0, parent);
-    }
-    Ok(chain)
+pub fn lineage_of(part: &Token) -> Vec<LineageLevel> {
+    part.levels().cloned().collect()
 }
 
 /// An upper bound of the encoded [burn transfer, inclusion proof] pair with return data of `r_len` bytes: the transfer, the
@@ -2048,7 +2107,7 @@ pub fn lineage_of(part: &Token) -> Result<Vec<Token>> {
 pub fn burn_pair_bound(r_len: usize) -> usize {
     let transfer = 3 + 1 + 45 + 34 + 3 + r_len + 9;
     let cd = 3 + 1 + 45 + 34 + 34 + 9 + 67;
-    4 + transfer + 3 + 1 + cd + 9 + 3 + 32 + 32 * 256 + (24 << 10)
+    4 + 1 + transfer + 3 + 1 + cd + 9 + 3 + 32 + 32 * 256 + (24 << 10)
 }
 
 /// Everything of the redeem transaction besides the evidence and the gap proofs: ABI heads and padding, the start head, the envelope.

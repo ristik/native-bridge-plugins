@@ -11,7 +11,8 @@ import { UnicityCertificateVerifier } from '@unicitylabs/state-transition-sdk/li
 import { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js';
 import { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 
-import { eq } from '../bytes.js';
+import { eq, toHex } from '../bytes.js';
+import { HU } from './crypto.js';
 import { nativeUcScan } from '../resources.js';
 import { certificateFailure, TrustInput } from '../trust.js';
 import { NativeError } from '../errors.js';
@@ -20,13 +21,16 @@ import type { Config } from './config.js';
 import { Nb2Error, fail, refuse, wrap, type Rule } from './errors.js';
 
 export { TrustInput };
+export type { AuthenticatedOrigin } from '../trust.js';
 
 /** The B1 bound of one certificate's bytes (b1ref.MaxUCBytes). */
 export const MAX_B1_UC_BYTES = 24_576;
+const MAX_B1_SIGNATURES = 16;
 
 /** The history must be the one Γ names: its genesis EntryID is rootGenesis32 and its network Γ's. */
 export function bindTrust(t: TrustInput, c: Config): void {
-  if (!eq(t.id, c.rootGenesis) || Number(t.network.id) !== c.network) refuse('TrustInput', 'the trust-base history is not the one Γ names');
+  if (t.origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
+  if (!eq(t.history.genesisPin, c.rootGenesis) || Number(t.network.id) !== c.network) refuse('TrustInput', 'the trust-base history is not the one Γ names');
 }
 
 const TAG_UC = 39001n;
@@ -48,6 +52,7 @@ function scanCertificate(raw: Uint8Array): void {
   }
   const seal = uc[6].kids[0].kids;
   if (!isUint(seal[1]) || seal[1].arg === 0n || seal[1].arg > 65535n) fail('Shape', 'seal network');
+  if (seal[7].kids.length > 2 * MAX_B1_SIGNATURES) fail('InputTooLarge', 'seal signatures');
   for (let i = 1; i < seal[7].kids.length; i += 2) if (!isBytes(seal[7].kids[i])) fail('Shape', 'seal signature');
   try {
     nativeUcScan(raw, MAX_B1_UC_BYTES);
@@ -80,8 +85,13 @@ export function decodeUc(raw: Uint8Array): UnicityCertificate {
   return uc;
 }
 
+/** A valid checkpoint may advance while an aggregator request is in flight. */
+export class SealAheadOfOrigin extends Nb2Error {
+  public constructor() { super('SealEpoch', 'seal exceeds the authenticated B1 origin'); }
+}
+
 const UC_VERIFIER = new UnicityCertificateVerifier(
-  new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: 16 }),
+  new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: MAX_B1_SIGNATURES }),
 );
 
 const NATIVE_TO_RULE: Record<string, Rule> = {
@@ -105,6 +115,11 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
   if (uc.shardConfigurationHash.length !== 32) fail('CertStructure', 'ShardConfHash is not 32 bytes');
   if (!eq(uc.shardTreeCertificate.shard.encode(), shard)) fail('CertStructure', 'shard');
   if (BigInt(uc.unicityTreeCertificate.partitionIdentifier) !== BigInt(partition)) fail('CertStructure', 'partition');
+  const origin = t.origin;
+  if (origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
+  if (uc.unicitySeal.epoch > origin.usableEpoch || uc.unicitySeal.rootChainRoundNumber > origin.rootRound) {
+    throw new SealAheadOfOrigin();
+  }
   let r;
   try {
     r = await UC_VERIFIER.verifyCertificate(t.history, uc, { partitionId: uc.unicityTreeCertificate.partitionIdentifier });
@@ -115,13 +130,23 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
     const reason = certificateFailure(r) ?? 'ErrQuorumNotMet';
     fail(NATIVE_TO_RULE[reason] ?? 'CertStructure', reason);
   }
+  // A checkpoint beyond this epoch proves it has closed. The SDK can enforce its
+  // exclusive end only after the authenticated successor is held.
+  const epoch = uc.unicitySeal.epoch;
+  if (epoch < origin.usableEpoch) {
+    const successor = t.history.entryForEpoch(epoch + 1n);
+    if (successor === null) fail('NoEntryForEpoch', `missing authenticated successor for epoch ${epoch}`);
+    // An asynchronous SDK verification may have started before the successor arrived.
+    if (uc.unicitySeal.rootChainRoundNumber >= successor.epochStartRound) fail('SealEpoch', 'seal is outside its closed epoch');
+  }
 }
 
 /**
- * A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Every failure is `DepositUC` except
- * `NoEntryForEpoch`, which keeps its retryable name.
+ * A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Certificate failures are wrapped in `DepositUC`.
+ * Trust binding and retryable `NoEntryForEpoch` keep their own errors.
  */
 export async function verifyEvmUc(t: TrustInput, raw: Uint8Array, c: Config): Promise<UnicityCertificate> {
+  bindTrust(t, c);
   let uc: UnicityCertificate;
   try {
     uc = decodeUc(raw);
@@ -146,4 +171,17 @@ export async function verifyEvmUc(t: TrustInput, raw: Uint8Array, c: Config): Pr
 /** Whether a state ID falls in a shard's key range (the shard ID's bits are a prefix of the ID's). */
 export function inShard(shard: ShardId, sid: Uint8Array): boolean {
   return shard.isPrefixOf(sid);
+}
+
+/** For one complete seal and shard, canonical UC equality implies exact B1 claim equality. */
+export function claimConsistency(): (uc: UnicityCertificate, raw: Uint8Array) => void {
+  const claims = new Map<string, string>();
+  return (uc, raw) => {
+    const key = [toHex(HU(uc.unicitySeal.toCBOR())), uc.unicityTreeCertificate.partitionIdentifier,
+      toHex(uc.shardTreeCertificate.shard.encode())].join('/');
+    const digest = toHex(HU(raw));
+    const previous = claims.get(key);
+    if (previous !== undefined && previous !== digest) fail('CertStructure', 'conflicting claims for the same seal and shard');
+    claims.set(key, digest);
+  };
 }

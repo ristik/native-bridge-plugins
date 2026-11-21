@@ -1,26 +1,19 @@
-/**
- * Ordinary token operations on the unchanged SDK wire (`protocol/interop.md` "SDK wire"): the root mint with the receipt-backed reason,
- * transfers, the return burn and the split (burn-and-mint with the protocol 6 lineage formats). Transactions are built byte for byte
- * as the SDK builds them (test/nb2/sdk-parity.test.ts compares with the SDK's own constructors), signed by the owner's
- * {@link OwnerSigner} (the universal minter for a mint), and certified by an {@link Aggregator}. Every certified result is verified
- * offline by this package's verifier before it is returned.
- */
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { DataHash } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/DataHash.js';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/crypto/hash/HashAlgorithm.js';
 import type { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
 
 import { eq } from '../bytes.js';
-import { array, cArr, raw, scanNative, tagContent } from './cbor.js';
+import { array, cArr, headTag, MAX_U64, raw, scanNative, tagContent } from './cbor.js';
 import { TAG } from './config.js';
-import { HU, minterScalar, signUnlock, unlockMessage, verifyUnlock } from './crypto.js';
+import { LIMITS, decodeReceiptBacking } from './deposit.js';
+import { HU, minterScalar, minterScalarValid, parseKey, signUnlock, unlockMessage, verifyUnlock } from './crypto.js';
 import { WalletError, refuse } from './errors.js';
-import { encodeSplitJustification, encodeSplitManifest, splitOutputCommitment, SumTree } from './split.js';
+import { decodeSplitJustification, encodeSplitJustification, encodeSplitManifest, encodeSumProof, splitOutputCommitment, SumTree } from './split.js';
 import {
-  burnPredicate, decodeToken, encodeCertification, encodeMint, encodePredicate, encodeTransfer, mintSourceHash, resultState, signaturePredicate,
-  tokenIdOf, valueData, type Certification, type MintTx, type Predicate, type Token, type TransferTx,
+  MAX_CHILD_MINT, MAX_ROOT_MINT, burnPredicate, decodeToken, encodeLevel, frameLevel, frameLineage, lineageOf, encodeProof, encodeCertification, encodeMint, encodePredicate, encodeTransfer, mintSourceHash, resultState, signaturePredicate,
+  tokenIdOf, valueData, type Certification, type MintTx, type Predicate, type LineageLevel, type TransferTx,
 } from './token.js';
-import { cTag, cUint } from './cbor.js';
 import type { Deadline } from './cbor.js';
 
 /** A Unicity owner key: its compressed public key and the 65-byte r||s||id unlock signature over a 32-byte message. */
@@ -55,29 +48,46 @@ export interface Aggregator {
 
 /** The certification request of a mint: the universal minter's unlock over (h0, txHash). */
 export function mintRequest(m: MintTx): { tx: Uint8Array; cd: Uint8Array } {
+  const reason = m.justification;
+  const kind = reason === null ? null : headTag(reason);
+  if (reason === null || (kind !== TAG.receiptBacking && kind !== TAG.splitJustification)) refuse('BadInput', 'missing bridge mint reason');
   const tx = encodeMint(m);
+  if (kind === TAG.receiptBacking ? reason.length > LIMITS.justificationBytes || tx.length > MAX_ROOT_MINT : tx.length > MAX_CHILD_MINT) {
+    refuse('BadInput', 'bridge mint exceeds its signed byte limit');
+  }
+  if (kind === TAG.receiptBacking) decodeReceiptBacking(reason);
+  else decodeSplitJustification(reason);
   const id = tokenIdOf(m.salt, m.network);
   const h0 = mintSourceHash(id);
   const txHash = HU(tx);
   const key = minterScalar(id);
+  if (!minterScalarValid(key)) refuse('BadInput', 'invalid universal minter scalar');
   const unlock = signUnlock(key, h0, txHash);
   verifyUnlock(secp256k1.getPublicKey(key, true), h0, txHash, unlock);
   const cd: Certification = { source: signaturePredicate(secp256k1.getPublicKey(key, true)), sourceHash: h0, txHash, deadline: m.deadline, unlock };
   return { tx, cd: encodeCertification(cd) };
 }
 
-/** The exact token of one certified mint. */
-export const tokenOfMint = (tx: Uint8Array, proof: Uint8Array): Uint8Array => cTag(TAG.token, cArr(cUint(2), cArr(tx, proof), cArr()));
+/** Export a certified root. */
+export const tokenOfMint = (tx: Uint8Array, proof: Uint8Array): Uint8Array =>
+  frameLineage([frameLevel(new Uint8Array(), tx, proof, [])]);
 
-/** A token with one more certified transfer: the exact earlier pairs, then (tx, proof). */
+/** Add the child level to the exact signed records of the parent. */
+export function tokenOfChild(parent: Uint8Array, allocation: Uint8Array, tx: Uint8Array, proof: Uint8Array): Uint8Array {
+  const levels = lineageOf(decodeToken(parent)).map(encodeLevel);
+  return frameLineage([...levels, frameLevel(allocation, tx, proof, [])]);
+}
+
+/** Preserve the exact signed bytes when appending a certified transfer. */
 export function appendTransfer(token: Uint8Array, tx: Uint8Array, proof: Uint8Array): Uint8Array {
-  const k = array(tagContent(scanNative(token), TAG.token), 3);
-  const pairs = k[2].kids.map((p) => raw(token, p));
-  return cTag(TAG.token, cArr(cUint(2), raw(token, k[1]), cArr(...pairs, cArr(tx, proof))));
+  const part = decodeToken(token);
+  const pairs = part.transfersRaw.map((rawTx, i) => cArr(rawTx, encodeProof(part.proofs[i])));
+  const last = frameLevel(part.allocation, part.mintRaw, encodeProof(part.mintProof), [...pairs, cArr(tx, proof)]);
+  return frameLineage([...part.ancestors.map(encodeLevel), last]);
 }
 
 /** The current owner predicate and state of a decoded token. */
-export function headOf(t: Token): { owner: Predicate; state: Uint8Array } {
+export function headOf(t: LineageLevel): { owner: Predicate; state: Uint8Array } {
   const id = tokenIdOf(t.mint.salt, t.mint.network);
   let state = resultState(mintSourceHash(id), id);
   let owner = t.mint.recipient;
@@ -115,26 +125,32 @@ export const freshMask = (): Uint8Array => crypto.getRandomValues(new Uint8Array
 
 // ---- splits -------------------------------------------------------------------------------------
 
-export interface SplitOutput { ownerKey: Uint8Array; amount: bigint; salt: Uint8Array }
+export interface SplitOutput { ownerKey: Uint8Array; amount: bigint; salt: Uint8Array; deadline?: Deadline }
 
 /** The fixed parts of a split: the manifest, its burn transfer, and each child's mint template (without its justification). */
-export function splitPlan(parent: Token, outputs: SplitOutput[], ty: Uint8Array, aid: Uint8Array, mask: Uint8Array, deadline: Deadline = null): {
+export function splitPlan(parent: LineageLevel, outputs: SplitOutput[], ty: Uint8Array, aid: Uint8Array, mask: Uint8Array, deadline: Deadline = null): {
   manifest: Uint8Array; burn: TransferTx; children: MintTx[]; tree: SumTree; parentId: Uint8Array;
 } {
+  for (const output of outputs) {
+    parseKey(output.ownerKey);
+    if (output.salt.length !== 32 || (output.deadline != null && (output.deadline <= 0n || output.deadline > MAX_U64))) {
+      refuse('BadInput', 'invalid child salt or deadline');
+    }
+  }
   const parentId = tokenIdOf(parent.mint.salt, parent.mint.network);
   const children: MintTx[] = outputs.map((o) => ({
-    network: parent.mint.network, recipient: signaturePredicate(o.ownerKey), salt: o.salt, type: ty, justification: null, data: valueData(aid, o.amount), deadline: null,
+    network: parent.mint.network, recipient: signaturePredicate(o.ownerKey), salt: o.salt, type: ty, justification: null, data: valueData(aid, o.amount), deadline: o.deadline ?? null,
   }));
   const tree = SumTree.build(children.map((m, i) => ({ key: tokenIdOf(m.salt, m.network), data: splitOutputCommitment(parentId, m), value: outputs[i].amount })));
   const manifest = encodeSplitManifest(tree.root);
   return { manifest, burn: { recipient: burnPredicate(HU(manifest)), mask, data: manifest, deadline }, children, tree, parentId };
 }
 
-/** A child's mint with its split reason over the exact burned parent token. */
-export function childMint(burnedParent: Uint8Array, tree: SumTree, child: MintTx): MintTx {
+/** Prepare a child after the parent split verifier has derived its authenticated link. */
+export function childMint(link: Uint8Array, tree: SumTree, child: MintTx): { mint: MintTx; allocation: Uint8Array } {
   const proof = tree.proof(tokenIdOf(child.salt, child.network));
   if (proof === null) throw new WalletError('BadInput', 'child not in the allocation tree');
-  return { ...child, justification: encodeSplitJustification(burnedParent, proof) };
+  return { mint: { ...child, justification: encodeSplitJustification(link) }, allocation: encodeSumProof(proof) };
 }
 
 export { encodePredicate };

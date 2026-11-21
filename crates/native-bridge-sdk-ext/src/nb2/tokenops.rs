@@ -1,8 +1,3 @@
-//! Ordinary token operations on the unchanged SDK wire (`tokenops.ts`): the root mint with the receipt-backed reason, transfers,
-//! the return burn and the split (burn-and-mint with the protocol 6 lineage formats). Transactions are built byte for byte as
-//! the SDK builds them, signed by the owner's [`OwnerSigner`] (the universal minter for a mint), and certified by an
-//! [`Aggregator`]. Every certified result is verified offline by this package's verifier before the bridge returns it.
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use num_bigint::BigUint;
@@ -10,11 +5,14 @@ use num_bigint::BigUint;
 use super::cbor::*;
 use super::config::tag;
 use super::crypto::{
-    hu, minter_scalar, public_key, sign_recoverable, sign_unlock, unlock_message, verify_unlock,
+    hu, minter_scalar, minter_scalar_valid, parse_key, public_key, sign_recoverable, sign_unlock,
+    unlock_message, verify_unlock,
 };
+use super::deposit::{decode_receipt_backing, limits};
 use super::errors::{refuse, Error, Result, WalletReason};
 use super::split::{
-    encode_split_justification, encode_split_manifest, split_output_commitment, SumLeaf, SumTree,
+    decode_split_justification, encode_split_justification, encode_split_manifest,
+    encode_sum_proof, split_output_commitment, SumLeaf, SumTree,
 };
 use super::token::*;
 
@@ -69,11 +67,34 @@ pub struct Request {
 
 /// The certification request of a mint: the universal minter's unlock over (h0, txHash).
 pub fn mint_request(m: &MintTx) -> Result<Request> {
+    let reason = m.justification.as_deref().unwrap_or_default();
     let tx = encode_mint(m);
+    let kind = head_tag(reason);
+    let fits = match kind {
+        Some(tag::RECEIPT_BACKING) => {
+            reason.len() <= limits::JUSTIFICATION_BYTES && tx.len() <= MAX_ROOT_MINT
+        }
+        Some(tag::SPLIT_JUSTIFICATION) => tx.len() <= MAX_CHILD_MINT,
+        _ => false,
+    };
+    if !fits {
+        return refuse(
+            WalletReason::BadInput,
+            "missing or oversized bridge mint reason",
+        );
+    }
+    if kind == Some(tag::RECEIPT_BACKING) {
+        decode_receipt_backing(reason)?;
+    } else {
+        decode_split_justification(reason)?;
+    }
     let id = token_id_of(&m.salt, m.network);
     let h0 = mint_source_hash(&id);
     let tx_hash = hu(&[&tx]);
     let key = minter_scalar(&id);
+    if !minter_scalar_valid(&key) {
+        return refuse(WalletReason::BadInput, "invalid universal minter scalar");
+    }
     let unlock = sign_unlock(&key, &h0, &tx_hash);
     let pk = public_key(&key);
     verify_unlock(&pk, &h0, &tx_hash, &unlock)?;
@@ -90,28 +111,46 @@ pub fn mint_request(m: &MintTx) -> Result<Request> {
     })
 }
 
-/// The exact token of one certified mint.
+/// Export a certified root.
 pub fn token_of_mint(tx: &[u8], proof: &[u8]) -> Vec<u8> {
-    c_tag(
-        tag::TOKEN,
-        &c_arr(&[&c_uint(2), &c_arr(&[tx, proof]), &c_arr(&[])]),
-    )
+    frame_lineage(&[frame_level(&[], tx, proof, &[])])
 }
 
-/// A token with one more certified transfer: the exact earlier pairs, then (tx, proof).
+/// Add the child level to the exact signed records of the parent.
+pub fn token_of_child(
+    parent: &[u8],
+    allocation: &[u8],
+    tx: &[u8],
+    proof: &[u8],
+) -> Result<Vec<u8>> {
+    let parent = decode_token(parent)?;
+    let mut levels: Vec<_> = parent.levels().map(encode_level).collect();
+    levels.push(frame_level(allocation, tx, proof, &[]));
+    Ok(frame_lineage(&levels))
+}
+
+/// Preserve the exact signed bytes when appending a certified transfer.
 pub fn append_transfer(token: &[u8], tx: &[u8], proof: &[u8]) -> Result<Vec<u8>> {
-    let it = scan_native(token)?;
-    let k = array(tag_content(&it, tag::TOKEN)?, 3)?;
-    let mut pairs: Vec<Vec<u8>> = k[2].kids.iter().map(|p| raw(token, p).to_vec()).collect();
+    let part = decode_token(token)?;
+    let mut levels: Vec<_> = part.ancestors.iter().map(encode_level).collect();
+    let mut pairs: Vec<_> = part
+        .transfers_raw
+        .iter()
+        .zip(&part.proofs)
+        .map(|(tx, proof)| c_arr(&[tx, &encode_proof(proof)]))
+        .collect();
     pairs.push(c_arr(&[tx, proof]));
-    Ok(c_tag(
-        tag::TOKEN,
-        &c_arr(&[&c_uint(2), raw(token, &k[1]), &c_arr_v(&pairs)]),
-    ))
+    levels.push(frame_level(
+        &part.allocation,
+        &part.mint_raw,
+        &encode_proof(&part.mint_proof),
+        &pairs,
+    ));
+    Ok(frame_lineage(&levels))
 }
 
 /// The current owner predicate and state of a decoded token.
-pub fn head_of(t: &Token) -> (Predicate, [u8; 32]) {
+pub fn head_of(t: &LineageLevel) -> (Predicate, [u8; 32]) {
     let id = token_id_of(&t.mint.salt, t.mint.network);
     let mut state = result_state(&mint_source_hash(&id), &id);
     let mut owner = t.mint.recipient.clone();
@@ -169,6 +208,7 @@ pub struct SplitOutput {
     pub owner_key: Vec<u8>,
     pub amount: BigUint,
     pub salt: Vec<u8>,
+    pub deadline: Deadline,
 }
 
 /// The fixed parts of a split: the manifest, its burn transfer, and each child's mint template (without its justification).
@@ -182,13 +222,19 @@ pub struct SplitPlan {
 }
 
 pub fn split_plan(
-    parent: &Token,
+    parent: &LineageLevel,
     outputs: &[SplitOutput],
     ty: &[u8],
     aid: &[u8],
     mask: &[u8],
     deadline: Deadline,
 ) -> Result<SplitPlan> {
+    for output in outputs {
+        parse_key(&output.owner_key)?;
+        if output.salt.len() != 32 || output.deadline == Some(0) {
+            return refuse(WalletReason::BadInput, "invalid child salt or deadline");
+        }
+    }
     let parent_id = token_id_of(&parent.mint.salt, parent.mint.network);
     let children: Vec<MintTx> = outputs
         .iter()
@@ -199,7 +245,7 @@ pub fn split_plan(
             ty: ty.to_vec(),
             justification: None,
             data: Some(value_data(aid, &o.amount)),
-            deadline: None,
+            deadline: o.deadline,
         })
         .collect();
     let leaves: Vec<SumLeaf> = children
@@ -228,15 +274,18 @@ pub fn split_plan(
     })
 }
 
-/// A child's mint with its split reason over the exact burned parent token.
-pub fn child_mint(burned_parent: &[u8], tree: &SumTree, child: &MintTx) -> Result<MintTx> {
+/// Prepare a child after the parent split verifier has derived its authenticated link.
+pub fn child_mint(link: &[u8; 32], tree: &SumTree, child: &MintTx) -> Result<(MintTx, Vec<u8>)> {
     let Some(proof) = tree.proof(&token_id_of(&child.salt, child.network)) else {
         return refuse(WalletReason::BadInput, "child not in the allocation tree");
     };
-    Ok(MintTx {
-        justification: Some(encode_split_justification(burned_parent, &proof)),
-        ..child.clone()
-    })
+    Ok((
+        MintTx {
+            justification: Some(encode_split_justification(link)),
+            ..child.clone()
+        },
+        encode_sum_proof(&proof),
+    ))
 }
 
 /// A fresh 32-byte random value (a state mask or a salt).

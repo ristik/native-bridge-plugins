@@ -6,17 +6,18 @@ import {
 import { HU } from './crypto.js';
 import { Nb2Error, fail, type Rule } from './errors.js';
 
-export const NATIVE_BRIDGE_PROTO_VERSION = 9;
+export const NATIVE_BRIDGE_PROTO_VERSION = 10;
 
 export const TAG = {
-  predicate: 39032n, mint: 39041n, transfer: 39045n, certification: 39031n, token: 39040n, inclusion: 39033n, value: 39050n,
+  predicate: 39032n, mint: 39041n, transfer: 39045n, certification: 39031n, inclusion: 39033n, value: 39050n,
   splitJustification: 39044n, splitManifest: 39046n, receiptBacking: 39051n, segmentReturn: 39052n,
 } as const;
 
+export const CONFIG_VERSION = 2n;
 export const V2_VERSION = 1n;
 export const DOMAIN = {
   config: 'UNICITY_NB2_CFG', depositIntent: 'UNICITY_NB2_DEPOSIT_INTENT', depositSalt: 'UNICITY_NB2_DEPOSIT_SALT', burn: 'UNICITY_NB2_BURN',
-  redemption: 'UNICITY_NB2_REDEMPTION', splitOutput: 'UNICITY_SPLIT_OUTPUT',
+  redemption: 'UNICITY_NB2_REDEMPTION', splitOutput: 'UNICITY_NB2_11_OUTPUT',
 } as const;
 
 /** a_UCT = H_U(UTF8("unicity-nb2-asset:native-uct")). */
@@ -67,7 +68,7 @@ export const CONFIG_ARITY = 19;
 
 export function encodeConfig(c: Config): Uint8Array {
   return cArr(
-    cBytes(ascii(DOMAIN.config)), cUint(V2_VERSION), cUint(c.network), cBytes(c.rootGenesis), cBytes(c.executionGenesis), cUint(c.chainId),
+    cBytes(ascii(DOMAIN.config)), cUint(CONFIG_VERSION), cUint(c.network), cBytes(c.rootGenesis), cBytes(c.executionGenesis), cUint(c.chainId),
     cUint(c.evmPartition), cBytes(c.evmShard), cUint(c.aggregatorPartition), cBytes(c.vault), cBytes(c.asset), cBytes(c.ty), cBytes(c.aid),
     cBytes(c.semanticProfileHash), cBytes(c.verifier), cBytes(c.verifierCodeHash), cUint(c.K), cUint(c.B), cAmount(c.Qmax),
   );
@@ -108,7 +109,7 @@ export function decodeConfig(b: Uint8Array, p: Params): Config {
   if (b.length > MAX_CONFIG_BYTES) throw new ConfigError(CONFIG_ARITY, new Nb2Error('InputTooLarge'));
   const k = at(CONFIG_ARITY, () => array(scanOne(b), CONFIG_ARITY));
   at(0, () => literal(k[0], DOMAIN.config));
-  at(1, () => version(k[1], V2_VERSION));
+  at(1, () => version(k[1], CONFIG_VERSION));
   const network = Number(at(2, () => uintIn(k[2], 1n, 65535n)));
   const rootGenesis = at(3, () => bytesN(k[3], 32));
   const executionGenesis = at(4, () => bytesN(k[4], 32));
@@ -142,12 +143,12 @@ export function decodeConfig(b: Uint8Array, p: Params): Config {
 const identityString = (network: number, rootGenesis: Uint8Array, executionGenesis: Uint8Array, chainId: bigint): string =>
   `${network}:${toHex(rootGenesis)}:${toHex(executionGenesis)}:${chainId}`;
 
-/** ty = H_U(UTF8("unicity-bridge:unicity-native-nb2:" + Dstr)). */
+/** ty = H_U(UTF8("unicity-bridge:unicity-native-nb2-11:" + Dstr)). */
 export const deriveType = (network: number, rootGenesis: Uint8Array, executionGenesis: Uint8Array, chainId: bigint): Uint8Array =>
-  HU(ascii(`unicity-bridge:unicity-native-nb2:${identityString(network, rootGenesis, executionGenesis, chainId)}`));
-/** aid = H_U(UTF8("unicity-bridge-coin:unicity-native-nb2:" + Dstr)). */
+  HU(ascii(`unicity-bridge:unicity-native-nb2-11:${identityString(network, rootGenesis, executionGenesis, chainId)}`));
+/** aid = H_U(UTF8("unicity-bridge-coin:unicity-native-nb2-11:" + Dstr)). */
 export const deriveCoin = (network: number, rootGenesis: Uint8Array, executionGenesis: Uint8Array, chainId: bigint): Uint8Array =>
-  HU(ascii(`unicity-bridge-coin:unicity-native-nb2:${identityString(network, rootGenesis, executionGenesis, chainId)}`));
+  HU(ascii(`unicity-bridge-coin:unicity-native-nb2-11:${identityString(network, rootGenesis, executionGenesis, chainId)}`));
 
 /** What the vault constructor checks Γ against. */
 export interface Environment { address: Uint8Array; chainId: bigint; verifierCodeHash: Uint8Array }

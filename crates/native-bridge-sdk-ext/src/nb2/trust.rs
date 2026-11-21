@@ -12,13 +12,20 @@ use super::cbor::{array, is_bytes, is_uint, scan_native, tag_content};
 use super::config::Config;
 use super::errors::{fail, fail_d, refuse, wrap, Error, Nb2Error, Result, Rule, WalletReason};
 use crate::error::NativeError;
-pub use crate::trust::TrustInput;
+pub use crate::trust::{AuthenticatedOrigin, TrustInput};
 
 /// The B1 bound of one certificate's bytes (b1ref.MaxUCBytes).
 pub const MAX_B1_UC_BYTES: usize = 24_576;
+const MAX_B1_SIGNATURES: usize = 16;
 
 /// The history must be the one Γ names: its genesis EntryID is rootGenesis32 and its network Γ's.
 pub fn bind_trust(t: &TrustInput, c: &Config) -> Result<()> {
+    if !t.origin().is_some_and(|origin| origin.root_round > 0) {
+        return refuse(
+            WalletReason::TrustInput,
+            "an authenticated B1 origin is required",
+        );
+    }
     if t.id() != c.root_genesis || t.network_id().id() != c.network {
         return refuse(
             WalletReason::TrustInput,
@@ -88,6 +95,9 @@ fn scan_certificate(raw: &[u8]) -> Result<()> {
         return fail_d(Rule::Shape, "seal network");
     }
     let sigs = &seal[7].kids;
+    if sigs.len() > 2 * MAX_B1_SIGNATURES {
+        return fail_d(Rule::InputTooLarge, "seal signatures");
+    }
     let mut i = 1;
     while i < sigs.len() {
         if !is_bytes(&sigs[i]) {
@@ -149,6 +159,20 @@ pub fn uc_check(
     if uc.unicity_tree_certificate.partition_identifier != partition {
         return fail_d(Rule::CertStructure, "partition");
     }
+    if uc.unicity_seal.signatures.len() > MAX_B1_SIGNATURES {
+        return fail(Rule::UnsupportedCertificateEncoding);
+    }
+    let Some(origin) = t.origin().filter(|origin| origin.root_round > 0) else {
+        return refuse(
+            WalletReason::TrustInput,
+            "an authenticated B1 origin is required",
+        );
+    };
+    if uc.unicity_seal.epoch > origin.usable_epoch
+        || uc.unicity_seal.root_chain_round_number > origin.root_round
+    {
+        return fail_d(Rule::SealEpoch, "seal exceeds the authenticated B1 origin");
+    }
     let mut session = SealSession::new(t.history());
     verify_certificate_of_partition(
         &mut session,
@@ -159,12 +183,28 @@ pub fn uc_check(
     .map_err(|e| {
         let rule = crate::trust::certificate_failure(&e).map_or(Rule::QuorumNotMet, native_to_rule);
         Error::Rule(Nb2Error::with_detail(rule, alloc::format!("{e:?}")))
-    })
+    })?;
+    // A checkpoint beyond this epoch proves it has closed. The SDK can enforce its
+    // exclusive end only after the authenticated successor is held.
+    let epoch = uc.unicity_seal.epoch;
+    if epoch < origin.usable_epoch {
+        let Some(successor) = t.history().get(epoch + 1) else {
+            return fail_d(
+                Rule::NoEntryForEpoch,
+                alloc::format!("missing authenticated successor for epoch {epoch}"),
+            );
+        };
+        if uc.unicity_seal.root_chain_round_number >= successor.epoch_start {
+            return fail_d(Rule::SealEpoch, "seal is outside its closed epoch");
+        }
+    }
+    Ok(())
 }
 
-/// A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Every failure is `DepositUC` except
-/// `NoEntryForEpoch`, which keeps its retryable name (carrying `DepositUC`, its on-chain name).
+/// A deposit or seal receipt's EVM certificate for exactly (Γ.evmPartition, Γ.evmShard). Certificate failures are wrapped in
+/// `DepositUC`. Trust binding and retryable `NoEntryForEpoch` keep their own errors.
 pub fn verify_evm_uc(t: &TrustInput, raw: &[u8], c: &Config) -> Result<UnicityCertificate> {
+    bind_trust(t, c)?;
     let uc = decode_uc(raw).map_err(|e| wrap(Rule::DepositUC, e))?;
     if ShardId::decode(&c.evm_shard).is_err() {
         return fail_d(Rule::DepositUC, "Γ.evmShard");
@@ -187,4 +227,33 @@ pub fn in_shard(shard: &ShardId, sid: &[u8]) -> bool {
 /// The shard of a certificate, re-encoded.
 pub fn shard_bytes(uc: &UnicityCertificate) -> alloc::vec::Vec<u8> {
     uc.shard_tree_certificate.shard.encode()
+}
+
+/// For one complete seal and shard, canonical UC equality implies exact B1 claim equality.
+#[derive(Default)]
+pub(crate) struct ClaimConsistency {
+    claims: alloc::collections::BTreeMap<([u8; 32], u32, alloc::vec::Vec<u8>), [u8; 32]>,
+}
+
+impl ClaimConsistency {
+    pub(crate) fn check(&mut self, uc: &UnicityCertificate, raw: &[u8]) -> Result<()> {
+        let key = (
+            super::crypto::hu(&[&uc.unicity_seal.to_cbor()]),
+            uc.unicity_tree_certificate.partition_identifier,
+            shard_bytes(uc),
+        );
+        let digest = super::crypto::hu(&[raw]);
+        if self
+            .claims
+            .get(&key)
+            .is_some_and(|previous| *previous != digest)
+        {
+            return fail_d(
+                Rule::CertStructure,
+                "conflicting claims for the same seal and shard",
+            );
+        }
+        self.claims.insert(key, digest);
+        Ok(())
+    }
 }

@@ -17,19 +17,19 @@ use super::config::tag;
 use super::crypto::{he, hu};
 use super::deposit::decode_receipt_backing;
 use super::segment::gap_proof_len;
-use super::split::decode_split_justification;
+use super::split::decode_sum_proof;
 use super::token::{
-    concat, encode_proof, encode_token, mint_source_hash, result_state, state_id, token_id_of,
-    Predicate, Token, PRED_SIGNATURE,
+    concat, encode_proof, mint_source_hash, result_state, state_id, token_id_of, LineageLevel,
+    Predicate, PRED_SIGNATURE,
 };
 use super::util::{from_hex, to_hex};
 
 /// What the gas model sees of a prospective redemption.
 pub struct RedeemShape<'a> {
-    /// The evidence bytes (`C(1, Token)`), or an upper bound of their length when the burn does not exist yet.
+    /// The flat evidence bytes, or an upper bound of their length when the burn does not exist yet.
     pub evidence_bytes: usize,
     /// The decoded token of the lineage walk, root first, when known (counts certificates, signatures and paths).
-    pub lineage: &'a [Token],
+    pub lineage: &'a [LineageLevel],
     /// Transactions the evidence will hold that are not in `lineage` yet (the burn about to be made).
     pub pending_transactions: usize,
     /// Historical gap proofs.
@@ -681,7 +681,7 @@ impl ProbeTable {
 }
 
 /// The part's current owner and state (`tokenops` head, repeated here to keep this module free of the signing code).
-fn head_of(t: &Token) -> (Predicate, [u8; 32]) {
+fn head_of(t: &LineageLevel) -> (Predicate, [u8; 32]) {
     let id = token_id_of(&t.mint.salt, t.mint.network);
     let mut state = result_state(&mint_source_hash(&id), &id);
     let mut owner = t.mint.recipient.clone();
@@ -782,25 +782,27 @@ pub fn redeem_features(s: &RedeemShape<'_>) -> Option<RedeemFeatures> {
     let dp = decode_receipt_backing(j).ok()?.proof;
     let evm = shape_of(&dp.uc)?;
     let rcpt = receipt_shape(&dp.header, &dp.nodes, dp.log_index)?;
-    // the CBOR walks (`gas.ts` redeemFeatures): scan of the evidence, every split justification, J and every transaction's data;
-    // skip of every parent token, every genesis, every proof's UC and every predicate's three fields
+    // Count each flat decoding unit, including the separate root reason and child allocations.
     let mut scan = CborCount {
         items: 2,
         long: 0,
         nodes: 1,
     };
     let mut skip = CborCount::default();
-    scan.add(cbor_count(&encode_token(part)));
     scan.add(cbor_count(j));
     let mut alloc_steps = 0;
     for (i, t) in l.iter().enumerate() {
         if i > 0 {
             let sj = t.mint.justification.as_deref()?;
             scan.add(cbor_count(sj));
-            alloc_steps += decode_split_justification(sj).ok()?.proof.len();
+            alloc_steps += decode_sum_proof(&t.allocation).ok()?.len();
+            scan.add(cbor_count(&t.allocation));
         }
-        if i < l.len() - 1 {
-            skip.add(cbor_count(&encode_token(t)));
+        scan.add(cbor_count(&t.mint_raw));
+        scan.add(cbor_count(&encode_proof(&t.mint_proof)));
+        for (tx, proof) in t.transfers_raw.iter().zip(&t.proofs) {
+            scan.add(cbor_count(tx));
+            scan.add(cbor_count(&encode_proof(proof)));
         }
         skip.items += 1;
         skip.nodes += 1;
@@ -1285,7 +1287,8 @@ fn rebuilt(
 /// exactly the calibrated artifacts with the immutables this deployment must have, and the manifest pins [`NATIVE_GAS_SCHEDULE`].
 pub fn calibrated_deployment(d: &DeploymentCode<'_>) -> bool {
     use calibrated_deployment as c;
-    if d.native_gas_schedule != Some(NATIVE_GAS_SCHEDULE) {
+    // The measured binaries used configuration version 1.
+    if d.gamma.get(17) != Some(&1) || d.native_gas_schedule != Some(NATIVE_GAS_SCHEDULE) {
         return false;
     }
     if to_hex(&he(&[d.helper_code])) != c::HELPER_CODE_HASH || d.verifier.len() != 20 {

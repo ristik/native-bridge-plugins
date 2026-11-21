@@ -3,7 +3,7 @@ import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
 import { concat, eq } from '../bytes.js';
-import { array, ascii, bstr, bytesN, cArr, cBytes, cTag, cUint, scanOne, tagContent, u256, uintIn, version, type Item } from './cbor.js';
+import { MAJ_ARRAY, array, ascii, bstr, bytesN, cArr, cBytes, cTag, cUint, scanBoundedArray, tagContent, u256, uintIn, version, type Item } from './cbor.js';
 import { DOMAIN, MAX_DEPOSIT, MAX_INDEX, TAG, V2_VERSION, type Config } from './config.js';
 import { HE, HU } from './crypto.js';
 import { fail } from './errors.js';
@@ -56,7 +56,7 @@ export const encodeReceiptBacking = (j: ReceiptBacking): Uint8Array =>
 
 export function decodeReceiptBacking(b: Uint8Array): ReceiptBacking {
   if (b.length > LIMITS.justificationBytes) fail('InputTooLarge');
-  const k = array(tagContent(scanOne(b), TAG.receiptBacking), 5);
+  const k = array(tagContent(scanBoundedArray(b, [0, 4, 5], LIMITS.receiptNodes, 'InputTooLarge'), TAG.receiptBacking), 5);
   version(k[0], V2_VERSION);
   const d = bytesN(k[1], 32);
   const n = uintIn(k[2], 1n, MAX_DEPOSIT);
@@ -67,7 +67,8 @@ export function decodeReceiptBacking(b: Uint8Array): ReceiptBacking {
 /** A standalone DepositProof container (a seal receipt). */
 export function decodeDepositProof(b: Uint8Array): DepositProof {
   if (b.length > LIMITS.justificationBytes) fail('InputTooLarge');
-  return decodeDepositProofItem(scanOne(b));
+  if (b.length !== 0 && b[0] >> 5 !== MAJ_ARRAY) fail('Shape');
+  return decodeDepositProofItem(scanBoundedArray(b, [5], LIMITS.receiptNodes, 'InputTooLarge'));
 }
 
 function decodeDepositProofItem(it: Item): DepositProof {
@@ -83,7 +84,6 @@ function decodeDepositProofItem(it: Item): DepositProof {
   const txIndex = uintIn(k[3], 0n, MAX_INDEX);
   const logIndex = uintIn(k[4], 0n, MAX_INDEX);
   if (k[5].major !== 4) fail('Shape');
-  if (k[5].kids.length > LIMITS.receiptNodes) fail('InputTooLarge');
   const nodes = k[5].kids.map((x, i) => blob(x, i === k[5].kids.length - 1 ? LIMITS.receiptLeafNodeBytes : LIMITS.receiptBranchNodeBytes));
   return { uc, header, txIndex, logIndex, nodes };
 }

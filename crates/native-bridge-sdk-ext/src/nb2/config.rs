@@ -10,7 +10,7 @@ use super::crypto::hu;
 use super::errors::{Error, Nb2Error, Result, Rule};
 use super::util::{max_bits, to_hex};
 
-pub const NATIVE_BRIDGE_PROTO_VERSION: u64 = 9;
+pub const NATIVE_BRIDGE_PROTO_VERSION: u64 = 10;
 
 /// The CBOR tags of the profile.
 pub mod tag {
@@ -18,7 +18,6 @@ pub mod tag {
     pub const MINT: u64 = 39041;
     pub const TRANSFER: u64 = 39045;
     pub const CERTIFICATION: u64 = 39031;
-    pub const TOKEN: u64 = 39040;
     pub const INCLUSION: u64 = 39033;
     pub const VALUE: u64 = 39050;
     pub const SPLIT_JUSTIFICATION: u64 = 39044;
@@ -27,6 +26,7 @@ pub mod tag {
     pub const SEGMENT_RETURN: u64 = 39052;
 }
 
+pub const CONFIG_VERSION: u64 = 2;
 pub const V2_VERSION: u64 = 1;
 
 /// The domain strings.
@@ -36,7 +36,7 @@ pub mod domain {
     pub const DEPOSIT_SALT: &str = "UNICITY_NB2_DEPOSIT_SALT";
     pub const BURN: &str = "UNICITY_NB2_BURN";
     pub const REDEMPTION: &str = "UNICITY_NB2_REDEMPTION";
-    pub const SPLIT_OUTPUT: &str = "UNICITY_SPLIT_OUTPUT";
+    pub const SPLIT_OUTPUT: &str = "UNICITY_NB2_11_OUTPUT";
 }
 
 /// a_UCT = H_U(UTF8("unicity-nb2-asset:native-uct")).
@@ -153,7 +153,7 @@ pub const CONFIG_ARITY: usize = 19;
 pub fn encode_config(c: &Config) -> Vec<u8> {
     c_arr_v(&[
         c_bytes(domain::CONFIG.as_bytes()),
-        c_uint(V2_VERSION),
+        c_uint(CONFIG_VERSION),
         c_uint(c.network as u64),
         c_bytes(&c.root_genesis),
         c_bytes(&c.execution_genesis),
@@ -220,7 +220,7 @@ pub fn decode_config(b: &[u8], p: &Params) -> Result<Config> {
     let root = at(CONFIG_ARITY, scan_one(b))?;
     let k = at(CONFIG_ARITY, array(&root, CONFIG_ARITY))?;
     at(0, literal(&k[0], domain::CONFIG))?;
-    at(1, version(&k[1], V2_VERSION))?;
+    at(1, version(&k[1], CONFIG_VERSION))?;
     let network = at(2, uint_in(&k[2], 1, 65535))? as u16;
     let root_genesis = a32(at(3, bytes_n(&k[3], 32))?);
     let execution_genesis = a32(at(4, bytes_n(&k[4], 32))?);
@@ -289,7 +289,7 @@ fn identity_string(
     )
 }
 
-/// ty = H_U(UTF8("unicity-bridge:unicity-native-nb2:" + Dstr)).
+/// ty = H_U(UTF8("unicity-bridge:unicity-native-nb2-11:" + Dstr)).
 pub fn derive_type(
     network: u16,
     root_genesis: &[u8],
@@ -297,13 +297,13 @@ pub fn derive_type(
     chain_id: u64,
 ) -> [u8; 32] {
     let s = format!(
-        "unicity-bridge:unicity-native-nb2:{}",
+        "unicity-bridge:unicity-native-nb2-11:{}",
         identity_string(network, root_genesis, execution_genesis, chain_id)
     );
     hu(&[s.as_bytes()])
 }
 
-/// aid = H_U(UTF8("unicity-bridge-coin:unicity-native-nb2:" + Dstr)).
+/// aid = H_U(UTF8("unicity-bridge-coin:unicity-native-nb2-11:" + Dstr)).
 pub fn derive_coin(
     network: u16,
     root_genesis: &[u8],
@@ -311,7 +311,7 @@ pub fn derive_coin(
     chain_id: u64,
 ) -> [u8; 32] {
     let s = format!(
-        "unicity-bridge-coin:unicity-native-nb2:{}",
+        "unicity-bridge-coin:unicity-native-nb2-11:{}",
         identity_string(network, root_genesis, execution_genesis, chain_id)
     );
     hu(&[s.as_bytes()])

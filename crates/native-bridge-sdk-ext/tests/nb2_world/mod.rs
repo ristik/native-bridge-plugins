@@ -32,12 +32,12 @@ use native_bridge_sdk_ext::nb2::rpc::{JsonRpc, RpcError};
 use native_bridge_sdk_ext::nb2::segment::segment_sealed_data;
 use native_bridge_sdk_ext::nb2::token::leaf_value;
 use native_bridge_sdk_ext::nb2::tokenops::Aggregator;
+use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
 use native_bridge_sdk_ext::nb2::util::{arr, be_int, from_hex, hex0x, to_u64, u256, u256_64};
 use native_bridge_sdk_ext::nb2::vaultmodel::{
     tag_words, RecipientBehaviour, VaultEvent, VaultModel, VerifierAnswer,
 };
 use native_bridge_sdk_ext::nb2::verify::{verdict_abi, verify_return};
-use native_bridge_sdk_ext::trust::TrustInput;
 use num_bigint::BigUint;
 use serde_json::{json, Map, Value};
 use unicity_token::api::bft::{
@@ -125,7 +125,12 @@ pub fn make_root(n: usize) -> Root {
     let bundle = TrustBaseHistory::from_trusted_chain(vec![entry])
         .unwrap()
         .to_bundle();
-    let trust = TrustInput::from_bundle(&bundle, &pin).unwrap();
+    let trust = TrustInput::from_bundle(&bundle, &pin)
+        .unwrap()
+        .with_authenticated_origin(AuthenticatedOrigin {
+            usable_epoch: 1,
+            root_round: 1_000_000,
+        });
     Root {
         signers,
         bundle,
@@ -140,7 +145,12 @@ pub fn root_of(bundle: &[u8], pin: [u8; 32], n: usize) -> Root {
         signers: signers_of(n),
         bundle: bundle.to_vec(),
         pin,
-        trust: TrustInput::from_bundle(bundle, &pin).unwrap(),
+        trust: TrustInput::from_bundle(bundle, &pin)
+            .unwrap()
+            .with_authenticated_origin(AuthenticatedOrigin {
+                usable_epoch: 1,
+                root_round: 1_000_000,
+            }),
     }
 }
 

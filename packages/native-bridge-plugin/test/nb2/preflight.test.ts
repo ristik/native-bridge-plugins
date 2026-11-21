@@ -5,7 +5,7 @@ import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/Cer
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { SignaturePredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicate.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
 import { TokenSalt } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenSalt.js';
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js';
 
@@ -13,9 +13,9 @@ import { eq } from '../../src/bytes.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
-import { decodeToken, signaturePredicate } from '../../src/nb2/token.js';
+import { decodeToken, encodeProof, signaturePredicate } from '../../src/nb2/token.js';
 import { localOwner, mintRequest } from '../../src/nb2/tokenops.js';
-import { evmAccount, key, setup, VAULT } from './world.js';
+import { evmAccount, key, setup, FakeChain, VAULT } from './world.js';
 import type { GasModel } from '../../src/nb2/gas.js';
 import { ProvisionalGasModel } from '../../src/nb2/gas.js';
 
@@ -65,9 +65,10 @@ test('preflight: an oversized token, unfundable gas and an unboundable gas cost 
 });
 
 test('the default gas estimate is refused for a verifier it is not calibrated for: the stand-in verifier code is not Γ\'s', async () => {
-  const s = await minted({ gas: undefined });
-  assert.equal(s.w.gas.name, 'estimate-nb2-1179');
-  assert.equal(await outcome(s.w.planReturn(s.token, r, s.payer.address)), 'BadDeployment');
+  const s = await minted();
+  const bridge = await NativeBridgeV2.open({ ...s.options('default gas'), gas: undefined });
+  assert.equal(bridge.gas.name, 'estimate-nb2-1179');
+  assert.equal(await outcome(bridge.planReturn(s.token, r, s.payer.address)), 'BadDeployment');
   // the world's own tests supply the model as a wallet supplies its own (world.ts WORLD_GAS): no build check, the bound as computed
 });
 
@@ -97,7 +98,7 @@ test('index rule: a plain state() read is not evidence outside stateReadOnly; an
   assert.equal((await u.w.planReturn(u.token, r, u.payer.address)).a, 0n);
 });
 
-test('SDK parity: the plug-in mint is the SDK mint, and the SDK decodes the minted token', async () => {
+test('SDK parity: the plug-in mint is the SDK mint, and the SDK decodes its inclusion proof', async () => {
   const s = await minted();
   const t = decodeToken(s.token);
   const sdkMint = await MintTransaction.create(NetworkId.fromId(t.mint.network), SignaturePredicate.create(s.owner.publicKey), {
@@ -106,8 +107,8 @@ test('SDK parity: the plug-in mint is the SDK mint, and the SDK decodes the mint
   assert.ok(eq(sdkMint.toCBOR(), t.mintRaw));
   const ours = mintRequest({ ...t.mint, recipient: signaturePredicate(s.owner.publicKey) });
   assert.ok(eq((await CertificationData.fromMintTransaction(sdkMint)).toCBOR(), ours.cd));
-  const sdk = await SdkToken.fromCBOR(s.token);
-  assert.ok(eq(sdk.toCBOR(), s.token));
+  const proof = encodeProof(t.mintProof);
+  assert.ok(eq(InclusionProof.fromCBOR(proof).toCBOR(), proof));
 });
 
 test('unlock recovery IDs 2 and 3 are refused (astra delta ruling): such a lineage is not returnable', async () => {
@@ -123,4 +124,25 @@ test('unlock recovery IDs 2 and 3 are refused (astra delta ruling): such a linea
     bad[64] = id;
     assert.throws(() => verifyUnlock(secp256k1.getPublicKey(k, true), src, tx, bad), (e) => e instanceof Nb2Error && e.rule === 'UnlockRecovery');
   }
+});
+
+test('deposit estimates the pinned protocol 10 deployment and checks its gas limit before signing', async () => {
+  const s = await setup();
+  const code = Buffer.from('verifier code');
+  const chain = await FakeChain.create(s.root, { ...s.cfg, verifierCodeHash: HE(code) });
+  const payer = evmAccount(chain, 'estimate payer');
+  const owner = localOwner(key('estimate owner'));
+  chain.code.set(Buffer.from(s.cfg.verifier).toString('hex'), code);
+  const pins = { ...s.pins, gamma: chain.gamma };
+  const options = s.options('estimated deposit');
+  const bridge = await NativeBridgeV2.open({ ...options, pins, rpc: chain, gas: undefined });
+  const plan = await bridge.planDeposit(3n, owner.publicKey);
+  await bridge.submitDeposit(plan, payer);
+  assert.equal((await bridge.journal.depositForUpdate(plan.intent))!.sends[0].gas, '144000');
+  assert.ok(chain.calls.includes('eth_estimateGas'));
+
+  const limited = await NativeBridgeV2.open({ ...s.options('limited deposit'), gas: undefined, rpc: chain, pins: { ...pins, userGasLimit: 143_999n } });
+  const denied = await limited.planDeposit(3n, owner.publicKey);
+  assert.equal(await outcome(limited.submitDeposit(denied, payer)), 'CapacityExceeded');
+  assert.equal((await limited.journal.depositForUpdate(denied.intent))!.sends.length, 0);
 });

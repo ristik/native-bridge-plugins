@@ -691,11 +691,11 @@ fn the_default_gas_bound_is_refused_for_a_verifier_it_is_not_calibrated_for() {
     let w = setup();
     let payer = w.evm_account("p");
     let owner = local_owner(&key("o"));
+    let t = minted(&open(&w, "prefund", World::store()), &payer, &owner, 3);
     let mut o = w.options("w", World::store());
     o.gas = None;
     let b = NativeBridgeV2::open(o).unwrap();
     assert_eq!(b.gas.name(), "estimate-nb2-1179");
-    let t = minted(&b, &payer, &owner, 3);
     assert_eq!(
         reason(b.plan_return(&t, &recipient("recipient"), &payer.address(), None)),
         "BadDeployment"
@@ -1445,7 +1445,9 @@ mod sdk_aggregator {
             recipient: signature_predicate(&local_owner(&key("o")).public_key()),
             salt: vec![seed; 32],
             ty: vec![2; 32],
-            justification: None,
+            justification: Some(
+                native_bridge_sdk_ext::nb2::split::encode_split_justification(&[0; 32]),
+            ),
             data: None,
             deadline: None,
         };
@@ -1542,4 +1544,212 @@ mod sdk_aggregator {
             Some(WalletReason::Unconfirmed)
         );
     }
+}
+
+#[test]
+fn deposit_estimates_the_pinned_protocol_10_deployment_and_checks_the_user_limit() {
+    let mut w = setup();
+    let code = b"verifier code";
+    w.cfg.verifier_code_hash = he(&[code]);
+    w.chain = FakeChain::create(w.root.clone(), w.cfg.clone());
+    w.pins = pins_of(&w.chain);
+    let payer = w.evm_account("estimate payer");
+    let owner = local_owner(&key("estimate owner"));
+    w.chain
+        .with(|s| s.code.insert(w.cfg.verifier, b"verifier code".to_vec()));
+    let mut opts = w.options("estimated deposit", World::store());
+    opts.gas = None;
+    let bridge = NativeBridgeV2::open(opts).unwrap();
+    let plan = bridge.plan_deposit(&big(3), &owner.public_key()).unwrap();
+    bridge.submit_deposit(&plan, &payer).unwrap();
+    assert_eq!(
+        bridge.journal.deposit(plan.intent).unwrap().unwrap().sends[0].gas,
+        "144000"
+    );
+
+    let mut opts = w.options("limited deposit", World::store());
+    opts.gas = None;
+    opts.pins.user_gas_limit = 143_999;
+    let bridge = NativeBridgeV2::open(opts).unwrap();
+    let plan = bridge.plan_deposit(&big(3), &owner.public_key()).unwrap();
+    assert_eq!(
+        reason(bridge.submit_deposit(&plan, &payer)),
+        "CapacityExceeded"
+    );
+    assert!(bridge
+        .journal
+        .deposit(plan.intent)
+        .unwrap()
+        .unwrap()
+        .sends
+        .is_empty());
+}
+
+#[test]
+fn split_retries_the_exact_request_after_an_unusable_parent_proof_and_restart() {
+    use native_bridge_sdk_ext::nb2::cbor::{
+        array, c_arr, c_tag, c_uint, raw, scan_native, tag_content,
+    };
+    use native_bridge_sdk_ext::nb2::config::tag;
+    use native_bridge_sdk_ext::nb2::tokenops::Aggregator;
+    use std::sync::Mutex;
+
+    struct OnceCorrupt {
+        inner: Arc<FakeAggregator>,
+        requests: Mutex<Vec<Vec<u8>>>,
+    }
+    impl Aggregator for OnceCorrupt {
+        fn certify(&self, cd: &[u8]) -> Result<Vec<u8>> {
+            let proof = self.inner.certify(cd)?;
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(cd.to_vec());
+            if requests.len() != 1 {
+                return Ok(proof);
+            }
+            let item = scan_native(&proof)?;
+            let p = array(tag_content(&item, tag::INCLUSION)?, 5)?;
+            Ok(c_tag(
+                tag::INCLUSION,
+                &c_arr(&[
+                    raw(&proof, &p[0]),
+                    raw(&proof, &p[1]),
+                    &c_uint(p[2].arg + 1),
+                    raw(&proof, &p[3]),
+                    raw(&proof, &p[4]),
+                ]),
+            ))
+        }
+    }
+    struct CountSigner(LocalOwner, AtomicUsize);
+    impl OwnerSigner for CountSigner {
+        fn public_key(&self) -> [u8; 33] {
+            self.0.public_key()
+        }
+        fn sign_unlock(&self, digest: &[u8; 32]) -> core::result::Result<[u8; 65], String> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.sign_unlock(digest)
+        }
+    }
+    let w = setup();
+    let store = World::store();
+    let payer = w.evm_account("split retry payer");
+    let owner = CountSigner(local_owner(&key("split retry owner")), AtomicUsize::new(0));
+    let root = minted(&open(&w, "split retry", store.clone()), &payer, &owner.0, 3);
+    let aggregator = Arc::new(OnceCorrupt {
+        inner: w.agg.clone(),
+        requests: Mutex::new(Vec::new()),
+    });
+    let options = || {
+        let mut o = w.options("split retry", store.clone());
+        o.aggregator = aggregator.clone();
+        o
+    };
+    let split_id = key("split retry id");
+    let outputs = [(owner.public_key().to_vec(), big(3))];
+    let bridge = NativeBridgeV2::open(options()).unwrap();
+    assert_eq!(
+        reason(bridge.split(&root, &owner, &outputs, Some(split_id))),
+        "InclusionProof"
+    );
+    let pending = bridge.journal.split(&hex(&split_id)).unwrap().unwrap();
+    assert_eq!(pending.status, "burn-requested");
+    assert!(pending.burned.is_none());
+
+    let restarted = NativeBridgeV2::open(options()).unwrap();
+    let children = restarted
+        .split(&root, &owner, &outputs, Some(split_id))
+        .unwrap();
+    assert_eq!(restarted.verify_token(&children[0]).unwrap().amount, big(3));
+    let requests = aggregator.requests.lock().unwrap();
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(owner.1.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
+    use native_bridge_sdk_ext::nb2::config::Build;
+    use native_bridge_sdk_ext::nb2::token::{decode_token, encode_token};
+    use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+    use unicity_token::api::bft::TrustBaseHistory;
+
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../protocol/vectors/nb2-continuation-v1.1/"
+    );
+    let read = |file: &str| std::fs::read(format!("{CORPUS}{file}")).unwrap();
+    let gamma = read("gamma.bin");
+    let cfg = native_bridge_sdk_ext::nb2::config::decode_config(
+        &gamma,
+        &native_bridge_sdk_ext::nb2::config::production_params(),
+    )
+    .unwrap();
+    let pin = cfg.root_genesis;
+    let bundle = read("transcripts/held-sibling-0/utb.cbor");
+    let extended = TrustInput::from_bundle(&bundle, &pin).unwrap();
+    let lagging = TrustBaseHistory::from_trusted_chain(vec![extended.history().genesis().clone()])
+        .unwrap()
+        .to_bundle();
+    let origin = AuthenticatedOrigin {
+        usable_epoch: 2,
+        root_round: 1_005,
+    };
+    let held = read("transcripts/held-sibling-0/evidence.bin");
+    let mut future = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
+    future.part.transfers.pop();
+    future.part.transfers_raw.pop();
+    future.part.proofs.pop();
+    let future = encode_token(&future);
+
+    for offers_origin in [false, true] {
+        let world = setup();
+        let foreign = world.root.trust.clone();
+        let mut opts = world.options("authenticated refresh", World::store());
+        opts.pins.gamma = gamma.clone();
+        opts.pins.build = Build::Production;
+        opts.trust = TrustInput::from_bundle(&lagging, &pin)
+            .unwrap()
+            .with_authenticated_origin(origin);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let bundle = bundle.clone();
+        opts.refresh_trust = Some(Box::new(move |current| {
+            assert_eq!(current.id(), pin);
+            assert_eq!(current.origin(), Some(origin));
+            assert_eq!(current.history().latest().epoch, 1);
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(foreign.clone());
+            }
+            let fresh = TrustInput::from_bundle(&bundle, &pin).unwrap();
+            Ok(if offers_origin {
+                fresh.with_authenticated_origin(AuthenticatedOrigin {
+                    usable_epoch: 2,
+                    root_round: 10_000,
+                })
+            } else {
+                fresh
+            })
+        }));
+        let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
+        assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
+        assert!(bridge.verify_token(&held).is_ok());
+        assert!(bridge.verify_token(&held).is_ok());
+        assert_eq!(reason(bridge.verify_token(&future)), "SealEpoch");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // The same genesis and valid bundle structure are insufficient if a refresh
+    // would remove an already held successor.
+    let world = setup();
+    let mut opts = world.options("trust rollback", World::store());
+    opts.pins.gamma = gamma;
+    opts.pins.build = Build::Production;
+    opts.trust = extended.with_authenticated_origin(AuthenticatedOrigin {
+        usable_epoch: 3,
+        root_round: 10_000,
+    });
+    let rollback = TrustInput::from_bundle(&lagging, &pin).unwrap();
+    opts.refresh_trust = Some(Box::new(move |_| Ok(rollback.clone())));
+    let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
+    assert_eq!(reason(bridge.verify_token(&future)), "TrustInput");
+    assert!(bridge.verify_token(&held).is_ok());
 }

@@ -15,15 +15,15 @@ import { TAG } from './config.js';
 import { HE, HU } from './crypto.js';
 import { decodeReceiptBacking } from './deposit.js';
 import { redeemCalldataLength } from './abi.js';
-import { decodeSplitJustification } from './split.js';
-import { PRED_SIGNATURE, encodeProof, encodeToken, mintSourceHash, resultState, stateId, tokenIdOf, type Predicate, type Token } from './token.js';
+import { decodeSumProof } from './split.js';
+import { PRED_SIGNATURE, encodeProof, mintSourceHash, resultState, stateId, tokenIdOf, type Predicate, type LineageLevel } from './token.js';
 
 /** What the gas model sees of a prospective redemption. */
 export interface RedeemShape {
-  /** The evidence bytes (`C(1, Token)`), or an upper bound of their length when the burn does not exist yet. */
+  /** The flat evidence bytes, or an upper bound of their length when the burn does not exist yet. */
   evidenceBytes: number;
   /** The decoded token of the lineage walk, root first, when known (counts certificates, signatures and paths). */
-  lineage: Token[];
+  lineage: LineageLevel[];
   /** Transactions the evidence will hold that are not in `lineage` yet (the burn about to be made). */
   pendingTransactions: number;
   /** Historical gap proofs. */
@@ -541,7 +541,7 @@ class ProbeTable {
 }
 
 /** The part's current owner and state (tokenops headOf, repeated here to keep this module free of the signing code). */
-function headOf(t: Token): { owner: Predicate; state: Uint8Array } {
+function headOf(t: LineageLevel): { owner: Predicate; state: Uint8Array } {
   const id = tokenIdOf(t.mint.salt, t.mint.network);
   let state = resultState(mintSourceHash(id), id);
   let owner = t.mint.recipient;
@@ -609,14 +609,9 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
     return null;
   }
   if (evm === null || rcpt === null) return null;
-  // the CBOR walks (NativeBridgeVerifierV2): a byte string's content is walked only by the check that opens it.
-  // scan (strict or loose, one price): the evidence [1, part] (_evidence), every split justification, so each parent token once
-  // (_splitJustification), J (_rootMint), every transaction's data (_mintAmount, _returnData, _splitBurn: each at most once)
-  // skip: every parent token (_splitJustification's skip(k0)), every token's genesis [mint, proof] (_token's skip(g)), every proof's UC
-  // (_proof), every predicate's three fields (_pred)
+  // Count each flat decoding unit, including the separate root reason and child allocations.
   const scan: CborCount = { items: 2, long: 0, nodes: 1 };
   const skip: CborCount = { items: 0, long: 0, nodes: 0 };
-  addCount(scan, cborCount(encodeToken(part)));
   addCount(scan, cborCount(j));
   let allocSteps = 0;
   for (let i = 0; i < L.length; i++) {
@@ -626,12 +621,18 @@ export function redeemFeatures(s: RedeemShape): RedeemFeatures | null {
       if (sj === null) return null;
       addCount(scan, cborCount(sj));
       try {
-        allocSteps += decodeSplitJustification(sj).proof.length;
+        allocSteps += decodeSumProof(t.allocation).length;
+        addCount(scan, cborCount(t.allocation));
       } catch {
         return null;
       }
     }
-    if (i < L.length - 1) addCount(skip, cborCount(encodeToken(t)));
+    addCount(scan, cborCount(t.mintRaw));
+    addCount(scan, cborCount(encodeProof(t.mintProof)));
+    for (let j = 0; j < t.transfersRaw.length; j++) {
+      addCount(scan, cborCount(t.transfersRaw[j]));
+      addCount(scan, cborCount(encodeProof(t.proofs[j])));
+    }
     // the genesis array's head and its two items
     skip.items += 1;
     skip.nodes += 1;
@@ -950,7 +951,8 @@ function rebuilt(code: Uint8Array, length: number, masked: string, positions: re
  */
 export function calibratedDeployment(d: DeploymentCode): boolean {
   const c = CALIBRATED_DEPLOYMENT;
-  if (d.nativeGasSchedule !== NATIVE_GAS_SCHEDULE) return false;
+  // The measured binaries used configuration version 1.
+  if (d.gamma[17] !== 1 || d.nativeGasSchedule !== NATIVE_GAS_SCHEDULE) return false;
   if (toHex(HE(d.helperCode)) !== c.helperCodeHash) return false;
   const production = d.K === 64n && d.B === 16n;
   const v = c.verifier;
