@@ -31,7 +31,7 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, Nb2Error, WalletError, appendTransfer, certifyChecked, decodeRevert, deriveBridgeKey, evidenceOf,
+  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, Nb2Error, WalletError, appendTransfer, certifyChecked, deriveBridgeKey, evidenceOf,
   freshMask, localOwner, transferRequest,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
   type ReturnRecord,
@@ -627,15 +627,11 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
 }
 
 /**
- * The deployed verifier's QuorumNotMet inside VerifierRefused, as the plug-in reports it: `Nb2Error` with rule `VerifierRefused` and the
- * vault's revert data in `args[0]`, thrown by buildRedeem's simulation before anything is signed. Right after a burn's certification the EVM
- * chain's seal registry may not have imported the root round the burn's certificate names yet, and on chain that reads as a bad quorum
- * (bft-core#1125); the plug-in and the Go reference accept the same bytes, and the vault accepts them a few blocks later. The plug-in still
- * classifies it as `stop` (classifyRedeemError); a wallet tells it apart with this function.
+ * The deployed verifier reports QuorumNotMet for both a seal awaiting import and an invalid quorum. Only the
+ * vault's wrapped refusal is eligible for the bounded seal-import wait.
  */
-export function isRegistryLag(e: unknown): boolean {
-  if (!(e instanceof Nb2Error) || e.rule !== 'VerifierRefused' || typeof e.args?.[0] !== 'string') return false;
-  return decodeRevert(unhex(e.args[0]))?.rule === 'QuorumNotMet';
+export function isRegistryLag(e: unknown): e is Nb2Error {
+  return e instanceof Nb2Error && e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet';
 }
 
 /** How long a redemption waits out the registry lag (#1125) before it reports the refusal. */
@@ -644,35 +640,40 @@ export const REGISTRY_LAG_MS = 120_000;
 /** The refusal of a redemption that waited out REGISTRY_LAG_MS: the burn is intact, and `redeem` can run again. */
 export class RegistryLagExpired extends Error {
   public constructor(public readonly label: string, public readonly refusal: unknown) {
-    super(`the deployed verifier still answers QuorumNotMet after ${REGISTRY_LAG_MS / 1000} s (bft-core#1125). Nothing was sent and the burn is intact: run redeem ${label} again later. If it persists, the certificate may really lack its quorum: report it`);
+    super(`the deployed verifier still answers QuorumNotMet after ${REGISTRY_LAG_MS / 1000} s (bft-core#1125). The burn is intact: run redeem ${label} again later. If it persists, the certificate may really lack its quorum: report it`);
   }
 }
 
 /**
  * Return, step 3: redeem LABEL's burn on the EVM: the witness (one SegmentSealed log per segment since the burn's index, the gap proofs) is
- * built from the chain, sent, and reconciled until the payment's block is certified. A paid return answers paid without a send. A
- * QuorumNotMet from the verifier within REGISTRY_LAG_MS of the first try is the registry lag of #1125: wait and build again (the burn
- * never changes, and nothing is sent while the simulation refuses); after that it is reported as RegistryLagExpired. LAG, when given,
- * is told how long the wait took.
+ * built from the chain, sent, and reconciled until the payment's block is certified. A paid return answers paid without a send.
+ * Wrapped QuorumNotMet may be seal import lag. Start retries only within REGISTRY_LAG_MS, then report RegistryLagExpired if still refused.
+ * An in-flight attempt may finish later. LAG, when given, is told how long the wait took.
  */
 export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_000, note: (reason: string) => void = () => undefined, lag?: (ms: number) => void): Promise<ReconcileResult> {
   const id = unhex((await w.returnRecord(label)).returnId);
-  const t0 = Date.now();
+  const started = performance.now();
+  const deadline = started + REGISTRY_LAG_MS;
   let r: ReconcileResult;
-  let waited = false;
+  let lastRefusal: Nb2Error | undefined;
   for (;;) {
+    if (lastRefusal !== undefined) {
+      const remaining = deadline - performance.now();
+      if (remaining > 0) await sleep(Math.min(pollMs, remaining));
+      if (performance.now() >= deadline) throw new RegistryLagExpired(label, lastRefusal);
+    }
     try {
       r = await w.bridge.submitRedeem(id, w.signer);
       break;
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
-      if (Date.now() - t0 > REGISTRY_LAG_MS) throw new RegistryLagExpired(label, e);
-      if (!waited) note('the verifier answers QuorumNotMet: the seal registry has not imported the burn\'s root round yet (#1125)');
-      waited = true;
-      await sleep(pollMs);
+      if (lastRefusal === undefined && performance.now() < deadline) {
+        note('the verifier answers QuorumNotMet: waiting for possible seal registry lag (#1125)');
+      }
+      lastRefusal = e;
     }
   }
-  if (waited) lag?.(Date.now() - t0);
+  if (lastRefusal !== undefined) lag?.(performance.now() - started);
   for (let i = 0; r.state === 'pending' && i < polls; i++) {
     await sleep(pollMs);
     r = await w.bridge.reconcile(id);

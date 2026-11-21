@@ -8,7 +8,7 @@ use num_bigint::BigUint;
 
 use super::crypto::he;
 use super::deposit::topic;
-use super::errors::Rule;
+use super::errors::{is_retryable_verifier_refusal, Rule};
 use super::util::{arr, be_int, cat, to_u64, u256, u256_64};
 
 fn sel(sig: &str) -> [u8; 4] {
@@ -261,7 +261,7 @@ pub enum RedeemAction {
     Wait,
     /// BadGapProof, ChainMismatch, BadHistoryLength: a wrong proof or start head, repairable without a new burn.
     RepairProof,
-    /// NoEntryForEpoch inside VerifierRefused, Reentrancy, PayoutFailed, an out-of-gas: retry with more gas or later.
+    /// A potentially transient verifier or payout refusal, or an out-of-gas.
     RetryLater,
     /// The evidence or the deployment is refused: tell the user, do not resend.
     Stop,
@@ -295,7 +295,7 @@ pub fn classify_redeem_error(e: Option<&DecodedError>) -> RedeemAction {
         Rule::VerifierRefused => {
             if e.inner
                 .as_ref()
-                .is_some_and(|i| i.rule == Rule::NoEntryForEpoch)
+                .is_some_and(|i| is_retryable_verifier_refusal(i.rule))
             {
                 RedeemAction::RetryLater
             } else {

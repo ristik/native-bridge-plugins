@@ -57,8 +57,13 @@ impl fmt::Display for Rule {
     }
 }
 
-/// The one retryable rule: the verifier holds no trust-base entry of the seal's epoch yet.
+/// Offline verification can retry once the trust history holds the seal's epoch.
 pub const RETRYABLE_RULES: &[Rule] = &[Rule::NoEntryForEpoch];
+
+/// The deployed verifier cannot distinguish a pending seal import from an invalid quorum.
+pub(crate) fn is_retryable_verifier_refusal(inner: Rule) -> bool {
+    matches!(inner, Rule::NoEntryForEpoch | Rule::QuorumNotMet)
+}
 
 /// A section 14 refusal. `args` are a vault error's arguments as the vectors write them (decimal or `0x` hex); `inner` is the
 /// rule a wrapper (`SealReceipt`, `SegmentLog`) carries. `config_field` is set on a Γ failure (`ConfigShape`): the first
@@ -105,9 +110,13 @@ impl Nb2Error {
         }
     }
 
-    /// Retryable once the trust-base history holds the epoch: NoEntryForEpoch, alone or wrapped (a SealReceipt carrying it).
+    /// Retry after trust-history refresh or, for an ambiguous on-chain refusal, after seal import.
     pub fn retryable(&self) -> bool {
-        RETRYABLE_RULES.contains(&self.rule) || self.inner.as_ref().is_some_and(|i| i.retryable())
+        RETRYABLE_RULES.contains(&self.rule)
+            || self.inner.as_ref().is_some_and(|i| {
+                i.retryable()
+                    || (self.rule == Rule::VerifierRefused && is_retryable_verifier_refusal(i.rule))
+            })
     }
 
     /// The innermost rule of a wrapper chain.
@@ -245,7 +254,7 @@ impl Error {
         }
     }
 
-    /// A rule error that is retryable after a trust refresh.
+    /// A rule error that is eligible for a retry.
     pub fn retryable(&self) -> bool {
         matches!(self, Error::Rule(e) if e.retryable())
     }

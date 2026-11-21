@@ -29,7 +29,7 @@ use serde_json::json;
 
 use super::abi::{
     classify_redeem_error, decode_deposited, decode_paid, decode_revert, deposit_calldata,
-    redeem_calldata, redeem_calldata_length, DecodedError, RedeemAction,
+    redeem_calldata, redeem_calldata_length, DecodedError, ErrArg, RedeemAction,
 };
 use super::cbor::{c_arr, c_bytes, head_tag};
 use super::config::{asset_uct, build_params, decode_config, domain_of, tag, Build, Config};
@@ -144,6 +144,22 @@ impl BridgeOptions {
             sleep: None,
             now: None,
         }
+    }
+}
+
+fn redeem_refusal(e: DecodedError, detail: Option<String>) -> Nb2Error {
+    Nb2Error {
+        detail,
+        args: e
+            .args
+            .into_iter()
+            .map(|arg| match arg {
+                ErrArg::Int(v) => v.to_string(),
+                ErrArg::Word(w) => hex(&w),
+            })
+            .collect(),
+        inner: e.inner.map(|inner| Box::new(redeem_refusal(*inner, None))),
+        ..Nb2Error::new(e.rule)
     }
 }
 
@@ -1575,21 +1591,11 @@ impl NativeBridgeV2 {
                         );
                     }
                     if let Some(e) = e {
-                        let args = e
-                            .args
-                            .iter()
-                            .map(|x| match x {
-                                super::abi::ErrArg::Int(v) => v.to_string(),
-                                super::abi::ErrArg::Word(w) => hex(w),
-                            })
-                            .collect();
-                        return Err(Error::Rule(Nb2Error {
-                            args,
-                            ..Nb2Error::with_detail(
-                                e.rule,
-                                format!("simulation refused ({})", action.name()),
-                            )
-                        }));
+                        return Err(redeem_refusal(
+                            e,
+                            Some(format!("simulation refused ({})", action.name())),
+                        )
+                        .into());
                     }
                     // no rule: an RPC without simulation; the model's bound stands
                 }
@@ -1688,16 +1694,30 @@ impl NativeBridgeV2 {
                 RedeemAction::Reconcile => return self.reconcile_inner(return_id),
                 RedeemAction::RebuildHistory | RedeemAction::RepairProof => continue,
                 RedeemAction::RetryLater => {
+                    if let Some(e) = e.filter(|e| {
+                        e.rule == Rule::VerifierRefused
+                            && e.inner
+                                .as_ref()
+                                .is_some_and(|i| i.rule == Rule::QuorumNotMet)
+                    }) {
+                        return Err(redeem_refusal(
+                            e,
+                            Some("simulation after reverted redeem refused (retry-later)".into()),
+                        )
+                        .into());
+                    }
                     // an out-of-gas or a transient payout failure: one retry with more gas
                     gas_bump = 2;
                     continue;
                 }
                 _ => {
-                    let rule = e.map_or(Rule::PayoutFailed, |e| e.rule);
-                    return Err(Error::Rule(Nb2Error::with_detail(
-                        rule,
-                        format!("redeem {} reverted: stop and tell the user", hex(&tx.hash)),
-                    )));
+                    let detail =
+                        format!("redeem {} reverted: stop and tell the user", hex(&tx.hash));
+                    let error = match e {
+                        Some(e) => redeem_refusal(e, Some(detail)),
+                        None => Nb2Error::with_detail(Rule::PayoutFailed, detail),
+                    };
+                    return Err(error.into());
                 }
             }
         }
