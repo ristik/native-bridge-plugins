@@ -620,6 +620,11 @@ export class NativeBridgeV2 {
     return { operations, bytes, ordinarySegments: pMax };
   }
 
+  private checkReturnRecipient(recipient: Uint8Array): void {
+    if (recipient.length !== 20) refuse('BadInput', 'an EVM recipient is 20 bytes');
+    if (recipient.every((x) => x === 0) || eq(recipient, this.cfg.vault)) refuse('RecipientRefused', 'the zero address and the vault are refused');
+  }
+
   /**
    * Plan the return of a whole held part to `recipient` on the EVM: verify its full provenance, pick the index from a verified seal
    * receipt, and run the capacity preflight (section 12.5): the complete prospective return with the history already owed from `a` plus
@@ -635,8 +640,7 @@ export class NativeBridgeV2 {
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const part = decodeToken(token);
       const held = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, part));
-      if (recipient.length !== 20) refuse('BadInput', 'an EVM recipient is 20 bytes');
-      if (recipient.every((x) => x === 0) || eq(recipient, this.cfg.vault)) refuse('RecipientRefused', 'the zero address and the vault are refused');
+      this.checkReturnRecipient(recipient);
       const warnings: string[] = [];
       if ((await this.evm.code(recipient)).length > 0) warnings.push('the recipient is a contract: a payout it refuses strands the burn (simulation is not a guarantee)');
       // the index
@@ -757,14 +761,14 @@ export class NativeBridgeV2 {
     const held = await this.verifyToken(src);
     const head = headOf(decodeToken(src));
     const receiver = unhex(rec.recipient);
+    this.checkReturnRecipient(receiver);
     const a = undec(rec.a);
     const request = parseCertification(unhex(rec.burnRequest!));
     const rawTx = unhex(rec.burnTx!);
     const tx = parseTransfer(rawTx);
     const expected = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient: receiver, amount: held.amount, minIndex: a });
     await this.verifyReturnAnchor(rec);
-    if (rec.returnId !== hex(HU(src)) || held.amount !== undec(rec.amount) || receiver.length !== 20 ||
-      receiver.every((b) => b === 0) || eq(receiver, this.cfg.vault) ||
+    if (rec.returnId !== hex(HU(src)) || held.amount !== undec(rec.amount) ||
       tx.data === null || !eq(tx.data, expected) || tx.deadline !== null || request.deadline !== null ||
       !eq(encodePredicate(tx.recipient), encodePredicate(burnPredicate(HU(expected)))) ||
       head.owner.type !== 1n || !eq(encodePredicate(head.owner), encodePredicate(request.source)) ||
@@ -815,24 +819,28 @@ export class NativeBridgeV2 {
    * Certify the terminal burn of a planned return: R signs the recipient, the amount and the index. The exact request is journaled
    * before certification, the certified burn before this returns; a second call resumes the same burn and never makes another.
    */
-  public burn(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+  public burn(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
     returnId = Uint8Array.from(returnId);
-    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner, admission));
+    const recipient = expectedRecipient && Uint8Array.from(expectedRecipient);
+    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner, admission, recipient));
   }
 
-  private async burnInner(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+  private async burnInner(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'planned') {
       // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
       if (owner === undefined) return refuse('BadInput', 'only the holder can sign a new burn');
       if (admission) await this.verifyReturnAnchor(rec);
+      const recipient = unhex(rec.recipient);
+      this.checkReturnRecipient(recipient);
+      if (expectedRecipient && !eq(recipient, expectedRecipient)) refuse('BadInput', 'planned return does not match the authorized recipient');
       const source = unhex(rec.source);
       const held = await this.verifyToken(source);
       if (rec.returnId !== hex(returnId) || !eq(HU(source), returnId) || held.amount !== undec(rec.amount)) {
         refuse('BadInput', 'planned return does not match the verified source and amount');
       }
       await this.admitReturn(rec, held.amount, admission);
-      const R = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient: unhex(rec.recipient), amount: held.amount, minIndex: undec(rec.a) });
+      const R = encodeReturnData({ d: this.domain, asset: ASSET_UCT, recipient, amount: held.amount, minIndex: undec(rec.a) });
       const { tx, cd } = await transferRequest(source, owner, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
       rec.burnTx = hex(tx);
       rec.burnRequest = hex(cd);
@@ -1019,7 +1027,9 @@ export class NativeBridgeV2 {
   private async reconcileSend(rec: ReturnRecord, archives: readonly EvmReader[], resubmit: boolean): Promise<ReconcileResult> {
     const send = rec.sends.at(-1);
     if (!send) return { state: 'not-paid' };
-    const txHash = unhex(send.hash);
+    const raw = unhex(send.raw);
+    const { hash: txHash } = decodeSignedTx(raw);
+    if (hex(txHash) !== send.hash) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
     let seen = false;
     for (const reader of archives) {
       let receipt: ReceiptJson | null;
@@ -1044,7 +1054,7 @@ export class NativeBridgeV2 {
       }
     }
     if (!seen && resubmit) {
-      try { await this.evm.sendRaw(unhex(send.raw)); }
+      try { await this.evm.sendRaw(raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
     return { state: 'pending', txHash };

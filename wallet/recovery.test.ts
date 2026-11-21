@@ -170,7 +170,7 @@ test('ordinary release gas bound survives missing and smaller estimates with pos
   assert.equal(BigInt(paid.sends[0].gas), smallEstimate.gasLimit);
 });
 
-test('the signing gate rejects mismatched amounts, record IDs and source IDs on both routes', async (t) => {
+test('the signing gate binds the source, amount, IDs and authorized recipient on both routes', async (t) => {
   for (const ordinary of [false, true]) {
     const { w, aggregator } = await setup(t, ordinary);
     const plan = await planReturn(w, 'coin', undefined, undefined, caps);
@@ -183,10 +183,17 @@ test('the signing gate rejects mismatched amounts, record IDs and source IDs on 
     let signatures = 0;
     const owner = w.owner(0);
     const signer = { ...owner, signUnlock: (hash: Uint8Array) => { signatures++; return owner.signUnlock(hash); } };
-    for (const patch of [{ amount: '20' }, { returnId: hx(key('different-record-id')) }, { source: hx(other) }]) {
+    const cases = [
+      { patch: { amount: '20' } }, { patch: { returnId: hx(key('different-record-id')) } }, { patch: { source: hx(other) } },
+      { patch: { recipient: hx(new Uint8Array(19)) } },
+      { patch: { recipient: hx(new Uint8Array(20)) }, reason: 'RecipientRefused' },
+      { patch: { recipient: hx(w.bridge.cfg.vault) }, reason: 'RecipientRefused' },
+      { patch: { recipient: hx(key('different authorized address').slice(0, 20)) } },
+    ];
+    for (const { patch, reason = 'BadInput' } of cases) {
       const corrupt = JSON.stringify({ ...JSON.parse(before), ...patch });
       assert.ok(await store.putIf(keyOfRecord, before, corrupt));
-      await assert.rejects(w.bridge.burn(plan.returnId, signer, walletAdmission(w, caps)), { reason: 'BadInput' });
+      await assert.rejects(w.bridge.burn(plan.returnId, signer, walletAdmission(w, caps), plan.recipient), { reason });
       assert.ok(await store.putIf(keyOfRecord, corrupt, before));
     }
     assert.equal(signatures, 0);
@@ -475,6 +482,36 @@ test('a certified alternate archive carries a recovered payment through a pruned
   assert.equal(chain.balanceOf(w.signer.address) - balance, 19n);
 });
 
+test('restore checks full gap batches and every settlement suffix against the release envelope', async (t) => {
+  const { w, dir, manifest, open, rpc } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const correct = join(dir, 'valid-gap-plan.json');
+  publishReturnBackup(w, rec, correct);
+  const backup = JSON.parse(readFileSync(correct, 'utf8'));
+  const release = JSON.parse(readFileSync(manifest, 'utf8'));
+  const template = release.recovery.ranges.find((r: { max: { entry: string } }) => r.max.entry === 'advanceGaps');
+  release.recovery.ranges.push(
+    { ...template, max: { ...template.max, gaps: 66, receiptBytes: 65_535 } },
+    { ...template, max: { ...template.max, gaps: 67, calldataBytes: 68 } },
+    { ...template, max: { ...template.max, gaps: 68 }, execution: '25000000' },
+    { ...template, max: { ...template.max, gaps: 69 } },
+  );
+  writeFileSync(manifest, JSON.stringify(release));
+  const offline = { certify: async () => { throw new Error('expected a certified backup'); } };
+  const relay = await open('portable-gap-plan', rpc, { aggregator: offline });
+  const invalid = join(dir, 'invalid-gap-plan.json');
+  // Check truncated receipt coverage, undersized calldata, excessive gas, a missing suffix and an absent advance class.
+  for (const advanceGaps of [66, 67, 68, 69, 70]) {
+    const doc = structuredClone(backup);
+    doc.pending.recovery.advanceGaps = advanceGaps;
+    writeFileSync(invalid, JSON.stringify(doc));
+    await assert.rejects(restoreReturn(relay, invalid), { rule: 'CapacityPreflight' });
+    assert.equal(await relay.bridge.journal.ret(rec.returnId), null);
+  }
+  assert.deepEqual((await restoreReturn(relay, correct)).recovery, rec.recovery);
+});
+
 test('portable replay refreshes for later certified cuts and reopening preserves the merged authority', async (t) => {
   const { w, open, rpc, root, chain, deployment, dir, manifest } = await setup(t);
   await burn(w, 'coin', undefined, undefined, caps);
@@ -556,10 +593,14 @@ test('the shared payer budget counts an outstanding cold send before an ordinary
   await assert.rejects(resumePayout(w, rec, { ...caps, feeBudget: combined - 1n }, true), { rule: 'CapacityPreflight' });
   assert.equal((await w.bridge.journal.ret(rec.returnId))!.sends.length, 0);
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).pending.raw, raw);
+  chain.balances.set(hx(w.signer.address).slice(2), combined - 1n);
+  await assert.rejects(resumePayout(w, rec, caps, true), { rule: 'CapacityPreflight' });
+  assert.equal((await w.bridge.journal.ret(rec.returnId))!.sends.length, 0);
+  chain.balances.set(hx(w.signer.address).slice(2), combined);
   // Mine the ordinary attempt while the previous signed cold packet is still accounted for.
   chain.dropPool();
   chain.autoMine = true;
-  assert.equal((await resumePayout(w, rec, { ...caps, feeBudget: combined }, true)).state, 'paid');
+  assert.equal((await resumePayout(w, rec, caps, true)).state, 'paid');
 });
 
 test('ordinary settlement refuses to re-sign a failed receipt until its exact transaction is certified', async (t) => {
@@ -600,6 +641,47 @@ test('ordinary settlement refuses to re-sign a failed receipt until its exact tr
     (1_221_000n + 16n * BigInt(packet.calldata.length)) * caps.maxFeePerGas;
   await assert.rejects(recoverStep(restarted, cold, { ...caps, feeBudget: combined - 1n }), { rule: 'CapacityPreflight' });
   assert.equal(sends, 1);
+  // The balance already reflects the mined failure. Only the next attempt needs funds here.
+  chain.balances.set(hx(restarted.signer.address).slice(2), ordinaryTx.gas * ordinaryTx.maxFeePerGas);
   assert.equal((await resumePayout(restarted, cold, caps, true)).state, 'paid');
   assert.equal(sends, 2);
+});
+
+test('ordinary restart refuses an unrelated certified failure hash in the send journal', async (t) => {
+  const { w, chain, cfg, rpc, open } = await setup(t, true);
+  const marker = key('unrelated certified failure').slice(0, 20);
+  chain.coldCall = async (_vault, to, data) => {
+    if (eq(to, marker) || (eq(to, cfg.vault) && eq(data.subarray(0, 4), SELECTOR.redeem))) {
+      throw new Nb2Error('PayoutFailed');
+    }
+    return undefined;
+  };
+  const unrelated = await signTx(w.signer, { chainId: cfg.chainId, nonce: await w.bridge.evm.nonce(w.signer.address),
+    maxFeePerGas: 15n, maxPriorityFeePerGas: 1n, gas: 1_000_000n, to: marker, value: 0n, data: new Uint8Array() });
+  await w.bridge.evm.sendRaw(unrelated.raw);
+  const failed = (await w.bridge.evm.receipt(unrelated.hash))!;
+  await w.bridge.evm.verifyFailedReceipt(unrelated.hash, cfg, w.trust, failed);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  let sends = 0;
+  const transport: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_estimateGas') return '0x1d4c0' as T;
+    if (method === 'eth_sendRawTransaction') {
+      sends++;
+      const raw = unhex(params[0] as string);
+      await chain.mine([raw]);
+      return hx(decodeSignedTx(raw).hash) as T;
+    }
+    return rpc.call<T>(method, params);
+  } };
+  const first = await open('holder', transport);
+  assert.equal((await resumePayout(first, rec, caps)).state, 'pending');
+  const path = `${first.bridge.journal.prefix}return/${rec.returnId.slice(2)}`;
+  const original = (await first.bridge.journal.store.get(path))!;
+  const unrelatedFailure = JSON.parse(original);
+  unrelatedFailure.sends[0].hash = hx(unrelated.hash);
+  assert.ok(await first.bridge.journal.store.putIf(path, original, JSON.stringify(unrelatedFailure)));
+  const restarted = await open('holder', transport);
+  await assert.rejects(resumePayout(restarted, rec, caps), /hash does not match its signed transaction/);
+  assert.equal(sends, 1);
 });

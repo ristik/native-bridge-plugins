@@ -710,7 +710,7 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
   w.update(label, { spent: BURNING });
   let b: Awaited<ReturnType<typeof w.bridge.burn>>;
   try {
-    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized)), note);
+    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized), plan?.recipient ?? recipient), note);
   } catch (err) {
     const r = await w.bridge.journal.ret(id);
     if (r === null || r.status === 'planned') w.update(label, { spent: undefined });

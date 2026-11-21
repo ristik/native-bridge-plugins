@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   AmbiguousBroadcast, EvmReader, HttpJsonRpc, Nb2Error, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
-  buildParams, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, redeemCalldataLength, recoveryGeneration,
+  buildParams, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryGeneration,
   recoveryRpcSource, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
   type RedeemShape, type ReturnAdmission, type ReturnRecord, type TrustInput, type SendRecord, type RedeemOptions,
@@ -107,7 +107,13 @@ async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
   }
 }
 
-async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, spent = 0n): Promise<RecoveryLimits & { currentBid: bigint }> {
+interface FeeReservations { total: bigint; attempts: { nonce: bigint; fee: bigint }[] }
+
+async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations): Promise<RecoveryLimits & { currentBid: bigint }> {
+  // Read the mined nonce first. If a send lands between reads, reserving it for this check is conservative.
+  const minedNonce = reserved?.attempts.length ? await w.bridge.evm.nonce(payer, 'latest') : 0n;
+  const outstanding = reserved?.attempts.reduce((sum, tx) => tx.nonce >= minedNonce ? sum + tx.fee : sum, 0n) ?? 0n;
+  const spent = reserved?.total ?? 0n;
   const [balance, nonce, fees] = await Promise.all([w.bridge.evm.balance(payer), w.bridge.evm.nonce(payer), w.bridge.evm.fees()]);
   const currentBid = 2n * fees.baseFee + fees.priority;
   if (nonce > p.maxNonce || currentBid > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
@@ -115,24 +121,27 @@ async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, spent = 0n
   }
   return { ...p, gas: p.gas < w.pins.userGasLimit ? p.gas : w.pins.userGasLimit,
     signedBytes: Math.min(p.signedBytes, Number(w.pins.maxEncodedTxBytes)), chainId: w.bridge.cfg.chainId,
-    balance, currentBid, feeBudget: p.feeBudget - spent };
+    balance: balance > outstanding ? balance - outstanding : 0n, currentBid, feeBudget: p.feeBudget - spent };
 }
 
 /** Both routes reserve the maximum fee of each durable signed transaction, once per payer. */
-function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends): bigint {
+function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends): FeeReservations {
   const recovery = loadRecovery(w, rec);
   const raw = [...ordinary.map((send) => send.raw), ...(recovery?.attempts ?? [])];
   if (recovery?.pending) raw.push(recovery.pending.raw);
   if (recovery?.settled?.submitted) raw.push(recovery.settled.submitted.raw);
   const hashes = new Set<string>();
-  let fee = uint(recovery?.fees ?? '0'); // older local journals recorded only the total, conservatively retained
+  const attempts: FeeReservations['attempts'] = [];
+  let total = uint(recovery?.fees ?? '0'); // older local journals recorded only the total, conservatively retained
   for (const signed of raw) {
     const { request, from, hash } = decodeSignedTx(bytes(signed));
     if (!eq(from, payer) || hashes.has(hx(hash))) continue;
     hashes.add(hx(hash));
-    fee += request.gas * request.maxFeePerGas;
+    const fee = request.gas * request.maxFeePerGas;
+    attempts.push({ nonce: request.nonce, fee });
+    total += fee;
   }
-  return fee;
+  return { total, attempts };
 }
 
 export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): RedeemOptions {
@@ -277,6 +286,16 @@ export async function restoreReturn(w: Wallet, file: string): Promise<ReturnReco
   await w.bridge.importPendingReturn(rec, terminal === undefined ? undefined : bytes(terminal), async (verified) => {
     if (!release) return;
     checkSchedule(verified, w.bridge.returnHeadroom(bytes(verified.source)).operations);
+    const { cfg } = w.bridge;
+    // Check transport and gas independently of the relayer's bids and funding.
+    // Maximal field widths cover the entire signed envelope.
+    const maxFeePerGas = (1n << 256n) - 1n;
+    const batch = quoteRecoveryGapBatch(cfg.K, verified.recovery!.advanceGaps, release.calibration, {
+      gas: w.pins.userGasLimit, signedBytes: Number(w.pins.maxEncodedTxBytes), calldataBytes: 393_216,
+      chainId: cfg.chainId, maxNonce: (1n << 64n) - 1n, maxFeePerGas, maxPriorityFeePerGas: maxFeePerGas,
+      balance: 0n, feeBudget: 0n,
+    });
+    if (!batch) throw new Nb2Error('CapacityPreflight', 'portable gap batch or settlement suffix is outside the release limits');
     if (!backup.checkpoint) return;
     const session = await openSession(w, release, verified);
     await replay(w, session, verified, backup.checkpoint);

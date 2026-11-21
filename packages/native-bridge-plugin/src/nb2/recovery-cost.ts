@@ -134,6 +134,27 @@ const gapShape = (entry: 'advanceGaps' | 'redeemRecovered', gaps: number, width:
   calldataBytes: calldataSize(42 + 1 + 4 + RECEIPT_BYTES + 2 + (gaps === 0 ? 0 : 32) + gaps * width),
 });
 
+/** Quote the exact full advance and all terminal suffixes with the widest allowed predecessor receipt. */
+export function quoteRecoveryGapBatch(K: bigint, batch: number, calibration: RecoveryCalibration, limits: RecoveryLimits):
+  { advance: RecoveryQuote; settle: RecoveryQuote } | null {
+  if (!Number.isSafeInteger(batch) || batch < 1 || batch > 1024 || !validLimits(limits)) return null;
+  const width = gapProofLen(K);
+  const advance = quoteRange(gapShape('advanceGaps', batch, width), 1, calibration, limits);
+  if (advance === null) return null;
+  const settle = quoteSettlementSuffixes(batch, width, calibration, limits);
+  return settle === null ? null : { advance, settle };
+}
+
+function quoteSettlementSuffixes(batch: number, width: number, calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote | null {
+  let settle: RecoveryQuote | null = null;
+  for (let count = 0; count < batch; count++) {
+    const quote = quoteRange(gapShape('redeemRecovered', count, width), 1, calibration, limits);
+    if (quote === null) return null;
+    if (settle === null || quote.fee > settle.fee) settle = quote;
+  }
+  return settle;
+}
+
 export interface RecoveryBacklog {
   signedStart: bigint;
   observed: bigint;
@@ -240,13 +261,9 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   }
   // Once fewer than q gaps remain, settle against the latest proved endpoint. Price
   // every possible terminal suffix: the release need not price it monotonically.
-  let settle: RecoveryQuote | null = null;
-  for (let count = 0; count < q; count++) {
-    const quote = quoteRange(gapShape('redeemRecovered', count, width), 1, calibration, limits);
-    if (quote === null) fail('CapacityPreflight', 'unqualified settlement suffix');
-    if (settle === null || quote.fee > settle.fee) settle = quote;
-  }
-  const totalFee = run.reduce((sum, call) => sum + call.fee, 0n) + advance.fee * calls + settle!.fee;
+  const settle = quoteSettlementSuffixes(q, width, calibration, limits);
+  if (settle === null) fail('CapacityPreflight', 'unqualified settlement suffix');
+  const totalFee = run.reduce((sum, call) => sum + call.fee, 0n) + advance.fee * calls + settle.fee;
   if (totalFee > limits.feeBudget || totalFee > limits.balance) fail('CapacityPreflight', 'insufficient recovery fee budget');
-  return { run, advance: { quote: advance, calls }, settle: settle!, settlementMaxGaps: q - 1, totalFee };
+  return { run, advance: { quote: advance, calls }, settle, settlementMaxGaps: q - 1, totalFee };
 }
