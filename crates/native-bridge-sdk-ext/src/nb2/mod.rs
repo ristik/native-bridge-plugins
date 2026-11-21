@@ -17,6 +17,8 @@ pub mod evm;
 pub mod gas;
 pub mod header;
 pub mod mpt;
+pub mod recovery;
+pub mod recovery_cost;
 pub mod rlp;
 pub mod rules;
 pub mod segment;

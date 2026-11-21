@@ -40,7 +40,7 @@ const BY_SELECTOR = new Map<string, Rule>(ALL_RULES.map((r) => [toHex(selectorOf
 const pad32 = (b: Uint8Array): Uint8Array => concat(b, new Uint8Array((32 - (b.length % 32)) % 32));
 
 /** Standard ABI of (static words..., dynamic bytes...) arguments given in order, each a word or bytes. */
-function abiEncode(args: ({ word: Uint8Array } | { bytes: Uint8Array })[]): Uint8Array {
+export function abiEncode(args: ({ word: Uint8Array } | { bytes: Uint8Array })[]): Uint8Array {
   const heads: Uint8Array[] = [];
   const tails: Uint8Array[] = [];
   let tailLen = 0;

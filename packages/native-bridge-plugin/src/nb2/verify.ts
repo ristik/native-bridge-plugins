@@ -101,7 +101,7 @@ async function walk(c: Config, d: Uint8Array, t: TrustInput, part: Token, mode: 
   return { level: level!, terminal: part };
 }
 
-function parseMintData(c: Config, data: Uint8Array | null): bigint {
+export function parseMintData(c: Config, data: Uint8Array | null): bigint {
   if (data === null) fail('MintData');
   try {
     const v = array(tagContent(scanOne(data!), TAG.value), 3);

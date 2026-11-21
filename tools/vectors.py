@@ -5,7 +5,9 @@ import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "protocol/vectors/nb2-continuation-v1.1"
+SUPPLEMENT = ROOT.with_name("nb2-continuation-v1.1-supplement")
 PINNED = {
+    SUPPLEMENT / "MANIFEST": "1ae87096cf7503e274cf0b97591709379bd0500efae53b7db46224d945852f1e",
     "MANIFEST": "3be02f4163a1a9e06d5b83c0a50ab8468c6a060c1352d3a969a96b477be28034",
     "transcripts/MANIFEST": "41856353c08fa85b87ce59e470ac152213ac7de3031fb8a721989ae08755a651",
 }

@@ -116,7 +116,7 @@ function decodeReceipt(v: Uint8Array): RlpItem {
  * receipt path keyed by RLP(txIndex) (`ReceiptPath`), type and status, `logs[logIndex]` (`LogIndex`) and its address (`LogEmitter`).
  * The caller checks its event's topics and data.
  */
-export async function verifyReceiptLog(c: Config, t: TrustInput, p: DepositProof): Promise<ReceiptLog> {
+export async function verifyReceiptLog(c: Config, t: TrustInput, p: DepositProof, emitter: Uint8Array = c.vault): Promise<ReceiptLog> {
   const uc = await verifyEvmUc(t, p.uc, c);
   const header = bindHeader(p.header, uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
   let value: Uint8Array;
@@ -131,7 +131,7 @@ export async function verifyReceiptLog(c: Config, t: TrustInput, p: DepositProof
   const l = logs.kids[Number(p.logIndex)];
   if (!l.list || l.kids.length !== 3 || l.kids[0].list || l.kids[0].str.length !== 20 || !l.kids[1].list || l.kids[2].list) fail('LogIndex');
   // the emitter before the topics (section 6.2 step 5)
-  if (!eq(l.kids[0].str, c.vault)) fail('LogEmitter');
+  if (!eq(l.kids[0].str, emitter)) fail('LogEmitter');
   const topics: Uint8Array[] = [];
   for (const tp of l.kids[1].kids) {
     if (tp.list || tp.str.length !== 32) fail('LogTopics');

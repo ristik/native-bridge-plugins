@@ -200,7 +200,7 @@ fn check_origin(
         .check(&decode_uc(&reason.proof.uc)?, &reason.proof.uc)
 }
 
-fn parse_mint_data(c: &Config, data: Option<&[u8]>) -> Result<BigUint> {
+pub(crate) fn parse_mint_data(c: &Config, data: Option<&[u8]>) -> Result<BigUint> {
     let Some(data) = data else {
         return fail(Rule::MintData);
     };
