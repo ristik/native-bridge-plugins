@@ -381,3 +381,30 @@ test('authority snapshots isolate in-place history appends before a durable save
   assert.equal(guard.revision, 0);
   assert.equal((await guard.checkpoint).history.tip?.epoch, genesis.epoch);
 });
+
+test('recovery authority accepts an authenticated append beyond the initial load limit', { timeout: 180_000 }, async () => {
+  const { RootTrustBaseV2 } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js');
+  const { TRUST_BASE_BUNDLE_LIMITS } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/ReleasePin.js');
+  const { makeRoot, successorEntry } = await import('../rootfixture.js');
+  const root = await makeRoot(1, 1, 31);
+  const max = TRUST_BASE_BUNDLE_LIMITS.maxEntries;
+  const cfg = { ...decodeConfig(await read('gamma.bin'), PRODUCTION_PARAMS), rootGenesis: root.pin };
+  const trust = root.trust.withAuthenticatedOrigin({ usableEpoch: BigInt(max), rootRound: BigInt(max) });
+  const append = async (epoch: number): Promise<void> => {
+    const raw = await successorEntry(root, BigInt(epoch), 1, 31);
+    await trust.history.append(RootTrustBaseV2.decode(raw));
+    root.entries.push(raw);
+  };
+  for (let epoch = 2; epoch <= max; epoch++) await append(epoch);
+  let savedTip: bigint | undefined;
+  const guard = new RecoveryAuthority(trust, async (candidate) => { savedTip = candidate.history.tip?.epoch; });
+  await append(max + 1);
+  const extended = trust.withAuthenticatedOrigin({ usableEpoch: BigInt(max + 1), rootRound: BigInt(max + 1) });
+  const overLimit = await extended.history.toBundle();
+  await assert.rejects(TrustInput.fromBundle(overLimit, root.pin), { reason: 'ErrTrustBase' });
+  await guard.accept(extended, cfg);
+  assert.equal(savedTip, BigInt(max + 1));
+  const readback = await guard.checkpoint;
+  assert.equal(readback.history.entries.length, max + 1);
+  assert.deepEqual(await readback.history.tip!.entryId(), await extended.history.tip!.entryId());
+});

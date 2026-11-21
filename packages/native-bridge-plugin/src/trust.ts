@@ -10,6 +10,7 @@
  */
 import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { TRUST_BASE_BUNDLE_LIMITS } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/ReleasePin.js';
+import { RootTrustBaseV2 } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/RootTrustBaseV2.js';
 import { TrustBaseBundle } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js';
 import { TrustBaseHistory } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseHistory.js';
 import type { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicityCertificate.js';
@@ -66,6 +67,17 @@ export class TrustInput {
       return fail('ErrTrustBase');
     }
     return new TrustInput(history);
+  }
+
+  /** Copy a running history through the SDK's authenticated append path. */
+  public async snapshot(): Promise<TrustInput> {
+    const history = TrustBaseHistory.create(this.id);
+    const origin = this.origin;
+    // Capture independent entries before the source can append while we validate.
+    const entries = this.history.entries.map((entry) => RootTrustBaseV2.decode(entry.encode()));
+    for (const entry of entries) await history.append(entry);
+    const copy = new TrustInput(history);
+    return origin === undefined ? copy : copy.withAuthenticatedOrigin(origin);
   }
 
   /** Attach a checkpoint authenticated by the caller. Token evidence and UTB history do not establish this bound. */

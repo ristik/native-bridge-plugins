@@ -71,14 +71,21 @@ const GAS_LIMIT = 24_000_000n;
 const U64_MAX = (1n << 64n) - 1n;
 const U256_MAX = (1n << 256n) - 1n;
 
+function validLimits(limits: RecoveryLimits): boolean {
+  const payer = [limits.gas, limits.chainId, limits.maxNonce, limits.maxFeePerGas, limits.maxPriorityFeePerGas, limits.balance, limits.feeBudget];
+  return Number.isSafeInteger(limits.calldataBytes) && Number.isSafeInteger(limits.signedBytes)
+    && payer.every((value) => typeof value === 'bigint' && value >= 0n)
+    && (limits.maxTransactionFee === undefined || (typeof limits.maxTransactionFee === 'bigint' && limits.maxTransactionFee >= 0n));
+}
+
 export function quoteRecovery(shape: RecoveryShape, calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote | null {
-  return quoteRange(shape, shape.receiptBytes, calibration, limits);
+  const snapshot = { ...limits };
+  return validLimits(snapshot) ? quoteRange(shape, shape.receiptBytes, calibration, snapshot) : null;
 }
 
 function quoteRange(shape: RecoveryShape, minReceiptBytes: number, calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote | null {
   const { calldataBytes: n } = shape;
-  if (!Number.isSafeInteger(n) || !Number.isSafeInteger(limits.calldataBytes) || !Number.isSafeInteger(limits.signedBytes)
-    || n < 68 || n > Math.min(CALLDATA_BYTES, limits.calldataBytes)) return null;
+  if (!Number.isSafeInteger(n) || n < 68 || n > Math.min(CALLDATA_BYTES, limits.calldataBytes)) return null;
   let execution: bigint | null = null;
   for (const range of calibration.ranges ?? []) {
     const { max } = range;
@@ -150,6 +157,8 @@ export interface RecoveryBacklog {
 export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, trust: TrustInput, params: Params,
   deployment: RecoveryDeployment, calibration: RecoveryCalibration, limits: RecoveryLimits, backlog: RecoveryBacklog, startingSeal?: Uint8Array,
 ): Promise<{ run: RecoveryQuote[]; advance: { quote: RecoveryQuote; calls: bigint }; settle: RecoveryQuote; settlementMaxGaps: number; totalFee: bigint }> {
+  limits = { ...limits };
+  if (!validLimits(limits)) fail('CapacityPreflight', 'invalid recovery payer limits');
   backlog = { ...backlog };
   const times = [backlog.elapsedMs, backlog.receiptP99Ms, backlog.finalInclusionMs, backlog.qualifiedForMs];
   const counts = [backlog.signedStart, backlog.observed, backlog.duringProgress, backlog.peakSeals, backlog.advancePeakSeals, backlog.finalPeakSeals];

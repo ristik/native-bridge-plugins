@@ -1,5 +1,4 @@
 /** NB2 continuation v1.1 packet construction and authenticated checkpoint boundaries. */
-import { TrustBaseBundle } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js';
 import { concat, concatBytes, eq, toHex } from '../bytes.js';
 import { abiEncode } from './abi.js';
 import { ascii, be, beInt, cArr, cTag, head, raw, scanNative, u16, u64, u256 } from './cbor.js';
@@ -12,7 +11,7 @@ import { verifySealReceipt } from './rules.js';
 import { foldHistory, gapProofLen, GapTree } from './segment.js';
 import { decodeSplitManifest, parentLink } from './split.js';
 import { decodeToken, lineageOf, mintSourceHash, resultState, stateId, tokenIdOf } from './token.js';
-import { bindTrust, decodeUc, SealAheadOfOrigin, TrustInput } from './trust.js';
+import { bindTrust, decodeUc, SealAheadOfOrigin, type TrustInput } from './trust.js';
 import { parseMintData, verdictAbi, verifyPart, type Verdict } from './verify.js';
 
 const version = u16(0x0101);
@@ -192,28 +191,19 @@ export interface GapPrior { seq: bigint; cursor?: { next: bigint; head: Uint8Arr
 export interface GapPacket { shape: RecoveryShape; calldata: Uint8Array; event: RecoveryEvent | null; next: bigint; head: Uint8Array | undefined }
 export interface RunPacket { shape: RecoveryShape; calldata: Uint8Array; end: number; state: Uint8Array | null; event: RecoveryEvent }
 
-async function copyTrust(input: TrustInput): Promise<TrustInput> {
-  const origin = input.origin;
-  const pin = input.id;
-  // The SDK returns a new entry array. Capture it before the caller can append.
-  const bundle = await TrustBaseBundle.encode(input.history.entries);
-  const copy = await TrustInput.fromBundle(bundle, pin);
-  return origin === undefined ? copy : copy.withAuthenticatedOrigin(origin);
-}
-
 /** One authority for all sessions on a deployment. Restore the persisted checkpoint before reopening. */
 export class RecoveryAuthority {
   #pending: Promise<unknown> = Promise.resolve();
   #held: Promise<TrustInput>;
   #revision = 0;
   constructor(checkpoint: TrustInput, private readonly persist: (next: TrustInput) => Promise<void>) {
-    this.#held = copyTrust(checkpoint);
+    this.#held = checkpoint.snapshot();
     void this.#held.catch(() => {});
   }
-  get checkpoint(): Promise<TrustInput> { return this.#held.then(copyTrust); }
+  get checkpoint(): Promise<TrustInput> { return this.#held.then((held) => held.snapshot()); }
   get revision(): number { return this.#revision; }
   accept(offered: TrustInput, cfg: Config): Promise<void> {
-    const snapshot = copyTrust(offered);
+    const snapshot = offered.snapshot();
     void snapshot.catch(() => {});
     const next = this.#pending.then(async () => {
       const held = await this.#held;
@@ -229,7 +219,7 @@ export class RecoveryAuthority {
       if (candidate.history.tip!.epoch === tip.epoch && candidate.origin!.rootRound === held.origin!.rootRound
         && candidate.origin!.usableEpoch === held.origin!.usableEpoch) return;
       try {
-        await this.persist(await copyTrust(candidate));
+        await this.persist(await candidate.snapshot());
       } catch (e) {
         throw new WalletError('TrustInput', 'could not persist recovery authority', e);
       }
