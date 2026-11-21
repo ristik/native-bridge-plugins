@@ -49,6 +49,19 @@ for (const name of ['root', 'transfers', 'one-split', 'depth-20', 'shared-claim'
     });
     assert.deepEqual(Buffer.from(session.id), Buffer.from(c.Session, 'hex'));
     assert.deepEqual(Buffer.from(session.pageRoot), Buffer.from(c.PageRoot, 'hex'));
+    if (name === 'root') {
+      const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
+      const calibration = { pins, runtimeHash: fromHex(c.RecoveryRuntimeHash)!, executionBound: () => 1_000_000n };
+      const limits = { signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: cfg.chainId, maxNonce: 255n,
+        maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, balance: 10n ** 18n, feeBudget: 10n ** 18n };
+      const whole = await session.run(0, 2, trust);
+      const one = await session.run(0, 1, trust);
+      assert.ok(whole.calldata.length > one.calldata.length);
+      const planned = await session.runBounded(0, trust, calibration, { ...limits, calldataBytes: whole.calldata.length - 1 });
+      assert.equal(planned.packet.end, 1);
+      assert.deepEqual(planned.packet.calldata, one.calldata);
+      await assert.rejects(session.runBounded(0, trust, calibration, { ...limits, calldataBytes: one.calldata.length - 1 }), { rule: 'CapacityPreflight' });
+    }
     let from = 0;
     let prior: { seq: bigint; receipt: Uint8Array } | undefined;
     for (const [calldata, , state, topics, data, receipt] of trace(gunzipSync(packed))) {

@@ -286,6 +286,17 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
             None,
         )
     };
+    let (session, _, _, _) = load(BASE, "transcripts/root");
+    let whole = session.run(0, 2, &trust, None).unwrap();
+    let one = session.run(0, 1, &trust, None).unwrap();
+    assert!(whole.calldata.len() > one.calldata.len());
+    limits.calldata_bytes = whole.calldata.len() - 1;
+    let (cut, _) = session
+        .run_bounded(0, &trust, &calibration, &limits, None)
+        .unwrap();
+    assert_eq!(cut.end, 1);
+    assert_eq!(cut.calldata, one.calldata);
+    limits.calldata_bytes = 393_216;
     let admitted = quote(&limits).unwrap();
     assert_eq!(
         admitted
