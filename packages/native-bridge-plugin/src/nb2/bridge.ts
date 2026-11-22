@@ -140,6 +140,8 @@ export type ReconcileResult =
 export interface ReturnEvidence {
   /** Exact signed settlement hashes held locally. */
   settlements?: readonly Uint8Array[];
+  /** Also check matching pending-block calls before reporting a provisional payment hint. */
+  pending?: { recovery?: Uint8Array };
   /** A certified vault receipt. Its transaction hash is a lookup hint. */
   paid?: ReturnRecord['paid'];
   readOnly?: boolean;
@@ -948,12 +950,18 @@ export class NativeBridgeV2 {
    */
   public buildRedeem(returnId: Uint8Array, envelope?: RedeemOptions['envelope']): Promise<RedeemTx> {
     returnId = Uint8Array.from(returnId);
-    return this.locked(`return/${toHex(returnId)}`, () => this.buildRedeemInner(returnId, envelope));
+    return this.locked(`return/${toHex(returnId)}`, async () => {
+      const rec = await this.returnRecord(returnId);
+      this.requireRedeemable(rec);
+      return this.buildRedeemInner(rec, envelope);
+    });
   }
 
-  private async buildRedeemInner(returnId: Uint8Array, envelope?: RedeemOptions['envelope']): Promise<RedeemTx> {
-    const rec = await this.returnRecord(returnId);
-    if (rec.status !== 'burned' && rec.status !== 'submitted') refuse('NotPending', `return ${hexq(returnId)} is ${rec.status}`);
+  private requireRedeemable(rec: ReturnRecord): void {
+    if (rec.status !== 'burned' && rec.status !== 'submitted') refuse('NotPending', `return ${rec.returnId} is ${rec.status}`);
+  }
+
+  private async buildRedeemInner(rec: ReturnRecord, envelope?: RedeemOptions['envelope']): Promise<RedeemTx> {
     const a = undec(rec.a);
     const eta = unhex(rec.eta!);
     const evidence = evidenceOf(unhex(rec.burned!));
@@ -1005,7 +1013,7 @@ export class NativeBridgeV2 {
       const encoded = envelope && envelope.encodedBytes < pins.maxEncodedTxBytes ? envelope.encodedBytes : pins.maxEncodedTxBytes;
       const gasCap = envelope && envelope.gas < pins.userGasLimit ? envelope.gas : pins.userGasLimit;
       capacityExceeded(encoded, BigInt(evidence.length), lO, this.cfg.K, P, gasLimit!, gasCap);
-      return { returnId, calldata, gasLimit: gasLimit!, P, endpoint: st.segment, history, eta, claimedStart: a };
+      return { returnId: unhex(rec.returnId), calldata, gasLimit: gasLimit!, P, endpoint: st.segment, history, eta, claimedStart: a };
     }
   }
 
@@ -1021,20 +1029,22 @@ export class NativeBridgeV2 {
 
   private async submitRedeemInner(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
     const archives = options.archives ?? [this.evm];
-    const previous = await this.returnRecord(returnId);
-    const first = previous.sends[0] && decodeSignedTx(unhex(previous.sends[0].raw));
-    const payer = previous.executionPayer ? unhex(previous.executionPayer) : first?.from;
+    // Reconciliation, construction and the journal CAS share this snapshot.
+    const fresh = await this.returnRecord(returnId);
+    const first = fresh.sends[0] && decodeSignedTx(unhex(fresh.sends[0].raw));
+    const payer = fresh.executionPayer ? unhex(fresh.executionPayer) : first?.from;
     const different = payer && !eq(payer, signer.address);
-    const prior = await this.reconcileInner(returnId, archives, { readOnly: Boolean(different) });
+    const pending = { recovery: options.recovery };
+    const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending });
     if (prior.state === 'paid' || prior.state === 'needs-archive') return prior;
     if (different) return { state: 'route-blocked', route: 'ordinary', txHash: first?.hash ?? returnId, payer };
     if (prior.state !== 'not-paid') return prior;
     let gasBump = 1n;
     for (let attempt = 0; attempt < 4; attempt++) {
-      const fresh = await this.returnRecord(returnId);
+      this.requireRedeemable(fresh);
       const competing = await this.settlementGate(fresh, archives, options.recovery);
       if (competing) return competing;
-      const rtx = await this.buildRedeemInner(returnId, options.envelope);
+      const rtx = await this.buildRedeemInner(fresh, options.envelope);
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
         options.admit && ((request) => options.admit!(request, fresh.sends)));
@@ -1045,7 +1055,7 @@ export class NativeBridgeV2 {
       await this.journal.putReturn(fresh);
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
-      const outcome = await this.reconcileInner(returnId, archives, { readOnly: true });
+      const outcome = await this.reconcileRecord(fresh, archives, { readOnly: true, pending });
       if (outcome.state !== 'not-paid') return outcome;
       // reverted: classify by simulating the same call at the current state
       const re = await this.evm.estimateGas({ from: signer.address, to: this.cfg.vault, data: rtx.calldata });
@@ -1089,6 +1099,19 @@ export class NativeBridgeV2 {
 
   private async settlementGate(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array,
     observed?: Uint8Array): Promise<ReconcileResult | undefined> {
+    const pending = await this.pendingSettlements(rec, archives, recovery);
+    const settlements = [...pending.values()].filter((hash) => !observed || !eq(hash, observed));
+    if (observed) settlements.unshift(observed);
+    const proof = await this.findPaid(rec, archives, true, { settlements });
+    if (proof) return proof;
+    for (const hash of settlements) {
+      if (pending.has(hex(hash)) && !(await this.exactFailure(hash, archives)).failed) {
+        return { state: 'pending', txHash: hash };
+      }
+    }
+  }
+
+  private async pendingSettlements(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array): Promise<Map<string, Uint8Array>> {
     const pending = new Map<string, Uint8Array>();
     const eta = unhex(rec.eta!);
     const failed = new Set(rec.sends.filter((s) => s.failed).map((s) => s.hash));
@@ -1113,19 +1136,14 @@ export class NativeBridgeV2 {
         if (matches) pending.set(hex(hash), hash);
       }
     }
-    const settlements = [...pending.values()].filter((hash) => !observed || !eq(hash, observed));
-    if (observed) settlements.unshift(observed);
-    const proof = await this.findPaid(rec, archives, true, { settlements });
-    if (proof) return proof;
-    for (const hash of settlements) {
-      if (pending.has(hex(hash)) && !(await this.exactFailure(hash, archives)).failed) {
-        return { state: 'pending', txHash: hash };
-      }
-    }
+    return pending;
   }
 
   private async reconcileInner(returnId: Uint8Array, archives: readonly EvmReader[] = [this.evm], evidence?: ReturnEvidence): Promise<ReconcileResult> {
-    const rec = await this.returnRecord(returnId);
+    return this.reconcileRecord(await this.returnRecord(returnId), archives, evidence);
+  }
+
+  private async reconcileRecord(rec: ReturnRecord, archives: readonly EvmReader[], evidence?: ReturnEvidence): Promise<ReconcileResult> {
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
     if (rec.status === 'burn-requested') {
       const eta = hex(await this.validatePendingReturn(rec));
@@ -1193,6 +1211,12 @@ export class NativeBridgeV2 {
     }
     const discoveredPaid = await verify();
     if (discoveredPaid) return discoveredPaid;
+
+    if (hinted.size && evidence?.pending) {
+      for (const [hash, tx] of await this.pendingSettlements(rec, archives, evidence.pending.recovery)) candidates.set(hash, tx);
+      const pendingPaid = await verify();
+      if (pendingPaid) return pendingPaid;
+    }
 
     let changed = false;
     // Indexed or remembered claims trigger proof reads. A certified failure retires only that exact claim.

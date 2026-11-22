@@ -334,7 +334,7 @@ export async function reconcileReturn(w: Wallet, rec: ReturnRecord, policy?: Pay
   const settlements = (journal?.superseded ?? []).map((raw) => decodeSignedTx(bytes(raw)))
     .filter((tx) => eq(tx.request.to, w.bridge.cfg.vault)).map((tx) => tx.hash);
   if (journal?.pending?.cut.kind === 'settle') settlements.push(decodeSignedTx(bytes(journal.pending.raw)).hash);
-  const evidence: ReturnEvidence = { paid: incoming?.paid, settlements, readOnly: !resubmit };
+  const evidence: ReturnEvidence = { paid: incoming?.paid, settlements, pending: { recovery: recoveryEmitter(w) }, readOnly: !resubmit };
   const paidResult = (record: ReturnRecord): ReconcileResult =>
     record.paid ? { state: 'paid', txHash: bytes(record.paid.txHash, 32), blockNumber: uint(record.paid.blockNumber) }
       : record.paidProof ? { state: 'pending', txHash: bytes(record.paidProof.txHash, 32) } : { state: 'not-paid' };
