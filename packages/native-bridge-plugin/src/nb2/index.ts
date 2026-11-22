@@ -22,6 +22,7 @@ export {
 } from './deposit.js';
 export { decodeToken, encodeToken, type Token, type LineageLevel } from './token.js';
 export { TrustInput, verifyEvmUc, type AuthenticatedOrigin } from './trust.js';
+export { refreshNb2Origin, type Nb2OriginBinding, type Nb2OriginCheckpoint } from './origin.js';
 export { VaultModel } from './vaultmodel.js';
 export { parentLink, splitOutputCommitment, decodeSplitJustification, decodeSumProof, type SumStep } from './split.js';
 
