@@ -14,6 +14,9 @@ export interface Nb2OriginCheckpoint extends AuthenticatedOrigin {
   blockNumber: number;
 }
 
+/** Maximum UTF-8 size of the complete `nb2-origin.json` response body. */
+export const MAX_NB2_ORIGIN_BYTES = 4096;
+
 const hash = /^0x[0-9a-f]{64}$/;
 const uint64Max = (1n << 64n) - 1n;
 
@@ -24,17 +27,30 @@ function word(value: unknown): bigint {
   return BigInt(value);
 }
 
-/**
- * Validate a record fetched over the release operator's authenticated HTTPS channel.
- * Start with the pinned release's checkpoint, then use the last accepted checkpoint
- * as `held`. The caller persists it and returns `trust` from the existing refresh hook.
- */
-export function refreshNb2Origin(trust: TrustInput, binding: Nb2OriginBinding, held: Nb2OriginCheckpoint, document: unknown):
-  { trust: TrustInput; checkpoint: Nb2OriginCheckpoint } {
+function decodeOrigin(bytes: Uint8Array): Record<string, unknown> {
+  if (bytes.byteLength > MAX_NB2_ORIGIN_BYTES) {
+    throw new WalletError('TrustInput', `B1 checkpoint exceeds ${MAX_NB2_ORIGIN_BYTES} bytes`);
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch (error) {
+    throw new WalletError('TrustInput', 'invalid B1 checkpoint JSON', error);
+  }
   if (document === null || typeof document !== 'object' || Array.isArray(document)) {
     throw new WalletError('TrustInput', 'invalid B1 checkpoint document');
   }
-  const record = document as Record<string, unknown>;
+  return document as Record<string, unknown>;
+}
+
+/**
+ * Decode and validate UTF-8 bytes fetched over the operator's authenticated HTTPS channel.
+ * Start with the pinned release's checkpoint, then use the last accepted checkpoint
+ * as `held`. The caller persists it and returns `trust` from the existing refresh hook.
+ */
+export function refreshNb2Origin(trust: TrustInput, binding: Nb2OriginBinding, held: Nb2OriginCheckpoint, bytes: Uint8Array):
+  { trust: TrustInput; checkpoint: Nb2OriginCheckpoint } {
+  const record = decodeOrigin(bytes);
   if (record.schema !== 'unicity-nb2-origin' || record.version !== 1 ||
       record.network !== binding.network || record.network !== Number(trust.network.id) ||
       record.generation !== binding.generation ||
