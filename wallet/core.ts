@@ -41,7 +41,7 @@ import {
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
-import { hasPeerComplete, qualifyExistingRecovery, reconcileReturn, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
+import { hasPeerComplete, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -791,7 +791,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
   if (lastRefusal !== undefined) lag?.(performance.now() - started);
   for (let i = 0; r.state === 'pending' && i < polls; i++) {
     await sleep(pollMs);
-    r = (await reconcileReturn(w, rec, policy)).result;
+    r = await pollOrdinaryPayout(w, rec, r.txHash, policy);
   }
   if (r.state === 'paid') w.update(label, { note: 'paid' });
   return r;

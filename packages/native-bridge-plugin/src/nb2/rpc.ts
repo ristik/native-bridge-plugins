@@ -447,13 +447,15 @@ export class EvmReader {
     const block = await this.rpc.call<{ transactions?: unknown[] } | null>('eth_getBlockByNumber', ['pending', true]);
     const calls: { hash: Uint8Array; calldata: Uint8Array }[] = [];
     if (!Array.isArray(block?.transactions)) return calls;
-    for (const tx of block.transactions.slice(0, 1024)) {
+    const destination = hexOf(to);
+    for (const tx of block.transactions) {
       if (tx === null || typeof tx !== 'object') continue;
       const call = tx as { to?: string; hash?: string; input?: string };
-      if (typeof call.to !== 'string' || call.to.toLowerCase() !== hexOf(to) ||
+      if (typeof call.to !== 'string' || call.to.toLowerCase() !== destination ||
         typeof call.hash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(call.hash) ||
         typeof call.input !== 'string' || call.input.length > 2 + 2 * 393216 || !/^0x(?:[0-9a-f]{2})*$/i.test(call.input)) continue;
       calls.push({ hash: bytesOf(call.hash, 'pending hash'), calldata: bytesOf(call.input, 'pending calldata') });
+      if (calls.length === 1024) break;
     }
     return calls;
   }

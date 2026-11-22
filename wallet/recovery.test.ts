@@ -8,7 +8,7 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  EvmReader, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, appendTransfer, buildHistory, decodeSignedTx,
+  EvmReader, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
   evidenceOf, quoteRecoveryGapBatch, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
@@ -1723,8 +1723,9 @@ test('exact failed sends can combine a retained header with a body-only or raw-o
   }
 });
 
-test('a visible peer settlement stops both routes before signing, and hidden concurrent sends pay once', async (t) => {
-  const { w, chain, dir, cfg, deployment, open, rpc } = await setup(t);
+async function pendingPeerSettlement(t: TestContext) {
+  const world = await setup(t);
+  const { w, chain, dir, cfg, deployment, open } = world;
   const signing = join(dir, 'one-payer-signing.json');
   await burn(w, 'coin', undefined, undefined, caps, signing);
   const rec = await w.returnRecord('coin');
@@ -1747,6 +1748,11 @@ test('a visible peer settlement stops both routes before signing, and hidden con
   chain.autoMine = false;
   const other = await recoverStep(relay, remote, caps);
   assert.equal(other.state, 'pending');
+  return { ...world, relay, remote, other };
+}
+
+test('a visible peer settlement stops both routes before signing, and hidden concurrent sends pay once', async (t) => {
+  const { w, chain, dir, open, rpc, relay, remote, other } = await pendingPeerSettlement(t);
   const active = join(dir, 'peer-active.json');
   publishReturnBackup(relay, remote, active);
   const held = await restoreReturn(w, active);
@@ -1851,4 +1857,160 @@ test('Paid tries every eligible child header with every available companion sour
   assert.equal((await restoreReturn(holder, backup, partial.policy)).status, 'paid');
   assert.ok(asked.has(child.hash));
   assert.equal(asked.size, 2, 'the archive saw both child candidates');
+});
+
+test('all pending settlement candidates are checked for certified Paid regardless of order', async (t) => {
+  const { w, chain, dir, open, rpc, other } = await pendingPeerSettlement(t);
+  const pooled = await rpc.call<{ transactions: { hash: string; input: string; to: string }[] }>('eth_getBlockByNumber', ['pending', true]);
+  const winner = pooled.transactions[0];
+  assert.equal(winner.hash, hx(other.txHash));
+  const unresolved = { ...winner, hash: hx(key('unresolved settlement')) };
+  await chain.flush();
+  const archive = await partialProofReader(t, async (method, params) => method === 'eth_getLogs' ? [] : rpc.call(method, params));
+  for (const transactions of [[unresolved, winner], [winner, unresolved]]) {
+    const name = `candidate-${transactions[0].hash.slice(2)}`;
+    cpSync(w.dir, join(dir, name), { recursive: true });
+    const primary: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_getBlockByNumber' && params[0] === 'pending') return Promise.resolve({ transactions } as T);
+      if (method === 'eth_getLogs') return Promise.resolve([] as T);
+      if (method === 'eth_getTransactionReceipt') return Promise.resolve(null as T);
+      if (method === 'eth_sendRawTransaction') throw new Error('must reconcile certified Paid before signing');
+      return rpc.call<T>(method, params);
+    } };
+    const holder = await open(name, primary, { seed: key('holder') });
+    const result = await redeem(holder, 'coin', 0, 0, undefined, undefined, archive.policy);
+    assert.equal(result.state, 'paid');
+    assert.deepEqual(result.txHash, other.txHash);
+    assert.deepEqual((await holder.returnRecord('coin')).sends, []);
+  }
+});
+
+test('ordinary redeem polls the peer hash while pending and after it leaves the pending block', async (t) => {
+  const { w, chain, open, rpc, other } = await pendingPeerSettlement(t);
+  const pending = await redeem(w, 'coin', 1, 0, undefined, undefined, caps);
+  assert.deepEqual(pending, { state: 'pending', txHash: other.txHash });
+
+  let pendingReads = 0;
+  const transport: JsonRpc = { call: async <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getLogs') return [] as T;
+    if (method === 'eth_getBlockByNumber' && params[0] === 'pending' && ++pendingReads === 2) await chain.flush();
+    if (method === 'eth_sendRawTransaction') throw new Error('polling must not sign a new settlement');
+    return rpc.call<T>(method, params);
+  } };
+  const holder = await open('holder', transport);
+  const paid = await redeem(holder, 'coin', 1, 0, undefined, undefined, caps);
+  assert.equal(paid.state, 'paid');
+  assert.deepEqual(paid.txHash, other.txHash);
+  assert.deepEqual((await holder.returnRecord('coin')).sends, []);
+});
+
+test('unrelated pending transactions do not consume the vault scan limit', async (t) => {
+  const { open, rpc, other } = await pendingPeerSettlement(t);
+  const transport: JsonRpc = { call: async <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber' && params[0] === 'pending') {
+      const pending = await rpc.call<{ transactions: object[] }>(method, params);
+      const unrelated = { to: hx(key('unrelated destination').slice(0, 20)), input: '0x', hash: hx(key('unrelated tx')) };
+      return { transactions: [...Array(1024).fill(unrelated), ...pending.transactions] } as T;
+    }
+    if (method === 'eth_sendRawTransaction') throw new Error('the vault call is visible after unrelated traffic');
+    return rpc.call<T>(method, params);
+  } };
+  const holder = await open('holder', transport);
+  assert.deepEqual(await redeem(holder, 'coin', 0, 0, undefined, undefined, caps), { state: 'pending', txHash: other.txHash });
+  assert.deepEqual((await holder.returnRecord('coin')).sends, []);
+});
+
+test('ordinary redeem recognizes pending recovery with the pinned emitter and no payer policy', async (t) => {
+  const { open, rpc, other } = await pendingPeerSettlement(t);
+  const holder = await open('holder', { call: <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_sendRawTransaction') throw new Error('the visible recovery call must defer signing');
+    return rpc.call<T>(method, params);
+  } });
+  assert.deepEqual(await redeem(holder, 'coin', 0), { state: 'pending', txHash: other.txHash });
+  assert.deepEqual((await holder.returnRecord('coin')).sends, []);
+});
+
+test('ordinary submission preserves another SDK instance’s durable send at the same payer nonce', async (t) => {
+  const { w, open, rpc } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const { returnId } = await w.returnRecord('coin');
+  const id = unhex(returnId);
+  let durable!: string;
+  const second = await open('holder', { call: <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_maxPriorityFeePerGas') return Promise.resolve('0x2' as T);
+    if (method === 'eth_sendRawTransaction') {
+      durable = params[0] as string;
+      throw new Error('second SDK stopped before broadcast');
+    }
+    return rpc.call<T>(method, params);
+  } });
+  let competed = false;
+  const first = await open('holder', { call: async <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber' && params[0] === 'pending' && !competed) {
+      competed = true;
+      await assert.rejects(second.bridge.submitRedeem(id, second.signer), /second SDK stopped before broadcast/);
+      assert.equal((await second.returnRecord('coin')).sends[0].raw, durable);
+    }
+    if (method === 'eth_sendRawTransaction') throw new Error('conflicting send must not broadcast');
+    return rpc.call<T>(method, params);
+  } });
+  await assert.rejects(first.bridge.submitRedeem(id, first.signer, { admit: async (request) => {
+    const competing = decodeSignedTx(unhex(durable));
+    assert.deepEqual(competing.from, first.signer.address);
+    assert.equal(competing.request.nonce, request.nonce);
+    assert.notEqual(competing.request.maxPriorityFeePerGas, request.maxPriorityFeePerGas);
+  } }), (err: unknown) => err instanceof WalletError && err.reason === 'JournalConflict');
+  assert.deepEqual((await first.returnRecord('coin')).sends.map((send) => send.raw), [durable]);
+});
+
+test('ordinary and recovery resume prefer a certified pending candidate over a saved payment hint', async (t) => {
+  const { w, chain, cfg, rpc, rpcOn, open, dir, other } = await pendingPeerSettlement(t);
+  const rec = await w.returnRecord('coin');
+  assert.ok(rec.recovery);
+  const pool = await rpc.call<{ transactions: { hash: string; input: string; to: string }[] }>('eth_getBlockByNumber', ['pending', true]);
+  assert.equal(pool.transactions[0].hash, hx(other.txHash));
+  const fork = chain.fork();
+  fork.coldCall = chain.coldCall;
+  const hint = await signTx(w.signer, { chainId: cfg.chainId, nonce: await w.bridge.evm.nonce(w.signer.address),
+    maxFeePerGas: 23n, maxPriorityFeePerGas: 1n, gas: 2_000_000n, to: cfg.vault, value: 0n, data: unhex(pool.transactions[0].input) });
+  await fork.mine([hint.raw]); // The payment receipt exists but has no certifying child.
+  const speculative = await open('holder', rpcOn(fork));
+  assert.deepEqual((await reconcileReturn(speculative, rec, caps, undefined, false)).result, { state: 'pending', txHash: hint.hash });
+  assert.equal((await speculative.returnRecord('coin')).paidProof?.txHash, hx(hint.hash));
+  await chain.flush();
+  const certified: JsonRpc = { call: <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getLogs') return Promise.resolve([] as T);
+    if (method === 'eth_getBlockByNumber' && params[0] === 'pending') return Promise.resolve(pool as T);
+    if (method === 'eth_sendRawTransaction') throw new Error('certified Paid must close the return before a send');
+    return rpc.call<T>(method, params);
+  } };
+  for (const ordinary of [true, false]) {
+    if (!ordinary) {
+      await reconcileReturn(speculative, rec, caps, undefined, false);
+      assert.equal((await reconcileReturn(speculative, rec, caps, undefined, false)).result.state, 'needs-archive');
+    }
+    const name = ordinary ? 'ordinary-hint' : 'recovery-hint';
+    cpSync(w.dir, join(dir, name), { recursive: true });
+    const resumed = await open(name, certified, { seed: key('holder') });
+    const result = await resumePayout(resumed, rec, caps, ordinary);
+    assert.equal(result.state, 'paid');
+    assert.deepEqual(result.txHash, other.txHash);
+    const row = await resumed.returnRecord('coin');
+    assert.equal(row.paidProof, undefined);
+    assert.deepEqual(row.sends, []);
+  }
+});
+
+test('ordinary redeem refuses a planned return with NotPending before looking for settlements', async (t) => {
+  const { w, open, rpc } = await setup(t, true);
+  await planReturn(w, 'coin', undefined, undefined, caps);
+  let pendingReads = 0;
+  const holder = await open('holder', { call: <T>(method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber' && params[0] === 'pending') pendingReads++;
+    if (method === 'eth_sendRawTransaction') throw new Error('a planned return must not broadcast');
+    return rpc.call<T>(method, params);
+  } });
+  await assert.rejects(redeem(holder, 'coin', 0), (err: unknown) => err instanceof WalletError && err.reason === 'NotPending');
+  assert.equal(pendingReads, 0);
+  assert.equal((await holder.returnRecord('coin')).status, 'planned');
 });
