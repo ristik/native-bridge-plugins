@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { toHex } from '../../src/bytes.js';
-import { NativeBridgeV2, refreshNb2Origin, type Nb2OriginCheckpoint } from '../../src/nb2/index.js';
+import { MAX_NB2_ORIGIN_BYTES, NativeBridgeV2, refreshNb2Origin, type Nb2OriginCheckpoint } from '../../src/nb2/index.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, makeRoot, makeConfig, roundAtLeast, roundNow, setup } from './world.js';
 
+const encode = (data: unknown) => new TextEncoder().encode(JSON.stringify(data));
 const blockHash = (hex: string) => '0x' + hex.repeat(64);
 
 test('checkpoint refresh rejects rollback, wrong binding and malformed or conflicting fields', async () => {
@@ -16,7 +17,7 @@ test('checkpoint refresh rejects rollback, wrong binding and malformed or confli
   const binding = { network: cfg.network, generation: 'public-a', genesisHash: '0x' + toHex(cfg.executionGenesis), releaseSha256: 'a'.repeat(64) };
   const candidate = { schema: 'unicity-nb2-origin', version: 1, ...binding,
     blockHash: blockHash('2'), blockNumber: 13, usableEpoch: '2', rootRound: '550' };
-  const apply = (changes: Record<string, unknown>) => refreshNb2Origin(trust, binding, held, { ...candidate, ...changes });
+  const apply = (changes: Record<string, unknown>) => refreshNb2Origin(trust, binding, held, encode({ ...candidate, ...changes }));
   assert.deepEqual(apply({}).checkpoint, { blockHash: blockHash('2'), blockNumber: 13, usableEpoch: 2n, rootRound: 550n });
   assert.deepEqual(apply({ blockHash: held.blockHash, blockNumber: held.blockNumber, rootRound: '500' }).checkpoint, held);
   for (const changed of [
@@ -34,7 +35,31 @@ test('checkpoint refresh rejects rollback, wrong binding and malformed or confli
     { blockNumber: held.blockNumber, blockHash: held.blockHash, usableEpoch: '3' },
   ]) assert.throws(() => apply(changed), /conflicts/);
   const ahead = trust.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 600n });
-  assert.throws(() => refreshNb2Origin(ahead, binding, held, candidate), /rolls back/);
+  assert.throws(() => refreshNb2Origin(ahead, binding, held, encode(candidate)), /rolls back/);
+});
+
+test('the encoded checkpoint limit includes extra fields and applies before parsing', async () => {
+  const root = await makeRoot();
+  const cfg = makeConfig(root);
+  const held = { blockHash: blockHash('1'), blockNumber: 12, usableEpoch: 1n, rootRound: 500n };
+  const trust = root.trust.withAuthenticatedOrigin(held);
+  const binding = { network: cfg.network, generation: 'public-a', genesisHash: '0x' + toHex(cfg.executionGenesis), releaseSha256: 'a'.repeat(64) };
+  const record = { schema: 'unicity-nb2-origin', version: 1, ...binding,
+    blockHash: blockHash('2'), blockNumber: 13, usableEpoch: '1', rootRound: '550', extension: '' };
+  const apply = (bytes: Uint8Array) => refreshNb2Origin(trust, binding, held, bytes);
+  const available = MAX_NB2_ORIGIN_BYTES - encode(record).byteLength;
+  record.extension = 'é'.repeat(Math.floor(available / 2)) + ' '.repeat(available % 2);
+  const atLimit = encode(record);
+  assert.equal(atLimit.byteLength, MAX_NB2_ORIGIN_BYTES);
+  assert.equal(apply(atLimit).checkpoint.rootRound, 550n);
+
+  record.extension += 'x';
+  const overLimit = encode(record);
+  assert.equal(overLimit.byteLength, MAX_NB2_ORIGIN_BYTES + 1);
+  assert.throws(() => apply(overLimit), /checkpoint exceeds 4096 bytes/);
+  assert.throws(() => apply(new Uint8Array(overLimit.byteLength)), /checkpoint exceeds 4096 bytes/);
+  assert.throws(() => apply(new TextEncoder().encode('{')), /invalid B1 checkpoint JSON/);
+  assert.throws(() => apply(Uint8Array.of(0x22, 0xff, 0x22)), /invalid B1 checkpoint JSON/);
 });
 
 test('the existing refresh hook verifies a deposit hundreds of rounds beyond an unchanged release', async () => {
@@ -53,7 +78,7 @@ test('the existing refresh hook verifies a deposit hundreds of rounds beyond an 
   const bridge = await NativeBridgeV2.open({
     ...w.options('checkpoint'), trust, refreshTrust: async () => {
       refreshes++;
-      ({ trust, checkpoint: held } = refreshNb2Origin(trust, binding, held, reply));
+      ({ trust, checkpoint: held } = refreshNb2Origin(trust, binding, held, encode(reply)));
       return trust;
     },
   });

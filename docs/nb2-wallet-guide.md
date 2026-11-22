@@ -8,15 +8,21 @@ the wallet. UTB refresh updates the held history. A new origin requires its own 
 
 For the public testnet, fetch `/release/nb2-origin.json` from the same authenticated HTTPS origin as
 the digest-pinned release. Fetch with cache revalidation or `cache: "no-store"` and keep the
-request on the release origin. Use `refreshNb2Origin(trust, binding, held, document)` from the `./nb2` entry
-point. Supply the release's generation and execution genesis, its network pin, and the independently
-held release SHA-256 (lowercase hex without `0x`). Use the verified release's origin as the initial
-`held` checkpoint, converting its epoch and round strings to bigint. On refresh, extend UTB history as
-usual and return the helper's `trust` through the plug-in's existing `refreshTrust` hook. Serialize
-acceptance and persist the returned `checkpoint` under the release digest before returning the updated
-trust, so a reload resumes from the last accepted checkpoint. Pass the document unchanged to the helper.
-It validates the schema, deployment binding and monotonic progression. HTTPS authenticates the record;
-a checkpoint that still precedes a certificate leaves that certificate pending an adequate origin.
+request on the release origin. Read the response stream as bytes with the exported
+`MAX_NB2_ORIGIN_BYTES` limit (4096 bytes). Count the chunks after HTTP content decoding. If a chunk
+would bring the total over the limit, cancel the read before buffering that chunk. Apply the byte count
+even when the response supplies a Content-Length. Pass the resulting `Uint8Array` directly to
+`refreshNb2Origin(trust, binding, held, bytes)` from the `./nb2` entry point. The helper checks the
+size again before UTF-8 decoding and JSON parsing.
+
+Supply the release's generation and execution genesis, its network pin, and the independently held
+release SHA-256 (lowercase hex without `0x`). Use the verified release's origin as the initial `held`
+checkpoint, converting its epoch and round strings to bigint. On refresh, extend UTB history as usual
+and return the helper's `trust` through the plug-in's existing `refreshTrust` hook. Serialize acceptance
+and persist the returned `checkpoint` under the release digest before returning the updated trust, so
+a reload resumes from the last accepted checkpoint. The helper validates the schema, deployment binding
+and monotonic progression. HTTPS authenticates the record. A checkpoint that still precedes a certificate
+leaves that certificate pending an adequate origin.
 
 
 This guide is for a wallet developer. It shows how to move native UCT between the EVM chain and Unicity with the TypeScript plug-in
