@@ -6,6 +6,18 @@ trusted deployment or registry checkpoint channel. Unlocking and proving lineage
 certificate. For a moving deployment, update the origin file with a newer authenticated checkpoint and reopen
 the wallet. UTB refresh updates the held history. A new origin requires its own authenticated checkpoint.
 
+For the public testnet, fetch `/release/nb2-origin.json` from the same authenticated HTTPS origin as
+the digest-pinned release. Fetch with cache revalidation or `cache: "no-store"` and keep the
+request on the release origin. Use `refreshNb2Origin(trust, binding, held, document)` from the `./nb2` entry
+point. Supply the release's generation and execution genesis, its network pin, and the independently
+held release SHA-256 (lowercase hex without `0x`). Use the verified release's origin as the initial
+`held` checkpoint, converting its epoch and round strings to bigint. On refresh, extend UTB history as
+usual and return the helper's `trust` through the plug-in's existing `refreshTrust` hook. Serialize
+acceptance and persist the returned `checkpoint` under the release digest before returning the updated
+trust, so a reload resumes from the last accepted checkpoint. Pass the document unchanged to the helper.
+It validates the schema, deployment binding and monotonic progression. HTTPS authenticates the record;
+a checkpoint that still precedes a certificate leaves that certificate pending an adequate origin.
+
 
 This guide is for a wallet developer. It shows how to move native UCT between the EVM chain and Unicity with the TypeScript plug-in
 (`packages/native-bridge-plugin`, entry point `./nb2`). You don't handle segments, gap proofs or receipt tries yourself: the plug-in builds and
