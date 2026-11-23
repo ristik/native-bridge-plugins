@@ -98,6 +98,8 @@ A `proven` deposit with `mintProof` is certified and awaiting offline verificati
 An extra deposit may hold `reason` and `mintProof` under its `seenDeposits` entry until its verified token is installed.
 If an ahead proof cannot be verified, `mint(intent, { recoverProof: true })` or the CLI's `mint NAME --recover-proof`
 asks for one alternative for the same request. It replaces the saved proof only after verification under held authority.
+If verification definitively rejects the saved proof, an alternative that lies ahead of the origin becomes the new pending
+candidate. It still has to pass full verification before the token becomes usable.
 
 The plug-in sends no value for a record that is not `planned` or `submitted`, is not backed up (unless the deployment opts out), or
 whose `rho` does not derive from this wallet's `k_w`.
@@ -128,9 +130,15 @@ record. A different recipient for the same source is refused. Readers of the sha
 leave this separate key alone.
 
 The CLI keeps its own pending transfer files keyed by destination name. `transfer NAME NEW --recover-proof` can request
-one alternative for its existing signed request. It replaces the retained proof only after verifying the alternative.
+one alternative for its existing signed request. An ahead proof is replaced only after verifying the alternative. After a
+definitive refusal, an ahead replacement is saved as pending until it can be verified.
 The journal writer checks the protocol framing before saving a proof. A mint proof can occupy up to 40,952 bytes.
 The complete transfer pair, including its array header and signed transaction, can occupy up to 40,960 bytes.
+
+The plug-in's `mintExtraDeposit`, `transfer`, `split` and `burn` methods also accept a final `{ recoverProof: true }`
+argument. Supply the earlier arguments as usual, including `undefined` for unused optional positions. For a split, the
+option applies to the pending manifest burn or child mint. A return reuses the signed burn and still runs its certification
+hook and full burn verification before it can be used to redeem.
 
 ## `return`
 

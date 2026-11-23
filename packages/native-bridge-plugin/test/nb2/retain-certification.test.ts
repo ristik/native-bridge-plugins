@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
+import { NativeBridgeV2, type ProofRecoveryOptions, type ReturnAdmission } from '../../src/nb2/bridge.js';
+import { depositCalldata } from '../../src/nb2/abi.js';
+import { firstOwnerOf } from '../../src/nb2/deposit.js';
 import { Nb2Error } from '../../src/nb2/errors.js';
+import { signTx } from '../../src/nb2/evm.js';
+import { hex } from '../../src/nb2/journal.js';
 import { MAX_MINT_PROOF } from '../../src/nb2/token.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { SealAheadOfOrigin } from '../../src/nb2/trust.js';
@@ -109,6 +113,123 @@ test('Mint recovery replaces a future seal only with a verified proof of the sam
   assert.equal((await resumed.verifyToken(await resumed.mint(intent, { recoverProof: true }))).amount, 8n);
   assert.equal(attempts, 3);
 });
+
+test('after a structural refusal Mint retains the next valid but ahead proof across reload', async () => {
+  const w = await setup();
+  const opts = w.options('replacement catch-up');
+  const boot = await NativeBridgeV2.open(opts);
+  const { intent } = await boot.planDeposit(8n, localOwner(key('replacement owner')).publicKey);
+  await boot.submitDeposit(intent, evmAccount(w.chain, 'replacement payer'));
+  await boot.collectDepositProof(intent);
+  let origin = roundNow();
+  let calls = 0;
+  let request: Uint8Array | undefined;
+  let replacement: Uint8Array | undefined;
+  const moving = new FakeAggregator(w.root, true);
+  const open = () => NativeBridgeV2.open({ ...opts, trust: w.root.trust.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: origin }),
+    aggregator: { certify: async (cd) => {
+      if (request) assert.deepEqual(cd, request);
+      request ??= cd.slice();
+      if (++calls === 1) return framedProof(cd, 512);
+      roundAtLeast(origin + 4n);
+      replacement = await moving.certify(cd);
+      return replacement;
+    } },
+  });
+  const first = await open();
+  await assert.rejects(first.mint(intent), { rule: 'Length' });
+  assert.ok((await first.journal.deposit(intent))?.mintProof);
+  await assert.rejects(first.mint(intent), ahead);
+  const resumed = await open();
+  const pending = await resumed.journal.deposit(intent);
+  assert.equal(pending?.mintProof, hex(replacement!));
+  assert.equal(pending?.status, 'proven');
+  assert.equal(pending?.token, undefined);
+  await assert.rejects(resumed.mint(intent), ahead);
+  assert.equal(calls, 2);
+  origin = roundNow();
+  const caughtUp = await open();
+  assert.equal((await caughtUp.verifyToken(await caughtUp.mint(intent))).amount, 8n);
+  assert.equal(calls, 2);
+});
+
+for (const operation of ['extra mint', 'transfer', 'split burn', 'split child', 'return burn'] as const) {
+  test(`${operation} can recover the exact request from an unusable future seal`, async () => {
+    const w = await setup();
+    const opts = w.options(`recover ${operation}`);
+    const boot = await NativeBridgeV2.open(opts);
+    const owner = localOwner(key(`owner ${operation}`));
+    const recipient = localOwner(key(`recipient ${operation}`));
+    const payer = evmAccount(w.chain, `payer ${operation}`);
+    const deposit = await boot.planDeposit(8n, owner.publicKey);
+    await boot.submitDeposit(deposit.intent, payer);
+    await boot.collectDepositProof(deposit.intent);
+    const source = await boot.mint(deposit.intent);
+    if (operation === 'extra mint') {
+      const extra = await signTx(payer, {
+        chainId: w.cfg.chainId, nonce: BigInt(await w.chain.call<string>('eth_getTransactionCount', [hex(payer.address), 'pending'])),
+        maxPriorityFeePerGas: 1n, maxFeePerGas: 15n, gas: 200_000n, to: w.cfg.vault, value: 8n,
+        data: depositCalldata(firstOwnerOf(recipient.publicKey), deposit.rho),
+      });
+      await w.chain.call('eth_sendRawTransaction', [hex(extra.raw)]);
+      await boot.recoverDeposits(1n);
+    }
+    const outputs = [{ ownerKey: recipient.publicKey, amount: 8n }];
+    const plan = operation === 'return burn' ? await boot.planReturn(source, payer.address, payer.address) : undefined;
+    const poisonAt = operation === 'split child' ? 2 : 1;
+    let calls = 0;
+    let request: Uint8Array | undefined;
+    let hooks = 0;
+    let admitCertification = true;
+    const admission: ReturnAdmission = { beforeCertification: async (record) => {
+      hooks++;
+      assert.equal(record.status, 'burn-requested');
+      assert.equal(record.burned, undefined);
+      assert.equal(record.eta, undefined);
+      if (request) assert.equal(record.burnRequest, hex(request));
+      if (!admitCertification) throw new Error('certification admission refused');
+    } };
+    const open = () => NativeBridgeV2.open({ ...opts, aggregator: { certify: async (cd) => {
+      const call = ++calls;
+      if (call === poisonAt) request = cd.slice();
+      if (call === poisonAt + 1) assert.deepEqual(cd, request);
+      const good = await w.agg.certify(cd);
+      return call === poisonAt ? withoutQuorum(good, w.root, true) : good;
+    } } });
+    const run = async (bridge: NativeBridgeV2, recovery?: ProofRecoveryOptions) => {
+      if (operation === 'extra mint') return bridge.mintExtraDeposit(deposit.intent, 2n, recovery);
+      if (operation === 'transfer') return bridge.transfer(source, owner, recipient.publicKey, recovery);
+      if (plan) {
+        const result = await bridge.burn(plan.returnId, recovery ? undefined : owner, admission, payer.address, recovery);
+        assert.equal(result.verdict.amount, 8n);
+        assert.deepEqual(result.verdict.recipient, payer.address);
+        assert.equal(result.verdict.minSegment, plan.a);
+        return result.burned;
+      }
+      return (await bridge.split(source, owner, outputs, undefined, recovery))[0];
+    };
+    await assert.rejects(run(await open()), ahead);
+    const resumed = await open();
+    await assert.rejects(run(resumed), ahead);
+    assert.equal(calls, poisonAt);
+    if (plan) {
+      const saved = await resumed.journal.ret(hex(plan.returnId));
+      admitCertification = false;
+      await assert.rejects(run(resumed, { recoverProof: true }), /certification admission refused/);
+      assert.equal(calls, poisonAt);
+      assert.deepEqual(await resumed.journal.ret(hex(plan.returnId)), saved);
+      admitCertification = true;
+    }
+    const verified = await run(resumed, { recoverProof: true });
+    if (plan) {
+      assert.equal(hooks, 3);
+      assert.equal((await resumed.journal.ret(hex(plan.returnId)))?.status, 'burned');
+    } else {
+      assert.deepEqual((await resumed.verifyToken(verified)).owner, recipient.publicKey);
+    }
+    assert.equal(calls, poisonAt + (operation === 'split burn' ? 2 : 1));
+  });
+}
 
 test('Mint checks its proof bound before journaling and allows the exact maximum frame', async () => {
   const w = await setup();

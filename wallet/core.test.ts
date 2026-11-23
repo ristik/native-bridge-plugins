@@ -15,7 +15,7 @@ import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
 import { MAX_TRANSFER_PAIR } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
 import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
-import { framedProof, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
+import { framedProof, withSeal, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
 import { WORLD_GAS, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type WalletConfig } from './core.js';
 
@@ -160,6 +160,35 @@ test('transfer: explicit recovery preserves an ahead candidate until a healthy p
   const token = await transfer(resumed, 'coin', 'coin2', 1, undefined, true);
   assert.equal((await resumed.bridge.verifyToken(token)).amount, 10n);
   assert.equal(x.agg.submitted, before + 3);
+});
+
+test('transfer: a rejected saved proof is replaced by a fixed ahead candidate across reopen', async (t) => {
+  const x = await withCoin();
+  const certify = x.agg.certify.bind(x.agg);
+  const origin = x.w.trust.origin!;
+  let calls = 0;
+  let request: Uint8Array | undefined;
+  let replacement: Uint8Array | undefined;
+  t.mock.method(x.agg, 'certify', async (cd: Uint8Array) => {
+    if (request) assert.deepEqual(cd, request);
+    request ??= cd.slice();
+    if (++calls === 1) return framedProof(cd, 512);
+    replacement = await withSeal(await certify(cd), x.root, origin.rootRound + BigInt(calls) + 3n, x.root.signers.length);
+    return replacement;
+  });
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), { rule: 'Length' });
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), SealAheadOfOrigin);
+  const path = x.w.pendingFile('coin2');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).proof, hex(replacement!));
+  const resumed = await x.openAt();
+  t.mock.method(resumed, 'refreshAuthority', async () => resumed.trust);
+  await assert.rejects(transfer(resumed, 'coin', 'coin2', 1), SealAheadOfOrigin);
+  assert.equal(calls, 2);
+  await resumed.persistAuthority(resumed.trust.withAuthenticatedOrigin({ ...origin, rootRound: origin.rootRound + 5n }));
+  const caughtUp = await x.openAt();
+  const token = await transfer(caughtUp, 'coin', 'coin2', 1);
+  assert.equal((await caughtUp.bridge.verifyToken(token)).amount, 10n);
+  assert.equal(calls, 2);
 });
 
 test('transfer: overflow leaves the pending file unchanged and the maximum pair fits', async (t) => {

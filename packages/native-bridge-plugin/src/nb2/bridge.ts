@@ -97,6 +97,9 @@ export const deriveBridgeKey = (seed: Uint8Array): Uint8Array => hmac(sha256, se
 
 export interface DepositPlan { intent: bigint; amount: bigint; rho: Uint8Array; firstOwner: Uint8Array; calldata: Uint8Array; record: DepositRecord }
 
+/** Ask for a verified alternative when the exact signed request holds an ahead proof. */
+export interface ProofRecoveryOptions { recoverProof?: boolean }
+
 export interface ReturnPlan {
   returnId: Uint8Array;
   amount: bigint;
@@ -431,7 +434,7 @@ export class NativeBridgeV2 {
   }
 
   /** Mint with receipt-backed reason J. Recovery can look for a verified alternative to an ahead proof. */
-  public mint(intent: bigint, options?: { recoverProof?: boolean }): Promise<Uint8Array> {
+  public mint(intent: bigint, options?: ProofRecoveryOptions): Promise<Uint8Array> {
     const recoverProof = options?.recoverProof;
     return this.locked(`deposit/${intent}`, async () => {
       const rec = await this.depositRecord(intent);
@@ -455,7 +458,8 @@ export class NativeBridgeV2 {
    * Mint a further deposit that carries this intent's rho (`seenDeposits`): a reused secret, or a second device. Its value is a
    * separate root token with its own deposit number; nothing is lost.
    */
-  public mintExtraDeposit(intent: bigint, depositNumber: bigint): Promise<Uint8Array> {
+  public mintExtraDeposit(intent: bigint, depositNumber: bigint, options?: ProofRecoveryOptions): Promise<Uint8Array> {
+    const recoverProof = options?.recoverProof;
     return this.locked(`deposit/${intent}`, async () => {
       const rec = await this.depositRecord(intent);
       const x = (rec.seenDeposits ?? []).find((s) => s.depositNumber === dec(depositNumber));
@@ -468,7 +472,7 @@ export class NativeBridgeV2 {
         x!.reason = hex(reason);
         x!.mintProof = proof;
         await this.journal.putDeposit(rec);
-      });
+      }, recoverProof);
       x!.token = hex(token);
       delete x!.reason;
       delete x!.mintProof;
@@ -523,7 +527,8 @@ export class NativeBridgeV2 {
   }
 
   /** An ordinary transfer to `toKey`; the result is verified before it is returned. */
-  public async transfer(token: Uint8Array, owner: OwnerSigner, toKey: Uint8Array): Promise<Uint8Array> {
+  public async transfer(token: Uint8Array, owner: OwnerSigner, toKey: Uint8Array, options?: ProofRecoveryOptions): Promise<Uint8Array> {
+    const recoverProof = options?.recoverProof;
     token = Uint8Array.from(token);
     toKey = Uint8Array.from(toKey);
     parseKey(toKey);
@@ -546,7 +551,7 @@ export class NativeBridgeV2 {
         const held = await verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(out));
         if (!eq(held.owner.params, toKey)) refuse('ProviderFault', 'the certified transfer has another recipient');
         return out;
-      });
+      }, { recoverProof });
     });
   }
 
@@ -554,15 +559,18 @@ export class NativeBridgeV2 {
    * Split a held token into whole parts. The plan is journaled first, then the burn's
    * exact request, the burned parent and each child as it is minted; a call with the same `splitId` resumes.
    */
-  public split(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], splitId?: Uint8Array): Promise<Uint8Array[]> {
+  public split(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], splitId?: Uint8Array,
+    options?: ProofRecoveryOptions): Promise<Uint8Array[]> {
     token = Uint8Array.from(token);
     outputs = outputs.map(({ ownerKey, amount }) => ({ ownerKey: Uint8Array.from(ownerKey), amount }));
     splitId = splitId === undefined ? undefined : Uint8Array.from(splitId);
     const id = splitId ?? HU(cArr(cBytes(ascii('UNICITY_NB2_WALLET_SPLIT')), cBytes(token)));
-    return this.locked(`split/${toHex(id)}`, () => this.splitInner(token, owner, outputs, id));
+    const recoverProof = options?.recoverProof;
+    return this.locked(`split/${toHex(id)}`, () => this.splitInner(token, owner, outputs, id, recoverProof));
   }
 
-  private async splitInner(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], id: Uint8Array): Promise<Uint8Array[]> {
+  private async splitInner(token: Uint8Array, owner: OwnerSigner, outputs: { ownerKey: Uint8Array; amount: bigint }[], id: Uint8Array,
+    recoverProof?: boolean): Promise<Uint8Array[]> {
     let rec = await this.journal.splitForUpdate(hex(id));
     if (rec === null) {
       const held = await this.verifyToken(token);
@@ -599,7 +607,7 @@ export class NativeBridgeV2 {
       const verified = await this.retainedCertification(unhex(rec.burnRequest!), transferProofLimit(tx), rec.burnProof, async (proof) => {
         rec.burnProof = proof;
         await this.journal.putSplit(rec);
-      }, (proof) => verifyBurn(appendTransfer(unhex(rec.source), tx, proof)));
+      }, (proof) => verifyBurn(appendTransfer(unhex(rec.source), tx, proof)), { recoverProof });
       rec.burned = hex(verified.burned);
       delete rec.burnProof;
       rec.status = 'burned';
@@ -633,7 +641,7 @@ export class NativeBridgeV2 {
         const held = await verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token));
         if (held.amount !== undec(output.amount)) refuse('ProviderFault', 'a split child has another amount');
         return token;
-      });
+      }, { recoverProof });
       output.token = hex(child);
       delete output.mintProof;
       await this.journal.putSplit(rec);
@@ -661,13 +669,15 @@ export class NativeBridgeV2 {
   /** Keep a certification result through trust refresh, retry and reload. */
   private async retainedCertification<T>(request: Uint8Array, maxBytes: number, saved: string | undefined,
     save: (proof: string) => Promise<void>, verify: (proof: Uint8Array) => Promise<T>,
-    options: { recoverProof?: boolean; beforeCertification?: () => Promise<void> } = {}): Promise<T> {
+    options: ProofRecoveryOptions & { beforeCertification?: () => Promise<void> } = {}): Promise<T> {
+    let rejected = saved !== undefined;
     if (saved !== undefined && /^0x([0-9a-f]{2})*$/.test(saved)) {
+      rejected = false;
       let replace = false;
       const verifySaved = async () => {
         try { return await verify(unhex(saved)); } catch (error) {
-          replace = error instanceof Nb2Error && (!this.trustBehind(error) ||
-            (options.recoverProof === true && isSealAheadOfOrigin(error)));
+          rejected = error instanceof Nb2Error && !this.trustBehind(error);
+          replace = rejected || (options.recoverProof === true && isSealAheadOfOrigin(error));
           throw error;
         }
       };
@@ -680,7 +690,13 @@ export class NativeBridgeV2 {
     await options.beforeCertification?.();
     const proof = await certifyChecked(this.opts.aggregator, request, maxBytes);
     if (saved !== undefined) {
-      const verified = await verify(proof);
+      let verified: T;
+      try { verified = await verify(proof); } catch (error) {
+        // An ahead proof can still be usable. Only stage an unverified
+        // replacement when the old proof was definitively rejected.
+        if (rejected && isSealAheadOfOrigin(error)) await save(hex(proof));
+        throw error;
+      }
       await save(hex(proof));
       return verified;
     }
@@ -964,13 +980,16 @@ export class NativeBridgeV2 {
    * Certify the terminal burn of a planned return: R signs the recipient, the amount and the index. The exact request is journaled
    * before certification, the certified burn before this returns; a second call resumes the same burn and never makes another.
    */
-  public burn(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+  public burn(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array,
+    options?: ProofRecoveryOptions): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
     returnId = Uint8Array.from(returnId);
     const recipient = expectedRecipient && Uint8Array.from(expectedRecipient);
-    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner, admission, recipient));
+    const recoverProof = options?.recoverProof;
+    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner, admission, recipient, recoverProof));
   }
 
-  private async burnInner(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
+  private async burnInner(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array,
+    recoverProof?: boolean): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
     const rec = await this.returnRecord(returnId);
     if (rec.status === 'planned') {
       // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
@@ -997,7 +1016,7 @@ export class NativeBridgeV2 {
     if (rec.status === 'burn-requested' || (rec.status === 'paid' && !rec.burned)) {
       if (!rec.burnRequest || !rec.burnTx) refuse('EvidenceMissing', 'the exact signed burn is unavailable');
       await this.certifyReturn(rec, rec.status === 'burn-requested' && admission?.beforeCertification
-        ? (record) => admission.beforeCertification!(record) : undefined);
+        ? (record) => admission.beforeCertification!(record) : undefined, recoverProof);
       await this.journal.putReturn(rec);
     }
     const burned = unhex(rec.burned!);
@@ -1006,7 +1025,7 @@ export class NativeBridgeV2 {
     return { burned, eta: verdict.eta, verdict };
   }
 
-  private async certifyReturn(rec: ReturnRecord, beforeCertification?: (record: ReturnRecord) => Promise<void>): Promise<void> {
+  private async certifyReturn(rec: ReturnRecord, beforeCertification?: (record: ReturnRecord) => Promise<void>, recoverProof?: boolean): Promise<void> {
     const tx = unhex(rec.burnTx!);
     const { burned, v } = await this.retainedCertification(unhex(rec.burnRequest!), transferProofLimit(tx), rec.burnProof, async (proof) => {
       rec.burnProof = proof;
@@ -1017,7 +1036,7 @@ export class NativeBridgeV2 {
       if (v.minSegment !== undec(rec.a) || v.amount !== undec(rec.amount) || !eq(v.recipient, unhex(rec.recipient))) refuse('ProviderFault', 'the certified burn is not the planned one');
       if (rec.eta !== undefined && rec.eta !== hex(v.eta)) refuse('JournalConflict', 'certified burn does not match the journaled redemption ID');
       return { burned, v };
-    }, { beforeCertification: beforeCertification && (() => beforeCertification(structuredClone(rec))) });
+    }, { recoverProof, beforeCertification: beforeCertification && (() => beforeCertification(structuredClone(rec))) });
     rec.burned = hex(burned);
     delete rec.burnProof;
     rec.eta = hex(v.eta);

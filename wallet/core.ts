@@ -653,16 +653,26 @@ export async function transfer(w: Wallet, from: string, to: string, owner: numbe
     return token;
   };
   let t: Uint8Array | undefined;
+  let rejected = false;
   if (p.proof !== undefined) {
     try { t = await verify(unhex(p.proof), recoverProof); } catch (error) {
       if (!(error instanceof Nb2Error) || error.retryable || (isSealAheadOfOrigin(error) && !recoverProof)) throw error;
+      rejected = !isSealAheadOfOrigin(error);
     }
   }
   if (t === undefined) {
     const proof = await certifyChecked(w.aggregator, unhex(p.cd), transferProofLimit(tx));
-    if (p.proof !== undefined) t = await verify(proof, true);
-    p.proof = hx(proof);
-    writeDurable(file, JSON.stringify(p));
+    const save = () => {
+      p.proof = hx(proof);
+      writeDurable(file, JSON.stringify(p));
+    };
+    if (p.proof !== undefined) {
+      try { t = await verify(proof, true); } catch (error) {
+        if (rejected && isSealAheadOfOrigin(error)) save();
+        throw error;
+      }
+    }
+    save();
     t ??= await verify(proof);
   }
   const e = w.entry(p.from);
