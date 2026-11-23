@@ -112,7 +112,7 @@ export class FakeAggregator implements Aggregator {
   public readonly certified = new Map<string, Uint8Array>();
   public time = 1_700_000_000n;
   public calls = 0;
-  public constructor(private readonly root: Root) {}
+  public constructor(private readonly root: Root, private readonly movingProofs = false) {}
 
   public async certify(request: Uint8Array): Promise<Uint8Array> {
     this.calls++;
@@ -121,8 +121,8 @@ export class FakeAggregator implements Aggregator {
     const prior = this.certified.get(toHex(sid));
     if (prior !== undefined) {
       // single spend: the same request gets its proof again, another transaction from the same state is refused
-      if (toHex(prior).includes(toHex(request))) return prior;
-      throw new Error('fake aggregator: state already spent by another transaction');
+      if (!toHex(prior).includes(toHex(request))) throw new Error('fake aggregator: state already spent by another transaction');
+      if (!this.movingProofs) return prior;
     }
     const t = ++this.time;
     const smt = new SparseMerkleTree(new DataHasherFactory(HashAlgorithm.SHA256, NodeDataHasher));

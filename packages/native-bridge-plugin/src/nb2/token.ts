@@ -79,6 +79,7 @@ export interface Token extends LineageLevel {
 export const lineageOf = (token: Token): LineageLevel[] => [...token.ancestors, token];
 
 export const MAX_TRANSFER_PAIR = 40_960;
+export const MAX_MINT_PROOF = MAX_TRANSFER_PAIR - 8;
 export const MAX_ROOT_MINT = 66_048;
 export const MAX_CHILD_MINT = 512;
 export const MAX_ALLOCATION = 20_480;
@@ -139,7 +140,7 @@ export function decodeToken(input: Uint8Array): Token {
     if (i !== 0 && allocation.length === 0) fail('SplitProofShape');
     const mintRaw = framed(i === 0 ? MAX_ROOT_MINT : MAX_CHILD_MINT);
     const mint = decodeMint(scanOne(mintRaw));
-    const proofRaw = framed(40_960 - 8);
+    const proofRaw = framed(MAX_MINT_PROOF);
     const mintProof = decodeProof(scanNative(proofRaw), proofRaw);
     const count = number(8);
     if (count > BigInt(Math.floor((b.length - offset) / 4))) fail('Length');

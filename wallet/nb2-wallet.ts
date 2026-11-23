@@ -137,6 +137,8 @@ async function main(): Promise<void> {
     return relay(dir, rest, policy, ordinary, cold);
   }
   const all = flag(rest, '--all');
+  const recoverProof = flag(rest, '--recover-proof');
+  if (recoverProof && cmd !== 'mint' && cmd !== 'transfer') throw new Error('--recover-proof requires mint or transfer');
   const recipient = recipientOpt ? address(recipientOpt) : undefined;
   // a command that moves value checks the deployment again first: a network reset can leave the same chain ID and vault address with
   // another vault behind them, and the saved manifest is then not that deployment's
@@ -166,8 +168,8 @@ async function main(): Promise<void> {
       return;
     }
     case 'mint': {
-      need(rest, 1, 'mint NAME');
-      const m = await mint(w, rest[0], retrying('the deposit proof'));
+      need(rest, 1, 'mint NAME [--recover-proof]');
+      const m = await mint(w, rest[0], retrying('the deposit proof'), recoverProof);
       say(`minted ${rest[0]}: ${formatAmount(m.amount)} from deposit ${m.depositNumber}, token ${hx(m.tokenId).slice(0, 18)}.., J ${m.reasonBytes} bytes`);
       return;
     }
@@ -179,9 +181,9 @@ async function main(): Promise<void> {
       return;
     }
     case 'transfer': {
-      need(rest, 2, 'transfer NAME NEW [--to-key KEY]');
+      need(rest, 2, 'transfer NAME NEW [--to-key KEY] [--recover-proof]');
       const own = (w.entry(rest[0]).owner + 1) % 4;
-      const token = await transfer(w, rest[0], rest[1], own, toKeyOpt ? unhex(toKeyOpt) : undefined);
+      const token = await transfer(w, rest[0], rest[1], own, toKeyOpt ? unhex(toKeyOpt) : undefined, recoverProof);
       say(await returnHeadroom(w, token));
       if (toKeyOpt) say(`transferred ${rest[0]} to ${toKeyOpt}: hand ${resolve(w.dir, 'tokens', `${rest[1]}.cbor`)} to its owner`);
       else say(`transferred ${rest[0]} as ${rest[1]} to the wallet's owner key ${own}`);
