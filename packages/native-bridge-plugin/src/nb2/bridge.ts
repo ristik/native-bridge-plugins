@@ -37,7 +37,7 @@ import { MAX_MINT_PROOF, encodeToken, decodeToken, burnPredicate, signaturePredi
 import {
   appendTransfer, certifyChecked, headOf, childMint, freshMask, mintRequest, splitPlan, tokenOfChild, tokenOfMint, transferProofLimit, transferRequest, type Aggregator, type OwnerSigner,
 } from './tokenops.js';
-import { bindTrust, isSealAheadOfOrigin, verifyEvmUc, type TrustInput } from './trust.js';
+import { bindTrust, isCertificationTrustPending, isSealAheadOfOrigin, verifyEvmUc, type TrustInput } from './trust.js';
 import { burnTransitionId, decodeEvidence, encodeReturnData, evidenceOf, redemptionId, verifyHeld, verifyPart, verifySplit, type Verdict } from './verify.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -692,10 +692,11 @@ export class NativeBridgeV2 {
     if (saved !== undefined) {
       let verified: T;
       try { verified = await verify(proof); } catch (error) {
-        // An ahead proof can still be usable. Only stage an unverified
+        // A proof awaiting trust can still be usable. Only stage an unverified
         // replacement when the old proof was definitively rejected.
-        if (rejected && isSealAheadOfOrigin(error)) await save(hex(proof));
-        throw error;
+        if (!rejected || !isCertificationTrustPending(error)) throw error;
+        await save(hex(proof));
+        return this.retryingTrust(() => verify(proof));
       }
       await save(hex(proof));
       return verified;

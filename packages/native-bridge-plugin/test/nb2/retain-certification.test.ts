@@ -9,7 +9,7 @@ import { hex } from '../../src/nb2/journal.js';
 import { MAX_MINT_PROOF } from '../../src/nb2/token.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { SealAheadOfOrigin } from '../../src/nb2/trust.js';
-import { framedProof, withoutQuorum } from './certification-fixtures.js';
+import { framedProof, successor, withSeal, withoutQuorum } from './certification-fixtures.js';
 import { evmAccount, FakeAggregator, key, roundAtLeast, roundNow, setup } from './world.js';
 
 function ahead(error: unknown): boolean {
@@ -150,6 +150,54 @@ test('after a structural refusal Mint retains the next valid but ahead proof acr
   origin = roundNow();
   const caughtUp = await open();
   assert.equal((await caughtUp.verifyToken(await caughtUp.mint(intent))).amount, 8n);
+  assert.equal(calls, 2);
+});
+
+test('Mint retains a replacement missing a UTB epoch, refreshes, and resumes it after reload', async () => {
+  const w = await setup();
+  const opts = w.options('replacement missing epoch');
+  const boot = await NativeBridgeV2.open(opts);
+  const { intent } = await boot.planDeposit(8n, localOwner(key('missing epoch owner')).publicKey);
+  await boot.submitDeposit(intent, evmAccount(w.chain, 'missing epoch payer'));
+  await boot.collectDepositProof(intent);
+  const start = roundNow() + 1n;
+  const next = await successor(w.root, start);
+  const origin = { ...w.root.trust.origin!, usableEpoch: 2n };
+  let calls = 0;
+  let refreshes = 0;
+  let available = false;
+  let request: Uint8Array | undefined;
+  let pendingProof: string | undefined;
+  const open = (trust = w.root.trust.withAuthenticatedOrigin(origin)) => NativeBridgeV2.open({ ...opts, trust,
+    aggregator: { certify: async (cd) => {
+      if (request) assert.deepEqual(cd, request);
+      request ??= cd.slice();
+      if (++calls === 1) return framedProof(cd, 512);
+      const proof = await withSeal(await w.agg.certify(cd), next, start + 1n, next.signers.length, 2n);
+      pendingProof = hex(proof);
+      return proof;
+    } },
+    refreshTrust: async () => {
+      refreshes++;
+      const record = await boot.journal.deposit(intent);
+      assert.ok(pendingProof);
+      assert.equal(record?.mintProof, pendingProof);
+      assert.equal(record?.status, 'proven');
+      assert.equal(record?.token, undefined);
+      return available ? next.trust.withAuthenticatedOrigin(origin) : undefined;
+    },
+  });
+  const first = await open(w.root.trust);
+  await assert.rejects(first.mint(intent), { rule: 'Length' });
+  const waiting = await open();
+  await assert.rejects(waiting.mint(intent), (error: unknown) =>
+    error instanceof Nb2Error && error.rule === 'NoEntryForEpoch' && error.inner?.rule === 'DepositUC');
+  assert.equal(refreshes, 1);
+  const resumed = await open();
+  assert.equal((await resumed.journal.deposit(intent))?.mintProof, pendingProof);
+  available = true;
+  assert.equal((await resumed.verifyToken(await resumed.mint(intent))).amount, 8n);
+  assert.equal(refreshes, 2);
   assert.equal(calls, 2);
 });
 

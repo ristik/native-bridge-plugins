@@ -41,7 +41,7 @@ import {
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { transferProofLimit } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
-import { isSealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
+import { isCertificationTrustPending, isSealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
 import { hasPeerComplete, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
@@ -668,8 +668,7 @@ export async function transfer(w: Wallet, from: string, to: string, owner: numbe
     };
     if (p.proof !== undefined) {
       try { t = await verify(proof, true); } catch (error) {
-        if (rejected && isSealAheadOfOrigin(error)) save();
-        throw error;
+        if (!rejected || !isCertificationTrustPending(error)) throw error;
       }
     }
     save();

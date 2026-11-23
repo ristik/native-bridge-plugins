@@ -4,13 +4,16 @@ import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/Unici
 import { array, cArr, cBytes, cTag, cUint, raw, scanNative, tagContent } from '../../src/nb2/cbor.js';
 import { TAG } from '../../src/nb2/config.js';
 import { decodeUc } from '../../src/nb2/trust.js';
+import { nextEpoch } from '../rootfixture.js';
 import type { Root } from './world.js';
 
-export async function withSeal(proof: Uint8Array, root: Root, round: bigint | undefined, signerCount: number): Promise<Uint8Array> {
+export const successor = (root: Root, start: bigint) => nextEpoch({ ...root, entries: [root.trust.history.tip!.encode()] }, start, 4, 55);
+
+export async function withSeal(proof: Uint8Array, root: Root, round: bigint | undefined, signerCount: number, epoch?: bigint): Promise<Uint8Array> {
   const fields = array(tagContent(scanNative(proof), TAG.inclusion), 5);
   const uc = decodeUc(raw(proof, fields[4]));
   const old = uc.unicitySeal;
-  const seal = await UnicitySeal.create(old.networkId, round ?? old.rootChainRoundNumber, old.epoch, old.timestamp,
+  const seal = await UnicitySeal.create(old.networkId, round ?? old.rootChainRoundNumber, epoch ?? old.epoch, old.timestamp,
     old.previousHash, old.hash, new Map(root.signers.slice(0, signerCount)));
   const candidate = new UnicityCertificate(uc.inputRecord, uc.technicalRecordHash, uc.shardConfigurationHash,
     uc.shardTreeCertificate, uc.unicityTreeCertificate, seal);

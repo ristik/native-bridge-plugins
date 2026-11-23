@@ -97,6 +97,13 @@ export function isSealAheadOfOrigin(error: unknown): boolean {
   return false;
 }
 
+export function isCertificationTrustPending(error: unknown): boolean {
+  for (let cause = error; cause instanceof Nb2Error; cause = cause.inner) {
+    if (cause instanceof SealAheadOfOrigin || cause.rule === 'NoEntryForEpoch') return true;
+  }
+  return false;
+}
+
 const UC_VERIFIER = new UnicityCertificateVerifier(
   new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), undefined, { maxSignatures: MAX_B1_SIGNATURES }),
 );

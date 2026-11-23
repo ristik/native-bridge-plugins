@@ -7,6 +7,9 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, w
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
+import type { ITrustBaseSource } from '@unicitylabs/state-transition-sdk/lib/api/ITrustBaseSource.js';
+import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
+import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponseWire.js';
 
 import { toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import { revertData } from '../packages/native-bridge-plugin/src/nb2/abi.js';
@@ -15,9 +18,9 @@ import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
 import { MAX_TRANSFER_PAIR } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
 import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
-import { framedProof, withSeal, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
-import { WORLD_GAS, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
-import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type WalletConfig } from './core.js';
+import { framedProof, successor, withSeal, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
+import { WORLD_GAS, key, roundNow, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
+import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type OpenOptions, type WalletConfig } from './core.js';
 
 const dirs: string[] = [];
 after(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
@@ -61,7 +64,7 @@ async function world(opts: { badCodeHash?: boolean } = {}) {
   const agg = new Flaky(s.agg);
   const dir = join(tmp(), 'w');
   const secret = key('wallet secret');
-  const openAt = (d = dir): Promise<Wallet> => new Wallet(d, secret, config).open({ check: false, lock: false, rpc: s.chain, aggregator: agg, gas: WORLD_GAS });
+  const openAt = (d = dir, overrides: OpenOptions = {}): Promise<Wallet> => new Wallet(d, secret, config).open({ check: false, lock: false, rpc: s.chain, aggregator: agg, gas: WORLD_GAS, ...overrides });
   return { ...s, config, agg, dir, secret, openAt };
 }
 
@@ -164,6 +167,7 @@ test('transfer: explicit recovery preserves an ahead candidate until a healthy p
 
 test('transfer: a rejected saved proof is replaced by a fixed ahead candidate across reopen', async (t) => {
   const x = await withCoin();
+  t.mock.method(x.w, 'refreshAuthority', async () => x.w.trust);
   const certify = x.agg.certify.bind(x.agg);
   const origin = x.w.trust.origin!;
   let calls = 0;
@@ -188,6 +192,51 @@ test('transfer: a rejected saved proof is replaced by a fixed ahead candidate ac
   const caughtUp = await x.openAt();
   const token = await transfer(caughtUp, 'coin', 'coin2', 1);
   assert.equal((await caughtUp.bridge.verifyToken(token)).amount, 10n);
+  assert.equal(calls, 2);
+});
+
+test('transfer: a replacement missing a UTB epoch is saved before refresh and reused across reopen', async (t) => {
+  const x = await withCoin();
+  const start = roundNow() + 1n;
+  const next = await successor(x.root, start);
+  const certify = x.agg.certify.bind(x.agg);
+  const origin = { ...x.w.trust.origin!, usableEpoch: 2n };
+  const path = x.w.pendingFile('coin2');
+  let calls = 0;
+  let refreshes = 0;
+  let available = false;
+  let request: Uint8Array | undefined;
+  let pendingProof: string | undefined;
+  t.mock.method(x.agg, 'certify', async (cd: Uint8Array) => {
+    if (request) assert.deepEqual(cd, request);
+    request ??= cd.slice();
+    if (++calls === 1) return framedProof(cd, 512);
+    const proof = await withSeal(await certify(cd), next, start + 1n, next.signers.length, 2n);
+    pendingProof = hex(proof);
+    return proof;
+  });
+  const trustSource: ITrustBaseSource = { getTrustBasePage: async ({ fromEpoch, network }) => {
+    refreshes++;
+    assert.equal(fromEpoch, 2n);
+    assert.ok(pendingProof);
+    assert.equal(JSON.parse(readFileSync(path, 'utf8')).proof, pendingProof);
+    return encodeTrustBaseResponse({ fromEpoch, network: network.id, nextEpoch: null,
+      effectiveEnd: available ? 2n : 1n, endEntryId: available ? await next.trust.history.tip!.entryId() : null,
+      entries: available ? [next.entries[1]] : [], status: BigInt(available ? TrustBaseStatus.OK : TrustBaseStatus.NOT_YET_AVAILABLE) });
+  } };
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), { rule: 'Length' });
+  await x.w.persistAuthority(x.w.trust.withAuthenticatedOrigin(origin));
+  const waiting = await x.openAt(x.dir, { trustSource });
+  await assert.rejects(transfer(waiting, 'coin', 'coin2', 1), (error: unknown) =>
+    error instanceof Nb2Error && error.rule === 'NoEntryForEpoch' && error.inner?.rule === 'DepositUC');
+  assert.equal(refreshes, 1);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).proof, pendingProof);
+  const resumed = await x.openAt(x.dir, { trustSource });
+  available = true;
+  const token = await transfer(resumed, 'coin', 'coin2', 1);
+  assert.equal((await resumed.bridge.verifyToken(token)).amount, 10n);
+  assert.equal((await x.openAt()).trust.history.tip?.epoch, 2n);
+  assert.equal(refreshes, 2);
   assert.equal(calls, 2);
 });
 
