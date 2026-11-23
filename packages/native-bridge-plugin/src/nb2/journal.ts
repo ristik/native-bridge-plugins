@@ -5,6 +5,7 @@
  *   nb2/v1/<D>/intents          the intent counter: the next unused intent i (its high-water mark is next - 1)
  *   nb2/v1/<D>/deposit/<i>      one deposit, from its plan to the minted token
  *   nb2/v1/<D>/split/<id>       one split, from its plan to the minted children
+ *   nb2/v1/<D>/transfer/<id>    one ordinary transfer and its retained certification
  *   nb2/v1/<D>/return/<id>      one return, from its plan to the Paid event
  *
  * <D> is the deployment domain in lowercase hex without 0x. Byte strings are 0x-prefixed lowercase hex; integers are decimal strings
@@ -94,6 +95,8 @@ export interface DepositRecord extends Base {
   reason?: Hex;
   /** The certified token. */
   token?: Hex;
+  /** Exact mint proof, awaiting offline verification. */
+  mintProof?: Hex;
   /** Optional: r itself, when the wallet backs up secrets rather than the high-water mark. */
   secret?: Hex;
   /** The head block when the plan was made: a deposit carrying this rho is looked for from here before the first send. */
@@ -102,12 +105,12 @@ export interface DepositRecord extends Base {
    * Every Deposited event seen with this rho (a faulty wallet that reused r, or two devices). The first is the record's own deposit;
    * each further one is a separate root token (its own n), minted with `mintExtraDeposit`.
    */
-  seenDeposits?: { tx: Hex; depositNumber: Dec; blockNumber: Dec; amount: Dec; firstOwner: Hex; token?: Hex }[];
+  seenDeposits?: { tx: Hex; depositNumber: Dec; blockNumber: Dec; amount: Dec; firstOwner: Hex; token?: Hex; mintProof?: Hex; reason?: Hex }[];
 }
 
 export type SplitStatus = 'planned' | 'burn-requested' | 'burned' | 'minted';
 
-export interface SplitOutputRecord { ownerKey: Hex; amount: Dec; salt: Hex; token: Hex | null }
+export interface SplitOutputRecord { ownerKey: Hex; amount: Dec; salt: Hex; token: Hex | null; mintProof?: Hex }
 
 export interface SplitRecord extends Base {
   kind: 'split';
@@ -119,7 +122,17 @@ export interface SplitRecord extends Base {
   /** The manifest burn transaction and its certification request, journaled before the first submission. */
   burnTx?: Hex;
   burnRequest?: Hex;
+  burnProof?: Hex;
   burned?: Hex;
+}
+
+export interface TransferRecord extends Base {
+  kind: 'transfer';
+  transferId: Hex;
+  recipient: Hex;
+  tx: Hex;
+  request: Hex;
+  proof?: Hex;
 }
 
 export type ReturnStatus = 'planned' | 'burn-requested' | 'burned' | 'submitted' | 'paid';
@@ -141,6 +154,7 @@ export interface ReturnRecord extends Base {
   status: ReturnStatus;
   burnTx?: Hex;
   burnRequest?: Hex;
+  burnProof?: Hex;
   /** SID from which the exact signed request can be reconciled. */
   certificationLocator?: Hex;
   /** The authenticated cold route and the admission bound used at signing. */
@@ -163,7 +177,7 @@ export interface ReturnRecord extends Base {
   paid?: { txHash: Hex; blockNumber: Dec; blockHash?: Hex; receipt?: Hex; txIndex?: Dec; logIndex?: Dec };
 }
 
-export type AnyRecord = IntentsRecord | DepositRecord | SplitRecord | ReturnRecord;
+export type AnyRecord = IntentsRecord | DepositRecord | SplitRecord | ReturnRecord | TransferRecord;
 
 export const hex = (b: Uint8Array): Hex => `0x${toHex(b)}`;
 export function unhex(s: Hex): Uint8Array {
@@ -257,6 +271,14 @@ export class Journal {
   }
   public putSplit(r: SplitRecord): Promise<void> {
     return this.write(this.key('split', r.splitId.slice(2)), r);
+  }
+
+  public transferForUpdate(id: Hex): Promise<TransferRecord | null> {
+    return this.read<TransferRecord>(this.key('transfer', id.slice(2)), 'transfer', true);
+  }
+
+  public putTransfer(r: TransferRecord): Promise<void> {
+    return this.write(this.key('transfer', r.transferId.slice(2)), r);
   }
 
   public ret(id: Hex): Promise<ReturnRecord | null> {

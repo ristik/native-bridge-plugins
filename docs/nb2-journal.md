@@ -31,6 +31,7 @@ a record. Within one process, calls on the same record are serialized.
 | `nb2/v1/<D>/intents` | the intent counter |
 | `nb2/v1/<D>/deposit/<i>` | the deposit of intent `i` (decimal) |
 | `nb2/v1/<D>/split/<id>` | one split; `<id>` is the split ID in hex without `0x` |
+| `nb2/v1/<D>/transfer/<id>` | one TypeScript ordinary transfer; `<id>` is `H_U(source)` in hex without `0x` |
 | `nb2/v1/<D>/return/<id>` | one return; `<id>` is the return ID in hex without `0x` |
 
 `<D>` is the deployment domain `D = H_U(Γ)`, in lowercase hex without `0x`. A record whose `domain` differs from its key's is refused.
@@ -78,6 +79,7 @@ and match each `rho` against the certified `Deposited` events (`recoverDeposits`
 | `receiptProof` | hex, optional | the `DepositProof` container |
 | `reason` | hex, optional | `J = tag(39051, [1, b(D), n, b(r), DepositProof])` |
 | `token` | hex, optional | the certified minted token |
+| `mintProof` | hex, optional | exact aggregator proof retained while the record is `proven`; verify before installing `token` |
 | `secret` | hex, optional | `r` itself, only when the wallet backs up secrets instead of the high-water mark |
 | `plannedBlock` | dec, optional | the head block at planning; before the first send, the vault's `Deposited` events from here on are searched for this `rho` |
 | `seenDeposits` | array, optional | every `Deposited` event carrying this `rho`, as `{tx, depositNumber, blockNumber, amount, firstOwner, token?}` (the entry's own 42-byte first owner, which its mint goes to); merged, never replaced; the first is the record's own; each further one (a reused secret, or two devices) is a separate root token, minted with `mintExtraDeposit` |
@@ -91,6 +93,9 @@ The status moves only forwards:
 | `deposited` | a successful receipt has a `Deposited` log with this `rho` |
 | `proven` | J is verified offline and stored |
 | `minted` | the certified token is verified offline and stored |
+
+A `proven` deposit with `mintProof` is certified and awaiting offline verification. It resumes from the saved proof.
+An extra deposit may hold `reason` and `mintProof` under its `seenDeposits` entry until its verified token is installed.
 
 The plug-in sends no value for a record that is not `planned` or `submitted`, is not backed up (unless the deployment opts out), or
 whose `rho` does not derive from this wallet's `k_w`.
@@ -107,9 +112,18 @@ whose `rho` does not derive from this wallet's `k_w`.
 | `status` | string | `planned`, `burn-requested`, `burned` or `minted` |
 | `burnTx` | hex, optional | the exact manifest burn transfer |
 | `burnRequest` | hex, optional | its certification data (CD), written before the first submission |
+| `burnProof` | hex, optional | exact aggregator proof retained while the split is `burn-requested` |
 | `burned` | hex, optional | the certified burned parent |
 
 The plan (`source`, `outputs` with salts, `mask`) fixes the manifest and every child mint. A resumed split rebuilds the same bytes.
+Each output may retain `mintProof` until its verified `token` is installed.
+
+## `transfer`
+
+The TypeScript plug-in journals `transferId`, the recipient key (`recipient`), the signed `tx`, and its exact `request` before
+certification. It saves the returned `proof` before offline verification. Repeating the same source and recipient resumes this
+record. A different recipient for the same source is refused. Readers of the shared deposit, split and return records can
+leave this separate key alone.
 
 ## `return`
 
@@ -126,6 +140,7 @@ The plan (`source`, `outputs` with salts, `mask`) fixes the manifest and every c
 | `sealReceipt` | hex, optional | the verified seal receipt (`DepositProof` container); absent when `a = 0` |
 | `status` | string | `planned`, `burn-requested`, `burned`, `submitted` or `paid` |
 | `burnTx` | hex, optional | the exact return burn transfer, data `R` |
+| `burnProof` | hex, optional | exact aggregator proof awaiting verification of the return burn |
 | `burnRequest` | hex, optional | its CD, written before certification |
 | `burned` | hex, optional | the certified burned part: the redeem evidence is `C(1, burned)` |
 | `eta` | hex, optional | the redemption ID, from the offline verdict |
