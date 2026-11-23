@@ -12,8 +12,10 @@ import { toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import { revertData } from '../packages/native-bridge-plugin/src/nb2/abi.js';
 import { Nb2Error } from '../packages/native-bridge-plugin/src/nb2/errors.js';
 import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
+import { MAX_TRANSFER_PAIR } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
 import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
+import { framedProof, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
 import { WORLD_GAS, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type WalletConfig } from './core.js';
 
@@ -130,6 +132,53 @@ test('transfer: a retained proof survives an origin lag and a CLI reopen', async
   const again = await x.openAt();
   assert.equal((await again.bridge.verifyToken(await transfer(again, 'coin', 'coin2', 1))).amount, 10n);
   assert.equal(x.agg.submitted, before + 1);
+});
+
+test('transfer: explicit recovery preserves an ahead candidate until a healthy proof verifies', async (t) => {
+  const x = await withCoin();
+  const certify = x.agg.certify.bind(x.agg);
+  let request: Uint8Array | undefined;
+  let healthy = false;
+  const before = x.agg.submitted;
+  t.mock.method(x.agg, 'certify', async (cd: Uint8Array) => {
+    if (request) assert.deepEqual(cd, request);
+    request ??= cd.slice();
+    const proof = await certify(cd);
+    return healthy ? proof : withoutQuorum(proof, x.root, x.agg.submitted === before + 1);
+  });
+  const path = x.w.pendingFile('coin2');
+  t.mock.method(x.w, 'refreshAuthority', async () => x.w.trust);
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), SealAheadOfOrigin);
+  const pending = readFileSync(path, 'utf8');
+  const resumed = await x.openAt();
+  t.mock.method(resumed, 'refreshAuthority', async () => resumed.trust);
+  await assert.rejects(transfer(resumed, 'coin', 'coin2', 1), SealAheadOfOrigin);
+  assert.equal(x.agg.submitted, before + 1);
+  await assert.rejects(transfer(resumed, 'coin', 'coin2', 1, undefined, true), { rule: 'QuorumNotMet' });
+  assert.equal(readFileSync(path, 'utf8'), pending);
+  healthy = true;
+  const token = await transfer(resumed, 'coin', 'coin2', 1, undefined, true);
+  assert.equal((await resumed.bridge.verifyToken(token)).amount, 10n);
+  assert.equal(x.agg.submitted, before + 3);
+});
+
+test('transfer: overflow leaves the pending file unchanged and the maximum pair fits', async (t) => {
+  const x = await withCoin();
+  const path = x.w.pendingFile('coin2');
+  let overflow = true;
+  let pending = '';
+  let txBytes = 0;
+  t.mock.method(x.agg, 'certify', async (cd: Uint8Array) => {
+    pending = readFileSync(path, 'utf8');
+    txBytes = Buffer.from(JSON.parse(pending).tx.slice(2), 'hex').length;
+    return framedProof(cd, MAX_TRANSFER_PAIR - 1 - txBytes + Number(overflow));
+  });
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), { rule: 'InputTooLarge' });
+  assert.equal(readFileSync(path, 'utf8'), pending);
+  overflow = false;
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), { rule: 'Length' });
+  const proof = JSON.parse(readFileSync(path, 'utf8')).proof;
+  assert.equal(1 + txBytes + Buffer.from(proof.slice(2), 'hex').length, MAX_TRANSFER_PAIR);
 });
 
 test('durability: a power loss right after the burn is certified rolls back to a journal that holds the exact burn request', async () => {

@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { Nb2Error } from '../../src/nb2/errors.js';
+import { MAX_MINT_PROOF } from '../../src/nb2/token.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { SealAheadOfOrigin } from '../../src/nb2/trust.js';
+import { framedProof, withoutQuorum } from './certification-fixtures.js';
 import { evmAccount, FakeAggregator, key, roundAtLeast, roundNow, setup } from './world.js';
 
 function ahead(error: unknown): boolean {
@@ -76,4 +78,49 @@ test('transfer, split burn and child mint, and return burn also keep their proof
   const { burned } = await untilCovered(() => resumed.burn(plan.returnId, recipient));
   assert.ok(burned.length > 0);
   assert.equal(agg.calls, 5);
+});
+
+test('Mint recovery replaces a future seal only with a verified proof of the same request', async () => {
+  const w = await setup();
+  const opts = w.options('mint recovery');
+  const owner = localOwner(key('mint recovery owner'));
+  let serveHealthy = false;
+  let request: Uint8Array | undefined;
+  let attempts = 0;
+  const open = () => NativeBridgeV2.open({ ...opts, aggregator: { certify: async (cd) => {
+    if (request) assert.deepEqual(cd, request);
+    request ??= cd.slice();
+    attempts++;
+    const proof = await w.agg.certify(cd);
+    return serveHealthy ? proof : withoutQuorum(proof, w.root, attempts === 1);
+  } } });
+  const first = await open();
+  const { intent } = await first.planDeposit(8n, owner.publicKey);
+  await first.submitDeposit(intent, evmAccount(w.chain, 'mint recovery payer'));
+  await first.collectDepositProof(intent);
+  await assert.rejects(first.mint(intent), ahead);
+  const candidate = await first.journal.deposit(intent);
+  const resumed = await open();
+  await assert.rejects(resumed.mint(intent), ahead);
+  assert.equal(attempts, 1);
+  await assert.rejects(resumed.mint(intent, { recoverProof: true }), { rule: 'QuorumNotMet' });
+  assert.deepEqual(await resumed.journal.deposit(intent), candidate);
+  serveHealthy = true;
+  assert.equal((await resumed.verifyToken(await resumed.mint(intent, { recoverProof: true }))).amount, 8n);
+  assert.equal(attempts, 3);
+});
+
+test('Mint checks its proof bound before journaling and allows the exact maximum frame', async () => {
+  const w = await setup();
+  let size = MAX_MINT_PROOF + 1;
+  const bridge = await NativeBridgeV2.open({ ...w.options('mint bound'), aggregator: { certify: async (cd) => framedProof(cd, size) } });
+  const { intent } = await bridge.planDeposit(8n, localOwner(key('mint bound owner')).publicKey);
+  await bridge.submitDeposit(intent, evmAccount(w.chain, 'mint bound payer'));
+  await bridge.collectDepositProof(intent);
+  const pending = await bridge.journal.deposit(intent);
+  await assert.rejects(bridge.mint(intent), { rule: 'InputTooLarge' });
+  assert.deepEqual(await bridge.journal.deposit(intent), pending);
+  size--;
+  await assert.rejects(bridge.mint(intent), { rule: 'Length' });
+  assert.equal(Buffer.from((await bridge.journal.deposit(intent))!.mintProof!.slice(2), 'hex').length, MAX_MINT_PROOF);
 });

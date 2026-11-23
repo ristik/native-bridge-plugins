@@ -33,14 +33,15 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, Nb2Error, WalletError, appendTransfer, certifyChecked, deriveBridgeKey, evidenceOf,
-  freshMask, localOwner, transferRequest,
+  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, Nb2Error, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
+  freshMask, localOwner, transferRequest, verifyHeld,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
   type ReturnRecord,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
-import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
+import { transferProofLimit } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
+import { isSealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
 import { hasPeerComplete, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
@@ -606,12 +607,12 @@ export async function sendDeposit(w: Wallet, label: string): Promise<{ txHash: U
  * Mint: the deposit's receipt proof J once its block is certified (waited out while the certificate is not served yet), then the mint. A
  * deposit that has not landed is refused at once (NotPending): send it first.
  */
-export async function mint(w: Wallet, label: string, note?: (reason: string) => void): Promise<{ intent: bigint; depositNumber: bigint; reasonBytes: number; tokenId: Uint8Array; amount: bigint }> {
+export async function mint(w: Wallet, label: string, note?: (reason: string) => void, recoverProof = false): Promise<{ intent: bigint; depositNumber: bigint; reasonBytes: number; tokenId: Uint8Array; amount: bigint }> {
   const e = w.entry(label);
   if (e.intent === undefined) throw new Error(`${label} is not a deposit`);
   const intent = BigInt(e.intent);
   const p = await retry(() => w.bridge.collectDepositProof(intent), note, 120, 2_000, NOT_YET);
-  const token = await w.bridge.mint(intent);
+  const token = await w.bridge.mint(intent, { recoverProof });
   const v = await w.bridge.verifyToken(token);
   w.keep(label, token, 0, { intent: e.intent, amount: v.amount.toString(), note: undefined });
   return { intent, depositNumber: p.depositNumber, reasonBytes: p.reason.length, tokenId: v.tokenId, amount: v.amount };
@@ -625,7 +626,7 @@ export async function mint(w: Wallet, label: string, note?: (reason: string) => 
  *   3. the request is certified, the result verified and saved as TO, and the pending file removed.
  * A rerun resumes the same signed request and uses the retained proof once one has been saved.
  */
-export async function transfer(w: Wallet, from: string, to: string, owner: number, toKey?: Uint8Array): Promise<Uint8Array> {
+export async function transfer(w: Wallet, from: string, to: string, owner: number, toKey?: Uint8Array, recoverProof = false): Promise<Uint8Array> {
   let p: PendingTransfer;
   const file = w.pendingFile(to);
   if (NAME.test(to) && existsSync(file)) {
@@ -644,25 +645,25 @@ export async function transfer(w: Wallet, from: string, to: string, owner: numbe
     writeDurable(file, JSON.stringify(p));
     w.update(from, { spent: `${PENDING}${to}` });
   }
-  const verify = async (proof: Uint8Array) => {
-    const token = appendTransfer(w.token(p.from), unhex(p.tx), proof);
-    await w.bridge.verifyToken(token);
+  const tx = unhex(p.tx);
+  const verify = async (proof: Uint8Array, heldOnly = false) => {
+    const token = appendTransfer(w.token(p.from), tx, proof);
+    if (heldOnly) await verifyHeld(w.bridge.cfg, w.bridge.domain, w.trust, decodeToken(token));
+    else await w.bridge.verifyToken(token);
     return token;
   };
   let t: Uint8Array | undefined;
   if (p.proof !== undefined) {
-    try { t = await verify(unhex(p.proof)); } catch (error) {
-      if (!(error instanceof Nb2Error) || error.retryable) throw error;
-      for (let cause: Nb2Error | undefined = error; cause !== undefined; cause = cause.inner) {
-        if (cause instanceof SealAheadOfOrigin) throw error;
-      }
+    try { t = await verify(unhex(p.proof), recoverProof); } catch (error) {
+      if (!(error instanceof Nb2Error) || error.retryable || (isSealAheadOfOrigin(error) && !recoverProof)) throw error;
     }
   }
   if (t === undefined) {
-    const proof = await certifyChecked(w.aggregator, unhex(p.cd));
+    const proof = await certifyChecked(w.aggregator, unhex(p.cd), transferProofLimit(tx));
+    if (p.proof !== undefined) t = await verify(proof, true);
     p.proof = hx(proof);
     writeDurable(file, JSON.stringify(p));
-    t = await verify(proof);
+    t ??= await verify(proof);
   }
   const e = w.entry(p.from);
   w.keep(to, t, p.owner, { amount: e.amount, ...(p.toKey ? { spent: `sent to ${p.toKey}` } : {}) });

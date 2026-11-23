@@ -96,6 +96,8 @@ The status moves only forwards:
 
 A `proven` deposit with `mintProof` is certified and awaiting offline verification. It resumes from the saved proof.
 An extra deposit may hold `reason` and `mintProof` under its `seenDeposits` entry until its verified token is installed.
+If an ahead proof cannot be verified, `mint(intent, { recoverProof: true })` or the CLI's `mint NAME --recover-proof`
+asks for one alternative for the same request. It replaces the saved proof only after verification under held authority.
 
 The plug-in sends no value for a record that is not `planned` or `submitted`, is not backed up (unless the deployment opts out), or
 whose `rho` does not derive from this wallet's `k_w`.
@@ -124,6 +126,11 @@ The TypeScript plug-in journals `transferId`, the recipient key (`recipient`), t
 certification. It saves the returned `proof` before offline verification. Repeating the same source and recipient resumes this
 record. A different recipient for the same source is refused. Readers of the shared deposit, split and return records can
 leave this separate key alone.
+
+The CLI keeps its own pending transfer files keyed by destination name. `transfer NAME NEW --recover-proof` can request
+one alternative for its existing signed request. It replaces the retained proof only after verifying the alternative.
+The journal writer checks the protocol framing before saving a proof. A mint proof can occupy up to 40,952 bytes.
+The complete transfer pair, including its array header and signed transaction, can occupy up to 40,960 bytes.
 
 ## `return`
 

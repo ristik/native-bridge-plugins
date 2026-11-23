@@ -8,10 +8,10 @@ import { array, cArr, headTag, MAX_U64, raw, scanNative, tagContent } from './cb
 import { TAG } from './config.js';
 import { LIMITS, decodeReceiptBacking } from './deposit.js';
 import { HU, minterScalar, minterScalarValid, parseKey, signUnlock, unlockMessage, verifyUnlock } from './crypto.js';
-import { WalletError, refuse } from './errors.js';
+import { WalletError, fail, refuse } from './errors.js';
 import { decodeSplitJustification, encodeSplitJustification, encodeSplitManifest, encodeSumProof, splitOutputCommitment, SumTree } from './split.js';
 import {
-  MAX_CHILD_MINT, MAX_ROOT_MINT, burnPredicate, decodeToken, encodeLevel, frameLevel, frameLineage, lineageOf, encodeProof, encodeCertification, encodeMint, encodePredicate, encodeTransfer, mintSourceHash, resultState, signaturePredicate,
+  MAX_CHILD_MINT, MAX_ROOT_MINT, MAX_TRANSFER_PAIR, burnPredicate, decodeToken, encodeLevel, frameLevel, frameLineage, lineageOf, encodeProof, encodeCertification, encodeMint, encodePredicate, encodeTransfer, mintSourceHash, resultState, signaturePredicate,
   tokenIdOf, valueData, type Certification, type MintTx, type Predicate, type LineageLevel, type TransferTx,
 } from './token.js';
 import type { Deadline } from './cbor.js';
@@ -112,9 +112,13 @@ export async function transferRequest(token: Uint8Array, owner: OwnerSigner, tr:
   return { tx, cd: encodeCertification(cd) };
 }
 
-/** Certify and check that the proof is for exactly this request. */
-export async function certifyChecked(agg: Aggregator, cd: Uint8Array): Promise<Uint8Array> {
+/** A transfer pair is the one-byte CBOR array head and two inline items. */
+export const transferProofLimit = (tx: Uint8Array): number => MAX_TRANSFER_PAIR - 1 - tx.length;
+
+/** Certify and check that the proof fits its destination and matches exactly this request. */
+export async function certifyChecked(agg: Aggregator, cd: Uint8Array, maxBytes = Infinity): Promise<Uint8Array> {
   const proof = await agg.certify(cd);
+  if (proof.byteLength > maxBytes) fail('InputTooLarge');
   const k = array(tagContent(scanNative(proof), TAG.inclusion), 5);
   if (!eq(raw(proof, k[1]), cd)) refuse('ProviderFault', 'the inclusion proof is not for the submitted request');
   return proof;
