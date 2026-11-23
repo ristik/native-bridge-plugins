@@ -40,6 +40,7 @@ import {
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
+import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
 import { hasPeerComplete, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
@@ -252,7 +253,7 @@ export class FileJournalStore implements JournalStore {
 export interface TokenEntry { file: string; owner: number; amount: string; intent?: string; returnId?: string; authorizedRecipient?: string; note?: string; spent?: string; splitInto?: string[] }
 
 /** A transfer between its request and its saved result: tokens/<to>.pending.json. */
-interface PendingTransfer { from: string; to: string; owner: number; toKey?: string; tx: string; cd: string }
+interface PendingTransfer { from: string; to: string; owner: number; toKey?: string; tx: string; cd: string; proof?: string }
 
 const NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 const PENDING = 'transfer pending as ';
@@ -618,12 +619,11 @@ export async function mint(w: Wallet, label: string, note?: (reason: string) => 
 
 /**
  * An ordinary Unicity transfer of FROM, kept as TO: to the wallet's own owner key OWNER, or to another wallet's key TOKEY (the result is then
- * kept as sent: hand tokens/TO.cbor to its owner). The plug-in does not journal transfers, so the wallet does:
+ * kept as sent: hand tokens/TO.cbor to its owner). The CLI keeps the signed request under its destination name:
  *   1. TO is checked (a valid, new name) and FROM must be spendable, before anything is submitted;
  *   2. the exact request (its random mask included) is written durably to tokens/TO.pending.json, and FROM is marked spent;
  *   3. the request is certified, the result verified and saved as TO, and the pending file removed.
- * A rerun after a crash at any point resumes from the pending file: the same request is certified again (the aggregator answers with the
- * same proof), never a second one for the same state.
+ * A rerun resumes the same signed request and uses the retained proof once one has been saved.
  */
 export async function transfer(w: Wallet, from: string, to: string, owner: number, toKey?: Uint8Array): Promise<Uint8Array> {
   let p: PendingTransfer;
@@ -644,9 +644,26 @@ export async function transfer(w: Wallet, from: string, to: string, owner: numbe
     writeDurable(file, JSON.stringify(p));
     w.update(from, { spent: `${PENDING}${to}` });
   }
-  const proof = await certifyChecked(w.aggregator, unhex(p.cd));
-  const t = appendTransfer(w.token(p.from), unhex(p.tx), proof);
-  await w.bridge.verifyToken(t);
+  const verify = async (proof: Uint8Array) => {
+    const token = appendTransfer(w.token(p.from), unhex(p.tx), proof);
+    await w.bridge.verifyToken(token);
+    return token;
+  };
+  let t: Uint8Array | undefined;
+  if (p.proof !== undefined) {
+    try { t = await verify(unhex(p.proof)); } catch (error) {
+      if (!(error instanceof Nb2Error) || error.retryable) throw error;
+      for (let cause: Nb2Error | undefined = error; cause !== undefined; cause = cause.inner) {
+        if (cause instanceof SealAheadOfOrigin) throw error;
+      }
+    }
+  }
+  if (t === undefined) {
+    const proof = await certifyChecked(w.aggregator, unhex(p.cd));
+    p.proof = hx(proof);
+    writeDurable(file, JSON.stringify(p));
+    t = await verify(proof);
+  }
   const e = w.entry(p.from);
   w.keep(to, t, p.owner, { amount: e.amount, ...(p.toKey ? { spent: `sent to ${p.toKey}` } : {}) });
   w.update(p.from, { spent: `transferred as ${to}` });

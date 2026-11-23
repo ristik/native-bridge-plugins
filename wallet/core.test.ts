@@ -13,6 +13,7 @@ import { revertData } from '../packages/native-bridge-plugin/src/nb2/abi.js';
 import { Nb2Error } from '../packages/native-bridge-plugin/src/nb2/errors.js';
 import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
+import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { WORLD_GAS, key, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type WalletConfig } from './core.js';
 
@@ -112,6 +113,23 @@ test('transfer: a crash after certification resumes from the journal with the sa
   assert.equal(again.entry('coin').spent, 'transferred as coin2');
   assert.ok(!existsSync(join(x.dir, 'tokens', 'coin2.pending.json')));
   assert.deepEqual(readFileSync(join(x.dir, 'tokens', 'coin2.cbor')), Buffer.from(t));
+});
+
+test('transfer: a retained proof survives an origin lag and a CLI reopen', async (t) => {
+  const x = await withCoin();
+  const before = x.agg.submitted;
+  const verify = x.w.bridge.verifyToken.bind(x.w.bridge);
+  let verifications = 0;
+  t.mock.method(x.w.bridge, 'verifyToken', async (token: Uint8Array) => {
+    if (++verifications === 2) throw new SealAheadOfOrigin();
+    return verify(token);
+  });
+  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), SealAheadOfOrigin);
+  const pending = JSON.parse(readFileSync(join(x.dir, 'tokens', 'coin2.pending.json'), 'utf8'));
+  assert.match(pending.proof, /^0x[0-9a-f]+$/);
+  const again = await x.openAt();
+  assert.equal((await again.bridge.verifyToken(await transfer(again, 'coin', 'coin2', 1))).amount, 10n);
+  assert.equal(x.agg.submitted, before + 1);
 });
 
 test('durability: a power loss right after the burn is certified rolls back to a journal that holds the exact burn request', async () => {
