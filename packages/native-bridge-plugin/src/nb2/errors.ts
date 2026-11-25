@@ -82,6 +82,8 @@ export type WalletReason =
   | 'StateReadNotAdmitted' // a plain state() read on a deployment without stateReadOnly: not evidence (section 12.2)
   | 'CompanionUnknown' // the node does not hold the block on its canonical chain: re-resolve and retry (section 12.7)
   | 'CompanionProvider' // a companion whose witnesses are not [certificate, technical record]: use another provider
+  | 'TrustSyncRequired' // retry after a fresh successful UTB sync
+  | 'ImportLag' // the finalized destination is still missing the required signer epoch
   | 'TrustInput' // the trust-base history is not the one Γ names
   | 'JournalNotPersisted' // submitDeposit on a plan whose journal entry was not durably written first
   | 'JournalConflict' // a compare-and-swap of a journal record lost to another writer
@@ -100,6 +102,10 @@ export class WalletError extends Error {
   public constructor(public readonly reason: WalletReason, detail?: string, public readonly cause?: unknown) {
     super(`nb2 wallet: ${reason}${detail ? `: ${detail}` : ''}`);
     this.name = 'WalletError';
+  }
+
+  public get retryable(): boolean {
+    return this.reason === 'ImportLag' || this.reason === 'TrustSyncRequired';
   }
 }
 

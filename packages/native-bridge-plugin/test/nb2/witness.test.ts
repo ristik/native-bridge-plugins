@@ -108,20 +108,30 @@ test('a deployed quorum refusal is retryable and the same certified burn pays af
   assert.equal(sends, 1);
 });
 
-test('a finalized import lag preserves the exact signed return and sends once after import', async () => {
-  const { w, payer, burned, chain } = await world();
+test('a never-broadcast return rebuilds after two rollovers during finalized import lag', async () => {
+  const { w, payer, burned, chain, pay } = await world();
   const id = await burned();
+  const original = await w.buildRedeem(id);
   chain.importedTipEpoch = 0n;
-  const firstSendCount = chain.calls.filter((call) => call === 'eth_sendRawTransaction').length;
-  await assert.rejects(w.submitRedeem(id, payer), { reason: 'NotPending' });
+  const sends = () => chain.calls.filter((call) => call === 'eth_sendRawTransaction').length;
+  const firstSendCount = sends();
+  await assert.rejects(w.submitRedeem(id, payer), { reason: 'ImportLag', retryable: true });
   const pending = await w.journal.ret('0x' + toHex(id));
-  assert.equal(pending?.sends.length, 1);
-  assert.equal(chain.calls.filter((call) => call === 'eth_sendRawTransaction').length, firstSendCount);
+  assert.equal(pending?.status, 'burned');
+  assert.equal(pending?.sends.length, 0);
+  assert.equal(pending?.executionPayer, undefined);
+  assert.equal(sends(), firstSendCount);
   chain.importedTipEpoch = 1n;
-  assert.equal((await w.submitRedeem(id, payer)).state, 'pending');
-  assert.equal((await w.reconcile(id)).state, 'paid');
-  assert.equal((await w.journal.ret('0x' + toHex(id)))?.sends[0].raw, pending?.sends[0].raw);
-  assert.equal(chain.calls.filter((call) => call === 'eth_sendRawTransaction').length, firstSendCount + 1);
+  await pay(8);
+  const rebuilt = await w.buildRedeem(id);
+  assert.equal(rebuilt.endpoint, original.endpoint + 2n);
+  assert.notDeepEqual(rebuilt.calldata, original.calldata);
+  const beforeResume = sends();
+  assert.equal((await w.submitRedeem(id, payer)).state, 'paid');
+  const paid = await w.journal.ret('0x' + toHex(id));
+  assert.equal(paid?.burned, pending?.burned);
+  assert.equal(paid?.sends.length, 1);
+  assert.equal(sends(), beforeResume + 1);
 });
 
 test('a final refusal after a mined revert preserves the decoded inner rule', async () => {

@@ -17,7 +17,7 @@ use native_bridge_sdk_ext::nb2::deposit::{first_owner_of, topic};
 use native_bridge_sdk_ext::nb2::errors::{Error, Nb2Error, Result, Rule, WalletReason};
 use native_bridge_sdk_ext::nb2::evm::{sign_tx, EvmSigner, LocalKeySigner, TxRequest};
 use native_bridge_sdk_ext::nb2::gas::{GasModel, RedeemShape};
-use native_bridge_sdk_ext::nb2::journal::{hex, MemoryJournalStore, JOURNAL_FORMAT};
+use native_bridge_sdk_ext::nb2::journal::{hex, unhex, MemoryJournalStore, JOURNAL_FORMAT};
 use native_bridge_sdk_ext::nb2::rpc::{Estimate, EvmReader, JsonRpc, RpcError};
 use native_bridge_sdk_ext::nb2::rules::topic_index;
 use native_bridge_sdk_ext::nb2::segment::{build_history, check_segment_log};
@@ -537,6 +537,34 @@ fn deployed_quorum_refusal_is_retryable_until_seal_import() {
 
     x.w.chain.set_pre(None);
     assert_eq!(x.b.submit_redeem(&id, &x.payer).unwrap().state(), "paid");
+}
+
+#[test]
+fn never_broadcast_return_rebuilds_after_two_rollovers_during_import_lag() {
+    let x = WitnessWorld::new();
+    let id = x.burned();
+    let original = x.b.build_redeem(&id).unwrap();
+    x.w.chain.set_pre(Some(Box::new(|method, _| {
+        (method == "eth_getStorageAt").then(|| Ok(json!(hex0x(&[0; 32]))))
+    })));
+    let refused = x.b.submit_redeem(&id, &x.payer).unwrap_err();
+    assert_eq!(refused.reason(), Some(WalletReason::ImportLag));
+    assert!(refused.retryable());
+    let pending = x.b.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert_eq!(pending.status, "burned");
+    assert!(pending.sends.is_empty());
+    x.w.chain.set_pre(None);
+    x.pay(8);
+    let rebuilt = x.b.build_redeem(&id).unwrap();
+    assert_eq!(rebuilt.endpoint, original.endpoint + 2);
+    assert_ne!(rebuilt.calldata, original.calldata);
+    assert!(matches!(
+        x.b.submit_redeem(&id, &x.payer).unwrap(),
+        ReconcileResult::Paid { .. }
+    ));
+    let paid = x.b.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert_eq!(paid.burned, pending.burned);
+    assert_eq!(paid.sends.len(), 1);
 }
 
 #[test]
@@ -1690,10 +1718,11 @@ fn history_refresh_extends_the_installed_pin() {
         .unwrap()
         .to_bundle();
     let held = read("transcripts/held-sibling-0/evidence.bin");
+    let store = World::store();
     {
         let world = setup();
         let foreign = world.root.trust.clone();
-        let mut opts = world.options("authenticated refresh", World::store());
+        let mut opts = world.options("authenticated refresh", store.clone());
         opts.pins.gamma = gamma.clone();
         opts.pins.build = Build::Production;
         opts.trust = TrustInput::from_bundle(&lagging, &pin).unwrap();
@@ -1720,13 +1749,33 @@ fn history_refresh_extends_the_installed_pin() {
     // The same genesis and valid bundle structure are insufficient if a refresh
     // would remove an already held successor.
     let world = setup();
-    let mut opts = world.options("trust rollback", World::store());
-    opts.pins.gamma = gamma;
+    let mut opts = world.options("trust rollback", store.clone());
+    opts.pins.gamma = gamma.clone();
     opts.pins.build = Build::Production;
-    opts.trust = extended;
+    opts.trust = TrustInput::from_bundle(&lagging, &pin).unwrap();
     opts.trust_freshness_ms = Some(60_000);
     let rollback = TrustInput::from_bundle(&lagging, &pin).unwrap();
     opts.refresh_trust = Some(Box::new(move |_| Ok(rollback.clone())));
     let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
     assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
+}
+
+#[test]
+fn slow_utb_sync_cannot_publish_with_an_expired_window() {
+    let x = setup();
+    let mut opts = x.options("slow sync", World::store());
+    opts.trust_freshness_ms = Some(1);
+    opts.refresh_trust = Some(Box::new(|held| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        Ok(held)
+    }));
+    let bridge = NativeBridgeV2::open(opts).unwrap();
+    let world = WitnessWorld::new();
+    let token = world.burned();
+    let rec = world.b.journal.ret(&hex(&token)).unwrap().unwrap();
+    // Verification refuses for freshness before it can examine the lineage's deployment or burn.
+    let evidence = unhex(rec.burned.as_deref().unwrap()).unwrap();
+    let error = bridge.verify_token(&evidence).unwrap_err();
+    assert_eq!(error.reason(), Some(WalletReason::TrustSyncRequired));
+    assert!(error.retryable());
 }

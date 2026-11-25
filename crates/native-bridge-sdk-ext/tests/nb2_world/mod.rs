@@ -1051,6 +1051,7 @@ impl World {
             store,
             &derive_bridge_key(&key(seed))[..],
         );
+        o.unsafe_test_trust = true;
         o.backup = Some(Box::new(|_| Ok(())));
         o.receipt_timeout_ms = Some(0);
         o.poll_ms = Some(0);

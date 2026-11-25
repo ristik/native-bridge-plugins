@@ -12,9 +12,7 @@ import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/t
 import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseResponseWire.js';
 
 import { toHex } from '../packages/native-bridge-plugin/src/bytes.js';
-import { revertData } from '../packages/native-bridge-plugin/src/nb2/abi.js';
 import { Nb2Error } from '../packages/native-bridge-plugin/src/nb2/errors.js';
-import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
 import { MAX_TRANSFER_PAIR } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
 import { framedProof, successor, withSeal, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
@@ -280,14 +278,13 @@ test('redeem waits out a possible seal import lag before sending once', async ()
   const { w, chain } = await withCoin();
   await burn(w, 'coin');
   const rpc = chain.call.bind(chain);
-  const refusal = hex(revertData('VerifierRefused', revertData('QuorumNotMet')));
-  let firstEstimate = true;
+  let firstImport = true;
   let sends = 0;
   chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
     if (method === 'eth_sendRawTransaction') sends++;
-    if (method === 'eth_estimateGas' && firstEstimate) {
-      firstEstimate = false;
-      throw new RpcError(200, 3, 'execution reverted', refusal);
+    if (method === 'eth_getStorageAt' && firstImport) {
+      firstImport = false;
+      return ('0x' + '00'.repeat(32)) as T;
     }
     return rpc<T>(method, params);
   };
@@ -297,7 +294,7 @@ test('redeem waits out a possible seal import lag before sending once', async ()
     notes.push(note);
   })).state, 'paid');
   assert.equal(notes.length, 1);
-  assert.match(notes[0], /possible seal registry lag/);
+  assert.match(notes[0], /waiting for B1 registry import/);
   assert.equal(sends, 1);
 });
 

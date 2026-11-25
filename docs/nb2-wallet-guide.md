@@ -2,7 +2,7 @@
 
 The wallet verifies each certificate under the pinned Unicity Trust Base history. An epoch is valid from its start round through the round before the next installed epoch starts. The latest installed epoch has an open upper bound. Weighted quorum verification applies in every epoch.
 
-Configure `trustFreshnessMs` (Rust: `trust_freshness_ms`) and a trusted live UTB source for a wallet integration. Use 15 minutes on testnet or 7 days in production. The wallet synchronizes at the first acceptance after start or expiry, and when a seal needs a newer epoch. Successful synchronized history is authenticated and saved before the refresh returns. A partial fetch may save verified entries, but leaves the freshness record unchanged. A replayed certificate gives no freshness credit. The wallet requires a new sync after restart.
+The wallet requires the paired imported-tip profile and defaults to a 7-day UTB freshness window. Set `trustFreshnessMs` (Rust: `trust_freshness_ms`) to 15 minutes on testnet, and configure a trusted live UTB source. The wallet synchronizes at the first acceptance after start or expiry, and when a seal needs a newer epoch. Successful synchronized history is authenticated and saved before the refresh returns. A partial fetch may save verified entries. A failed or partial sync suspends acceptance until the saved history is installed through a successful sync. The durable tip remains a lower bound across restart. A replayed certificate gives no freshness credit. The wallet requires a new sync after restart.
 
 On the paired profile, Mint binds the receipt UC to the canonical child's committed root input before saving the mint reason. During D4, an existing child can supply the original in-term witness. A deposit in the frozen parent with no certified child waits for the successor acknowledgement and its authenticated recertification. A later same-input-record certificate cannot replace the certificate selected by an existing child.
 
@@ -351,7 +351,7 @@ sequenceDiagram
 ## Using the plug-in
 
 ```ts
-import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySigner, localOwner } from '@unicitylabs/native-bridge-plugin/nb2';
+import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySigner, localOwner, TESTNET_TRUST_FRESHNESS_MS } from '@unicitylabs/native-bridge-plugin/nb2';
 
 const bridge = await NativeBridgeV2.open({
   pins,                                  // the manifest's pins (nb2-release.json "pins"; wallet/core.ts pinsOf reads them)
@@ -361,7 +361,11 @@ const bridge = await NativeBridgeV2.open({
   journal: store,                        // your key-value store; its putIf MUST be atomic and durable (nb2-journal.md)
   bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
   backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
-  refreshTrust: async () => { /* append newer trust-base entries (wallet/trust.ts refreshAll) */ },
+  trustFreshnessMs: TESTNET_TRUST_FRESHNESS_MS, // omit for the production default of 7 days
+  refreshTrust: async () => {
+    const refreshed = await syncPinnedHistory(); // your bounded live sync, including durable storage
+    return refreshed;                          // the complete authenticated TrustInput, even when unchanged
+  },
   // gas: optional; the default is MeasuredGasModel (the redeem gas estimate, docs/nb2-gas-model.md), applied only to the deployment it is
   // calibrated for: its verifier, helper and vault code and the manifest's nativeGasSchedule (any other refuses the burn until you supply a
   // GasModel)
@@ -613,12 +617,11 @@ the bridge is a test system. Don't move real value through it.
 
 ## RPC requirements
 
-Any node that meets the wallet RPC contract (spec section 12.7, NB2-06, bft-core#1102) works. There is no bridge-specific service, and
-nothing read is trusted: every item is verified offline, so a provider that withholds data can only delay the wallet.
+Use the operator’s paired RPC for canonical-child selection when minting or receiving. This is the same operator trust as the former origin feed. The wallet checks that the child commits to the receipt UC’s origin and verifies the receipt trie, UC and lineage independently of the operator’s claim. An operator that lies about the canonical child can make a frozen-parent Mint fail later historical verification. The account, amount and payout still depend on verified evidence. Other evidence readers may supply the independently verifiable components in section 12.7.
 
 | Need | Method |
 |---|---|
-| The certificate of block N | `eth_getBlockByNumber(N+1, false)`, then `unicity_getSealCompanionV1(hash(N+1))`: `{"status":"found"}`, witness 0 |
+| The certificate of block N, including the receive check | `eth_getBlockByNumber(N+1, false)`, then `unicity_getSealCompanionV1(hash(N+1))`: `{"status":"found"}`, witness 0 |
 | The header of block N | `eth_getBlockByHash(hash, false)` |
 | The receipt-trie path | `eth_getTransactionReceipt`, `eth_getBlockReceipts(hash)` |
 | Segment logs, the newest seal, `Paid(eta)` | `eth_getLogs` with exactly one address and explicit windows of at most 10,000 blocks |

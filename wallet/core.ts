@@ -459,7 +459,7 @@ export class Wallet {
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
       backup: async (intents) => writeDurable(join(this.dir, 'backup.json'), JSON.stringify(intents)),
       refreshTrust: () => this.refreshAuthority(),
-      requireImportedTipProfile: !opts.rpc,
+      unsafeTestTrust: !!opts.rpc,
       trustFreshnessMs: opts.trustFreshnessMs ?? (opts.rpc ? undefined :
         this.release.status === 'testnet-provisional' ? TESTNET_TRUST_FRESHNESS_MS : PRODUCTION_TRUST_FRESHNESS_MS),
       receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
@@ -754,8 +754,8 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
  * The deployed verifier reports QuorumNotMet for both a seal awaiting import and an invalid quorum. Only the
  * vault's wrapped refusal is eligible for the bounded seal-import wait.
  */
-export function isRegistryLag(e: unknown): e is Nb2Error {
-  return e instanceof Nb2Error && e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet';
+export function isRegistryLag(e: unknown): e is Nb2Error | WalletError {
+  return e instanceof WalletError && e.reason === 'ImportLag' || e instanceof Nb2Error && e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet';
 }
 
 /** How long a redemption waits out the registry lag (#1125) before it reports the refusal. */
@@ -764,7 +764,7 @@ export const REGISTRY_LAG_MS = 120_000;
 /** The refusal of a redemption that waited out REGISTRY_LAG_MS: the burn is intact, and `redeem` can run again. */
 export class RegistryLagExpired extends Error {
   public constructor(public readonly label: string, public readonly refusal: unknown) {
-    super(`the deployed verifier still answers QuorumNotMet after ${REGISTRY_LAG_MS / 1000} s (bft-core#1125). The burn is intact: run redeem ${label} again later. If it persists, the certificate may really lack its quorum: report it`);
+    super(`the B1 registry is still unavailable for this return after ${REGISTRY_LAG_MS / 1000} s (bft-core#1125). The burn is intact: run redeem ${label} again later. If it persists, the certificate may really lack its quorum: report it`);
   }
 }
 
@@ -779,7 +779,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
   const started = performance.now();
   const deadline = started + REGISTRY_LAG_MS;
   let r: ReconcileResult;
-  let lastRefusal: Nb2Error | undefined;
+  let lastRefusal: Nb2Error | WalletError | undefined;
   for (;;) {
     if (lastRefusal !== undefined) {
       const remaining = deadline - performance.now();
@@ -792,7 +792,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
       if (lastRefusal === undefined && performance.now() < deadline) {
-        note('the verifier answers QuorumNotMet: waiting for possible seal registry lag (#1125)');
+        note(e instanceof WalletError ? 'waiting for B1 registry import' : 'waiting for possible seal registry lag');
       }
       lastRefusal = e;
     }
@@ -817,9 +817,9 @@ export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPo
 export async function receive(w: Wallet, label: string, token: Uint8Array, owner: number): Promise<string> {
   w.checkNewName(label);
   const snapshot = Uint8Array.from(token);
-  const held = await w.bridge.verifyToken(snapshot);
-  if (!held.owner || !eq(held.owner, w.ownerPub(owner))) throw new Error('the verified token belongs to another owner');
   const headroom = await returnHeadroom(w, snapshot);
+  const held = await w.bridge.verifyReceivedToken(snapshot);
+  if (!held.owner || !eq(held.owner, w.ownerPub(owner))) throw new Error('the verified token belongs to another owner');
   w.keep(label, snapshot, owner, { amount: String(held.amount) });
   return headroom;
 }

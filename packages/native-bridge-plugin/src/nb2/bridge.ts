@@ -85,7 +85,8 @@ export interface BridgeOptions {
   refreshTrust?: () => Promise<TrustInput | void>;
   /** Required freshness window for a wallet using its configured live UTB source. */
   trustFreshnessMs?: number;
-  requireImportedTipProfile?: boolean;
+  /** Only for local fixtures that use an old verifier or have no live UTB source. */
+  unsafeTestTrust?: boolean;
   /** Monotonic elapsed time. A new session starts stale because elapsed time across restarts is uncertain. */
   trustClock?: () => number;
   /** Receipt polling. */
@@ -195,6 +196,7 @@ export class NativeBridgeV2 {
   /** Whether the gas model applies to this deployment (checked once, from its runtime codes and native gas schedule). */
   private gasFits: boolean | null = null;
   private lastTrustSync?: number;
+  private trustSuspended = false;
   private refreshingTrust?: Promise<void>;
 
   private constructor(options: BridgeOptions) {
@@ -203,9 +205,10 @@ export class NativeBridgeV2 {
     this.cfg = decodeConfig(opts.pins.gamma, buildParams(opts.pins.build));
     this.domain = domainOf(opts.pins.gamma);
     bindTrust(opts.trust, this.cfg);
-    if (opts.requireImportedTipProfile && toHex(this.cfg.semanticProfileHash) !== IMPORTED_TIP_PROFILE_HASH) {
+    if (!opts.unsafeTestTrust && toHex(this.cfg.semanticProfileHash) !== IMPORTED_TIP_PROFILE_HASH) {
       refuse('BadDeployment', 'the wallet requires the paired imported-tip NB2 semantic profile');
     }
+    if (!opts.unsafeTestTrust) opts.trustFreshnessMs ??= PRODUCTION_TRUST_FRESHNESS_MS;
     if (opts.trustFreshnessMs !== undefined && (!Number.isFinite(opts.trustFreshnessMs) || opts.trustFreshnessMs <= 0)) {
       refuse('BadInput', 'the UTB freshness window must be positive and finite');
     }
@@ -470,7 +473,7 @@ export class NativeBridgeV2 {
       const mine = rec.seenDeposits?.find((x) => x.depositNumber === rec.depositNumber);
       if (mine !== undefined) mine.token = rec.token;
       await this.journal.putDeposit(rec);
-      return held === this.opts.trust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
+      return held === this.opts.trust && !this.refreshingTrust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
     });
   }
 
@@ -498,7 +501,7 @@ export class NativeBridgeV2 {
       delete x!.reason;
       delete x!.mintProof;
       await this.journal.putDeposit(rec);
-      return held === this.opts.trust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
+      return held === this.opts.trust && !this.refreshingTrust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
     });
   }
 
@@ -550,6 +553,18 @@ export class NativeBridgeV2 {
     const part = decodeToken(token);
     const h = await this.retryingTrust((trust) => verifyHeld(this.cfg, this.domain, trust, part));
     return { tokenId: h.tokenId, amount: h.amount, owner: h.owner.type === 1n ? h.owner.params : null, state: h.state };
+  }
+
+  /** Verify incoming lineage and bind its receipt to the paired RPC's canonical child. */
+  public async verifyReceivedToken(token: Uint8Array): ReturnType<NativeBridgeV2['verifyToken']> {
+    if (toHex(this.cfg.semanticProfileHash) !== IMPORTED_TIP_PROFILE_HASH) return this.verifyToken(token);
+    const part = decodeToken(Uint8Array.from(token));
+    const mint = lineageOf(part)[0].mint;
+    return this.retryingTrust(async (trust) => {
+      const held = await verifyHeld(this.cfg, this.domain, trust, part);
+      await this.evm.checkMintReceipt(decodeReceiptBacking(mint.justification!).proof);
+      return { tokenId: held.tokenId, amount: held.amount, owner: held.owner.type === 1n ? held.owner.params : null, state: held.state };
+    });
   }
 
   /** An ordinary transfer to `toKey`; the result is verified before it is returned. */
@@ -677,7 +692,7 @@ export class NativeBridgeV2 {
     rec.status = 'minted';
     await this.journal.putSplit(rec);
     const children = rec.outputs.map((o) => unhex(o.token!));
-    if (cached || held !== this.opts.trust || this.trustStale()) {
+    if (cached || held !== this.opts.trust || this.refreshingTrust || this.trustStale()) {
       await this.retryingTrust(async (trust) => {
         for (const token of children) await verifyHeld(this.cfg, this.domain, trust, decodeToken(token));
       });
@@ -746,14 +761,18 @@ export class NativeBridgeV2 {
   private trustStale(): boolean {
     if (this.opts.trustFreshnessMs === undefined) return false;
     const now = this.trustNow();
-    return this.lastTrustSync === undefined || !Number.isFinite(now) || now < this.lastTrustSync ||
+    return this.trustSuspended || this.lastTrustSync === undefined || !Number.isFinite(now) || now < this.lastTrustSync ||
       now - this.lastTrustSync >= this.opts.trustFreshnessMs;
   }
 
   /** Synchronize through the same coalesced path used by verification. */
   public syncTrust(): Promise<void> {
     if (this.refreshingTrust) return this.refreshingTrust;
-    this.refreshingTrust = this.installRefreshedTrust().finally(() => { this.refreshingTrust = undefined; });
+    this.refreshingTrust = this.installRefreshedTrust().catch((error: unknown) => {
+      // A failed sync may have persisted a verified prefix. Suspend this session until it can install it.
+      this.trustSuspended = true;
+      throw error;
+    }).finally(() => { this.refreshingTrust = undefined; });
     return this.refreshingTrust;
   }
 
@@ -761,7 +780,7 @@ export class NativeBridgeV2 {
     const start = this.trustNow();
     const offered = await this.opts.refreshTrust?.();
     if (!offered) {
-      if (this.trustStale()) refuse('TrustInput', 'a successful UTB sync is required');
+      if (this.opts.trustFreshnessMs !== undefined) refuse('TrustInput', 'a successful UTB sync must return authenticated history');
       return;
     }
     const candidate = await offered.snapshot();
@@ -772,14 +791,26 @@ export class NativeBridgeV2 {
     if (!match || !eq(await match.entryId(), await tip.entryId())) {
       refuse('TrustInput', 'authority refresh does not extend the installed history');
     }
-    if (this.opts.trustFreshnessMs !== undefined) {
+    const key = this.journal.prefix + 'trust-sync';
+    const previous = await this.journal.store.get(key);
+    if (previous !== null) {
+      let saved: { domain?: unknown; genesis?: unknown; tipEpoch?: unknown; tipId?: unknown } | null;
+      try { saved = JSON.parse(previous); } catch { saved = null; }
+      if (saved?.domain !== hex(this.domain) || saved.genesis !== hex(candidate.id)
+          || typeof saved.tipEpoch !== 'string' || !/^[1-9][0-9]{0,19}$/.test(saved.tipEpoch)) {
+        refuse('TrustInput', 'invalid durable UTB checkpoint');
+      }
+      const entry = candidate.history.entryForEpoch(BigInt(saved.tipEpoch));
+      if (!entry || hex(await entry.entryId()) !== saved.tipId) {
+        refuse('TrustInput', 'authority refresh does not extend the durable history');
+      }
+    }
+    if (this.opts.trustFreshnessMs !== undefined || previous !== null) {
       const stamp = this.trustNow();
       if (!Number.isFinite(start) || !Number.isFinite(stamp) || start < 0 || stamp < start || (this.lastTrustSync !== undefined && start < this.lastTrustSync)) {
         this.lastTrustSync = undefined;
         refuse('TrustInput', 'the UTB sync clock is uncertain');
       }
-      const key = this.journal.prefix + 'trust-sync';
-      const previous = await this.journal.store.get(key);
       const end = candidate.history.tip!;
       const record = JSON.stringify({
         domain: hex(this.domain), genesis: hex(candidate.id), tipEpoch: String(end.epoch), tipId: hex(await end.entryId()), syncedAt: Date.now(),
@@ -788,6 +819,7 @@ export class NativeBridgeV2 {
       this.lastTrustSync = start;
     }
     this.opts.trust = candidate;
+    this.trustSuspended = false;
   }
 
   /** Apply wallet freshness and pinning to verification of wallet-managed journal evidence. */
@@ -797,13 +829,18 @@ export class NativeBridgeV2 {
 
   /** Verify one decision against a held snapshot, repeating if another decision installed its successor. */
   private async retryingTrust<T>(f: (trust: TrustInput) => Promise<T>, refreshOnMissing = true): Promise<T> {
+    if (this.refreshingTrust) await this.refreshingTrust;
     if (this.trustStale()) await this.syncTrust();
     let refreshed = false;
     for (;;) {
+      if (this.trustStale()) refuse('TrustSyncRequired', 'the UTB freshness window elapsed before verification');
       const held = this.opts.trust;
       try {
         const result = await f(held);
-        if (held === this.opts.trust) return result;
+        if (this.refreshingTrust) await this.refreshingTrust;
+        if (held !== this.opts.trust) continue;
+        if (this.trustStale()) refuse('TrustSyncRequired', 'the UTB freshness window elapsed before publication');
+        return result;
       } catch (error) {
         if (held !== this.opts.trust) continue;
         if (refreshed || !refreshOnMissing || !this.trustBehind(error) || !this.opts.refreshTrust) throw error;
@@ -1230,16 +1267,25 @@ export class NativeBridgeV2 {
       this.requireRedeemable(fresh);
       const competing = await this.settlementGate(fresh, archives, options.recovery);
       if (competing) return competing;
-      const rtx = await this.buildRedeemInner(fresh, options.envelope);
+      let rtx: RedeemTx;
+      try {
+        rtx = await this.buildRedeemInner(fresh, options.envelope);
+      } catch (error) {
+        // A latest-state estimate can refuse a missing epoch before the finalized preflight runs.
+        if (error instanceof Nb2Error && error.rule === 'VerifierRefused') await this.checkOrdinaryImport(fresh);
+        throw error;
+      }
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
         options.admit && ((request) => options.admit!(request, fresh.sends)));
+      // Until the exact call passes preflight it has never been broadcast. Leave
+      // the burn rebuildable, including its history and route, on any refusal.
+      await this.checkOrdinaryImport(fresh, tx.raw);
       fresh.executionPayer ??= hex(signer.address);
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.blockNumber());
       await this.journal.putReturn(fresh);
-      await this.checkOrdinaryImport(fresh, tx.raw);
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
       const outcome = await this.reconcileRecord(fresh, archives, { readOnly: true, pending });
@@ -1472,9 +1518,9 @@ export class NativeBridgeV2 {
     return { state: 'pending', txHash };
   }
 
-  private async checkOrdinaryImport(rec: ReturnRecord, raw: Uint8Array): Promise<void> {
+  private async checkOrdinaryImport(rec: ReturnRecord, raw?: Uint8Array): Promise<void> {
     const part = decodeToken(unhex(rec.burned!));
-    const { from, request } = decodeSignedTx(raw);
+    const tx = raw && decodeSignedTx(raw);
     await this.retryingTrust(async (trust) => {
       await verifyPart(this.cfg, this.domain, trust, part);
       const lineage = lineageOf(part);
@@ -1486,7 +1532,7 @@ export class NativeBridgeV2 {
           if (signer > epoch) epoch = signer;
         }
       }
-      await this.evm.checkReturnImport(this.cfg, epoch, { ...request, from });
+      await this.evm.checkReturnImport(this.cfg, epoch, tx && { ...tx.request, from: tx.from });
     });
   }
 

@@ -1,7 +1,6 @@
 //! Wallet evidence from the ordinary execution RPC behind the deployment's public gateway (section 12.7, NB2-06 #1102;
-//! `rpc.ts`): one URL, JSON-RPC 2.0 POST, one request per call. Nothing read here is trusted: the adapters only fetch bytes,
-//! and every piece of evidence is verified offline by the pure functions of this module tree. A provider that withholds or
-//! falsifies data can only delay the wallet.
+//! `rpc.ts`): one URL, JSON-RPC 2.0 POST, one request per call. The paired RPC selects the canonical child for Mint and receive.
+//! Receipt, quorum and lineage checks independently authenticate the evidence.
 //!
 //! Gateway rules honoured here: `eth_getLogs` names one address and an explicit window of at most 10,000 blocks (a result-count
 //! error or the 8 MiB answer cap, HTTP 413, halves the window); 429 and a busy 503 are waited out; an HTTP 503 from
@@ -376,6 +375,11 @@ fn call<R: JsonRpc + ?Sized>(rpc: &R, method: &str, params: Value) -> Result<Val
     rpc.call(method, params).map_err(Error::from)
 }
 
+enum MintWitness<'a> {
+    Fetch,
+    Embedded(&'a [u8]),
+}
+
 /// The fresh B1 RootInputV2 limit (ureth execution/src/wire.rs).
 const MAX_ROOT_INPUT_BYTES: usize = 32 * 1024;
 
@@ -508,7 +512,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
     /// The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child
     /// does not exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
     pub fn certificate_of(&self, header: &Header, hash: &[u8]) -> Result<Vec<u8>> {
-        self.certificate_of_mode(header, hash, false, false)
+        self.certificate_of_mode(header, hash, false, None)
     }
 
     fn certificate_of_mode(
@@ -516,7 +520,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         header: &Header,
         hash: &[u8],
         bind_technical_record: bool,
-        bind_mint_witness: bool,
+        mint_witness: Option<MintWitness<'_>>,
     ) -> Result<Vec<u8>> {
         let n = header.number_u64();
         let child = call(
@@ -551,7 +555,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
             .as_array()
             .or_else(|| l["witnesses"].as_array())
             .unwrap_or(&empty);
-        if bind_mint_witness && l["status"] == "found" && witnesses.is_empty() {
+        if mint_witness.is_some() && l["status"] == "found" && witnesses.is_empty() {
             return refuse(
                 WalletReason::CompanionUnknown,
                 "the canonical child has no committed witness available",
@@ -559,8 +563,12 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         }
         check_companion(l["status"].as_str().unwrap_or(""), witnesses.len())?;
         let uc = bytes_of(&witnesses[0], "companion witness 0")?;
-        if bind_mint_witness {
-            check_mint_witness(&child_header, &l["companion"]["rootInput"], &uc)?;
+        if let Some(witness) = mint_witness {
+            let raw = match witness {
+                MintWitness::Fetch => &uc,
+                MintWitness::Embedded(raw) => raw,
+            };
+            check_mint_witness(&child_header, &l["companion"]["rootInput"], raw)?;
         }
         if bind_technical_record {
             use super::cbor::{array, is_bytes, is_uint, scan_native, MAJ_TEXT};
@@ -653,6 +661,16 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         self.receipt_proof_mode(tx_hash, emitter, topic0, None, false)
     }
 
+    pub fn check_mint_receipt(&self, proof: &DepositProof) -> Result<()> {
+        self.certificate_of_mode(
+            &super::header::decode_header(&proof.header)?,
+            &he(&[&proof.header]),
+            false,
+            Some(MintWitness::Embedded(&proof.uc)),
+        )?;
+        Ok(())
+    }
+
     /// The paired profile selects the parent's UC from the canonical child's committed origin.
     pub fn mint_receipt_proof(
         &self,
@@ -712,8 +730,12 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         };
         let block_hash = fixed_of(&json!(r.block_hash), 32, "blockHash")?;
         let (header, raw) = self.header_by_hash(&block_hash)?;
-        let uc =
-            self.certificate_of_mode(&header, &block_hash, event.is_some(), bind_mint_witness)?;
+        let uc = self.certificate_of_mode(
+            &header,
+            &block_hash,
+            event.is_some(),
+            bind_mint_witness.then_some(MintWitness::Fetch),
+        )?;
         let tx_index = qty64(&json!(r.transaction_index), "transactionIndex")?;
         let nodes = self.receipt_path(&header, &block_hash, tx_index)?;
         let proof = DepositProof {
@@ -908,7 +930,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         &self,
         cfg: &super::config::Config,
         epoch: u64,
-        tx: &super::evm::DecodedTx,
+        tx: Option<&super::evm::DecodedTx>,
     ) -> Result<()> {
         let genesis = call(&*self.rpc, "eth_getBlockByNumber", json!(["0x0", false]))?;
         if self.chain_id()? != cfg.chain_id
@@ -926,7 +948,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         )?;
         if finalized.is_null() || bytes_of(&finalized["hash"], "finalized hash")?.len() != 32 {
             return refuse(
-                WalletReason::NotPending,
+                WalletReason::ImportLag,
                 "waiting for a finalized execution block",
             );
         }
@@ -943,10 +965,13 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         let tip = bytes_of(&tip, "B1 imported tip epoch")?;
         if tip.len() != 32 || BigUint::from_bytes_be(&tip) < BigUint::from(epoch) {
             return refuse(
-                WalletReason::NotPending,
+                WalletReason::ImportLag,
                 format!("waiting for finalized B1 import of epoch {epoch}"),
             );
         }
+        let Some(tx) = tx else {
+            return Ok(());
+        };
         let req = &tx.request;
         call(
             &*self.rpc,

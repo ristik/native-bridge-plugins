@@ -155,6 +155,8 @@ pub enum WalletReason {
     CompanionProvider,
     /// The trust-base history is not the one Γ names.
     TrustInput,
+    TrustSyncRequired,
+    ImportLag,
     /// A step on a plan whose journal entry was not durably written first.
     JournalNotPersisted,
     /// A compare-and-swap of a journal record lost to another writer.
@@ -188,6 +190,8 @@ impl WalletReason {
             WalletReason::CompanionUnknown => "CompanionUnknown",
             WalletReason::CompanionProvider => "CompanionProvider",
             WalletReason::TrustInput => "TrustInput",
+            WalletReason::TrustSyncRequired => "TrustSyncRequired",
+            WalletReason::ImportLag => "ImportLag",
             WalletReason::JournalNotPersisted => "JournalNotPersisted",
             WalletReason::JournalConflict => "JournalConflict",
             WalletReason::RecipientRefused => "RecipientRefused",
@@ -254,9 +258,13 @@ impl Error {
         }
     }
 
-    /// A rule error that is eligible for a retry.
+    /// Whether this refusal is eligible for a retry.
     pub fn retryable(&self) -> bool {
         matches!(self, Error::Rule(e) if e.retryable())
+            || matches!(
+                self.reason(),
+                Some(WalletReason::ImportLag | WalletReason::TrustSyncRequired)
+            )
     }
 }
 

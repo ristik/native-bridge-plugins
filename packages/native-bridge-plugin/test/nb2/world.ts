@@ -483,7 +483,7 @@ export async function setup(semanticProfileHash?: Uint8Array) {
     gasReserve: 500_000n, returnReserveSegments: 64n, deploymentBlock: 1n, stateReadOnly: false,
   };
   const options = (seed: string, store = new MemoryJournalStore()): BridgeOptions => ({
-    pins, trust: root.trust, rpc: chain, aggregator: agg, journal: store, bridgeKey: deriveBridgeKey(key(seed)), backup: async () => {},
+    unsafeTestTrust: true, pins, trust: root.trust, rpc: chain, aggregator: agg, journal: store, bridgeKey: deriveBridgeKey(key(seed)), backup: async () => {},
     receiptTimeoutMs: 0, pollMs: 0, sleep: async () => {}, gas: WORLD_GAS,
   });
   return { root, cfg, chain, agg, pins, options };

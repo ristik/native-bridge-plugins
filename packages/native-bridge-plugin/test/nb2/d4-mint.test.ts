@@ -4,12 +4,13 @@ import { UnicityCertificate } from '@unicitylabs/state-transition-sdk/lib/api/bf
 import { UnicitySeal } from '@unicitylabs/state-transition-sdk/lib/api/bft/UnicitySeal.js';
 import { fromHex, toHex } from '../../src/bytes.js';
 import { IMPORTED_TIP_PROFILE_HASH, NativeBridgeV2 } from '../../src/nb2/bridge.js';
-import { decodeReceiptBacking } from '../../src/nb2/deposit.js';
+import { decodeReceiptBacking, encodeReceiptBacking } from '../../src/nb2/deposit.js';
 import type { JsonRpc } from '../../src/nb2/rpc.js';
-import { localOwner } from '../../src/nb2/tokenops.js';
+import { decodeToken } from '../../src/nb2/token.js';
+import { localOwner, mintRequest, tokenOfMint } from '../../src/nb2/tokenops.js';
 import { decodeUc, verifyEvmUc } from '../../src/nb2/trust.js';
 import { successor, withSeal } from './certification-fixtures.js';
-import { evmAccount, key, roundAtLeast, roundNow, setup, type Root } from './world.js';
+import { evmAccount, FakeAggregator, key, roundAtLeast, roundNow, setup, type Root } from './world.js';
 
 async function reseal(raw: Uint8Array, root: Root, round: bigint, epoch: bigint): Promise<Uint8Array> {
   const uc = decodeUc(raw);
@@ -37,7 +38,7 @@ test('D4 Mint uses the ancestor child’s in-term witness and waits for the froz
     }
     return result;
   } };
-  const bridge = await NativeBridgeV2.open({ ...opts, rpc, requireImportedTipProfile: true,
+  const bridge = await NativeBridgeV2.open({ ...opts, rpc,
     refreshTrust: async () => serveSuccessor ? next?.trust : undefined,
     aggregator: { async certify(request) {
       const proof = await w.agg.certify(request);
@@ -69,6 +70,15 @@ test('D4 Mint uses the ancestor child’s in-term witness and waits for the froz
   const ancestorProof = await bridge.collectDepositProof(ancestor.intent);
   assert.deepEqual(decodeReceiptBacking(ancestorProof.reason).proof.uc, ancestor.original);
   const ancestorToken = await bridge.mint(ancestor.intent);
+
+  assert.equal((await bridge.verifyReceivedToken(ancestorToken)).amount, 8n);
+  const originalMint = decodeToken(ancestorToken).mint;
+  const backing = decodeReceiptBacking(originalMint.justification!);
+  backing.proof.uc = await reseal(ancestor.original, w.root, start + 10n, 1n);
+  const candidate = mintRequest({ ...originalMint, justification: encodeReceiptBacking(backing) });
+  const incoming = tokenOfMint(candidate.tx, await new FakeAggregator(w.root).certify(candidate.cd));
+  assert.equal((await bridge.verifyToken(incoming)).amount, 8n, 'the old tip accepts the suffix quorum');
+  await assert.rejects(bridge.verifyReceivedToken(incoming), { reason: 'CompanionProvider' });
 
   await assert.rejects(bridge.collectDepositProof(frozen.intent), { reason: 'CompanionUnknown' });
   assert.equal((await bridge.journal.deposit(frozen.intent))?.reason, undefined);
