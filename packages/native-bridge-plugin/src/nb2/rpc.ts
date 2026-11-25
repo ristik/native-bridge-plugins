@@ -492,8 +492,8 @@ export class EvmReader {
         from: hexOf(tx.from), to: hexOf(tx.to), data: hexOf(tx.data), value: qty(tx.value), gas: qty(tx.gas),
       }, at]);
     } catch (error) {
-      if (error instanceof RpcError && typeof error.data === 'string' && error.data.startsWith('0x')) {
-        const raw = fromHex(error.data.slice(2));
+      if (error instanceof RpcError) {
+        const raw = revertDataOf(error);
         if (raw && decodeRevert(raw)?.rule === 'StaleEndpoint') fail('StaleEndpoint', 'payout history expired at the finalized head');
       }
       throw error;
