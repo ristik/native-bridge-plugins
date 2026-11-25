@@ -26,7 +26,7 @@ import { SparseMerkleTree } from '@unicitylabs/state-transition-sdk/lib/smt/radi
 
 import { concat, eq, fromHex, toHex } from '../../src/bytes.js';
 import { SELECTOR, revertData } from '../../src/nb2/abi.js';
-import { ascii, beInt, cArr, cBytes, cTag, cUint, u256 } from '../../src/nb2/cbor.js';
+import { ascii, beInt, cArr, cBytes, cNullOr, cTag, cUint, u256 } from '../../src/nb2/cbor.js';
 import { ASSET_UCT, TEST_PARAMS, deriveCoin, deriveType, domainOf, encodeConfig, type Config } from '../../src/nb2/config.js';
 import { HE, HU } from '../../src/nb2/crypto.js';
 import { TOPIC, depositedData } from '../../src/nb2/deposit.js';
@@ -36,12 +36,12 @@ import { EMPTY_TRIE_ROOT, EMPTY_UNCLE_HASH, encodeHeader, type Header } from '..
 import { buildTrie } from '../../src/nb2/mpt.js';
 import { rlpBytes, rlpIndexKey, rlpList, rlpUintEnc } from '../../src/nb2/rlp.js';
 import { segmentSealedData } from '../../src/nb2/segment.js';
-import { TrustInput } from '../../src/nb2/trust.js';
+import { decodeUc, TrustInput } from '../../src/nb2/trust.js';
 import { RpcError, type JsonRpc } from '../../src/nb2/rpc.js';
 import { VaultModel, type RecipientBehaviour, type VaultEvent } from '../../src/nb2/vaultmodel.js';
 import { verdictAbi, verifyReturn } from '../../src/nb2/verify.js';
 import type { Aggregator } from '../../src/nb2/tokenops.js';
-import { deriveBridgeKey, type BridgeOptions } from '../../src/nb2/bridge.js';
+import { deriveBridgeKey, IMPORTED_TIP_PROFILE_HASH, type BridgeOptions } from '../../src/nb2/bridge.js';
 import { MeasuredGasModel, type GasModel } from '../../src/nb2/gas.js';
 import { LocalKeySigner } from '../../src/nb2/evm.js';
 import { MemoryJournalStore } from '../../src/nb2/journal.js';
@@ -94,6 +94,18 @@ export async function makeUc(root: Root, partition: number, stateHash: Uint8Arra
   return new UnicityCertificate(ir, TR_HASH, conf, stc, new UnicityTreeCertificate(BigInt(partition), []), seal).toCBOR();
 }
 
+/** Go's fresh RootInputV2 layout, including the origin tuple committed in the child header. */
+export function fixtureRootInput(witness: Uint8Array, parent: Uint8Array): Uint8Array {
+  const uc = decodeUc(witness);
+  const seal = uc.unicitySeal;
+  const ir = uc.inputRecord;
+  const origin = cArr(cUint(NETWORK), cUint(seal.rootChainRoundNumber), cUint(seal.epoch), cUint(seal.timestamp),
+    cBytes(seal.hash), cArr(cUint(ir.roundNumber), cUint(ir.epoch), cNullOr(ir.previousHash), cNullOr(ir.nullableHash),
+      cUint(ir.timestamp), cNullOr(ir.blockHash)), cBytes(uc.technicalRecordHash!), cBytes(uc.shardConfigurationHash));
+  return cArr(cUint(2), cUint(NETWORK), cUint(EVM_PARTITION), cBytes(Uint8Array.of(0x80)), cUint(ir.roundNumber + 1n),
+    cUint(ir.epoch), cUint(ir.epoch), cBytes(parent), origin, TECHNICAL_RECORD, cArr(), cBytes(new Uint8Array(32)), cBytes(new Uint8Array(32)));
+}
+
 // ---- deployment ---------------------------------------------------------------------------------------
 
 export function makeConfig(root: Root, K = 4n, B = 2n): Config {
@@ -139,7 +151,7 @@ export class FakeAggregator implements Aggregator {
 
 interface Log { address: Uint8Array; topics: Uint8Array[]; data: Uint8Array }
 interface Rcpt { status: 0n | 1n; logs: Log[]; tx: Uint8Array; from: Uint8Array; revert: Uint8Array | null; gas: bigint; type: number }
-interface Block { header: Header; hash: Uint8Array; uc: Uint8Array | null; receipts: Rcpt[]; raws: Uint8Array[] }
+interface Block { header: Header; hash: Uint8Array; uc: Uint8Array | null; rootInput?: Uint8Array; receipts: Rcpt[]; raws: Uint8Array[] }
 
 export interface Faults {
   /** The next N sends are included but answered with HTTP 503 (partial broadcast, #1121). */
@@ -204,7 +216,7 @@ export class FakeChain implements JsonRpc {
   }
 
   /** Mine one block with the given signed transactions, and certify the previous block (its UC goes in this block's companion). */
-  public async mine(raws: Uint8Array[]): Promise<void> {
+  public async mine(raws: Uint8Array[], parentCertificate?: Uint8Array): Promise<void> {
     const n = BigInt(this.blocks.length);
     const receipts: Rcpt[] = [];
     for (const raw of raws) receipts.push(await this.execute(raw));
@@ -222,11 +234,14 @@ export class FakeChain implements JsonRpc {
       mixHash: new Uint8Array(32), nonce: new Uint8Array(8), baseFeePerGas: 7n, withdrawalsRoot: EMPTY_TRIE_ROOT, blobGasUsed: 0n, excessBlobGas: 0n,
       parentBeaconBlockRoot: new Uint8Array(32),
     };
-    const hash = HE(encodeHeader(header));
     const parent = this.blocks[Number(n) - 1];
-    if (parent) parent.uc = await makeUc(this.certificateAuthority?.root ?? this.root, EVM_PARTITION, parent.header.stateRoot,
+    if (parent) parent.uc = parentCertificate ?? await makeUc(this.certificateAuthority?.root ?? this.root, EVM_PARTITION, parent.header.stateRoot,
       parent.hash, header.timestamp, this.certificateAuthority?.epoch);
-    this.blocks.push({ header, hash, uc: null, receipts, raws });
+    const rootInput = parent && toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH
+      ? fixtureRootInput(parent.uc!, parent.hash) : undefined;
+    if (rootInput) header.extraData = HU(rootInput);
+    const hash = HE(encodeHeader(header));
+    this.blocks.push({ header, hash, uc: null, rootInput, receipts, raws });
   }
 
   /** The verifier inside the vault: the plug-in's own relation (the Solidity verifier is NB2-05's). */
@@ -371,7 +386,8 @@ export class FakeChain implements JsonRpc {
       case 'unicity_getSealCompanionV1': {
         const i = this.blocks.findIndex((x) => h(x.hash) === p[0]);
         if (i <= 0) return { status: 'unknown' };
-        return { status: 'found', companion: { witnesses: [h(this.blocks[i - 1].uc!), h(TECHNICAL_RECORD)] } };
+        const input = this.blocks[i].rootInput;
+        return { status: 'found', companion: { ...(input ? { rootInput: h(input) } : {}), witnesses: [h(this.blocks[i - 1].uc!), h(TECHNICAL_RECORD)] } };
       }
       case 'eth_getLogs': {
         const f = p[0];
@@ -456,9 +472,10 @@ export class FakeChain implements JsonRpc {
 const BOUND = new MeasuredGasModel();
 export const WORLD_GAS: GasModel = { name: BOUND.name, redeemGasLimit: (s) => BOUND.redeemGasLimit(s), depositGasLimit: () => BOUND.depositGasLimit() };
 
-export async function setup() {
+export async function setup(semanticProfileHash?: Uint8Array) {
   const root = await makeRoot();
   const cfg = makeConfig(root);
+  if (semanticProfileHash) cfg.semanticProfileHash = semanticProfileHash;
   const chain = await FakeChain.create(root, cfg);
   const agg = new FakeAggregator(root);
   const pins = {

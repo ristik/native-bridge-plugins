@@ -87,6 +87,8 @@ pub struct DeploymentPins {
 type Callback<A, R> = Box<dyn Fn(A) -> R + Send + Sync>;
 
 /// The bridge's inputs.
+const IMPORTED_TIP_PROFILE_HASH: &str =
+    "0x63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e";
 pub const TESTNET_TRUST_FRESHNESS_MS: u64 = 15 * 60 * 1000;
 pub const PRODUCTION_TRUST_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -338,8 +340,7 @@ impl NativeBridgeV2 {
         let domain = domain_of(&o.pins.gamma);
         bind_trust(&o.trust, &cfg)?;
         if o.require_imported_tip_profile
-            && hex(&cfg.semantic_profile_hash)
-                != "0x63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e"
+            && hex(&cfg.semantic_profile_hash) != IMPORTED_TIP_PROFILE_HASH
         {
             return refuse(
                 WalletReason::BadDeployment,
@@ -845,9 +846,11 @@ impl NativeBridgeV2 {
         amount: &BigUint,
         first_owner: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let rp = self
-            .evm
-            .receipt_proof(tx, &self.cfg.vault, &topic::deposited())?;
+        let rp = self.evm.mint_receipt_proof(
+            tx,
+            &self.cfg.vault,
+            hex(&self.cfg.semantic_profile_hash) == IMPORTED_TIP_PROFILE_HASH,
+        )?;
         let j = ReceiptBacking {
             d: self.domain,
             n,

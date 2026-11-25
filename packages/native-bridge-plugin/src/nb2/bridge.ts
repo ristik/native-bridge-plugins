@@ -409,7 +409,7 @@ export class NativeBridgeV2 {
 
   /** The receipt proof and J of deposit number `n` of intent `i`, verified offline. */
   private async proveDeposit(i: bigint, tx: Uint8Array, n: bigint, amount: bigint, firstOwner: Uint8Array): Promise<{ receiptProof: Uint8Array; reason: Uint8Array }> {
-    const rp = await this.evm.receiptProof(tx, this.cfg.vault, TOPIC.Deposited);
+    const rp = await this.evm.mintReceiptProof(tx, this.cfg.vault, toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH);
     const j = { d: this.domain, n, r: this.secretOf(i), proof: rp.proof };
     const ev = await this.retryingTrust((trust) => verifyDepositEvidence(this.cfg, this.domain, trust, j));
     if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');

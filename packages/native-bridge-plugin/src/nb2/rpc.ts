@@ -185,6 +185,31 @@ export function rawLogOf(l: Record<string, unknown>): RawLog {
   };
 }
 
+/** The fresh B1 RootInputV2 limit (ureth execution/src/wire.rs). */
+const MAX_ROOT_INPUT_BYTES = 32 * 1024;
+
+function checkMintWitness(child: Header, rootInput: unknown, witness: Uint8Array): void {
+  if (rootInput === undefined || rootInput === null || rootInput === '0x') {
+    refuse('CompanionUnknown', 'the canonical child has no committed root input available');
+  }
+  if (typeof rootInput !== 'string' || rootInput.length > 2 + MAX_ROOT_INPUT_BYTES * 2) {
+    refuse('CompanionProvider', 'invalid child root input size');
+  }
+  const raw = bytesOf(rootInput, 'child root input');
+  if (!eq(HU(raw), child.extraData)) refuse('CompanionProvider', 'root input does not open the child header commitment');
+  const fields = array(scanNative(raw), 13);
+  const origin = array(fields[8], 8);
+  const uc = decodeUc(witness);
+  const seal = uc.unicitySeal;
+  const position = [BigInt(seal.networkId.id), seal.rootChainRoundNumber, seal.epoch, seal.timestamp];
+  const hashes = [[origin[4], seal.hash], [origin[6], uc.technicalRecordHash], [origin[7], uc.shardConfigurationHash]] as const;
+  if (!isUint(fields[0]) || fields[0].arg !== 2n || !isBytes(fields[7]) || !eq(fields[7].data!, child.parentHash)
+      || position.some((value, i) => !isUint(origin[i]) || origin[i].arg !== value)
+      || hashes.some(([field, hash]) => hash === null || !isBytes(field) || !eq(field.data!, hash))) {
+    refuse('CompanionProvider', 'certificate is not the origin committed by the canonical child');
+  }
+}
+
 /** A built receipt proof and the facts it was built from. */
 export interface ReceiptProof { proof: DepositProof; encoded: Uint8Array; blockNumber: bigint; blockHash: Uint8Array; log: RawLog; receiptLogIndex: number }
 
@@ -227,19 +252,23 @@ export class EvmReader {
    * exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
    */
   public async certificateOf(header: Header, hash: Uint8Array, bindTechnicalRecord = false,
-    sources?: readonly EvmReader[], authenticate?: (uc: Uint8Array) => Promise<void>): Promise<Uint8Array> {
+    sources?: readonly EvmReader[], authenticate?: (uc: Uint8Array) => Promise<void>, bindMintWitness = false): Promise<Uint8Array> {
     const childOf = async (reader: EvmReader) => {
       const child = await reader.headerByNumber(header.number + 1n);
       if (!child || child.header.number !== header.number + 1n || !eq(child.header.parentHash, hash)) {
         refuse('CompanionUnknown', `block ${header.number} has no canonical child on this reader`);
       }
-      return child.hash;
+      return child;
     };
-    const companion = async (reader: EvmReader, child: Uint8Array) => {
-      const l = await reader.rpc.call<{ status: string; companion?: { witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(child)]);
+    const companion = async (reader: EvmReader, child: { header: Header; hash: Uint8Array }) => {
+      const l = await reader.rpc.call<{ status: string; companion?: { rootInput?: unknown; witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(child.hash)]);
       const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
+      if (bindMintWitness && l.status === 'found' && witnesses.length === 0) {
+        refuse('CompanionUnknown', 'the canonical child has no committed witness available');
+      }
       checkCompanion(l.status, witnesses.length);
       const uc = bytesOf(witnesses[0], 'companion witness 0');
+      if (bindMintWitness) checkMintWitness(child.header, l.companion?.rootInput, uc);
       if (bindTechnicalRecord) {
         const record = bytesOf(witnesses[1], 'companion witness 1');
         if (record.length > 4096) refuse('CompanionProvider', 'technical record is oversized');
@@ -257,7 +286,7 @@ export class EvmReader {
     const companions = new Map<string, Promise<Uint8Array>>();
     return proofFrom(sources, 'a child block header and its seal companion', async (reader) => {
       const child = await childOf(reader);
-      const key = hexOf(child);
+      const key = hexOf(child.hash);
       let candidate = companions.get(key);
       if (!candidate) {
         candidate = proofFrom(sources, 'the seal companion', (source) => companion(source, child));
@@ -324,8 +353,13 @@ export class EvmReader {
     });
   }
 
+  /** The paired profile selects the parent's UC from the canonical child's committed origin. */
+  public mintReceiptProof(txHash: Uint8Array, vault: Uint8Array, bound: boolean): Promise<ReceiptProof> {
+    return this.receiptProof(txHash, vault, TOPIC.Deposited, false, undefined, [], undefined, bound);
+  }
+
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>, archives: readonly EvmReader[] = [], authenticate?: (raw: Uint8Array, uc: Uint8Array) => Promise<void>): Promise<ReceiptProof> {
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>, archives: readonly EvmReader[] = [], authenticate?: (raw: Uint8Array, uc: Uint8Array) => Promise<void>, bindMintWitness = false): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);
@@ -340,7 +374,7 @@ export class EvmReader {
       ? await proofFrom(sources, 'the payment block header', (reader) => reader.headerByHash(blockHash))
       : await this.headerByHash(blockHash);
     const uc = await this.certificateOf(header, blockHash, bindTechnicalRecord, sources,
-      authenticate && ((encoded) => authenticate(raw, encoded)));
+      authenticate && ((encoded) => authenticate(raw, encoded)), bindMintWitness);
     const txIndex = qtyOf(r!.transactionIndex, 'transactionIndex');
     const nodes = sources
       ? await proofFrom(sources, 'the payment block receipts', (reader) => reader.receiptPath(header, blockHash, txIndex))

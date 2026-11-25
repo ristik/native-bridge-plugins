@@ -4,6 +4,8 @@ The wallet verifies each certificate under the pinned Unicity Trust Base history
 
 Configure `trustFreshnessMs` (Rust: `trust_freshness_ms`) and a trusted live UTB source for a wallet integration. Use 15 minutes on testnet or 7 days in production. The wallet synchronizes at the first acceptance after start or expiry, and when a seal needs a newer epoch. Successful synchronized history is authenticated and saved before the refresh returns. A partial fetch may save verified entries, but leaves the freshness record unchanged. A replayed certificate gives no freshness credit. The wallet requires a new sync after restart.
 
+On the paired profile, Mint binds the receipt UC to the canonical child's committed root input before saving the mint reason. During D4, an existing child can supply the original in-term witness. A deposit in the frozen parent with no certified child waits for the successor acknowledgement and its authenticated recertification. A later same-input-record certificate cannot replace the certificate selected by an existing child.
+
 Before broadcasting a return, the wallet checks the destination's imported epoch and simulates the exact transaction at the same canonical finalized block. A delayed import leaves the signed request and burn pending. Ship this wallet with the paired imported-tip verifier and generation from #1296.
 
 This guide is for a wallet developer. It shows how to move native UCT between the EVM chain and Unicity with the TypeScript plug-in
