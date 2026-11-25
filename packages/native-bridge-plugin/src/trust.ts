@@ -25,17 +25,10 @@ import { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verifi
 import { preflightUc } from './resources.js';
 import { fail, type NativeReason } from './errors.js';
 
-/** An externally authenticated B1 evaluation origin for this history and deployment. */
-export interface AuthenticatedOrigin {
-  readonly usableEpoch: bigint;
-  readonly rootRound: bigint;
-}
-
 export class TrustInput {
   private constructor(
     /** The held history; the wallet appends newer entries to it (each verified from its predecessor), never replaces held ones. */
     public readonly history: TrustBaseHistory,
-    public readonly origin?: AuthenticatedOrigin,
   ) {}
 
   /** The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal. */
@@ -72,21 +65,10 @@ export class TrustInput {
   /** Copy a running history through the SDK's authenticated append path. */
   public async snapshot(): Promise<TrustInput> {
     const history = TrustBaseHistory.create(this.id);
-    const origin = this.origin;
     // Capture independent entries before the source can append while we validate.
     const entries = this.history.entries.map((entry) => RootTrustBaseV2.decode(entry.encode()));
     for (const entry of entries) await history.append(entry);
-    const copy = new TrustInput(history);
-    return origin === undefined ? copy : copy.withAuthenticatedOrigin(origin);
-  }
-
-  /** Attach a checkpoint authenticated by the caller. Token evidence and UTB history do not establish this bound. */
-  public withAuthenticatedOrigin(origin: AuthenticatedOrigin): TrustInput {
-    const { usableEpoch, rootRound } = origin ?? {};
-    const max = (1n << 64n) - 1n;
-    if (typeof usableEpoch !== 'bigint' || typeof rootRound !== 'bigint'
-      || usableEpoch < 0n || usableEpoch > max || rootRound <= 0n || rootRound > max) fail('ErrTrustBase');
-    return new TrustInput(this.history, Object.freeze({ usableEpoch, rootRound }));
+    return new TrustInput(history);
   }
 
   public get network(): NetworkId {

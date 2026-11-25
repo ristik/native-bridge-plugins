@@ -29,7 +29,7 @@ export function worldOf(root: Root, chain: FakeChain, agg: FakeAggregator) {
     gasReserve: 500_000n, returnReserveSegments: 64n, deploymentBlock: 1n, stateReadOnly: false,
   };
   const options = (seed: string, store = new MemoryJournalStore()): BridgeOptions => ({
-    pins, trust: root.trust, rpc: chain, aggregator: agg, journal: store, bridgeKey: deriveBridgeKey(key(seed)), backup: async () => {},
+    unsafeTestTrust: true, pins, trust: root.trust, rpc: chain, aggregator: agg, journal: store, bridgeKey: deriveBridgeKey(key(seed)), backup: async () => {},
     receiptTimeoutMs: 0, pollMs: 0, sleep: async () => {}, gas: WORLD_GAS,
   });
   return { root, chain, agg, pins, options };
@@ -68,7 +68,7 @@ export async function restore(s: any) {
   const signers: [string, SigningService][] = Array.from({ length: s.signers }, (_, i) => [`root-${String(i).padStart(2, '0')}`, new SigningService(key(`root ${i}`))]);
   const bundle = unh(s.bundle);
   const pin = unh(s.pin);
-  const root: Root = { signers, bundle, pin, trust: (await TrustInput.fromBundle(bundle, pin)).withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 1000000n }) };
+  const root: Root = { signers, bundle, pin, trust: (await TrustInput.fromBundle(bundle, pin)) };
   roundAtLeast(BigInt(s.round));
   const cfg = decodeConfig(unh(s.gamma), TEST_PARAMS);
   const chain = await FakeChain.create(root, cfg);

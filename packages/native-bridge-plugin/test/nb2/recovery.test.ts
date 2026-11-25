@@ -56,8 +56,7 @@ for (const name of ['root', 'transfers', 'one-split', 'depth-20', 'shared-claim'
       read(base + 'context.json'), read(base + 'trace.bin.gz'),
     ]);
     const c = JSON.parse(context.toString());
-    const trust = (await TrustInput.fromBundle(bundle, decodeConfig(gamma, PRODUCTION_PARAMS).rootGenesis))
-      .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+    const trust = (await TrustInput.fromBundle(bundle, decodeConfig(gamma, PRODUCTION_PARAMS).rootGenesis));
     const session = await RecoverySession.create(gamma, evidence, new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, {
       salt, pins, recovery: fromHex(c.RecoveryAddress)!, runtimeHash: fromHex(c.RecoveryRuntimeHash)!,
     });
@@ -111,8 +110,7 @@ test('recovery replays the production-verifier T1 supplement and rejects its inv
     salt: await load('generation-salt.bin'), pins: fromHex(deployed.Pins)!,
     recovery: fromHex(deployed.RecoveryAddress)!, runtimeHash: fromHex(deployed.RecoveryRuntimeHash)!,
   };
-  const trust = (await TrustInput.fromBundle(await load('b1-rollover/utb.cbor'), decodeConfig(gamma, PRODUCTION_PARAMS).rootGenesis))
-    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const trust = (await TrustInput.fromBundle(await load('b1-rollover/utb.cbor'), decodeConfig(gamma, PRODUCTION_PARAMS).rootGenesis));
   const session = await RecoverySession.create(gamma, await load('b1-rollover/evidence.bin'), new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, deployment);
   let from = 0;
   let prior: { seq: bigint; receipt: Uint8Array } | undefined;
@@ -139,8 +137,7 @@ test('cold recovery reproduces gap and settlement calls and switches proof sourc
   const context = JSON.parse(String(await read(base + 'context.json')));
   const recovery = fromHex(context.RecoveryAddress)!;
   const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
-  const trust = (await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis))
-    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const trust = (await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis));
   const session = await RecoverySession.create(gamma, await read(base + 'evidence.bin'), new RecoveryAuthority(trust, async () => {}), PRODUCTION_PARAMS, {
     recovery, salt: await read('generation-salt.bin'), pins: await read('pins.bin'), runtimeHash: fromHex(context.RecoveryRuntimeHash)!,
   });
@@ -182,8 +179,7 @@ test('cold admission prices the terminal bound, reserve, signed envelope and ref
   const base = 'transcripts/held-sibling-0/';
   const context = JSON.parse(String(await read(base + 'context.json')));
   const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
-  const trust = (await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis))
-    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const trust = (await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis));
   const held = await read(base + 'evidence.bin');
   const deployment = {
     recovery: fromHex(context.RecoveryAddress)!, salt: await read('generation-salt.bin'),
@@ -278,7 +274,7 @@ test('recovery RPC proves the parent with the canonical child companion and its 
   await assert.rejects(reader.certificateOf(block.header, block.hash, true));
 });
 
-test('missing successor refresh is persisted and prevents authority rollback across sessions', async () => {
+test('successor authority is persisted and prevents authority rollback across sessions', async () => {
   const { TrustBaseBundle } = await import('@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseBundle.js');
   const base = 'transcripts/root/';
   const gamma = await read('gamma.bin');
@@ -289,14 +285,13 @@ test('missing successor refresh is persisted and prevents authority rollback acr
     recovery: fromHex(c.RecoveryAddress)!, runtimeHash: fromHex(c.RecoveryRuntimeHash)! };
   const full = await TrustInput.fromBundle(await read(base + 'utb.cbor'), cfg.rootGenesis);
   const short = await TrustInput.fromBundle(await TrustBaseBundle.encode(full.history.entries.slice(0, 1)), cfg.rootGenesis);
-  const previous = short.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 10_000n });
-  const lagging = short.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
-  const current = full.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_001n });
-  let persisted = { bundle: await previous.history.toBundle(), origin: previous.origin! };
+  const previous = short;
+  const current = full;
+  let persisted = { bundle: await previous.history.toBundle() };
   let failStore = false;
   const guard = new RecoveryAuthority(previous, async (input) => {
     if (failStore) throw new Error('write failed');
-    persisted = { bundle: await input.history.toBundle(), origin: input.origin! };
+    persisted = { bundle: await input.history.toBundle() };
   });
   const creating = RecoverySession.create(gamma, evidence, guard, PRODUCTION_PARAMS, deployment);
   gamma.fill(0); // Buffer input can be changed while verification is awaiting historical authority.
@@ -304,31 +299,18 @@ test('missing successor refresh is persisted and prevents authority rollback acr
   const { event } = await session.run(0, 2, previous);
   const [record] = trace(gunzipSync(await read(base + 'trace.bin.gz')));
   const proof = record[5];
-  let fetched = 0;
-  await assert.rejects(session.acquire(lagging, event, [async () => proof]), { rule: 'NoEntryForEpoch' });
   failStore = true;
-  await assert.rejects(session.acquire(lagging, event, [async () => proof], async () => current), { reason: 'TrustInput' });
-  assert.deepEqual((await guard.checkpoint).origin, lagging.origin);
+  await assert.rejects(session.acquire(current, event, [async () => proof]), { reason: 'TrustInput' });
   failStore = false;
-  const acquired = await session.acquire(lagging, event, [async () => proof], async (held) => {
-    assert.deepEqual(held.origin, lagging.origin);
-    assert.equal(held.history.tip?.epoch, lagging.history.tip?.epoch);
-    fetched++;
-    return current;
-  });
-  assert.equal(fetched, 1);
-  assert.deepEqual(acquired.trust.origin, current.origin);
-  assert.deepEqual(persisted.origin, current.origin);
+  await session.acquire(current, event, [async () => proof]);
   assert.deepEqual(persisted.bundle, await current.history.toBundle());
-  const staleOrigin = full.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 10_001n });
-  const staleHistory = short.withAuthenticatedOrigin(current.origin!);
-  for (const stale of [staleOrigin, staleHistory]) {
+  for (const stale of [short]) {
     await assert.rejects(session.acquire(stale, event, [async () => proof]), { reason: 'TrustInput' });
   }
-  const restored = (await TrustInput.fromBundle(persisted.bundle, current.id)).withAuthenticatedOrigin(persisted.origin);
+  const restored = (await TrustInput.fromBundle(persisted.bundle, current.id));
   const reopened = await RecoverySession.create(await read('gamma.bin'), evidence,
     new RecoveryAuthority(restored, async () => {}), PRODUCTION_PARAMS, deployment);
-  await assert.rejects(reopened.run(0, 2, staleHistory), { reason: 'TrustInput' });
+  await assert.rejects(reopened.run(0, 2, short), { reason: 'TrustInput' });
   await assert.rejects(reopened.verifyEvent(current, proof, { ...event, topics: [event.topics[0], new Uint8Array(32)] }), { reason: 'ProviderFault' });
   await reopened.verifyEvent(current, proof, event);
 });
@@ -363,8 +345,7 @@ test('authority snapshots isolate in-place history appends before a durable save
   const cfg = decodeConfig(await read('gamma.bin'), PRODUCTION_PARAMS);
   const full = await TrustInput.fromBundle(await read('transcripts/root/utb.cbor'), cfg.rootGenesis);
   const [genesis, successor] = full.history.entries;
-  const input = (await TrustInput.fromBundle(await TrustBaseBundle.encode([genesis]), cfg.rootGenesis))
-    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const input = (await TrustInput.fromBundle(await TrustBaseBundle.encode([genesis]), cfg.rootGenesis));
   let saving = false;
   const guard = new RecoveryAuthority(input, async () => {
     saving = true;
@@ -389,7 +370,7 @@ test('recovery authority accepts an authenticated append beyond the initial load
   const root = await makeRoot(1, 1, 31);
   const max = TRUST_BASE_BUNDLE_LIMITS.maxEntries;
   const cfg = { ...decodeConfig(await read('gamma.bin'), PRODUCTION_PARAMS), rootGenesis: root.pin };
-  const trust = root.trust.withAuthenticatedOrigin({ usableEpoch: BigInt(max), rootRound: BigInt(max) });
+  const trust = root.trust;
   const append = async (epoch: number): Promise<void> => {
     const raw = await successorEntry(root, BigInt(epoch), 1, 31);
     await trust.history.append(RootTrustBaseV2.decode(raw));
@@ -399,7 +380,7 @@ test('recovery authority accepts an authenticated append beyond the initial load
   let savedTip: bigint | undefined;
   const guard = new RecoveryAuthority(trust, async (candidate) => { savedTip = candidate.history.tip?.epoch; });
   await append(max + 1);
-  const extended = trust.withAuthenticatedOrigin({ usableEpoch: BigInt(max + 1), rootRound: BigInt(max + 1) });
+  const extended = trust;
   const overLimit = await extended.history.toBundle();
   await assert.rejects(TrustInput.fromBundle(overLimit, root.pin), { reason: 'ErrTrustBase' });
   await guard.accept(extended, cfg);

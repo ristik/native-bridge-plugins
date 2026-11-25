@@ -15,9 +15,11 @@ use native_bridge_sdk_ext::nb2::bridge::{NativeBridgeV2, ReconcileResult};
 use native_bridge_sdk_ext::nb2::crypto::{he, public_key, sign_unlock, verify_unlock};
 use native_bridge_sdk_ext::nb2::deposit::{first_owner_of, topic};
 use native_bridge_sdk_ext::nb2::errors::{Error, Nb2Error, Result, Rule, WalletReason};
-use native_bridge_sdk_ext::nb2::evm::{sign_tx, EvmSigner, LocalKeySigner, TxRequest};
+use native_bridge_sdk_ext::nb2::evm::{
+    decode_signed_tx, sign_tx, EvmSigner, LocalKeySigner, TxRequest,
+};
 use native_bridge_sdk_ext::nb2::gas::{GasModel, RedeemShape};
-use native_bridge_sdk_ext::nb2::journal::{hex, MemoryJournalStore, JOURNAL_FORMAT};
+use native_bridge_sdk_ext::nb2::journal::{hex, unhex, MemoryJournalStore, JOURNAL_FORMAT};
 use native_bridge_sdk_ext::nb2::rpc::{Estimate, EvmReader, JsonRpc, RpcError};
 use native_bridge_sdk_ext::nb2::rules::topic_index;
 use native_bridge_sdk_ext::nb2::segment::{build_history, check_segment_log};
@@ -436,34 +438,38 @@ struct WitnessWorld {
     b: NativeBridgeV2,
     payer: LocalKeySigner,
     owner: LocalOwner,
+    store: Arc<MemoryJournalStore>,
 }
 
 impl WitnessWorld {
     fn new() -> Self {
         let w = setup();
         let payer = w.evm_account("p");
-        let b = open(&w, "w", World::store());
+        let store = World::store();
+        let b = open(&w, "w", store.clone());
         WitnessWorld {
             w,
             b,
             payer,
             owner: local_owner(&key("o")),
+            store,
         }
     }
 
     fn pay(&self, n: usize) {
+        self.pay_as(n, &self.payer);
+    }
+
+    fn pay_as(&self, n: usize, payer: &LocalKeySigner) {
         for _ in 0..n {
-            let t = minted(&self.b, &self.payer, &self.owner, 1);
+            let t = minted(&self.b, payer, &self.owner, 1);
             let rp = self
                 .b
-                .plan_return(&t, &recipient("x"), &self.payer.address(), None)
+                .plan_return(&t, &recipient("x"), &payer.address(), None)
                 .unwrap();
             self.b.burn(&rp.return_id, &self.owner).unwrap();
             assert_eq!(
-                self.b
-                    .submit_redeem(&rp.return_id, &self.payer)
-                    .unwrap()
-                    .state(),
+                self.b.submit_redeem(&rp.return_id, payer).unwrap().state(),
                 "paid"
             );
         }
@@ -478,6 +484,49 @@ impl WitnessWorld {
         self.b.burn(&rp.return_id, &self.owner).unwrap();
         rp.return_id
     }
+}
+
+#[test]
+fn expired_payout_after_transport_loss_reuses_nonce_after_restart() {
+    let x = WitnessWorld::new();
+    let id = x.burned();
+    x.w.chain.set_pre(Some(Box::new(|method, _| {
+        (method == "eth_sendRawTransaction").then(|| {
+            Err(RpcError {
+                status: 503,
+                code: 0,
+                message: "transport before delivery".into(),
+                data: None,
+            })
+        })
+    })));
+    assert_eq!(x.b.submit_redeem(&id, &x.payer).unwrap().state(), "pending");
+    let pending = x.b.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert_eq!(pending.sends.len(), 1);
+    x.w.chain.set_pre(None);
+    x.pay_as(8, &x.w.evm_account("independent payer"));
+    let reopened = open(&x.w, "w", x.store.clone());
+    assert_eq!(
+        reopened.submit_redeem(&id, &x.payer).unwrap().state(),
+        "paid"
+    );
+    let paid = reopened.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert!(paid.paid.is_some());
+    assert_eq!(paid.burned, pending.burned);
+    assert_eq!(paid.sends.len(), 2);
+    assert_eq!(paid.sends[0], pending.sends[0]);
+    assert_eq!(paid.sends[1].nonce, pending.sends[0].nonce);
+    assert_ne!(paid.sends[1].raw, pending.sends[0].raw);
+    let old = decode_signed_tx(&unhex(&paid.sends[0].raw).unwrap()).unwrap();
+    let replacement = decode_signed_tx(&unhex(&paid.sends[1].raw).unwrap()).unwrap();
+    assert_eq!(
+        old.request.max_fee_per_gas,
+        replacement.request.max_fee_per_gas
+    );
+    assert_eq!(
+        old.request.max_priority_fee_per_gas,
+        replacement.request.max_priority_fee_per_gas
+    );
 }
 
 #[test]
@@ -540,6 +589,34 @@ fn deployed_quorum_refusal_is_retryable_until_seal_import() {
 }
 
 #[test]
+fn never_broadcast_return_rebuilds_after_two_rollovers_during_import_lag() {
+    let x = WitnessWorld::new();
+    let id = x.burned();
+    let original = x.b.build_redeem(&id).unwrap();
+    x.w.chain.set_pre(Some(Box::new(|method, _| {
+        (method == "eth_getStorageAt").then(|| Ok(json!(hex0x(&[0; 32]))))
+    })));
+    let refused = x.b.submit_redeem(&id, &x.payer).unwrap_err();
+    assert_eq!(refused.reason(), Some(WalletReason::ImportLag));
+    assert!(refused.retryable());
+    let pending = x.b.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert_eq!(pending.status, "burned");
+    assert!(pending.sends.is_empty());
+    x.w.chain.set_pre(None);
+    x.pay(8);
+    let rebuilt = x.b.build_redeem(&id).unwrap();
+    assert_eq!(rebuilt.endpoint, original.endpoint + 2);
+    assert_ne!(rebuilt.calldata, original.calldata);
+    assert!(matches!(
+        x.b.submit_redeem(&id, &x.payer).unwrap(),
+        ReconcileResult::Paid { .. }
+    ));
+    let paid = x.b.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert_eq!(paid.burned, pending.burned);
+    assert_eq!(paid.sends.len(), 1);
+}
+
+#[test]
 fn mined_final_refusal_preserves_the_decoded_inner_rule() {
     let x = WitnessWorld::new();
     let id = x.burned();
@@ -555,7 +632,7 @@ fn mined_final_refusal_preserves_the_decoded_inner_rule() {
     let seen_estimates = estimates.clone();
     let seen_sends = sends.clone();
     x.w.chain
-        .set_pre(Some(Box::new(move |method, _| match method {
+        .set_pre(Some(Box::new(move |method, params| match method {
             "eth_estimateGas" if seen_estimates.fetch_add(1, Ordering::Relaxed) == 0 => {
                 Some(Ok(json!("0x1d4c0")))
             }
@@ -565,6 +642,7 @@ fn mined_final_refusal_preserves_the_decoded_inner_rule() {
                 message: "execution reverted".into(),
                 data: Some(json!(hex0x(&refusal))),
             })),
+            "eth_call" if params[1].is_object() => Some(Ok(json!("0x"))),
             "eth_sendRawTransaction" => {
                 seen_sends.fetch_add(1, Ordering::Relaxed);
                 None
@@ -1666,10 +1744,9 @@ fn split_retries_the_exact_request_after_an_unusable_parent_proof_and_restart() 
 }
 
 #[test]
-fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
+fn history_refresh_extends_the_installed_pin() {
     use native_bridge_sdk_ext::nb2::config::Build;
-    use native_bridge_sdk_ext::nb2::token::{decode_token, encode_token};
-    use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+    use native_bridge_sdk_ext::nb2::trust::TrustInput;
     use unicity_token::api::bft::TrustBaseHistory;
 
     const CORPUS: &str = concat!(
@@ -1689,67 +1766,65 @@ fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
     let lagging = TrustBaseHistory::from_trusted_chain(vec![extended.history().genesis().clone()])
         .unwrap()
         .to_bundle();
-    let origin = AuthenticatedOrigin {
-        usable_epoch: 2,
-        root_round: 1_005,
-    };
     let held = read("transcripts/held-sibling-0/evidence.bin");
-    let mut future = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
-    future.part.transfers.pop();
-    future.part.transfers_raw.pop();
-    future.part.proofs.pop();
-    let future = encode_token(&future);
-
-    for offers_origin in [false, true] {
+    let store = World::store();
+    {
         let world = setup();
         let foreign = world.root.trust.clone();
-        let mut opts = world.options("authenticated refresh", World::store());
+        let mut opts = world.options("authenticated refresh", store.clone());
         opts.pins.gamma = gamma.clone();
         opts.pins.build = Build::Production;
-        opts.trust = TrustInput::from_bundle(&lagging, &pin)
-            .unwrap()
-            .with_authenticated_origin(origin);
+        opts.trust = TrustInput::from_bundle(&lagging, &pin).unwrap();
+        opts.trust_freshness_ms = Some(60_000);
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let bundle = bundle.clone();
         opts.refresh_trust = Some(Box::new(move |current| {
             assert_eq!(current.id(), pin);
-            assert_eq!(current.origin(), Some(origin));
             assert_eq!(current.history().latest().epoch, 1);
             if count.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(foreign.clone());
             }
             let fresh = TrustInput::from_bundle(&bundle, &pin).unwrap();
-            Ok(if offers_origin {
-                fresh.with_authenticated_origin(AuthenticatedOrigin {
-                    usable_epoch: 2,
-                    root_round: 10_000,
-                })
-            } else {
-                fresh
-            })
+            Ok(fresh)
         }));
         let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
         assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
         assert!(bridge.verify_token(&held).is_ok());
         assert!(bridge.verify_token(&held).is_ok());
-        assert_eq!(reason(bridge.verify_token(&future)), "SealEpoch");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     // The same genesis and valid bundle structure are insufficient if a refresh
     // would remove an already held successor.
     let world = setup();
-    let mut opts = world.options("trust rollback", World::store());
-    opts.pins.gamma = gamma;
+    let mut opts = world.options("trust rollback", store.clone());
+    opts.pins.gamma = gamma.clone();
     opts.pins.build = Build::Production;
-    opts.trust = extended.with_authenticated_origin(AuthenticatedOrigin {
-        usable_epoch: 3,
-        root_round: 10_000,
-    });
+    opts.trust = TrustInput::from_bundle(&lagging, &pin).unwrap();
+    opts.trust_freshness_ms = Some(60_000);
     let rollback = TrustInput::from_bundle(&lagging, &pin).unwrap();
     opts.refresh_trust = Some(Box::new(move |_| Ok(rollback.clone())));
     let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
-    assert_eq!(reason(bridge.verify_token(&future)), "TrustInput");
-    assert!(bridge.verify_token(&held).is_ok());
+    assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
+}
+
+#[test]
+fn slow_utb_sync_cannot_publish_with_an_expired_window() {
+    let x = setup();
+    let mut opts = x.options("slow sync", World::store());
+    opts.trust_freshness_ms = Some(1);
+    opts.refresh_trust = Some(Box::new(|held| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        Ok(held)
+    }));
+    let bridge = NativeBridgeV2::open(opts).unwrap();
+    let world = WitnessWorld::new();
+    let token = world.burned();
+    let rec = world.b.journal.ret(&hex(&token)).unwrap().unwrap();
+    // Verification refuses for freshness before it can examine the lineage's deployment or burn.
+    let evidence = unhex(rec.burned.as_deref().unwrap()).unwrap();
+    let error = bridge.verify_token(&evidence).unwrap_err();
+    assert_eq!(error.reason(), Some(WalletReason::TrustSyncRequired));
+    assert!(error.retryable());
 }

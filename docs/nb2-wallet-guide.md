@@ -1,29 +1,12 @@
 # Native bridge v2 wallet integration guide
 
-The wallet opens under an authenticated B1 evaluation origin from the release's `trust.origin` or the
-`init --trust-origin FILE` override. Both forms contain decimal strings `usableEpoch` and `rootRound` from the
-trusted deployment or registry checkpoint channel. Unlocking and proving lineage use this origin for every
-certificate. For a moving deployment, update the origin file with a newer authenticated checkpoint and reopen
-the wallet. UTB refresh updates the held history. A new origin requires its own authenticated checkpoint.
+The wallet verifies each certificate under the pinned Unicity Trust Base history. An epoch is valid from its start round through the round before the next installed epoch starts. The latest installed epoch has an open upper bound. Weighted quorum verification applies in every epoch.
 
-For the public testnet, fetch `/release/nb2-origin.json` from the same authenticated HTTPS origin as
-the digest-pinned release. Fetch with cache revalidation or `cache: "no-store"` and keep the
-request on the release origin. Read the response stream as bytes with the exported
-`MAX_NB2_ORIGIN_BYTES` limit (4096 bytes). Count the chunks after HTTP content decoding. If a chunk
-would bring the total over the limit, cancel the read before buffering that chunk. Apply the byte count
-even when the response supplies a Content-Length. Pass the resulting `Uint8Array` directly to
-`refreshNb2Origin(trust, binding, held, bytes)` from the `./nb2` entry point. The helper checks the
-size again before UTF-8 decoding and JSON parsing.
+The wallet requires the paired imported-tip profile and defaults to a 7-day UTB freshness window. Set `trustFreshnessMs` (Rust: `trust_freshness_ms`) to 15 minutes on testnet, and configure a trusted live UTB source. The wallet synchronizes at the first acceptance after start or expiry, and when a seal needs a newer epoch. Successful synchronized history is authenticated and saved before the refresh returns. A partial fetch may save verified entries. A failed or partial sync suspends acceptance until the saved history is installed through a successful sync. The durable tip remains a lower bound across restart. A replayed certificate gives no freshness credit. The wallet requires a new sync after restart.
 
-Supply the release's generation and execution genesis, its network pin, and the independently held
-release SHA-256 (lowercase hex without `0x`). Use the verified release's origin as the initial `held`
-checkpoint, converting its epoch and round strings to bigint. On refresh, extend UTB history as usual
-and return the helper's `trust` through the plug-in's existing `refreshTrust` hook. Serialize acceptance
-and persist the returned `checkpoint` under the release digest before returning the updated trust, so
-a reload resumes from the last accepted checkpoint. The helper validates the schema, deployment binding
-and monotonic progression. HTTPS authenticates the record. A checkpoint that still precedes a certificate
-leaves that certificate pending an adequate origin.
+On the paired profile, Mint binds the receipt UC to the canonical child's committed root input before saving the mint reason. During D4, an existing child can supply the original in-term witness. A deposit in the frozen parent with no certified child waits for the successor acknowledgement and its authenticated recertification. A later same-input-record certificate cannot replace the certificate selected by an existing child.
 
+Before broadcasting a return, the wallet checks the destination's imported epoch and simulates the exact transaction at the same canonical finalized block. A delayed import leaves the signed request and burn pending. Ship this wallet with the paired imported-tip verifier and generation from #1296.
 
 This guide is for a wallet developer. It shows how to move native UCT between the EVM chain and Unicity with the TypeScript plug-in
 (`packages/native-bridge-plugin`, entry point `./nb2`). You don't handle segments, gap proofs or receipt tries yourself: the plug-in builds and
@@ -93,7 +76,7 @@ operation count. `plan-return` measures the current fee and capacity limits.
 
 ## Continuation v1.1 and relayers
 
-Use the operator-authenticated v1.1 release and origin. The release's `recovery` object contains
+Use the operator-authenticated v1.1 release. The release's `recovery` object contains
 the hex `salt`, `address`, `runtimeHash` and `pins`; measured `ranges` for each funded entry point,
 operation count, gap count and supported receipt interval; and a `backlog` object. Each range has
 `minReceiptBytes`, the T5 `RecoveryShape` as `max`, and the measured upper bound `execution` as a
@@ -368,17 +351,21 @@ sequenceDiagram
 ## Using the plug-in
 
 ```ts
-import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySigner, localOwner } from '@unicitylabs/native-bridge-plugin/nb2';
+import { NativeBridgeV2, deriveBridgeKey, HttpJsonRpc, SdkAggregator, LocalKeySigner, localOwner, TESTNET_TRUST_FRESHNESS_MS } from '@unicitylabs/native-bridge-plugin/nb2';
 
 const bridge = await NativeBridgeV2.open({
   pins,                                  // the manifest's pins (nb2-release.json "pins"; wallet/core.ts pinsOf reads them)
-  trust,                                 // the pinned UTB history with an authenticated B1 origin
+  trust,                                 // the pinned UTB history
   rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway: nothing bridge-specific
   aggregator: new SdkAggregator(`${gatewayUrl}/aggregator`),
   journal: store,                        // your key-value store; its putIf MUST be atomic and durable (nb2-journal.md)
   bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
   backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
-  refreshTrust: async () => { /* append newer trust-base entries (wallet/trust.ts refreshAll) */ },
+  trustFreshnessMs: TESTNET_TRUST_FRESHNESS_MS, // omit for the production default of 7 days
+  refreshTrust: async () => {
+    const refreshed = await syncPinnedHistory(); // your bounded live sync, including durable storage
+    return refreshed;                          // the complete authenticated TrustInput, even when unchanged
+  },
   // gas: optional; the default is MeasuredGasModel (the redeem gas estimate, docs/nb2-gas-model.md), applied only to the deployment it is
   // calibrated for: its verifier, helper and vault code and the manifest's nativeGasSchedule (any other refuses the burn until you supply a
   // GasModel)
@@ -467,7 +454,7 @@ The table says what each error means and what your wallet does when it reaches y
 | Error | Where | Meaning | What the wallet does |
 |---|---|---|---|
 | `BadDeployment` | `NativeBridgeV2.open` (the installation check) | the RPC serves another chain, the vault's `config()` is not the pinned Γ, or its runtime code hash is not the pinned one | stop: the manifest and the node are not the same deployment (a reset network, a wrong URL or a stale manifest). Send nothing. |
-| `TrustInput` | `NativeBridgeV2.open` | the trust-base history or authenticated B1 origin required by Γ is missing or mismatched | use the authenticated bundle, genesis pin and origin checkpoint for the deployment |
+| `TrustInput` | `NativeBridgeV2.open` | the required trust history is missing, stale or mismatched | use the authenticated bundle and genesis pin, and synchronize with the configured live UTB source |
 | `BadInput` | any call | an argument outside the API's contract (a malformed key or address, a zero amount, a split with one output, a `k_w` that is not 32 bytes) | fix the call; nothing happened |
 | `NotPending` | mint, collectDepositProof, burn, buildRedeem, planReturn | the step doesn't apply to the record's state: minting a deposit that has not landed, burning or redeeming out of order, planning a part that is already burned | run the step the journal is at (`status`); not retryable as is |
 | `JournalNotPersisted` | submitDeposit | the plan or its backup is not durable | write and back up, then retry; nothing was sent |
@@ -630,12 +617,11 @@ the bridge is a test system. Don't move real value through it.
 
 ## RPC requirements
 
-Any node that meets the wallet RPC contract (spec section 12.7, NB2-06, bft-core#1102) works. There is no bridge-specific service, and
-nothing read is trusted: every item is verified offline, so a provider that withholds data can only delay the wallet.
+Use the operator’s paired RPC for canonical-child selection when minting or receiving. This is the same operator trust as the former origin feed. The wallet checks that the child commits to the receipt UC’s origin and verifies the receipt trie, UC and lineage independently of the operator’s claim. An operator that lies about the canonical child can make a frozen-parent Mint fail later historical verification. The account, amount and payout still depend on verified evidence. Other evidence readers may supply the independently verifiable components in section 12.7.
 
 | Need | Method |
 |---|---|
-| The certificate of block N | `eth_getBlockByNumber(N+1, false)`, then `unicity_getSealCompanionV1(hash(N+1))`: `{"status":"found"}`, witness 0 |
+| The certificate of block N, including the receive check | `eth_getBlockByNumber(N+1, false)`, then `unicity_getSealCompanionV1(hash(N+1))`: `{"status":"found"}`, witness 0 |
 | The header of block N | `eth_getBlockByHash(hash, false)` |
 | The receipt-trie path | `eth_getTransactionReceipt`, `eth_getBlockReceipts(hash)` |
 | Segment logs, the newest seal, `Paid(eta)` | `eth_getLogs` with exactly one address and explicit windows of at most 10,000 blocks |

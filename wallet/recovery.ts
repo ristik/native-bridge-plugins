@@ -6,11 +6,10 @@ import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   AmbiguousBroadcast, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryCatchUpCalls, recoveryGeneration,
-  recoveryRpcSource, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
+  recoveryRpcSource, replacementBid, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
   type RedeemShape, type ReturnAdmission, type ReturnRecord, type ReconcileResult, type TrustInput, type SendRecord, type RedeemOptions, type ReturnEvidence,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
-import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { beInt } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
 import { fsyncDir, hx, unhex, writeDurable, type Wallet } from './core.js';
@@ -109,7 +108,7 @@ async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
 
 interface FeeReservations { total: bigint; attempts: { nonce: bigint; fee: bigint }[] }
 
-async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations): Promise<RecoveryLimits & { currentBid: bigint }> {
+async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations, replacementNonce?: bigint): Promise<RecoveryLimits & { currentBid: bigint }> {
   const evm = w.bridge.evm;
   const block = reserved?.attempts.length ? await evm.blockNumber() : undefined;
   const [balance, minedNonce, nonce, fees] = await Promise.all([
@@ -118,7 +117,7 @@ async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?:
   const outstanding = reserved?.attempts.reduce((sum, tx) => tx.nonce >= minedNonce ? sum + tx.fee : sum, 0n) ?? 0n;
   const spent = reserved?.total ?? 0n;
   const currentBid = 2n * fees.baseFee + fees.priority;
-  if (nonce > p.maxNonce || currentBid > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
+  if ((replacementNonce ?? nonce) > p.maxNonce || currentBid > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
     throw new Nb2Error('CapacityPreflight', 'current payer nonce, bids or remaining budget exceed the declared limits');
   }
   return { ...p, gas: p.gas < w.pins.userGasLimit ? p.gas : w.pins.userGasLimit,
@@ -126,24 +125,22 @@ async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?:
     balance: balance > outstanding ? balance - outstanding : 0n, currentBid, feeBudget: p.feeBudget - spent };
 }
 
-/** Both routes reserve the maximum fee of each durable signed transaction, once per payer. */
-function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends): FeeReservations {
+/** Reserve the greatest fee at each payer nonce. At most one replacement can be mined. */
+function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends, replacing?: bigint): FeeReservations {
   const recovery = loadRecovery(w, rec);
-  const raw = [...ordinary.map((send) => send.raw), ...(recovery?.attempts ?? []), ...(recovery?.superseded ?? [])];
+  const raw = [...ordinary.map((send) => send.raw), ...(recovery?.attempts ?? []), ...(recovery?.superseded ?? []), ...(recovery?.replacedSettlements ?? [])];
   if (recovery?.pending) raw.push(recovery.pending.raw);
   if (recovery?.settled?.submitted) raw.push(recovery.settled.submitted.raw);
-  const hashes = new Set<string>();
-  const attempts: FeeReservations['attempts'] = [];
-  let total = uint(recovery?.fees ?? '0'); // older local journals recorded only the total, conservatively retained
+  const byNonce = new Map<bigint, bigint>();
+  const legacy = uint(recovery?.fees ?? '0');
   for (const signed of raw) {
-    const { request, from, hash } = decodeSignedTx(bytes(signed));
-    if (!eq(from, payer) || hashes.has(hx(hash))) continue;
-    hashes.add(hx(hash));
+    const { request, from } = decodeSignedTx(bytes(signed));
+    if (!eq(from, payer) || request.nonce === replacing) continue;
     const fee = request.gas * request.maxFeePerGas;
-    attempts.push({ nonce: request.nonce, fee });
-    total += fee;
+    if (fee > (byNonce.get(request.nonce) ?? 0n)) byNonce.set(request.nonce, fee);
   }
-  return { total, attempts };
+  const attempts = Array.from(byNonce, ([nonce, fee]) => ({ nonce, fee }));
+  return { total: attempts.reduce((sum, tx) => sum + tx.fee, legacy), attempts };
 }
 
 function recoveryEmitter(w: Wallet): Uint8Array | undefined {
@@ -159,7 +156,7 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
     recovery,
     admit: async (req, prior) => {
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
-      const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior));
+      const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior, req.nonce), req.nonce);
       const fee = req.gas * req.maxFeePerGas;
       if (req.gas > limits.gas || req.nonce > limits.maxNonce || req.maxFeePerGas > limits.maxFeePerGas ||
         req.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || req.data.length > limits.calldataBytes ||
@@ -198,7 +195,7 @@ function ordinaryEnvelope(w: Wallet, policy: PayerPolicy): ReturnAdmission['ordi
   return { encodedBytes: BigInt(Math.min(policy.signedBytes, policy.calldataBytes)), gas: policy.gas, gasFor: ordinaryGas(w) };
 }
 
-export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string): ReturnAdmission {
+export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string, replacing?: bigint): ReturnAdmission {
   return {
     ordinaryEnvelope: policy && ordinaryEnvelope(w, policy),
     checkOrdinary: w.release.recovery === undefined && policy === undefined ? undefined : async (rec, gas) => {
@@ -216,14 +213,14 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
       const release = recoveryRelease(w);
       await checkGraph(w, release);
       const payer = bytes(rec.payer ?? rec.recipient, 20);
-      const limits = await limitsOf(w, policy, payer, reservedFees(w, rec, payer));
+      const limits = await limitsOf(w, policy, payer, reservedFees(w, rec, payer, undefined, replacing), replacing);
       const a = uint(rec.a);
       const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
       const plan = await preflightRecovery(w.pins.gamma, bytes(rec.source), w.trust, buildParams(w.pins.build),
         release.deployment, release.calibration, limits, { ...release.backlog, signedStart: a, observed: segment < a ? a : segment },
         rec.sealReceipt ? bytes(rec.sealReceipt) : undefined);
       const calls = BigInt(plan.run.length) + plan.advance.calls + 1n;
-      if ((await w.bridge.evm.nonce(payer)) + calls - 1n > limits.maxNonce) {
+      if ((replacing ?? await w.bridge.evm.nonce(payer)) + calls - 1n > limits.maxNonce) {
         throw new Nb2Error('CapacityPreflight', 'recovery schedule exceeds the declared nonce horizon');
       }
       return { generation: hx(release.generation), calls: String(calls), totalFee: String(plan.totalFee),
@@ -237,32 +234,32 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
 
 /** Qualify a late ordinary burn for cold continuation under this payer's limits. */
 export async function qualifyExistingRecovery(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): Promise<ReturnRecord> {
-  const { result } = await reconcileForPayout(w, rec, 'recovery', policy, false);
+  const { result, handoff } = await reconcileForPayout(w, rec, 'recovery', policy, false);
   if (result.state === 'needs-archive') archiveRequired(result.txHash);
   if (result.state === 'route-blocked') routeRequired(result);
   const current = await w.bridge.journal.retForUpdate(rec.returnId);
   if (current?.status === 'paid') return current;
   if (!current?.burned) throw new WalletError('NotPending', 'certify the exact burn before choosing recovery');
   if (hasPeerComplete(w, current) || current.recovery) return current;
-  current.recovery = await qualifyLineage(w, current, policy);
+  current.recovery = await qualifyLineage(w, current, policy, handoff?.nonce);
   await w.bridge.journal.putReturn(current);
   return current;
 }
 
-async function qualifyLineage(w: Wallet, rec: ReturnRecord, policy: PayerPolicy) {
-  const qualify = walletAdmission(w, policy).recover;
+async function qualifyLineage(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, replacing?: bigint) {
+  const qualify = walletAdmission(w, policy, undefined, replacing).recover;
   if (!qualify) throw new Nb2Error('CapacityPreflight', 'qualified recovery release is required');
   return qualify({ ...rec, payer: hx(w.signer.address) });
 }
 
 /** After Complete, price only this payer's gap advances and settlement. */
-async function qualifySettlement(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, start: bigint) {
+async function qualifySettlement(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, start: bigint, replacing?: bigint) {
   const release = recoveryRelease(w);
   await checkGraph(w, release);
   const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
   const observed = segment < start ? start : segment;
-  const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address));
-  const nonce = await w.bridge.evm.nonce(w.signer.address);
+  const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, undefined, replacing), replacing);
+  const nonce = replacing ?? await w.bridge.evm.nonce(w.signer.address);
   const backlog = { ...release.backlog, signedStart: start, observed, duringProgress: 0n };
   const needed = observed - start + 64n;
   for (let batch = Number(needed < 1024n ? needed : 1024n); batch > 0; batch--) {
@@ -287,7 +284,7 @@ interface Backup {
 }
 
 /** A holder-selected private file. Hard-link publication cannot clobber a changed destination. */
-export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string): void {
+export async function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string): Promise<void> {
   if (!rec.burnRequest || !rec.certificationLocator) throw new Error('sign the return before exporting a relayer backup');
   const saved = loadRecovery(w, rec);
   const { source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator } = rec;
@@ -296,7 +293,9 @@ export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string):
   const endpoint = saved?.complete ?? saved?.cuts.find((item) => item.cut.kind === 'run' && item.state === undefined);
   const complete = endpoint && { seq: endpoint.seq, location: endpoint.location };
   const payer = boundPayer(rec, saved);
-  const active = !rec.paid && (blockedOrdinary(rec) || saved?.pending || saved?.superseded?.length || (!complete && payer));
+  const ordinary = blockedOrdinary(rec);
+  const active = !rec.paid && (saved?.pending || saved?.superseded?.length || (!complete && payer) ||
+    (ordinary && (!complete || !saved || !await completedOrdinaryHandoff(w, rec, saved, ordinary.txHash))));
   const copy: Backup = { version: 1, gamma: hx(w.pins.gamma), vaultRuntimeHash: hx(w.pins.vaultRuntimeCodeHash), pending,
     recover: rec.recovery ? true : undefined, handoff: active ? 'active' : undefined,
     activePayer: active && payer ? hx(payer.address) : undefined, terminal: complete ? saved!.evidence : rec.burned, complete,
@@ -331,7 +330,7 @@ export async function reconcileReturn(w: Wallet, rec: ReturnRecord, policy?: Pay
   incoming?: ImportEvidence, resubmit = true): Promise<{ record: ReturnRecord; result: ReconcileResult }> {
   const archive = policy ? readers(w, policy) : [w.bridge.evm];
   const journal = loadRecovery(w, rec);
-  const settlements = (journal?.superseded ?? []).map((raw) => decodeSignedTx(bytes(raw)))
+  const settlements = [...(journal?.superseded ?? []), ...(journal?.replacedSettlements ?? [])].map((raw) => decodeSignedTx(bytes(raw)))
     .filter((tx) => eq(tx.request.to, w.bridge.cfg.vault)).map((tx) => tx.hash);
   if (journal?.pending?.cut.kind === 'settle') settlements.push(decodeSignedTx(bytes(journal.pending.raw)).hash);
   const evidence: ReturnEvidence = { paid: incoming?.paid, settlements, pending: { recovery: recoveryEmitter(w) }, readOnly: !resubmit };
@@ -398,12 +397,13 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
         const session = await openSession(w, release, incoming);
         await verifyComplete(w, session, endpoint);
         if (!localComplete) {
-          if (verified.sends.at(-1) && !verified.sends.at(-1)!.failed) routeRequired(blockedOrdinary(verified)!);
+          const ordinary = blockedOrdinary(verified);
+          if (ordinary) routeRequired(ordinary);
           const superseded = [...(local?.superseded ?? [])];
           if (local?.pending) superseded.push(local.pending.raw);
           const journal: RecoveryJournal = {
             ...initialJournal(session, incoming, release), complete: { seq: endpoint.seq, location: endpoint.location },
-            fees: local?.fees, attempts: local?.attempts, superseded: superseded.length ? superseded : undefined,
+            fees: local?.fees, attempts: local?.attempts, signerEpochs: local?.signerEpochs, ordinaryHandoff: local?.ordinaryHandoff, replacedSettlements: local?.replacedSettlements, superseded: superseded.length ? superseded : undefined,
           };
           if ((await w.bridge.journal.ret(verified.returnId))?.burnRequest) saveRecovery(w, verified, journal);
           else freshCheckpoint = journal;
@@ -469,6 +469,11 @@ interface RecoveryJournal {
   complete?: PortableComplete;
   fees?: string;
   attempts?: string[];
+  signerEpochs?: Record<string, string>;
+  /** Earlier settlement bytes replaced at the same payer nonce. Reconcile them without resubmitting. */
+  replacedSettlements?: string[];
+  /** The ordinary send whose free nonce was used for the first continuation packet. */
+  ordinaryHandoff?: string;
   /** Signed local attempts whose work has been superseded by a certified peer cursor. */
   superseded?: string[];
   cuts: { cut: Exclude<Cut, { kind: 'settle' }>; location: Location; seq: string; nonce: string; priorSeq: string; state?: string; endpoint?: string; head?: string }[];
@@ -511,7 +516,7 @@ async function openSession(w: Wallet, release: ReleaseRecovery, rec: ReturnRecor
   const generation = hx(release.generation);
   if ((rec.recovery && rec.recovery.generation !== generation) || !rec.burned) throw new WalletError('BadDeployment', 'return belongs to another generation or is uncertified');
   const cached = sessions.get(w);
-  const trust = w.trust;
+  const trust = await w.bridge.verifyWithTrust(async (trust) => trust);
   let session = cached?.burned === rec.burned && cached.generation === generation && cached.trust === trust ? cached.session : undefined;
   if (session === undefined) {
     const authority = new RecoveryAuthority(trust, async (next) => w.persistAuthority(next));
@@ -560,7 +565,7 @@ function activeRecovery(rec: ReturnRecord, journal: RecoveryJournal): ReturnReco
 async function verifyComplete(w: Wallet, s: RecoverySession, endpoint: PortableComplete): Promise<Cursor> {
   bytes(endpoint.location.txHash, 32);
   const seq = uint(endpoint.seq);
-  const receipt = await withFreshAuthority(w, () => s.verifyComplete(w.trust, bytes(endpoint.location.proof), seq));
+  const receipt = await w.bridge.verifyWithTrust((trust) => s.verifyComplete(trust, bytes(endpoint.location.proof), seq));
   if (!matches(receipt, endpoint.location)) throw new Error('Complete locator disagrees with its authenticated receipt');
   return { from: s.operationCount, prior: { seq, receipt: receipt.encoded }, gap: { seq } };
 }
@@ -577,10 +582,10 @@ async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal:
     bytes(item.location.txHash, 32);
     if (uint(item.priorSeq) !== (cursor.prior?.seq ?? 0n)) throw new Error('checkpoint has the wrong preceding sequence');
     uint(item.nonce);
-    const packet = await withFreshAuthority(w, () => packetOf(s, w.trust, rec, cursor, item.cut));
+    const packet = await w.bridge.verifyWithTrust((trust) => packetOf(s, trust, rec, cursor, item.cut));
     if (!packet.event) throw new Error('settlement is reconciled through the vault Paid receipt');
     const event = packet.event;
-    const receipt = await withFreshAuthority(w, () => s.verifyEvent(w.trust, bytes(item.location.proof), event));
+    const receipt = await w.bridge.verifyWithTrust((trust) => s.verifyEvent(trust, bytes(item.location.proof), event));
     if (!matches(receipt, item.location)) throw new Error('checkpoint locator disagrees with its authenticated receipt');
     advanceCursor(cursor, packet, receipt.encoded);
     const state = 'state' in packet && packet.state ? hx(packet.state) : undefined;
@@ -589,6 +594,28 @@ async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal:
       item.head !== (cursor.gap?.cursor && hx(cursor.gap.cursor.head))) throw new Error('saved checkpoint disagrees with the authenticated cut');
   }
   return cursor;
+}
+
+/** A receipt authenticates the cursor; its transaction must separately prove who used the nonce. */
+async function completedOrdinaryHandoff(w: Wallet, rec: ReturnRecord, saved: RecoveryJournal, hash: Uint8Array): Promise<boolean> {
+  if (saved.ordinaryHandoff !== hx(hash)) return false;
+  try {
+    const old = decodeSignedTx(bytes(rec.sends.at(-1)!.raw));
+    const cut = saved.cuts.find((item) => item.nonce === String(old.request.nonce));
+    if (!cut) return false;
+    const release = recoveryRelease(w);
+    const active = activeRecovery(rec, saved);
+    const session = await openSession(w, release, active);
+    if (!(await replay(w, session, active, saved)).gap) return false;
+    const { blockHash, txHash, txIndex } = cut.location;
+    const raw = await w.bridge.evm.transactionAt(bytes(blockHash, 32), uint(txIndex), bytes(txHash, 32));
+    const mined = decodeSignedTx(raw);
+    return eq(mined.from, old.from) && mined.request.nonce === old.request.nonce &&
+      eq(mined.request.to, release.deployment.recovery);
+  } catch {
+    // Keep the export payer-bound if the proof or exact transaction is unavailable.
+    return false;
+  }
 }
 
 function advanceCursor(cursor: Cursor, packet: Awaited<ReturnType<typeof packetOf>>, receipt: Uint8Array): void {
@@ -606,18 +633,6 @@ function readers(w: Wallet, policy: PayerPolicy): EvmReader[] {
   return [w.bridge.evm, ...policy.archives.map((url) => new EvmReader(new HttpJsonRpc(url)))];
 }
 
-async function withFreshAuthority<T>(w: Wallet, f: () => Promise<T>): Promise<T> {
-  try {
-    return await f();
-  } catch (e) {
-    if (!(e instanceof Nb2Error)) throw e;
-    let cause = e;
-    while (cause.inner && !(cause instanceof SealAheadOfOrigin)) cause = cause.inner;
-    if (!e.retryable && !(cause instanceof SealAheadOfOrigin)) throw e;
-    await w.refreshAuthority();
-    return f();
-  }
-}
 
 async function segmentProofs(reader: EvmReader, w: Wallet, rec: ReturnRecord, start: bigint, end: bigint): Promise<Uint8Array[]> {
   const rows = await reader.segmentLogs(w.bridge.cfg.vault, uint(rec.fromBlock), start, end);
@@ -653,7 +668,7 @@ function boundPayer(rec: ReturnRecord, journal?: RecoveryJournal) {
 
 function blockedOrdinary(rec: ReturnRecord): RouteBlocked | undefined {
   const send = rec.sends.at(-1);
-  if (send && !send.failed) return { state: 'route-blocked', route: 'ordinary', txHash: decodeSignedTx(bytes(send.raw)).hash };
+  if (send && !rec.sends.some((prior) => prior.nonce === send.nonce && prior.failed)) return { state: 'route-blocked', route: 'ordinary', txHash: decodeSignedTx(bytes(send.raw)).hash };
 }
 
 export function routeRequired(result: RouteBlocked): never {
@@ -683,7 +698,8 @@ async function lowerRecoverySend(w: Wallet, rec: ReturnRecord, journal?: Recover
   }
 }
 
-async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary' | 'recovery', policy?: PayerPolicy, resubmit = true) {
+async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary' | 'recovery', policy?: PayerPolicy, resubmit = true): Promise<{ record: ReturnRecord; result: ReconcileResult;
+  handoff?: { hash: Uint8Array; nonce: bigint } }> {
   const first = await reconcileReturn(w, rec, policy, undefined, false);
   if (first.result.state === 'paid' || first.result.state === 'needs-archive') return first;
   rec = first.record;
@@ -694,8 +710,16 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
     return { record: rec, result };
   }
   const ordinary = blockedOrdinary(rec);
-  if (ordinary && route === 'recovery') {
-    return { record: rec, result: ordinary };
+  let handoff: { hash: Uint8Array; nonce: bigint } | undefined;
+  const localOrdinary = ordinary && first.result.state === 'pending' && !rec.paidProof &&
+    eq(first.result.txHash, ordinary.txHash);
+  const resumed = localOrdinary && journal?.ordinaryHandoff === hx(ordinary.txHash);
+  if (ordinary && route === 'recovery' && !resumed) {
+    if (localOrdinary && policy && !journal?.pending) {
+      const nonce = await w.bridge.expiredOrdinaryNonce(bytes(rec.returnId, 32), w.signer.address, readers(w, policy));
+      if (nonce !== undefined) handoff = { hash: ordinary.txHash, nonce };
+    }
+    if (!handoff) return { record: rec, result: ordinary };
   }
   if (journal?.pending && route === 'ordinary') {
     const held = activeRecovery(rec, journal);
@@ -716,20 +740,26 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
       return { record: rec, result };
     }
     if (resubmit) {
+      const epoch = journal?.signerEpochs?.[hx(lower.hash)];
+      if (epoch === undefined) throw new WalletError('NotPending', 'retry needs the authenticated cut for the prior signed packet');
+      await w.bridge.evm.checkReturnImport(w.bridge.cfg, uint(epoch), { ...lower.request, from: lower.from });
       try { await w.bridge.evm.sendRaw(lower.raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
     return { record: rec, result: { state: 'pending', txHash: lower.hash } as const };
   }
-  return resubmit && ordinary && first.result.state === 'pending' && route === 'ordinary' &&
-    !rec.paidProof && rec.sends.at(-1)?.failureProofReads === undefined
-    ? reconcileReturn(w, rec, policy) : first;
+  return route === 'recovery' && (resumed || handoff)
+    ? { record: rec, result: { state: 'not-paid' } as const, handoff }
+    : first;
 }
 
 /** Ordinary redeem shares payment closure and nonce reconciliation with recovery. */
 export async function redeemOrdinary(w: Wallet, rec: ReturnRecord, policy?: PayerPolicy): Promise<ReconcileResult> {
   const { record, result } = await reconcileForPayout(w, rec, 'ordinary', policy);
-  if (result.state !== 'not-paid') return result;
+  const last = record.sends.at(-1);
+  const local = result.state === 'pending' && last && !record.paidProof &&
+    last.failureProofReads === undefined && hx(result.txHash) === last.hash;
+  if (result.state !== 'not-paid' && !local) return result;
   const payout = await w.bridge.submitRedeem(bytes(record.returnId, 32), w.signer, ordinaryPayout(w, record, policy));
   if (payout.state === 'paid') await reconcileReturn(w, record, policy);
   return payout;
@@ -750,6 +780,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   const archive = readers(w, policy);
   const first = await reconcileForPayout(w, rec, 'recovery', policy);
   if (first.result.state !== 'not-paid') return first.result;
+  const handoff = first.handoff;
   rec = first.record;
   if (!rec.recovery && !hasPeerComplete(w, rec)) rec = await qualifyExistingRecovery(w, rec, policy);
   const release = recoveryRelease(w);
@@ -760,24 +791,41 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
   const journal = local ?? initialJournal(s, rec, release);
   const cursor = await replay(w, s, rec, journal);
 
-  if (journal.pending === undefined) {
+  const reconcile = () => reconcileReturn(w, rec, policy).then(({ result }) => result);
+  let expired: ReturnType<typeof decodeSignedTx> | undefined;
+  if (journal.pending) {
+    try {
+      return await reconcilePendingPacket(w, rec, release, s, journal, cursor, archive, reconcile);
+    } catch (error) {
+      if (!(error instanceof Nb2Error) || error.rule !== 'StaleEndpoint' || journal.pending.cut.kind !== 'settle') throw error;
+      const previous = decodeSignedTx(bytes(journal.pending.raw));
+      if (!eq(previous.from, w.signer.address) || await w.bridge.evm.nonce(previous.from, 'latest') !== previous.request.nonce) {
+        return { state: 'pending', txHash: previous.hash };
+      }
+      expired = previous;
+    }
+  }
+
+  {
+    const replacing = expired?.request.nonce ?? handoff?.nonce;
     if (journal.complete) {
-      rec = { ...rec, recovery: await qualifySettlement(w, rec, policy, cursor.gap?.cursor?.next ?? uint(rec.a)) };
+      rec = { ...rec, recovery: await qualifySettlement(w, rec, policy, cursor.gap?.cursor?.next ?? uint(rec.a), replacing) };
     } else {
       await qualifyRestoredSchedule(w, release, rec, journal, cursor);
     }
     const current = (await w.bridge.journal.ret(rec.returnId))!;
-    const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, current, w.signer.address));
+    const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, current, w.signer.address, undefined, replacing), replacing);
     let cut: Cut;
     let quote: RecoveryQuote | null;
     let calldata: Uint8Array;
+    let requiredSignerEpoch: bigint;
     let to = release.deployment.recovery;
     if (!cursor.gap) {
       const count = rec.recovery!.runCuts[journal.cuts.length];
       const packet = await s.run(cursor.from, count, w.trust, cursor.prior);
       cut = { kind: 'run', count };
       quote = quoteRecovery(packet.shape, release.calibration, limits);
-      ({ calldata } = packet);
+      ({ calldata, requiredSignerEpoch } = packet);
     } else {
       const start = cursor.gap.cursor?.next ?? uint(rec.a);
       const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
@@ -791,7 +839,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       for (const reader of archive) {
         try {
           const proofs = await segmentProofs(reader, w, rec, start, end);
-          gaps = await withFreshAuthority(w, () => s.certifiedGaps(w.trust, start, head, proofs));
+          gaps = await w.bridge.verifyWithTrust((trust) => s.certifiedGaps(trust, start, head, proofs));
           break;
         } catch (e) { error = e; }
       }
@@ -801,59 +849,79 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       const price = settlement && quoteRecovery(settlement.shape, release.calibration, limits);
       if (settlement && price) {
         cut = { kind: 'settle', gaps: gaps.map(hx) };
-        calldata = settlement.calldata;
+        ({ calldata, requiredSignerEpoch } = settlement);
         quote = price;
         to = w.bridge.cfg.vault;
       } else {
         if (BigInt(gaps.length) !== batch) throw new Nb2Error('CapacityPreflight', 'qualified settlement suffix exceeds payer limits');
         const packet = await s.gaps('advanceGaps', w.trust, cursor.prior!.receipt, cursor.gap, gaps, startHead);
         cut = { kind: 'advance', gaps: gaps.map(hx) };
-        ({ calldata } = packet);
+        ({ calldata, requiredSignerEpoch } = packet);
         quote = quoteRecovery(packet.shape, release.calibration, limits);
       }
     }
-    const nonce = await w.bridge.evm.nonce(w.signer.address);
+    const pendingNonce = await w.bridge.evm.nonce(w.signer.address);
+    const nonce = replacing ?? pendingNonce;
     if (quote === null || nonce > limits.maxNonce || quote.fee > limits.feeBudget || quote.fee > limits.balance) {
       throw new Nb2Error('CapacityPreflight', 'packet exceeds the remaining payer limits');
     }
-    if (cut.kind === 'settle') {
-      const competing = await w.bridge.checkSettlement(bytes(rec.returnId, 32), archive, release.deployment.recovery);
+    if (expired && pendingNonce > nonce &&
+        (limits.maxFeePerGas < replacementBid(expired.request.maxFeePerGas) ||
+         limits.maxPriorityFeePerGas < replacementBid(expired.request.maxPriorityFeePerGas))) {
+      throw new Nb2Error('CapacityPreflight', 'a pooled settlement replacement exceeds the payer bid limit');
+    }
+    if (cut.kind === 'settle' || expired || handoff) {
+      const replaced = expired ? [...(journal.replacedSettlements ?? []).filter((raw) =>
+        decodeSignedTx(bytes(raw)).request.nonce === nonce).map((raw) => decodeSignedTx(bytes(raw)).hash), expired.hash] : [];
+      const competing = await w.bridge.checkSettlement(bytes(rec.returnId, 32), archive, release.deployment.recovery, handoff?.hash, replaced);
       if (competing.state === 'paid') retainPayment(w, rec, hx(competing.txHash));
       if (competing.state !== 'not-paid') return competing;
+    }
+    const tx = await signTx(w.signer, { chainId: limits.chainId, nonce, maxFeePerGas: limits.maxFeePerGas,
+      maxPriorityFeePerGas: limits.maxPriorityFeePerGas, gas: quote.gas, to, value: 0n, data: calldata });
+    if (tx.raw.length > quote.signedBytes) throw new Nb2Error('CapacityPreflight', 'signed recovery packet exceeds its bound');
+    await w.bridge.evm.checkReturnImport(w.bridge.cfg, requiredSignerEpoch, { ...tx.request, from: w.signer.address });
+    if (handoff) {
+      const evm = w.bridge.evm;
+      if (await evm.nonce(w.signer.address, 'latest') !== nonce || await evm.nonce(w.signer.address) !== nonce) {
+        return { state: 'pending', txHash: handoff.hash };
+      }
+      journal.ordinaryHandoff = hx(handoff.hash);
+    } else if (expired && await w.bridge.evm.nonce(w.signer.address, 'latest') !== nonce) {
+      return { state: 'pending', txHash: expired.hash };
     }
     if (!current.executionPayer) {
       const durable = (await w.bridge.journal.retForUpdate(rec.returnId))!;
       durable.executionPayer = hx(w.signer.address);
       await w.bridge.journal.putReturn(durable);
     }
-    const tx = await signTx(w.signer, { chainId: limits.chainId, nonce, maxFeePerGas: limits.maxFeePerGas,
-      maxPriorityFeePerGas: limits.maxPriorityFeePerGas, gas: quote.gas, to, value: 0n, data: calldata });
-    if (tx.raw.length > quote.signedBytes) throw new Nb2Error('CapacityPreflight', 'signed recovery packet exceeds its bound');
+    if (expired) (journal.replacedSettlements ??= []).push(journal.pending!.raw);
+    (journal.signerEpochs ??= {})[hx(tx.hash)] = String(requiredSignerEpoch);
     journal.pending = { cut, raw: hx(tx.raw), txHash: hx(tx.hash), nonce: String(nonce), priorSeq: String(cursor.prior?.seq ?? 0n) };
     saveRecovery(w, rec, journal);
   }
-  return reconcilePendingPacket(w, rec, release, s, journal, cursor, archive, () => reconcileReturn(w, rec, policy).then(({ result }) => result));
+  return reconcilePendingPacket(w, rec, release, s, journal, cursor, archive, reconcile, true);
 }
 
 async function openPendingPacket(w: Wallet, rec: ReturnRecord, release: ReleaseRecovery, s: RecoverySession,
   cursor: Cursor, pending: NonNullable<RecoveryJournal['pending']>) {
   const raw = bytes(pending.raw);
-  const { request, hash } = decodeSignedTx(raw);
-  const packet = await withFreshAuthority(w, () => packetOf(s, w.trust, rec, cursor, pending.cut));
+  const { request, from, hash } = decodeSignedTx(raw);
+  const packet = await w.bridge.verifyWithTrust((trust) => packetOf(s, trust, rec, cursor, pending.cut));
   if (hx(hash) !== pending.txHash || String(request.nonce) !== pending.nonce || String(cursor.prior?.seq ?? 0n) !== pending.priorSeq ||
     request.value !== 0n || request.chainId !== w.bridge.cfg.chainId || !eq(request.data, packet.calldata) ||
     !eq(request.to, pending.cut.kind === 'settle' ? w.bridge.cfg.vault : release.deployment.recovery)) {
     throw new Error('pending transaction does not match the authenticated cut');
   }
-  return { raw, hash, packet };
+  return { raw, hash, packet, request, from };
 }
 
 /** Reconcile a durable send without signing. Restore only reads receipts. */
 async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: ReleaseRecovery, s: RecoverySession,
   journal: RecoveryJournal, cursor: Cursor, archive: readonly EvmReader[],
-  reconcile?: () => Promise<ReconcileResult>): Promise<RecoveryResult> {
+  reconcile?: () => Promise<ReconcileResult>, preflighted = false): Promise<RecoveryResult> {
   const pending = journal.pending!;
-  const { raw, hash, packet } = await openPendingPacket(w, rec, release, s, cursor, pending);
+  const { raw, hash, packet, request, from } = await openPendingPacket(w, rec, release, s, cursor, pending);
   const confirm = (receipt: RecoveryReceipt, txHint = hx(hash)): RecoveryResult => {
     if (pending.cut.kind === 'settle') throw new Error('settlement requires a certified Paid receipt');
     advanceCursor(cursor, packet, receipt.encoded);
@@ -866,22 +934,26 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     saveRecovery(w, rec, journal);
     return { state: 'checkpoint', txHash: hash };
   };
+  const ordinary = journal.ordinaryHandoff ? rec.sends.map((send) => send.raw) : [];
+  const earlier = [...(journal.replacedSettlements ?? []), ...ordinary].map((signed) => decodeSignedTx(bytes(signed)))
+    .filter((tx) => eq(tx.from, from) && tx.request.nonce === request.nonce);
   let pruned = false;
   let failed = false;
-  const outcome = async (): Promise<'missing' | 'pending' | 'success' | 'failed'> => {
+  const outcome = async (): Promise<'missing' | 'pending' | 'success' | 'earlier-paid' | 'failed'> => {
     let seen = false;
     let success = false;
-    for (const reader of archive) {
+    for (const tx of [hash, ...earlier.map((prior) => prior.hash)]) for (const reader of archive) {
       try {
-        const receipt = await reader.receipt(hash);
+        const receipt = await reader.receipt(tx);
         if (!receipt) continue;
         seen = true;
         if (BigInt(receipt.status) === 1n) {
+          if (!eq(tx, hash)) return 'earlier-paid';
           success = true;
           continue;
         }
         failed = true;
-        await withFreshAuthority(w, () => reader.verifyFailedReceipt(hash, w.bridge.cfg, w.trust, receipt, archive));
+        await w.bridge.verifyWithTrust((trust) => reader.verifyFailedReceipt(tx, w.bridge.cfg, trust, receipt, archive));
         return 'failed';
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
@@ -893,6 +965,11 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   };
   let mined = await outcome();
   if (mined === 'missing' && reconcile && pending.failureProofReads === undefined) {
+    if (!preflighted) {
+      await w.bridge.evm.checkReturnImport(w.bridge.cfg, packet.requiredSignerEpoch, { ...request, from });
+      (journal.signerEpochs ??= {})[hx(hash)] = String(packet.requiredSignerEpoch);
+      saveRecovery(w, rec, journal);
+    }
     try { await w.bridge.evm.sendRaw(raw); }
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     mined = await outcome();
@@ -915,13 +992,13 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     saveRecovery(w, rec, journal);
     return { state: 'retry', txHash: hash };
   }
-  if (pending.cut.kind === 'settle') {
+  if (mined === 'earlier-paid' || pending.cut.kind === 'settle') {
     const result = await reconcile?.();
     return !result || result.state === 'not-paid' || result.state === 'pending' ? unresolved() : result;
   }
   let acquired;
   try {
-    acquired = await s.acquire(w.trust, packet.event!, archive.map((r) => recoveryRpcSource(r, hash)), () => w.refreshAuthority());
+    acquired = await w.bridge.verifyWithTrust((trust) => s.acquire(trust, packet.event!, archive.map((r) => recoveryRpcSource(r, hash))));
   } catch (e) {
     if (e instanceof WalletError && (e.reason === 'CompanionUnknown' || e.reason === 'EvidenceMissing')) {
       return unresolved();

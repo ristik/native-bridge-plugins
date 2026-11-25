@@ -50,7 +50,7 @@ export function persistTrustFile(historyFile: string, bundle: Uint8Array): void 
  * persisting what was appended. A refused page keeps its authenticated prefix: when the tip advanced it is persisted, then the refusal propagates; a failed
  * write stops with TrustPersistError (the refusal its cause, when there is one). Returns the entries appended.
  */
-export async function refreshAll(trust: TrustInput, source: ITrustBaseSource, maxEntries: number, persist: (bundle: Uint8Array) => void): Promise<number> {
+export async function refreshAll(trust: TrustInput, source: ITrustBaseSource, maxEntries: number, persist: (bundle: Uint8Array) => void, signal?: AbortSignal): Promise<number> {
   const tip = () => trust.history.tip?.epoch ?? 0n;
   const write = async (refused?: unknown) => {
     try {
@@ -63,7 +63,7 @@ export async function refreshAll(trust: TrustInput, source: ITrustBaseSource, ma
   const before = tip();
   let appended: number;
   try {
-    appended = await TrustBaseUpdater.update(trust.history, [source], { limits: { ...TRUST_BASE_PAGE_LIMITS, maxEntries } });
+    appended = await TrustBaseUpdater.update(trust.history, [source], { signal, limits: { ...TRUST_BASE_PAGE_LIMITS, maxEntries } });
   } catch (refused) {
     if (tip() > before) await write(refused);
     throw refused;

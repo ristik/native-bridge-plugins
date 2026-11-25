@@ -21,7 +21,6 @@ import type { Config } from './config.js';
 import { Nb2Error, fail, refuse, wrap, type Rule } from './errors.js';
 
 export { TrustInput };
-export type { AuthenticatedOrigin } from '../trust.js';
 
 /** The B1 bound of one certificate's bytes (b1ref.MaxUCBytes). */
 export const MAX_B1_UC_BYTES = 24_576;
@@ -29,7 +28,6 @@ const MAX_B1_SIGNATURES = 16;
 
 /** The history must be the one Γ names: its genesis EntryID is rootGenesis32 and its network Γ's. */
 export function bindTrust(t: TrustInput, c: Config): void {
-  if (t.origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
   if (!eq(t.history.genesisPin, c.rootGenesis) || Number(t.network.id) !== c.network) refuse('TrustInput', 'the trust-base history is not the one Γ names');
 }
 
@@ -85,21 +83,9 @@ export function decodeUc(raw: Uint8Array): UnicityCertificate {
   return uc;
 }
 
-/** A valid checkpoint may advance while an aggregator request is in flight. */
-export class SealAheadOfOrigin extends Nb2Error {
-  public constructor() { super('SealEpoch', 'seal exceeds the authenticated B1 origin'); }
-}
-
-export function isSealAheadOfOrigin(error: unknown): boolean {
-  for (let cause = error; cause instanceof Nb2Error; cause = cause.inner) {
-    if (cause instanceof SealAheadOfOrigin) return true;
-  }
-  return false;
-}
-
 export function isCertificationTrustPending(error: unknown): boolean {
   for (let cause = error; cause instanceof Nb2Error; cause = cause.inner) {
-    if (cause instanceof SealAheadOfOrigin || cause.rule === 'NoEntryForEpoch') return true;
+    if (cause.rule === 'NoEntryForEpoch') return true;
   }
   return false;
 }
@@ -129,11 +115,6 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
   if (uc.shardConfigurationHash.length !== 32) fail('CertStructure', 'ShardConfHash is not 32 bytes');
   if (!eq(uc.shardTreeCertificate.shard.encode(), shard)) fail('CertStructure', 'shard');
   if (BigInt(uc.unicityTreeCertificate.partitionIdentifier) !== BigInt(partition)) fail('CertStructure', 'partition');
-  const origin = t.origin;
-  if (origin === undefined) refuse('TrustInput', 'an authenticated B1 origin is required');
-  if (uc.unicitySeal.epoch > origin.usableEpoch || uc.unicitySeal.rootChainRoundNumber > origin.rootRound) {
-    throw new SealAheadOfOrigin();
-  }
   let r;
   try {
     r = await UC_VERIFIER.verifyCertificate(t.history, uc, { partitionId: uc.unicityTreeCertificate.partitionIdentifier });
@@ -144,15 +125,7 @@ export async function ucCheck(t: TrustInput, uc: UnicityCertificate, partition: 
     const reason = certificateFailure(r) ?? 'ErrQuorumNotMet';
     fail(NATIVE_TO_RULE[reason] ?? 'CertStructure', reason);
   }
-  // A checkpoint beyond this epoch proves it has closed. The SDK can enforce its
-  // exclusive end only after the authenticated successor is held.
-  const epoch = uc.unicitySeal.epoch;
-  if (epoch < origin.usableEpoch) {
-    const successor = t.history.entryForEpoch(epoch + 1n);
-    if (successor === null) fail('NoEntryForEpoch', `missing authenticated successor for epoch ${epoch}`);
-    // An asynchronous SDK verification may have started before the successor arrived.
-    if (uc.unicitySeal.rootChainRoundNumber >= successor.epochStartRound) fail('SealEpoch', 'seal is outside its closed epoch');
-  }
+
 }
 
 /**

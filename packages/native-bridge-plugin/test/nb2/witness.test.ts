@@ -7,11 +7,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { toHex } from '../../src/bytes.js';
+import { fromHex, toHex } from '../../src/bytes.js';
 import { classifyRedeemError, decodeRevert, revertData } from '../../src/nb2/abi.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
+import { decodeSignedTx } from '../../src/nb2/evm.js';
 import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
+import { MemoryJournalStore } from '../../src/nb2/journal.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, setup, VAULT } from './world.js';
 import { EvmReader, RpcError } from '../../src/nb2/rpc.js';
@@ -20,18 +22,19 @@ async function world() {
   const s = await setup();
   const payer = evmAccount(s.chain, 'p');
   const owner = localOwner(key('o'));
-  const w = await NativeBridgeV2.open(s.options('w'));
-  const token = async (v: bigint): Promise<Uint8Array> => {
+  const store = new MemoryJournalStore();
+  const w = await NativeBridgeV2.open(s.options('w', store));
+  const token = async (v: bigint, actor = payer): Promise<Uint8Array> => {
     const p = await w.planDeposit(v, owner.publicKey);
-    await w.submitDeposit(p, payer);
+    await w.submitDeposit(p, actor);
     await w.collectDepositProof(p.intent);
     return w.mint(p.intent);
   };
-  const pay = async (n: number): Promise<void> => {
+  const pay = async (n: number, actor = payer): Promise<void> => {
     for (let k = 0; k < n; k++) {
-      const rp = await w.planReturn(await token(1n), HE(key('x')).slice(12), payer.address);
+      const rp = await w.planReturn(await token(1n, actor), HE(key('x')).slice(12), actor.address);
       await w.burn(rp.returnId, owner);
-      assert.equal((await w.submitRedeem(rp.returnId, payer)).state, 'paid');
+      assert.equal((await w.submitRedeem(rp.returnId, actor)).state, 'paid');
     }
   };
   const burned = async (): Promise<Uint8Array> => {
@@ -39,7 +42,7 @@ async function world() {
     await w.burn(rp.returnId, owner);
     return rp.returnId;
   };
-  return { ...s, w, payer, pay, burned };
+  return { ...s, w, payer, pay, burned, store };
 }
 
 test('history of zero, one and several segments; one rollover in flight is tolerated', async () => {
@@ -108,6 +111,105 @@ test('a deployed quorum refusal is retryable and the same certified burn pays af
   assert.equal(sends, 1);
 });
 
+test('a never-broadcast return rebuilds after two rollovers during finalized import lag', async () => {
+  const { w, payer, burned, chain, pay } = await world();
+  const id = await burned();
+  const original = await w.buildRedeem(id);
+  chain.importedTipEpoch = 0n;
+  const sends = () => chain.calls.filter((call) => call === 'eth_sendRawTransaction').length;
+  const firstSendCount = sends();
+  await assert.rejects(w.submitRedeem(id, payer), { reason: 'ImportLag', retryable: true });
+  const pending = await w.journal.ret('0x' + toHex(id));
+  assert.equal(pending?.status, 'burned');
+  assert.equal(pending?.sends.length, 0);
+  assert.equal(pending?.executionPayer, undefined);
+  assert.equal(sends(), firstSendCount);
+  chain.importedTipEpoch = 1n;
+  await pay(8);
+  const rebuilt = await w.buildRedeem(id);
+  assert.equal(rebuilt.endpoint, original.endpoint + 2n);
+  assert.notDeepEqual(rebuilt.calldata, original.calldata);
+  const beforeResume = sends();
+  assert.equal((await w.submitRedeem(id, payer)).state, 'paid');
+  const paid = await w.journal.ret('0x' + toHex(id));
+  assert.equal(paid?.burned, pending?.burned);
+  assert.equal(paid?.sends.length, 1);
+  assert.equal(sends(), beforeResume + 1);
+});
+
+test('a different signer is route-blocked while the bound payer is waiting for finalized import', async () => {
+  const { w, payer, burned, chain } = await world();
+  const id = await burned();
+  const call = chain.call.bind(chain);
+  chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') throw new Error('transport before delivery');
+    return call<T>(method, params);
+  };
+  await assert.rejects(w.submitRedeem(id, payer), /transport before delivery/);
+  chain.call = call;
+  const pending = (await w.journal.ret('0x' + toHex(id)))!.sends[0];
+  chain.importedTipEpoch = 0n;
+  const calls = chain.calls.length;
+  const other = await w.submitRedeem(id, evmAccount(chain, 'different signer'));
+  assert.deepEqual(other, {
+    state: 'route-blocked', route: 'ordinary', payer: payer.address, txHash: fromHex(pending.hash.slice(2))!,
+  });
+  assert.ok(!chain.calls.slice(calls).includes('eth_getStorageAt'));
+  await assert.rejects(w.submitRedeem(id, payer), { reason: 'ImportLag', retryable: true });
+});
+
+for (const pooled of [false, true]) test(`an expired payout reuses the nonce and certifies Paid after restart (pool race: ${pooled})`, async () => {
+  const { w, payer, burned, chain, pay, options, store } = await world();
+  const id = await burned();
+  const keyOf = '0x' + toHex(id);
+  const call = chain.call.bind(chain);
+  chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') throw new Error('transport before delivery');
+    return call<T>(method, params);
+  };
+  await assert.rejects(w.submitRedeem(id, payer), /transport before delivery/);
+  const pending = (await w.journal.ret(keyOf))!;
+  assert.equal(pending.sends.length, 1);
+  chain.call = call;
+  await pay(8, evmAccount(chain, 'independent payer'));
+  const reopened = await NativeBridgeV2.open(options('w', store));
+  const budget = { admit: async ({ maxFeePerGas, maxPriorityFeePerGas }: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }) => {
+    assert.equal(maxFeePerGas, 15n);
+    assert.equal(maxPriorityFeePerGas, 1n);
+  } };
+  if (pooled) {
+    chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_sendRawTransaction') {
+        const { request } = decodeSignedTx(fromHex(String(params[0]).slice(2))!);
+        if (request.maxFeePerGas === 15n) throw new RpcError(200, -32000, 'replacement transaction underpriced');
+      }
+      return call<T>(method, params);
+    };
+    await assert.rejects(reopened.submitRedeem(id, payer, budget), /replacement transaction underpriced/);
+  }
+  assert.equal((await reopened.submitRedeem(id, payer, pooled ? {} : budget)).state, 'paid');
+  const paid = (await reopened.journal.ret(keyOf))!;
+  assert.ok(paid.paid?.receipt);
+  assert.equal(paid.burned, pending.burned);
+  assert.equal(paid.sends.length, pooled ? 3 : 2);
+  assert.deepEqual(paid.sends[0], pending.sends[0]);
+  const [old, replacement] = paid.sends.map(({ raw }) => decodeSignedTx(fromHex(raw.slice(2))!));
+  assert.equal(replacement.request.nonce, old.request.nonce);
+  assert.deepEqual(replacement.from, old.from);
+  assert.notDeepEqual(replacement.request.data, old.request.data);
+  assert.equal(replacement.request.maxFeePerGas, old.request.maxFeePerGas);
+  assert.equal(replacement.request.maxPriorityFeePerGas, old.request.maxPriorityFeePerGas);
+  if (pooled) {
+    const bumped = decodeSignedTx(fromHex(paid.sends[2].raw.slice(2))!);
+    assert.equal(bumped.request.nonce, old.request.nonce);
+    assert.equal(bumped.request.maxFeePerGas, 17n);
+    assert.equal(bumped.request.maxPriorityFeePerGas, 2n);
+    assert.equal(new Set(paid.sends.map((send) => send.hash)).size, 3);
+  }
+  assert.equal(await call('eth_getTransactionReceipt', [paid.sends[0].hash]), null);
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid').length, 9);
+});
+
 test('a final refusal after a mined revert preserves the decoded inner rule', async () => {
   const { w, payer, burned, chain } = await world();
   const id = await burned();
@@ -122,6 +224,7 @@ test('a final refusal after a mined revert preserves the decoded inner rule', as
       if (++estimates === 1) return '0x1d4c0' as T;
       throw new RpcError(200, 3, 'execution reverted', `0x${toHex(refusal)}`);
     }
+    if (method === 'eth_call' && typeof params[1] === 'object') return '0x' as T;
     const result = await rpc<T>(method, params);
     if (method === 'eth_sendRawTransaction') hashes.push(result as string);
     return result;

@@ -1,7 +1,6 @@
 /** Build certified protocol 10 evidence for the paired development lane. */
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
-import { parseAuthenticatedOrigin } from '../../../wallet/core.js';
 import { eq, fromHex } from '../src/bytes.js';
 import { SdkAggregator } from '../src/nb2/aggregator.js';
 import { buildParams, decodeConfig } from '../src/nb2/config.js';
@@ -11,16 +10,16 @@ import { runLaneWorkload } from './nb2-lane-run.js';
 
 const { values } = parseArgs({
   options: {
-    gamma: { type: 'string' }, origin: { type: 'string' }, utb: { type: 'string' }, root: { type: 'string' }, owner: { type: 'string' },
+    gamma: { type: 'string' }, utb: { type: 'string' }, root: { type: 'string' }, owner: { type: 'string' },
     recipient: { type: 'string' }, aggregator: { type: 'string' }, output: { type: 'string' }, history: { type: 'string' },
     build: { type: 'string', default: 'production' }, seal: { type: 'string' },
   },
   strict: true,
 });
 
-const { gamma: gammaPath, origin, utb, root, owner: keyPath, recipient: address, aggregator, output, history, build, seal } = values;
-if (!gammaPath || !origin || !utb || !root || !keyPath || !address || !aggregator || !output) {
-  throw new Error('required options: --gamma --origin --utb --root --owner --recipient --aggregator --output --history');
+const { gamma: gammaPath, utb, root, owner: keyPath, recipient: address, aggregator, output, history, build, seal } = values;
+if (!gammaPath || !utb || !root || !keyPath || !address || !aggregator || !output) {
+  throw new Error('required options: --gamma --utb --root --owner --recipient --aggregator --output --history');
 }
 if (history !== 'transfers-600' && history !== 'one-split-600' && history !== 'depth-20') throw new Error('unknown --history');
 if (build !== 'production' && build !== 'test') throw new Error('unknown --build');
@@ -40,7 +39,7 @@ async function refreshTrust(): Promise<TrustInput> {
     historyTrust = await TrustInput.fromBundle(offered, cfg.rootGenesis);
     bundle = offered;
   }
-  return historyTrust.withAuthenticatedOrigin(parseAuthenticatedOrigin(JSON.parse(await readFile(origin!, 'utf8'))));
+  return historyTrust;
 }
 const trust = await refreshTrust();
 const agg = new SdkAggregator(aggregator, { allowInsecure: url.protocol === 'http:' });

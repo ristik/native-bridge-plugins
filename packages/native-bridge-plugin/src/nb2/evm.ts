@@ -21,6 +21,9 @@ export interface TxRequest {
   data: Uint8Array;
 }
 
+/** Minimum bid for replacing a possibly pooled transaction, rounded up past ten percent. */
+export const replacementBid = (bid: bigint): bigint => bid + bid / 10n + 1n;
+
 /** A signed transaction: its exact bytes and hash. */
 export interface SignedTx { raw: Uint8Array; hash: Uint8Array; request: TxRequest }
 

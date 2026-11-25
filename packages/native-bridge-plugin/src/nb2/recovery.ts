@@ -11,7 +11,7 @@ import { verifySealReceipt } from './rules.js';
 import { foldHistory, gapProofLen, GapTree } from './segment.js';
 import { decodeSplitManifest, parentLink } from './split.js';
 import { decodeToken, lineageOf, mintSourceHash, resultState, stateId, tokenIdOf } from './token.js';
-import { bindTrust, decodeUc, SealAheadOfOrigin, type TrustInput } from './trust.js';
+import { bindTrust, decodeUc, type TrustInput } from './trust.js';
 import { parseMintData, verdictAbi, verifyPart, type Verdict } from './verify.js';
 
 const version = u16(0x0101);
@@ -116,7 +116,7 @@ class Sparse {
   }
 }
 
-interface ClaimOpening { key: string; full: Uint8Array }
+interface ClaimOpening { key: string; full: Uint8Array; epoch: bigint }
 interface Operation { start: number; end: number; code: number; sid: Uint8Array; claims: ClaimOpening[]; after: Uint8Array | null }
 interface State {
   phase: number; pos: number; levels: number; transfers: number; owner: Uint8Array; state: Uint8Array;
@@ -145,7 +145,7 @@ function operations(evidence: Uint8Array, token: ReturnType<typeof decodeToken>,
     if (old !== undefined && !eq(old, value)) fail('CertStructure', 'conflicting recovery claim');
     const opening = claims.open(key, old === undefined ? hash('CLAIM', key, value) : undefined);
     values.set(hex, value);
-    return { key: hex, full: old === undefined ? concat(Uint8Array.of(0, 0), opening) : concat(Uint8Array.of(0, 1), old, opening) };
+    return { key: hex, epoch: uc.unicitySeal.epoch, full: old === undefined ? concat(Uint8Array.of(0, 0), opening) : concat(Uint8Array.of(0, 1), old, opening) };
   };
   const result: Operation[] = [];
   const chain = lineageOf(token);
@@ -210,8 +210,8 @@ export interface RecoveryReceipt {
 export type RecoveryReceiptSource = (emitter: Uint8Array, event: RecoveryEvent) => Promise<Uint8Array>;
 
 export interface GapPrior { seq: bigint; cursor?: { next: bigint; head: Uint8Array } }
-export interface GapPacket { shape: RecoveryShape; calldata: Uint8Array; event: RecoveryEvent | null; next: bigint; head: Uint8Array | undefined }
-export interface RunPacket { shape: RecoveryShape; calldata: Uint8Array; end: number; state: Uint8Array | null; event: RecoveryEvent }
+export interface GapPacket { requiredSignerEpoch: bigint; shape: RecoveryShape; calldata: Uint8Array; event: RecoveryEvent | null; next: bigint; head: Uint8Array | undefined }
+export interface RunPacket { requiredSignerEpoch: bigint; shape: RecoveryShape; calldata: Uint8Array; end: number; state: Uint8Array | null; event: RecoveryEvent }
 
 /** One authority for all sessions on a deployment. Restore the persisted checkpoint before reopening. */
 export class RecoveryAuthority {
@@ -235,11 +235,10 @@ export class RecoveryAuthority {
       const tip = held.history.tip!;
       const prefix = candidate.history.entryForEpoch(tip.epoch);
       if (prefix === null || !eq(await prefix.entryId(), await tip.entryId())
-        || candidate.origin!.rootRound < held.origin!.rootRound || candidate.origin!.usableEpoch < held.origin!.usableEpoch) {
-        refuse('TrustInput', 'recovery authority rolls back the held history or origin');
+        || candidate.history.tip!.epoch < tip.epoch) {
+        refuse('TrustInput', 'recovery authority rolls back the held history');
       }
-      if (candidate.history.tip!.epoch === tip.epoch && candidate.origin!.rootRound === held.origin!.rootRound
-        && candidate.origin!.usableEpoch === held.origin!.usableEpoch) return;
+      if (candidate.history.tip!.epoch === tip.epoch) return;
       try {
         await this.persist(await candidate.snapshot());
       } catch (e) {
@@ -294,10 +293,12 @@ export class RecoverySession {
     const seq = prior === undefined ? 1n : prior.seq + 1n;
     if (seq >= 1n << 64n || (prior && prior.seq <= 0n)) fail('Shape', 'sequence');
     let receiptBytes = 0;
+    let requiredSignerEpoch = 0n;
     if (prior !== undefined) {
       if (prior.receipt.length > receiptCap) fail('InputTooLarge', 'cold receipt');
       const receipt = Uint8Array.from(prior.receipt);
       receiptBytes = receipt.length;
+      requiredSignerEpoch = decodeUc(decodeDepositProof(receipt).uc).unicitySeal.epoch;
       const state = withSeq(this.ops[from - 1].after!, prior.seq);
       await this.verifyEvent(trust, receipt, this.event('progress', concat(u256(prior.seq), hash('STATE', this.session, state))));
       prefix = concat(Uint8Array.of(1), state, blob(receipt));
@@ -312,6 +313,7 @@ export class RecoverySession {
     const table = Array.from({ length: pages }, (_, i) => this.pages.opening(firstPage + i));
     const used = new Set<string>();
     const steps = this.ops.slice(from, end).map((op) => concat(Uint8Array.of(op.code), op.sid, ...op.claims.map((claim) => {
+      if (claim.epoch > requiredSignerEpoch) requiredSignerEpoch = claim.epoch;
       const cached = used.has(claim.key);
       used.add(claim.key);
       return cached ? Uint8Array.of(1) : claim.full;
@@ -324,7 +326,7 @@ export class RecoverySession {
     const calldata = coldCall('run', [this.header, prefix, Uint8Array.of(pages), ...table, Uint8Array.of(count), ...steps]);
     const shape: RecoveryShape = { entry: 'run', calldataBytes: calldata.length, operations: count, pages, gaps: 0,
       receiptBytes, openingBytes: steps.reduce((sum, step) => sum + step.length - 1, 0) };
-    return { shape, calldata, end, state, event };
+    return { requiredSignerEpoch, shape, calldata, end, state, event };
   }
 
   private checkCalibration(calibration: RecoveryCalibration, limits: RecoveryLimits): void {
@@ -418,9 +420,7 @@ export class RecoverySession {
           const receipt = await this.verifyEvent(await this.authority.checkpoint, proof, event);
           return { receipt, trust: await this.authority.checkpoint };
         } catch (e) {
-          let cause = e;
-          while (cause instanceof Nb2Error && cause.inner && !(cause instanceof SealAheadOfOrigin)) cause = cause.inner;
-          if (!refresh || (!(e instanceof Nb2Error && e.retryable) && !(cause instanceof SealAheadOfOrigin))) throw e;
+          if (!refresh || !(e instanceof Nb2Error && e.retryable)) throw e;
           const fresh = await refresh(await this.authority.checkpoint);
           await this.authority.accept(fresh, this.cfg);
           const receipt = await this.verifyEvent(await this.authority.checkpoint, proof, event);
@@ -485,7 +485,7 @@ export class RecoverySession {
       ...(!cursor && head ? [head] : []), ...gaps]);
     const shape: RecoveryShape = { entry, calldataBytes: calldata.length, operations: 0, pages: 0,
       gaps: gaps.length, receiptBytes: receipt.length, openingBytes: 0 };
-    return { shape, calldata, event, next, head: after };
+    return { requiredSignerEpoch: decodeUc(decodeDepositProof(receipt).uc).unicitySeal.epoch, shape, calldata, event, next, head: after };
   }
 
   /** Cut a gap suffix to the largest fitting advance. The caller retains the unconsumed suffix. */

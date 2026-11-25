@@ -55,17 +55,14 @@ or starts at segment zero when the vault has never sealed.
 
 ```sh
 npm exec -- tsx packages/native-bridge-plugin/scripts/nb2-lane-workload.ts \
-  --gamma /path/to/gamma.bin --utb /path/to/utb.cbor --origin /path/to/origin.json \
+  --gamma /path/to/gamma.bin --utb /path/to/utb.cbor \
   --root /path/to/held.nb2l \
   --owner /path/to/owner-key.hex --recipient 0x0000000000000000000000000000000000001234 \
   --aggregator http://127.0.0.1:8080 --history transfers-600 --output /path/to/return.nb2l
 ```
 
 History accepts `transfers-600`, `one-split-600` and `depth-20`. Supply `--build test` for a small-parameter
-development vault and `--seal /path/to/seal.cbor` for an authenticated nonzero starting index. The origin file comes from the authenticated deployment or registry checkpoint channel and contains decimal strings
-`usableEpoch` and `rootRound`. The producer reserves the output up front and keeps its journal beside it in
-`<output>.journal/`. Rerun with the same workload and output after an interruption. When a certificate is ahead of the held checkpoint, the producer reloads the origin and UTB files
-and rechecks the pending proof without sending another request. Update those files through the authenticated
-checkpoint channel. The producer waits up to two minutes per authority check, then leaves the journal ready
+development vault and `--seal /path/to/seal.cbor` for an authenticated nonzero starting index. The producer reserves the output up front and keeps its journal beside it in
+`<output>.journal/`. Rerun with the same workload and output after an interruption. When a certificate needs a newer signer epoch, the producer reloads the pinned UTB history and rechecks the pending proof without sending another request. Update the UTB file from an authenticated history source. The producer waits up to two minutes per authority check, then leaves the journal ready
 to resume. It checks destination ownership again before publishing. The producer prints the verdict and the exact signed mint and transfer byte totals per level. Both SDK extensions accept
 the resulting flat evidence. The online wallet's recovery fee qualification is tracked under NB2-C T5 and T6.

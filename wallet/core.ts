@@ -33,7 +33,7 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, Nb2Error, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
+  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, PRODUCTION_TRUST_FRESHNESS_MS, TESTNET_TRUST_FRESHNESS_MS, Nb2Error, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
   freshMask, localOwner, transferRequest, verifyHeld,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
   type ReturnRecord,
@@ -41,8 +41,8 @@ import {
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { transferProofLimit } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
-import { isCertificationTrustPending, isSealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
-import { TrustInput, type AuthenticatedOrigin } from '../packages/native-bridge-plugin/src/trust.js';
+import { isCertificationTrustPending } from '../packages/native-bridge-plugin/src/nb2/trust.js';
+import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
 import { hasPeerComplete, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
@@ -91,30 +91,8 @@ export interface Connection {
   /** the trust-base bundle and its genesis EntryID pin, published beside the manifest */
   trustBundle: string;
   trustPin: string;
-  /** Operator-authenticated evaluation checkpoint file. Defaults to trust.origin in the release. */
-  trustOrigin?: string;
-  /** the gateway's JSON-RPC URL and its aggregator route */
   rpc: string;
   aggregator: string;
-}
-
-/** Parse an origin supplied through the trusted deployment channel. */
-export function parseAuthenticatedOrigin(document: unknown): AuthenticatedOrigin {
-  const origin = document as { usableEpoch?: unknown; rootRound?: unknown } | null | undefined;
-  const uint = /^(0|[1-9][0-9]*)$/;
-  if (!origin || typeof origin.usableEpoch !== 'string' || !uint.test(origin.usableEpoch)
-    || typeof origin.rootRound !== 'string' || !uint.test(origin.rootRound)) {
-    throw new Error('the authenticated B1 origin requires decimal strings usableEpoch and rootRound');
-  }
-  return { usableEpoch: BigInt(origin.usableEpoch), rootRound: BigInt(origin.rootRound) };
-}
-
-function newerOrigin(held: AuthenticatedOrigin, offered: AuthenticatedOrigin): AuthenticatedOrigin {
-  if (offered.usableEpoch <= held.usableEpoch && offered.rootRound <= held.rootRound) return held;
-  if (offered.usableEpoch < held.usableEpoch || offered.rootRound < held.rootRound) {
-    throw new WalletError('TrustInput', 'inconsistent authenticated origin');
-  }
-  return offered;
 }
 
 /** config.json of a wallet directory: the connection, and where the secret comes from. */
@@ -124,7 +102,7 @@ export interface WalletConfig extends Connection {
 }
 
 /** A connection with the manifest's neighbours as defaults: the bundle and pin the manifest names, the gateway's /aggregator route. */
-export function connectionOf(o: { release: string; rpc: string; trustBundle?: string; trustPin?: string; trustOrigin?: string; aggregator?: string }): Connection {
+export function connectionOf(o: { release: string; rpc: string; trustBundle?: string; trustPin?: string; aggregator?: string }): Connection {
   const release = resolve(o.release);
   const m = JSON.parse(readFileSync(release, 'utf8')) as { trust?: { bundle?: string } };
   const here = dirname(release);
@@ -132,7 +110,6 @@ export function connectionOf(o: { release: string; rpc: string; trustBundle?: st
     release,
     trustBundle: resolve(o.trustBundle ?? join(here, m.trust?.bundle ?? 'trust-base.bundle.cbor')),
     trustPin: resolve(o.trustPin ?? join(here, 'trust-base.genesis.entryid')),
-    ...(o.trustOrigin ? { trustOrigin: resolve(o.trustOrigin) } : {}),
     rpc: o.rpc,
     aggregator: o.aggregator ?? `${o.rpc.replace(/\/+$/, '')}/aggregator`,
   };
@@ -325,6 +302,7 @@ export class GatewayAggregator {
 const tag = (s: string): Uint8Array => new TextEncoder().encode(s);
 
 export interface OpenOptions {
+  trustFreshnessMs?: number;
   /** run the installation check (chain ID, config() = Γ, the vault's runtime code hash); default true */
   check?: boolean;
   /** take the wallet directory's exclusive lock (lockWallet); default true. The lane runs one command at a time and opts out. */
@@ -420,26 +398,31 @@ export class Wallet {
    * Open the plug-in: the wallet lock, the held trust (the shipped bundle under its pin, extended by the wallet's own history), the journal,
    * the backup of the intent high-water mark, the trust refresh through the gateway's trust-base pages, and the installation check.
    */
-  private readOrigin(): AuthenticatedOrigin {
-    const origin = this.conn.trustOrigin ? JSON.parse(readFileSync(this.conn.trustOrigin, 'utf8')) :
-      (this.release.trust as { origin?: unknown } | undefined)?.origin;
-    return parseAuthenticatedOrigin(origin);
-  }
-
   private source!: ITrustBaseSource;
   private get authorityFile(): string { return join(this.dir, 'recovery-authority.json'); }
 
   /** These entries were locally authenticated when saved. Replay them under the shipped pin on reopen. */
   public async persistAuthority(trust: TrustInput): Promise<void> {
-    const origin = trust.origin!;
-    writeDurable(this.authorityFile, JSON.stringify({ usableEpoch: String(origin.usableEpoch), rootRound: String(origin.rootRound),
-      entries: trust.history.entries.map((entry) => hx(entry.encode())) }));
+    writeDurable(this.authorityFile, JSON.stringify({ entries: trust.history.entries.map((entry) => hx(entry.encode())) }));
   }
 
-  public async refreshAuthority(): Promise<TrustInput> {
-    const fresh = newerOrigin(this.trust.origin!, this.readOrigin());
-    const next = (await this.trust.snapshot()).withAuthenticatedOrigin(fresh);
-    await refreshAll(next, this.source, 64, () => undefined);
+  private refreshingAuthority?: Promise<TrustInput>;
+
+  public refreshAuthority(): Promise<TrustInput> {
+    return this.refreshingAuthority ??= this.syncAuthority().finally(() => { this.refreshingAuthority = undefined; });
+  }
+
+  private async syncAuthority(): Promise<TrustInput> {
+    const next = await this.trust.snapshot();
+    try {
+      await refreshAll(next, this.source, 64, () => undefined, AbortSignal.timeout(15_000));
+    } catch (error) {
+      if (next.history.tip!.epoch > this.trust.history.tip!.epoch) {
+        await this.persistAuthority(next);
+        this.trust = next;
+      }
+      throw error;
+    }
     try {
       await this.persistAuthority(next);
     } catch (e) {
@@ -462,14 +445,10 @@ export class Wallet {
       this.trust = held;
     }
     const saved = existsSync(this.authorityFile) ? JSON.parse(readFileSync(this.authorityFile, 'utf8')) as {
-      usableEpoch: string; rootRound: string; entries: string[];
+      entries: string[];
     } : undefined;
-    const offered = this.readOrigin();
-    const origin = saved ? newerOrigin(parseAuthenticatedOrigin(saved), offered) : offered;
     if (saved) for (const entry of saved.entries) await this.trust.history.append(RootTrustBaseV2.decode(unhex(entry)));
-    this.trust = this.trust.withAuthenticatedOrigin(origin);
-    if (saved?.usableEpoch !== String(origin.usableEpoch) || saved?.rootRound !== String(origin.rootRound) ||
-      saved?.entries.length !== this.trust.history.entries.length) await this.persistAuthority(this.trust);
+    if (saved?.entries.length !== this.trust.history.entries.length) await this.persistAuthority(this.trust);
     this.source = opts.trustSource ?? new AggregatorClient(this.conn.aggregator);
     const http = new HttpJsonRpc(this.conn.rpc, { retries: 20, timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);
@@ -480,6 +459,9 @@ export class Wallet {
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
       backup: async (intents) => writeDurable(join(this.dir, 'backup.json'), JSON.stringify(intents)),
       refreshTrust: () => this.refreshAuthority(),
+      unsafeTestTrust: !!opts.rpc,
+      trustFreshnessMs: opts.trustFreshnessMs ?? (opts.rpc ? undefined :
+        this.release.status === 'testnet-provisional' ? TESTNET_TRUST_FRESHNESS_MS : PRODUCTION_TRUST_FRESHNESS_MS),
       receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
     }, opts.check ?? true);
     return this;
@@ -648,7 +630,7 @@ export async function transfer(w: Wallet, from: string, to: string, owner: numbe
   const tx = unhex(p.tx);
   const verify = async (proof: Uint8Array, heldOnly = false) => {
     const token = appendTransfer(w.token(p.from), tx, proof);
-    if (heldOnly) await verifyHeld(w.bridge.cfg, w.bridge.domain, w.trust, decodeToken(token));
+    if (heldOnly) await w.bridge.verifyWithTrust((trust) => verifyHeld(w.bridge.cfg, w.bridge.domain, trust, decodeToken(token)), false);
     else await w.bridge.verifyToken(token);
     return token;
   };
@@ -656,8 +638,8 @@ export async function transfer(w: Wallet, from: string, to: string, owner: numbe
   let rejected = false;
   if (p.proof !== undefined) {
     try { t = await verify(unhex(p.proof), recoverProof); } catch (error) {
-      if (!(error instanceof Nb2Error) || error.retryable || (isSealAheadOfOrigin(error) && !recoverProof)) throw error;
-      rejected = !isSealAheadOfOrigin(error);
+      if (!(error instanceof Nb2Error) || (isCertificationTrustPending(error) && !recoverProof)) throw error;
+      rejected = !isCertificationTrustPending(error);
     }
   }
   if (t === undefined) {
@@ -772,8 +754,8 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
  * The deployed verifier reports QuorumNotMet for both a seal awaiting import and an invalid quorum. Only the
  * vault's wrapped refusal is eligible for the bounded seal-import wait.
  */
-export function isRegistryLag(e: unknown): e is Nb2Error {
-  return e instanceof Nb2Error && e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet';
+export function isRegistryLag(e: unknown): e is Nb2Error | WalletError {
+  return e instanceof WalletError && e.reason === 'ImportLag' || e instanceof Nb2Error && e.rule === 'VerifierRefused' && e.inner?.rule === 'QuorumNotMet';
 }
 
 /** How long a redemption waits out the registry lag (#1125) before it reports the refusal. */
@@ -782,7 +764,7 @@ export const REGISTRY_LAG_MS = 120_000;
 /** The refusal of a redemption that waited out REGISTRY_LAG_MS: the burn is intact, and `redeem` can run again. */
 export class RegistryLagExpired extends Error {
   public constructor(public readonly label: string, public readonly refusal: unknown) {
-    super(`the deployed verifier still answers QuorumNotMet after ${REGISTRY_LAG_MS / 1000} s (bft-core#1125). The burn is intact: run redeem ${label} again later. If it persists, the certificate may really lack its quorum: report it`);
+    super(`the B1 registry is still unavailable for this return after ${REGISTRY_LAG_MS / 1000} s (bft-core#1125). The burn is intact: run redeem ${label} again later. If it persists, the certificate may really lack its quorum: report it`);
   }
 }
 
@@ -797,7 +779,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
   const started = performance.now();
   const deadline = started + REGISTRY_LAG_MS;
   let r: ReconcileResult;
-  let lastRefusal: Nb2Error | undefined;
+  let lastRefusal: Nb2Error | WalletError | undefined;
   for (;;) {
     if (lastRefusal !== undefined) {
       const remaining = deadline - performance.now();
@@ -810,7 +792,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
       if (lastRefusal === undefined && performance.now() < deadline) {
-        note('the verifier answers QuorumNotMet: waiting for possible seal registry lag (#1125)');
+        note(e instanceof WalletError ? 'waiting for B1 registry import' : 'waiting for possible seal registry lag');
       }
       lastRefusal = e;
     }
@@ -835,9 +817,9 @@ export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPo
 export async function receive(w: Wallet, label: string, token: Uint8Array, owner: number): Promise<string> {
   w.checkNewName(label);
   const snapshot = Uint8Array.from(token);
-  const held = await w.bridge.verifyToken(snapshot);
-  if (!held.owner || !eq(held.owner, w.ownerPub(owner))) throw new Error('the verified token belongs to another owner');
   const headroom = await returnHeadroom(w, snapshot);
+  const held = await w.bridge.verifyReceivedToken(snapshot);
+  if (!held.owner || !eq(held.owner, w.ownerPub(owner))) throw new Error('the verified token belongs to another owner');
   w.keep(label, snapshot, owner, { amount: String(held.amount) });
   return headroom;
 }

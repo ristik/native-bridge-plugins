@@ -22,7 +22,7 @@ import {
   TOPIC, decodeDepositProof, decodeReceiptBacking, depositIntentSecret, depositSalt, encodeReceiptBacking, firstOwnerOf, rhoOf, verifyDepositEvidence, verifyReceiptLog,
 } from './deposit.js';
 import { Nb2Error, WalletError, fail, refuse } from './errors.js';
-import { decodeSignedTx, signTx, type EvmSigner, type SignedTx, type TxRequest } from './evm.js';
+import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, type TxRequest } from './evm.js';
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
@@ -37,7 +37,7 @@ import { MAX_MINT_PROOF, encodeToken, decodeToken, burnPredicate, signaturePredi
 import {
   appendTransfer, certifyChecked, headOf, childMint, freshMask, mintRequest, splitPlan, tokenOfChild, tokenOfMint, transferProofLimit, transferRequest, type Aggregator, type OwnerSigner,
 } from './tokenops.js';
-import { bindTrust, isCertificationTrustPending, isSealAheadOfOrigin, verifyEvmUc, type TrustInput } from './trust.js';
+import { bindTrust, decodeUc, isCertificationTrustPending, verifyEvmUc, type TrustInput } from './trust.js';
 import { burnTransitionId, decodeEvidence, encodeReturnData, evidenceOf, redemptionId, verifyHeld, verifyPart, verifySplit, type Verdict } from './verify.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -83,12 +83,24 @@ export interface BridgeOptions {
    * receipt or a token refused with the retryable NoEntryForEpoch is retried once after it; it is never treated as invalid.
    */
   refreshTrust?: () => Promise<TrustInput | void>;
+  /** Required freshness window for a wallet using its configured live UTB source. */
+  trustFreshnessMs?: number;
+  /** Only for local fixtures that use an old verifier or have no live UTB source. */
+  unsafeTestTrust?: boolean;
+  /** Monotonic elapsed time. A new session starts stale because elapsed time across restarts is uncertain. */
+  trustClock?: () => number;
   /** Receipt polling. */
   receiptTimeoutMs?: number;
   pollMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
+
+/** SHA-256 of the revision-2 NB2 semantic descriptor shipped by bft-core#1299. */
+export const IMPORTED_TIP_PROFILE_HASH = '63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e';
+
+export const TESTNET_TRUST_FRESHNESS_MS = 15 * 60_000;
+export const PRODUCTION_TRUST_FRESHNESS_MS = 7 * 24 * 60 * 60_000;
 
 export const DEFAULT_KEY_SCHEME = 'nb2-hmac-sha256-v1';
 
@@ -97,7 +109,7 @@ export const deriveBridgeKey = (seed: Uint8Array): Uint8Array => hmac(sha256, se
 
 export interface DepositPlan { intent: bigint; amount: bigint; rho: Uint8Array; firstOwner: Uint8Array; calldata: Uint8Array; record: DepositRecord }
 
-/** Ask for a verified alternative when the exact signed request holds an ahead proof. */
+/** Ask for a verified alternative when the exact signed request holds a proof awaiting history. */
 export interface ProofRecoveryOptions { recoverProof?: boolean }
 
 export interface ReturnPlan {
@@ -183,6 +195,9 @@ export class NativeBridgeV2 {
   private readonly locks = new Map<string, Promise<unknown>>();
   /** Whether the gas model applies to this deployment (checked once, from its runtime codes and native gas schedule). */
   private gasFits: boolean | null = null;
+  private lastTrustSync?: number;
+  private trustSuspended = false;
+  private refreshingTrust?: Promise<void>;
 
   private constructor(options: BridgeOptions) {
     const { bridgeKey, ...opts } = options;
@@ -190,6 +205,13 @@ export class NativeBridgeV2 {
     this.cfg = decodeConfig(opts.pins.gamma, buildParams(opts.pins.build));
     this.domain = domainOf(opts.pins.gamma);
     bindTrust(opts.trust, this.cfg);
+    if (!opts.unsafeTestTrust && toHex(this.cfg.semanticProfileHash) !== IMPORTED_TIP_PROFILE_HASH) {
+      refuse('BadDeployment', 'the wallet requires the paired imported-tip NB2 semantic profile');
+    }
+    if (!opts.unsafeTestTrust) opts.trustFreshnessMs ??= PRODUCTION_TRUST_FRESHNESS_MS;
+    if (opts.trustFreshnessMs !== undefined && (!Number.isFinite(opts.trustFreshnessMs) || opts.trustFreshnessMs <= 0)) {
+      refuse('BadInput', 'the UTB freshness window must be positive and finite');
+    }
     if (bridgeKey.length !== 32) refuse('BadInput', 'k_w is 32 bytes');
     this.#kw = bridgeKey.slice();
     if (opts.requireBackup !== false && opts.backup === undefined) refuse('BadInput', 'a backup of the intent high-water mark is required (or requireBackup: false on a test deployment)');
@@ -204,7 +226,7 @@ export class NativeBridgeV2 {
    * and its runtime code hash. These come from the RPC, which the wallet trusts here exactly as far as its manifest source.
    */
   public static async open(opts: BridgeOptions, check = true): Promise<NativeBridgeV2> {
-    const b = new NativeBridgeV2(opts);
+    const b = new NativeBridgeV2({ ...opts, trust: await opts.trust.snapshot() });
     if (check) {
       if ((await b.evm.chainId()) !== b.cfg.chainId) refuse('BadDeployment', 'the RPC serves another chain');
       if (!eq(await b.evm.vaultConfig(b.cfg.vault), opts.pins.gamma)) refuse('BadDeployment', 'the vault\'s config() is not the pinned Γ');
@@ -390,9 +412,9 @@ export class NativeBridgeV2 {
 
   /** The receipt proof and J of deposit number `n` of intent `i`, verified offline. */
   private async proveDeposit(i: bigint, tx: Uint8Array, n: bigint, amount: bigint, firstOwner: Uint8Array): Promise<{ receiptProof: Uint8Array; reason: Uint8Array }> {
-    const rp = await this.evm.receiptProof(tx, this.cfg.vault, TOPIC.Deposited);
+    const rp = await this.evm.mintReceiptProof(tx, this.cfg.vault, toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH);
     const j = { d: this.domain, n, r: this.secretOf(i), proof: rp.proof };
-    const ev = await this.retryingTrust(() => verifyDepositEvidence(this.cfg, this.domain, this.opts.trust, j));
+    const ev = await this.retryingTrust((trust) => verifyDepositEvidence(this.cfg, this.domain, trust, j));
     if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');
     return { receiptProof: rp.encoded, reason: encodeReceiptBacking(j) };
   }
@@ -406,9 +428,9 @@ export class NativeBridgeV2 {
       justification: reason, data: valueData(this.cfg.aid, amount), deadline: null,
     };
     const { tx, cd } = mintRequest(m);
-    return this.retainedCertification(cd, MAX_MINT_PROOF, saved, save, async (proof) => {
+    return this.retainedCertification(cd, MAX_MINT_PROOF, saved, save, async (proof, trust) => {
       const token = tokenOfMint(tx, proof);
-      const held = await verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token));
+      const held = await verifyHeld(this.cfg, this.domain, trust, decodeToken(token));
       if (held.amount !== amount) refuse('ProviderFault', 'the minted amount differs');
       return token;
     }, { recoverProof });
@@ -438,8 +460,9 @@ export class NativeBridgeV2 {
     const recoverProof = options?.recoverProof;
     return this.locked(`deposit/${intent}`, async () => {
       const rec = await this.depositRecord(intent);
-      if (rec.status === 'minted') return unhex(rec.token!);
+      if (rec.status === 'minted') return this.verifiedTokenBytes(unhex(rec.token!));
       if (rec.status !== 'proven') refuse('NotPending', `intent ${intent} is ${rec.status}: collect the deposit proof first`);
+      const held = this.opts.trust;
       const token = await this.mintWith(unhex(rec.reason!), unhex(rec.ownerKey), undec(rec.amount), rec.mintProof, async (proof) => {
         rec.mintProof = proof;
         await this.journal.putDeposit(rec);
@@ -450,7 +473,7 @@ export class NativeBridgeV2 {
       const mine = rec.seenDeposits?.find((x) => x.depositNumber === rec.depositNumber);
       if (mine !== undefined) mine.token = rec.token;
       await this.journal.putDeposit(rec);
-      return token;
+      return held === this.opts.trust && !this.refreshingTrust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
     });
   }
 
@@ -464,7 +487,8 @@ export class NativeBridgeV2 {
       const rec = await this.depositRecord(intent);
       const x = (rec.seenDeposits ?? []).find((s) => s.depositNumber === dec(depositNumber));
       if (x === undefined) refuse('NotPending', `no deposit number ${depositNumber} is journaled for intent ${intent}`);
-      if (x!.token !== undefined) return unhex(x!.token);
+      if (x!.token !== undefined) return this.verifiedTokenBytes(unhex(x!.token));
+      const held = this.opts.trust;
       // the entry's own first owner: another device may have deposited this rho to another key
       const firstOwner = unhex(x!.firstOwner);
       const reason = x!.reason === undefined ? (await this.proveDeposit(intent, unhex(x!.tx), depositNumber, undec(x!.amount), firstOwner)).reason : unhex(x!.reason);
@@ -477,7 +501,7 @@ export class NativeBridgeV2 {
       delete x!.reason;
       delete x!.mintProof;
       await this.journal.putDeposit(rec);
-      return token;
+      return held === this.opts.trust && !this.refreshingTrust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
     });
   }
 
@@ -519,11 +543,28 @@ export class NativeBridgeV2 {
 
   // ==== circulation =====================================================================================================
 
+  private async verifiedTokenBytes(token: Uint8Array): Promise<Uint8Array> {
+    await this.verifyToken(token);
+    return token;
+  }
+
   /** Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount, owner and spendable state. */
   public async verifyToken(token: Uint8Array): Promise<{ tokenId: Uint8Array; amount: bigint; owner: Uint8Array | null; state: Uint8Array }> {
     const part = decodeToken(token);
-    const h = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, part));
+    const h = await this.retryingTrust((trust) => verifyHeld(this.cfg, this.domain, trust, part));
     return { tokenId: h.tokenId, amount: h.amount, owner: h.owner.type === 1n ? h.owner.params : null, state: h.state };
+  }
+
+  /** Verify incoming lineage and bind its receipt to the paired RPC's canonical child. */
+  public async verifyReceivedToken(token: Uint8Array): ReturnType<NativeBridgeV2['verifyToken']> {
+    if (toHex(this.cfg.semanticProfileHash) !== IMPORTED_TIP_PROFILE_HASH) return this.verifyToken(token);
+    const part = decodeToken(Uint8Array.from(token));
+    const mint = lineageOf(part)[0].mint;
+    return this.retryingTrust(async (trust) => {
+      const held = await verifyHeld(this.cfg, this.domain, trust, part);
+      await this.evm.checkMintReceipt(decodeReceiptBacking(mint.justification!).proof);
+      return { tokenId: held.tokenId, amount: held.amount, owner: held.owner.type === 1n ? held.owner.params : null, state: held.state };
+    });
   }
 
   /** An ordinary transfer to `toKey`; the result is verified before it is returned. */
@@ -546,9 +587,9 @@ export class NativeBridgeV2 {
       return this.retainedCertification(unhex(rec.request), transferProofLimit(tx), rec.proof, async (proof) => {
         rec.proof = proof;
         await this.journal.putTransfer(rec);
-      }, async (proof) => {
+      }, async (proof, trust) => {
         const out = appendTransfer(token, tx, proof);
-        const held = await verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(out));
+        const held = await verifyHeld(this.cfg, this.domain, trust, decodeToken(out));
         if (!eq(held.owner.params, toKey)) refuse('ProviderFault', 'the certified transfer has another recipient');
         return out;
       }, { recoverProof });
@@ -597,8 +638,8 @@ export class NativeBridgeV2 {
       rec.status = 'burn-requested';
       await this.journal.putSplit(rec);
     }
-    const verifyBurn = async (burned: Uint8Array) => {
-      const split = await verifySplit(this.cfg, this.domain, this.opts.trust, decodeToken(burned));
+    const verifyBurn = async (burned: Uint8Array, trust: TrustInput) => {
+      const split = await verifySplit(this.cfg, this.domain, trust, decodeToken(burned));
       if (!eq(split.manifest, plan.tree.root)) refuse('ProviderFault', 'certified split manifest differs from the plan');
       return { burned, split };
     };
@@ -607,7 +648,7 @@ export class NativeBridgeV2 {
       const verified = await this.retainedCertification(unhex(rec.burnRequest!), transferProofLimit(tx), rec.burnProof, async (proof) => {
         rec.burnProof = proof;
         await this.journal.putSplit(rec);
-      }, (proof) => verifyBurn(appendTransfer(unhex(rec.source), tx, proof)), { recoverProof });
+      }, (proof, trust) => verifyBurn(appendTransfer(unhex(rec.source), tx, proof), trust), { recoverProof });
       rec.burned = hex(verified.burned);
       delete rec.burnProof;
       rec.status = 'burned';
@@ -619,7 +660,7 @@ export class NativeBridgeV2 {
       verified = await refreshBurn();
     } else {
       try {
-        verified = await this.retryingTrust(() => verifyBurn(unhex(rec.burned!)));
+        verified = await this.retryingTrust((trust) => verifyBurn(unhex(rec.burned!), trust));
       } catch (error) {
         // A journal from the previous verifier may have recorded an unchecked proof.
         if (rec.status !== 'burned' || !(error instanceof Nb2Error) || this.trustBehind(error) ||
@@ -628,6 +669,8 @@ export class NativeBridgeV2 {
       }
     }
     const { burned, split } = verified;
+    const held = this.opts.trust;
+    const cached = rec.outputs.some((output) => output.token !== null);
     for (let k = 0; k < rec.outputs.length; k++) {
       const output = rec.outputs[k];
       if (output.token !== null) continue;
@@ -636,9 +679,9 @@ export class NativeBridgeV2 {
       const child = await this.retainedCertification(cd, MAX_MINT_PROOF, output.mintProof, async (proof) => {
         output.mintProof = proof;
         await this.journal.putSplit(rec);
-      }, async (proof) => {
+      }, async (proof, trust) => {
         const token = tokenOfChild(burned, allocation, tx, proof);
-        const held = await verifyHeld(this.cfg, this.domain, this.opts.trust, decodeToken(token));
+        const held = await verifyHeld(this.cfg, this.domain, trust, decodeToken(token));
         if (held.amount !== undec(output.amount)) refuse('ProviderFault', 'a split child has another amount');
         return token;
       }, { recoverProof });
@@ -648,7 +691,13 @@ export class NativeBridgeV2 {
     }
     rec.status = 'minted';
     await this.journal.putSplit(rec);
-    return rec.outputs.map((o) => unhex(o.token!));
+    const children = rec.outputs.map((o) => unhex(o.token!));
+    if (cached || held !== this.opts.trust || this.refreshingTrust || this.trustStale()) {
+      await this.retryingTrust(async (trust) => {
+        for (const token of children) await verifyHeld(this.cfg, this.domain, trust, decodeToken(token));
+      });
+    }
+    return children;
   }
 
   // ==== Unicity -> EVM ==================================================================================================
@@ -658,31 +707,32 @@ export class NativeBridgeV2 {
     const log = await this.evm.newestSeal(this.cfg.vault, this.opts.pins.deploymentBlock);
     if (log === null) return null;
     const rp = await this.evm.receiptProof(log.transactionHash, this.cfg.vault, TOPIC.SegmentSealed, false, log);
-    const receipt = await this.retryingTrust(() => verifySealReceipt(this.cfg, this.domain, this.opts.trust, rp.encoded));
+    const receipt = await this.retryingTrust((trust) => verifySealReceipt(this.cfg, this.domain, trust, rp.encoded));
     return { receipt, encoded: rp.encoded };
   }
 
   private trustBehind(e: unknown): boolean {
-    return e instanceof Nb2Error && (e.retryable || isSealAheadOfOrigin(e));
+    return isCertificationTrustPending(e);
   }
 
   /** Keep a certification result through trust refresh, retry and reload. */
   private async retainedCertification<T>(request: Uint8Array, maxBytes: number, saved: string | undefined,
-    save: (proof: string) => Promise<void>, verify: (proof: Uint8Array) => Promise<T>,
+    save: (proof: string) => Promise<void>, verify: (proof: Uint8Array, trust: TrustInput) => Promise<T>,
     options: ProofRecoveryOptions & { beforeCertification?: () => Promise<void> } = {}): Promise<T> {
+    if (this.trustStale()) await this.syncTrust();
     let rejected = saved !== undefined;
     if (saved !== undefined && /^0x([0-9a-f]{2})*$/.test(saved)) {
       rejected = false;
       let replace = false;
-      const verifySaved = async () => {
-        try { return await verify(unhex(saved)); } catch (error) {
+      const verifySaved = async (trust: TrustInput) => {
+        try { return await verify(unhex(saved), trust); } catch (error) {
           rejected = error instanceof Nb2Error && !this.trustBehind(error);
-          replace = rejected || (options.recoverProof === true && isSealAheadOfOrigin(error));
+          replace = rejected || (options.recoverProof === true && isCertificationTrustPending(error));
           throw error;
         }
       };
       try {
-        return options.recoverProof ? await verifySaved() : await this.retryingTrust(verifySaved);
+        return options.recoverProof ? await this.retryingTrust(verifySaved, false) : await this.retryingTrust(verifySaved);
       } catch (error) {
         if (!replace) throw error;
       }
@@ -690,41 +740,113 @@ export class NativeBridgeV2 {
     await options.beforeCertification?.();
     const proof = await certifyChecked(this.opts.aggregator, request, maxBytes);
     if (saved !== undefined) {
-      let verified: T;
-      try { verified = await verify(proof); } catch (error) {
+      try { await this.retryingTrust((trust) => verify(proof, trust), false); } catch (error) {
         // A proof awaiting trust can still be usable. Only stage an unverified
         // replacement when the old proof was definitively rejected.
         if (!rejected || !isCertificationTrustPending(error)) throw error;
         await save(hex(proof));
-        return this.retryingTrust(() => verify(proof));
+        return this.retryingTrust((trust) => verify(proof, trust));
       }
       await save(hex(proof));
-      return verified;
+      return this.retryingTrust((trust) => verify(proof, trust), false);
     }
     await save(hex(proof));
-    return this.retryingTrust(() => verify(proof));
+    return this.retryingTrust((trust) => verify(proof, trust));
   }
 
-  /** Run `f` again after refreshing missing history or an origin behind its proof. */
-  private async retryingTrust<T>(f: () => Promise<T>): Promise<T> {
-    try {
-      return await f();
-    } catch (e) {
-      if (!this.trustBehind(e) || this.opts.refreshTrust === undefined) throw e;
-      const fresh = await this.opts.refreshTrust();
-      if (fresh) {
-        const candidate = await fresh.snapshot();
-        bindTrust(candidate, this.cfg);
-        const held = this.opts.trust;
-        const tip = held.history.tip!;
-        const match = candidate.history.entryForEpoch(tip.epoch);
-        if (!match || !eq(await match.entryId(), await tip.entryId()) ||
-          candidate.origin!.usableEpoch < held.origin!.usableEpoch || candidate.origin!.rootRound < held.origin!.rootRound) {
-          refuse('TrustInput', 'authority refresh does not extend the installed checkpoint');
-        }
-        this.opts.trust = candidate;
+  private trustNow(): number {
+    return (this.opts.trustClock ?? (() => performance.now()))();
+  }
+
+  private trustStale(): boolean {
+    if (this.opts.trustFreshnessMs === undefined) return false;
+    const now = this.trustNow();
+    return this.trustSuspended || this.lastTrustSync === undefined || !Number.isFinite(now) || now < this.lastTrustSync ||
+      now - this.lastTrustSync >= this.opts.trustFreshnessMs;
+  }
+
+  /** Synchronize through the same coalesced path used by verification. */
+  public syncTrust(): Promise<void> {
+    if (this.refreshingTrust) return this.refreshingTrust;
+    this.refreshingTrust = this.installRefreshedTrust().catch((error: unknown) => {
+      // A failed sync may have persisted a verified prefix. Suspend this session until it can install it.
+      this.trustSuspended = true;
+      throw error;
+    }).finally(() => { this.refreshingTrust = undefined; });
+    return this.refreshingTrust;
+  }
+
+  private async installRefreshedTrust(): Promise<void> {
+    const start = this.trustNow();
+    const offered = await this.opts.refreshTrust?.();
+    if (!offered) {
+      if (this.opts.trustFreshnessMs !== undefined) refuse('TrustInput', 'a successful UTB sync must return authenticated history');
+      return;
+    }
+    const candidate = await offered.snapshot();
+    bindTrust(candidate, this.cfg);
+    const held = this.opts.trust;
+    const tip = held.history.tip!;
+    const match = candidate.history.entryForEpoch(tip.epoch);
+    if (!match || !eq(await match.entryId(), await tip.entryId())) {
+      refuse('TrustInput', 'authority refresh does not extend the installed history');
+    }
+    const key = this.journal.prefix + 'trust-sync';
+    const previous = await this.journal.store.get(key);
+    if (previous !== null) {
+      let saved: { domain?: unknown; genesis?: unknown; tipEpoch?: unknown; tipId?: unknown } | null;
+      try { saved = JSON.parse(previous); } catch { saved = null; }
+      if (saved?.domain !== hex(this.domain) || saved.genesis !== hex(candidate.id)
+          || typeof saved.tipEpoch !== 'string' || !/^[1-9][0-9]{0,19}$/.test(saved.tipEpoch)) {
+        refuse('TrustInput', 'invalid durable UTB checkpoint');
       }
-      return f();
+      const entry = candidate.history.entryForEpoch(BigInt(saved.tipEpoch));
+      if (!entry || hex(await entry.entryId()) !== saved.tipId) {
+        refuse('TrustInput', 'authority refresh does not extend the durable history');
+      }
+    }
+    if (this.opts.trustFreshnessMs !== undefined || previous !== null) {
+      const stamp = this.trustNow();
+      if (!Number.isFinite(start) || !Number.isFinite(stamp) || start < 0 || stamp < start || (this.lastTrustSync !== undefined && start < this.lastTrustSync)) {
+        this.lastTrustSync = undefined;
+        refuse('TrustInput', 'the UTB sync clock is uncertain');
+      }
+      const end = candidate.history.tip!;
+      const record = JSON.stringify({
+        domain: hex(this.domain), genesis: hex(candidate.id), tipEpoch: String(end.epoch), tipId: hex(await end.entryId()), syncedAt: Date.now(),
+      });
+      if (!await this.journal.store.putIf(key, previous, record)) refuse('JournalConflict', 'the UTB sync record changed');
+      this.lastTrustSync = start;
+    }
+    this.opts.trust = candidate;
+    this.trustSuspended = false;
+  }
+
+  /** Apply wallet freshness and pinning to verification of wallet-managed journal evidence. */
+  public verifyWithTrust<T>(verify: (trust: TrustInput) => Promise<T>, refreshOnMissing = true): Promise<T> {
+    return this.retryingTrust(verify, refreshOnMissing);
+  }
+
+  /** Verify one decision against a held snapshot, repeating if another decision installed its successor. */
+  private async retryingTrust<T>(f: (trust: TrustInput) => Promise<T>, refreshOnMissing = true): Promise<T> {
+    if (this.refreshingTrust) await this.refreshingTrust;
+    if (this.trustStale()) await this.syncTrust();
+    let refreshed = false;
+    for (;;) {
+      if (this.trustStale()) refuse('TrustSyncRequired', 'the UTB freshness window elapsed before verification');
+      const held = this.opts.trust;
+      try {
+        const result = await f(held);
+        if (this.refreshingTrust) await this.refreshingTrust;
+        if (held !== this.opts.trust) continue;
+        if (this.trustStale()) refuse('TrustSyncRequired', 'the UTB freshness window elapsed before publication');
+        return result;
+      } catch (error) {
+        if (held !== this.opts.trust) continue;
+        if (refreshed || !refreshOnMissing || !this.trustBehind(error) || !this.opts.refreshTrust) throw error;
+        refreshed = true;
+        await this.syncTrust();
+      }
     }
   }
 
@@ -758,7 +880,7 @@ export class NativeBridgeV2 {
     const returnId = HU(token);
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const part = decodeToken(token);
-      const held = await this.retryingTrust(() => verifyHeld(this.cfg, this.domain, this.opts.trust, part));
+      const held = await this.retryingTrust((trust) => verifyHeld(this.cfg, this.domain, trust, part));
       this.checkReturnRecipient(recipient);
       const warnings: string[] = [];
       if ((await this.evm.code(recipient)).length > 0) warnings.push('the recipient is a contract: a payout it refuses strands the burn (simulation is not a guarantee)');
@@ -866,7 +988,7 @@ export class NativeBridgeV2 {
   }
 
   private async verifyReturnAnchor(rec: ReturnRecord): Promise<void> {
-    const seal = rec.sealReceipt ? await this.retryingTrust(() => verifySealReceipt(this.cfg, this.domain, this.opts.trust, unhex(rec.sealReceipt!))) : null;
+    const seal = rec.sealReceipt ? await this.retryingTrust((trust) => verifySealReceipt(this.cfg, this.domain, trust, unhex(rec.sealReceipt!))) : null;
     const anchor = burnIndex(this.cfg, this.domain, seal);
     if (anchor.a !== undec(rec.a) || !eq(anchor.startHead, unhex(rec.startHead)) ||
       undec(rec.fromBlock) !== (seal?.blockNumber ?? this.opts.pins.deploymentBlock)) {
@@ -918,7 +1040,7 @@ export class NativeBridgeV2 {
         !eq(appendTransfer(unhex(source), unhex(rec.burnTx!), encodeProof(final)), burned)) {
         refuse('BadInput', 'certified backup terminal does not extend the exact signed request');
       }
-      const verdict = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
+      const verdict = await this.retryingTrust((trust) => verifyPart(this.cfg, this.domain, trust, part));
       verified.status = 'burned';
       verified.burned = hex(burned);
       if (hex(verdict.eta) !== eta) refuse('BadInput', 'terminal disagrees with the signed redemption ID');
@@ -1022,7 +1144,7 @@ export class NativeBridgeV2 {
     }
     const burned = unhex(rec.burned!);
     const part = decodeEvidence(evidenceOf(burned));
-    const verdict = await this.retryingTrust(() => verifyPart(this.cfg, this.domain, this.opts.trust, part));
+    const verdict = await this.retryingTrust((trust) => verifyPart(this.cfg, this.domain, trust, part));
     return { burned, eta: verdict.eta, verdict };
   }
 
@@ -1031,9 +1153,9 @@ export class NativeBridgeV2 {
     const { burned, v } = await this.retainedCertification(unhex(rec.burnRequest!), transferProofLimit(tx), rec.burnProof, async (proof) => {
       rec.burnProof = proof;
       await this.journal.putReturn(rec);
-    }, async (proof) => {
+    }, async (proof, trust) => {
       const burned = appendTransfer(unhex(rec.source), tx, proof);
-      const v = await verifyPart(this.cfg, this.domain, this.opts.trust, decodeEvidence(evidenceOf(burned)));
+      const v = await verifyPart(this.cfg, this.domain, trust, decodeEvidence(evidenceOf(burned)));
       if (v.minSegment !== undec(rec.a) || v.amount !== undec(rec.amount) || !eq(v.recipient, unhex(rec.recipient))) refuse('ProviderFault', 'the certified burn is not the planned one');
       if (rec.eta !== undefined && rec.eta !== hex(v.eta)) refuse('JournalConflict', 'certified burn does not match the journaled redemption ID');
       return { burned, v };
@@ -1136,24 +1258,45 @@ export class NativeBridgeV2 {
     const payer = fresh.executionPayer ? unhex(fresh.executionPayer) : first?.from;
     const different = payer && !eq(payer, signer.address);
     const pending = { recovery: options.recovery };
-    const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending });
+    let expired: TxRequest | undefined;
+    let pooled = false;
+    const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending },
+      different ? undefined : (request, underpriced) => { expired = request; pooled = underpriced; });
     if (prior.state === 'paid' || prior.state === 'needs-archive') return prior;
     if (different) return { state: 'route-blocked', route: 'ordinary', txHash: first?.hash ?? returnId, payer };
     if (prior.state !== 'not-paid') return prior;
     let gasBump = 1n;
     for (let attempt = 0; attempt < 4; attempt++) {
       this.requireRedeemable(fresh);
-      const competing = await this.settlementGate(fresh, archives, options.recovery);
+      const superseded = expired ? fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce).map((send) => unhex(send.hash)) : [];
+      const competing = await this.settlementGate(fresh, archives, options.recovery, undefined, superseded);
       if (competing) return competing;
-      const rtx = await this.buildRedeemInner(fresh, options.envelope);
+      let rtx: RedeemTx;
+      try {
+        rtx = await this.buildRedeemInner(fresh, options.envelope);
+      } catch (error) {
+        // A latest-state estimate can refuse a missing epoch before the finalized preflight runs.
+        if (error instanceof Nb2Error && error.rule === 'VerifierRefused') await this.checkOrdinaryImport(fresh);
+        throw error;
+      }
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
-        options.admit && ((request) => options.admit!(request, fresh.sends)));
+        options.admit && ((request) => options.admit!(request, fresh.sends)), expired && {
+          nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
+            .map((send) => decodeSignedTx(unhex(send.raw)).request),
+        });
+      // Until the exact call passes preflight it has never been broadcast. Leave
+      // the burn rebuildable, including its history and route, on any refusal.
+      await this.checkOrdinaryImport(fresh, tx.raw);
+      if (expired && await this.evm.nonce(signer.address, 'latest') !== tx.request.nonce) {
+        return { state: 'pending', txHash: unhex(fresh.sends.at(-1)!.hash) };
+      }
       fresh.executionPayer ??= hex(signer.address);
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.blockNumber());
       await this.journal.putReturn(fresh);
+      expired = undefined;
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
       const outcome = await this.reconcileRecord(fresh, archives, { readOnly: true, pending });
@@ -1187,26 +1330,38 @@ export class NativeBridgeV2 {
     return this.locked(`return/${toHex(returnId)}`, () => this.reconcileInner(returnId, archives, evidence));
   }
 
+  /** Check whether the same payer can use an expired ordinary send's free nonce for continuation. */
+  public expiredOrdinaryNonce(returnId: Uint8Array, payer: Uint8Array, archives: readonly EvmReader[]): Promise<bigint | undefined> {
+    return this.locked(`return/${toHex(returnId)}`, async () => {
+      const rec = await this.returnRecord(returnId);
+      const last = rec.sends.at(-1);
+      if (!last || !eq(decodeSignedTx(unhex(last.raw)).from, payer)) return;
+      let nonce: bigint | undefined;
+      const result = await this.reconcileRecord(rec, archives, { readOnly: true }, (request) => { nonce = request.nonce; });
+      if (result.state === 'not-paid' && nonce !== undefined && await this.evm.nonce(payer) === nonce) return nonce;
+    });
+  }
+
   /** A final read-only check before signing a new settlement. */
-  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array, observed?: Uint8Array): Promise<ReconcileResult> {
+  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array, observed?: Uint8Array, replacing: readonly Uint8Array[] = []): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const rec = await this.returnRecord(returnId);
       if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
       if (!rec.eta) return { state: 'not-paid' };
-      return (await this.settlementGate(rec, archives, recovery, observed)) ?? { state: 'not-paid' };
+      return (await this.settlementGate(rec, archives, recovery, observed, replacing)) ?? { state: 'not-paid' };
     });
   }
 
   private async settlementGate(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array,
-    observed?: Uint8Array): Promise<ReconcileResult | undefined> {
+    observed?: Uint8Array, replacing: readonly Uint8Array[] = []): Promise<ReconcileResult | undefined> {
     const pending = await this.pendingSettlements(rec, archives, recovery);
     const settlements = [...pending.values()].filter((hash) => !observed || !eq(hash, observed));
     if (observed) settlements.unshift(observed);
-    const proof = await this.findPaid(rec, archives, true, { settlements });
+    const proof = await this.findPaid(rec, archives, true, { settlements: [...settlements, ...replacing] });
     if (proof) return proof;
     for (const hash of settlements) {
-      if (pending.has(hex(hash)) && !(await this.exactFailure(hash, archives)).failed) {
+      if (pending.has(hex(hash)) && !replacing.some((prior) => eq(prior, hash)) && !(await this.exactFailure(hash, archives)).failed) {
         return { state: 'pending', txHash: hash };
       }
     }
@@ -1228,7 +1383,7 @@ export class NativeBridgeV2 {
         let matches = eq(calldata.subarray(0, 4), SELECTOR.redeem) && eq(calldata.subarray(36, 68), eta);
         if (!matches && recovery) {
           try {
-            const claimed = await recoveredSettlementEta(this.cfg, this.domain, this.opts.trust, recovery, calldata);
+            const claimed = await this.retryingTrust((trust) => recoveredSettlementEta(this.cfg, this.domain, trust, recovery, calldata));
             matches = claimed !== undefined && eq(claimed, eta);
           } catch {
             // A malformed or unverified pending call supplies no evidence.
@@ -1244,7 +1399,7 @@ export class NativeBridgeV2 {
     return this.reconcileRecord(await this.returnRecord(returnId), archives, evidence);
   }
 
-  private async reconcileRecord(rec: ReturnRecord, archives: readonly EvmReader[], evidence?: ReturnEvidence): Promise<ReconcileResult> {
+  private async reconcileRecord(rec: ReturnRecord, archives: readonly EvmReader[], evidence?: ReturnEvidence, onExpired?: (tx: TxRequest, underpriced: boolean) => void): Promise<ReconcileResult> {
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
     if (rec.status === 'burn-requested') {
       const eta = hex(await this.validatePendingReturn(rec));
@@ -1252,7 +1407,7 @@ export class NativeBridgeV2 {
     }
     if (rec.eta === undefined) return { state: 'not-paid' };
     const paid = await this.findPaid(rec, archives, true, evidence);
-    return paid ?? this.reconcileSend(rec, archives, evidence?.readOnly !== true);
+    return paid ?? this.reconcileSend(rec, archives, evidence?.readOnly !== true, onExpired);
   }
 
   private async findPaid(rec: ReturnRecord, archives: readonly EvmReader[], persist = true, evidence?: ReturnEvidence): Promise<ReconcileResult | undefined> {
@@ -1352,24 +1507,39 @@ export class NativeBridgeV2 {
     if (!available && unavailable) throw unavailable;
   }
 
-  /** A return may sign again only after authenticating failure of its last exact send. */
-  private async reconcileSend(rec: ReturnRecord, archives: readonly EvmReader[], resubmit: boolean): Promise<ReconcileResult> {
+  /** Before signing again, reconcile the exact send. A finalized stale call may only be replaced at its unused nonce. */
+  private async reconcileSend(rec: ReturnRecord, archives: readonly EvmReader[], resubmit: boolean, onExpired?: (tx: TxRequest, underpriced: boolean) => void): Promise<ReconcileResult> {
     const send = rec.sends.at(-1);
     if (!send) return { state: 'not-paid' };
     const raw = unhex(send.raw);
-    const { hash: txHash } = decodeSignedTx(raw);
-    if (hex(txHash) !== send.hash) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
-    if (send.failed) {
-      if (send.failed.txHash !== hex(txHash) || unhex(send.failed.blockHash).length !== 32) refuse('BadInput', 'certified failure disagrees with its signed transaction');
-      return { state: 'not-paid' };
+    const { hash: txHash, from, request } = decodeSignedTx(raw);
+    if (hex(txHash) !== send.hash || request.nonce !== undec(send.nonce)) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
+    // A certified failure of any replacement at this nonce rules out all the others.
+    const sameNonce = rec.sends.filter((prior) => prior.nonce === send.nonce).reverse();
+    let evidence: { seen: boolean; pruned: boolean; attempted: boolean } | undefined;
+    for (const prior of sameNonce) {
+      const signed = decodeSignedTx(unhex(prior.raw));
+      if (!eq(signed.from, from) || signed.request.nonce !== request.nonce || hex(signed.hash) !== prior.hash) {
+        refuse('BadInput', 'ordinary replacement disagrees with its signed transaction');
+      }
+      if (prior.failed) {
+        if (prior.failed.txHash !== prior.hash || unhex(prior.failed.blockHash).length !== 32) refuse('BadInput', 'certified failure disagrees with its signed transaction');
+        return { state: 'not-paid' };
+      }
+      const outcome = await this.exactFailure(signed.hash, archives);
+      if (outcome.failed) {
+        prior.failed = outcome.failed;
+        delete send.failureProofReads;
+        await this.journal.putReturn(rec);
+        return { state: 'not-paid' };
+      }
+      evidence = {
+        seen: Boolean(evidence?.seen || outcome.seen),
+        pruned: Boolean(evidence?.pruned || outcome.pruned),
+        attempted: Boolean(evidence?.attempted || outcome.attempted),
+      };
     }
-    const { seen, pruned, attempted, failed } = await this.exactFailure(txHash, archives);
-    if (failed) {
-      send.failed = failed;
-      delete send.failureProofReads;
-      await this.journal.putReturn(rec);
-      return { state: 'not-paid' };
-    }
+    const { seen, pruned, attempted } = evidence!;
     if (attempted || send.failureProofReads !== undefined) {
       const reads = pruned ? FAILURE_PROOF_READS : Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
       if (reads !== send.failureProofReads) {
@@ -1378,11 +1548,47 @@ export class NativeBridgeV2 {
       }
     }
     if (send.failureProofReads === FAILURE_PROOF_READS) return { state: 'needs-archive', txHash };
-    if (!seen && resubmit && send.failureProofReads === undefined) {
-      try { await this.evm.sendRaw(raw); }
-      catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
+    if (!seen && (resubmit || onExpired) && send.failureProofReads === undefined) {
+      try { await this.checkOrdinaryImport(rec, raw); }
+      catch (error) {
+        if (!(error instanceof Nb2Error) || error.rule !== 'StaleEndpoint') throw error;
+        if (onExpired && await this.evm.nonce(from, 'latest') === request.nonce) {
+          onExpired(request, false);
+          return { state: 'not-paid' };
+        }
+        return { state: 'pending', txHash };
+      }
+      if (resubmit) {
+        try { await this.evm.sendRaw(raw); }
+        catch (error) {
+          if (onExpired && error instanceof RpcError && /replacement transaction underpriced/i.test(error.message) &&
+              await this.evm.nonce(from, 'latest') === request.nonce) {
+            onExpired(request, true);
+            return { state: 'not-paid' };
+          }
+          if (!(error instanceof AmbiguousBroadcast)) throw error;
+        }
+      }
     }
     return { state: 'pending', txHash };
+  }
+
+  private async checkOrdinaryImport(rec: ReturnRecord, raw?: Uint8Array): Promise<void> {
+    const part = decodeToken(unhex(rec.burned!));
+    const tx = raw && decodeSignedTx(raw);
+    await this.retryingTrust(async (trust) => {
+      await verifyPart(this.cfg, this.domain, trust, part);
+      const lineage = lineageOf(part);
+      const receipt = decodeReceiptBacking(lineage[0].mint.justification!).proof.uc;
+      let epoch = decodeUc(receipt).unicitySeal.epoch;
+      for (const level of lineage) {
+        for (const proof of [level.mintProof, ...level.proofs]) {
+          const signer = decodeUc(proof.uc).unicitySeal.epoch;
+          if (signer > epoch) epoch = signer;
+        }
+      }
+      await this.evm.checkReturnImport(this.cfg, epoch, tx && { ...tx.request, from: tx.from });
+    });
   }
 
   private async exactFailure(txHash: Uint8Array, archives: readonly EvmReader[]) {
@@ -1396,7 +1602,7 @@ export class NativeBridgeV2 {
         seen = true;
         if (BigInt(receipt.status) !== 0n) continue;
         attempted = true;
-        await this.retryingTrust(() => reader.verifyFailedReceipt(txHash, this.cfg, this.opts.trust, receipt, archives));
+        await this.retryingTrust((trust) => reader.verifyFailedReceipt(txHash, this.cfg, trust, receipt, archives));
         return { seen, attempted, pruned, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
@@ -1418,8 +1624,8 @@ export class NativeBridgeV2 {
       const recipientWord = concat(new Uint8Array(12), unhex(rec.recipient));
       const rp = await reader.receiptProof(tx, this.cfg.vault, TOPIC.Paid, false, {
         topics: [TOPIC.Paid, eta, recipientWord], data: u256(undec(rec.amount)),
-      }, archives, (raw, encoded) => this.retryingTrust(async () => {
-        const uc = await verifyEvmUc(this.opts.trust, encoded, this.cfg);
+      }, archives, (raw, encoded) => this.retryingTrust(async (trust) => {
+        const uc = await verifyEvmUc(trust, encoded, this.cfg);
         bindHeader(raw, uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
       }));
       receipt = rp.encoded;
@@ -1443,7 +1649,7 @@ export class NativeBridgeV2 {
   private async recordPaid(rec: ReturnRecord, tx: Uint8Array, receipt: Uint8Array, persist: boolean): Promise<ReconcileResult | null> {
     if (tx.length !== 32) refuse('BadInput', 'payment transaction hint is not a hash');
     const proof = decodeDepositProof(receipt);
-    const log = await this.retryingTrust(() => verifyReceiptLog(this.cfg, this.opts.trust, proof));
+    const log = await this.retryingTrust((trust) => verifyReceiptLog(this.cfg, trust, proof));
     const recipient = concat(new Uint8Array(12), unhex(rec.recipient));
     if (log.topics.length !== 3 || !eq(log.topics[0], TOPIC.Paid) || !eq(log.topics[1], unhex(rec.eta!)) ||
       !eq(log.topics[2], recipient) || log.data.length !== 32 || beInt(log.data) !== undec(rec.amount) ||
@@ -1476,9 +1682,21 @@ export class NativeBridgeV2 {
 
   // ==== EVM plumbing ====================================================================================================
 
-  private async signed(signer: EvmSigner, to: Uint8Array, data: Uint8Array, value: bigint, gas: bigint, admit?: (request: TxRequest) => Promise<void>): Promise<SignedTx> {
+  private async signed(signer: EvmSigner, to: Uint8Array, data: Uint8Array, value: bigint, gas: bigint, admit?: (request: TxRequest) => Promise<void>, replace?: { nonce: bigint; pooled: boolean; candidates: TxRequest[] }): Promise<SignedTx> {
     const [nonce, fees] = await Promise.all([this.evm.nonce(signer.address), this.evm.fees()]);
     const request = { chainId: this.cfg.chainId, nonce, maxPriorityFeePerGas: fees.priority, maxFeePerGas: 2n * fees.baseFee + fees.priority, gas, to, value, data };
+    if (replace) {
+      if (await this.evm.nonce(signer.address, 'latest') !== replace.nonce) refuse('NotPending', 'payout nonce changed during replacement');
+      request.nonce = replace.nonce;
+      if (replace.pooled || nonce > replace.nonce) {
+        for (const prior of replace.candidates) {
+          const fee = replacementBid(prior.maxFeePerGas);
+          const priority = replacementBid(prior.maxPriorityFeePerGas);
+          if (fee > request.maxFeePerGas) request.maxFeePerGas = fee;
+          if (priority > request.maxPriorityFeePerGas) request.maxPriorityFeePerGas = priority;
+        }
+      }
+    }
     await admit?.(request);
     return signTx(signer, request);
   }

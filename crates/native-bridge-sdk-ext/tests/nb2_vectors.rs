@@ -24,7 +24,7 @@ use native_bridge_sdk_ext::nb2::rules::{
 use native_bridge_sdk_ext::nb2::segment::{
     check_segment_log, fold_history, gap_proof_len, gap_root, segment_sealed_data,
 };
-use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+use native_bridge_sdk_ext::nb2::trust::TrustInput;
 use native_bridge_sdk_ext::nb2::util::{arr, from_hex, hex0x, u256, u256_64};
 use native_bridge_sdk_ext::nb2::vaultmodel::{
     RecipientBehaviour, VaultEvent, VaultModel, VerifierAnswer,
@@ -149,11 +149,7 @@ fn deployments(f: &Value) -> HashMap<String, Dep> {
                 &hx(&v["trustBundle"]),
                 &arr(&hx(&v["trustGenesisEntryId"])),
             )
-            .unwrap()
-            .with_authenticated_origin(AuthenticatedOrigin {
-                usable_epoch: 2,
-                root_round: u64::MAX,
-            });
+            .unwrap();
             (
                 name.clone(),
                 Dep {
@@ -290,18 +286,7 @@ fn seal_receipts_and_the_burn_index() {
             }
             continue;
         }
-        // The legacy epoch-3 cases specifically use a usable epoch whose history has yet to arrive.
-        let trust = match v["id"].as_str() {
-            Some("seal-no-entry-for-epoch" | "seal-root-before-epoch") => d
-                .trust
-                .clone()
-                .with_authenticated_origin(AuthenticatedOrigin {
-                    usable_epoch: 3,
-                    root_round: u64::MAX,
-                }),
-            _ => d.trust.clone(),
-        };
-        let r = verify_seal_receipt(&cfg, &domain, &trust, &hx(&v["receipt"]));
+        let r = verify_seal_receipt(&cfg, &domain, &d.trust, &hx(&v["receipt"]));
         let e = r.as_ref().err();
         let inner = e
             .and_then(|e| e.rule())

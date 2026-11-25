@@ -1,7 +1,6 @@
 //! Wallet evidence from the ordinary execution RPC behind the deployment's public gateway (section 12.7, NB2-06 #1102;
-//! `rpc.ts`): one URL, JSON-RPC 2.0 POST, one request per call. Nothing read here is trusted: the adapters only fetch bytes,
-//! and every piece of evidence is verified offline by the pure functions of this module tree. A provider that withholds or
-//! falsifies data can only delay the wallet.
+//! `rpc.ts`): one URL, JSON-RPC 2.0 POST, one request per call. The paired RPC selects the canonical child for Mint and receive.
+//! Receipt, quorum and lineage checks independently authenticate the evidence.
 //!
 //! Gateway rules honoured here: `eth_getLogs` names one address and an explicit window of at most 10,000 blocks (a result-count
 //! error or the 8 MiB answer cap, HTTP 413, halves the window); 429 and a busy 503 are waited out; an HTTP 503 from
@@ -376,6 +375,74 @@ fn call<R: JsonRpc + ?Sized>(rpc: &R, method: &str, params: Value) -> Result<Val
     rpc.call(method, params).map_err(Error::from)
 }
 
+enum MintWitness<'a> {
+    Fetch,
+    Embedded(&'a [u8]),
+}
+
+/// The fresh B1 RootInputV2 limit (ureth execution/src/wire.rs).
+const MAX_ROOT_INPUT_BYTES: usize = 32 * 1024;
+
+fn check_mint_witness(child: &Header, root_input: &Value, witness: &[u8]) -> Result<()> {
+    use super::cbor::{array, is_bytes, is_uint, scan_native};
+    if root_input.is_null() || root_input == "0x" {
+        return refuse(
+            WalletReason::CompanionUnknown,
+            "the canonical child has no committed root input available",
+        );
+    }
+    if !root_input
+        .as_str()
+        .is_some_and(|s| s.len() <= 2 + MAX_ROOT_INPUT_BYTES * 2)
+    {
+        return refuse(
+            WalletReason::CompanionProvider,
+            "invalid child root input size",
+        );
+    }
+    let raw = bytes_of(root_input, "child root input")?;
+    if super::crypto::hu(&[&raw]).as_slice() != child.extra_data {
+        return refuse(
+            WalletReason::CompanionProvider,
+            "root input does not open the child header commitment",
+        );
+    }
+    let item = scan_native(&raw)?;
+    let fields = array(&item, 13)?;
+    let origin = array(&fields[8], 8)?;
+    let uc = super::trust::decode_uc(witness)?;
+    let seal = &uc.unicity_seal;
+    let position = [
+        u64::from(seal.network_id.id()),
+        seal.root_chain_round_number,
+        seal.epoch,
+        seal.timestamp,
+    ];
+    let hashes = [
+        (4, Some(seal.hash.as_slice())),
+        (6, uc.technical_record_hash.as_deref()),
+        (7, Some(uc.shard_configuration_hash.as_slice())),
+    ];
+    if !is_uint(&fields[0])
+        || fields[0].arg != 2
+        || !is_bytes(&fields[7])
+        || fields[7].data != child.parent_hash
+        || origin
+            .iter()
+            .zip(position)
+            .any(|(field, value)| !is_uint(field) || field.arg != value)
+        || hashes
+            .into_iter()
+            .any(|(i, hash)| !is_bytes(&origin[i]) || Some(origin[i].data) != hash)
+    {
+        return refuse(
+            WalletReason::CompanionProvider,
+            "certificate is not the origin committed by the canonical child",
+        );
+    }
+    Ok(())
+}
+
 impl<R: JsonRpc + ?Sized> EvmReader<R> {
     pub fn new(rpc: std::sync::Arc<R>) -> Self {
         EvmReader { rpc }
@@ -445,7 +512,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
     /// The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child
     /// does not exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
     pub fn certificate_of(&self, header: &Header, hash: &[u8]) -> Result<Vec<u8>> {
-        self.certificate_of_mode(header, hash, false)
+        self.certificate_of_mode(header, hash, false, None)
     }
 
     fn certificate_of_mode(
@@ -453,6 +520,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         header: &Header,
         hash: &[u8],
         bind_technical_record: bool,
+        mint_witness: Option<MintWitness<'_>>,
     ) -> Result<Vec<u8>> {
         let n = header.number_u64();
         let child = call(
@@ -487,8 +555,21 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
             .as_array()
             .or_else(|| l["witnesses"].as_array())
             .unwrap_or(&empty);
+        if mint_witness.is_some() && l["status"] == "found" && witnesses.is_empty() {
+            return refuse(
+                WalletReason::CompanionUnknown,
+                "the canonical child has no committed witness available",
+            );
+        }
         check_companion(l["status"].as_str().unwrap_or(""), witnesses.len())?;
         let uc = bytes_of(&witnesses[0], "companion witness 0")?;
+        if let Some(witness) = mint_witness {
+            let raw = match witness {
+                MintWitness::Fetch => &uc,
+                MintWitness::Embedded(raw) => raw,
+            };
+            check_mint_witness(&child_header, &l["companion"]["rootInput"], raw)?;
+        }
         if bind_technical_record {
             use super::cbor::{array, is_bytes, is_uint, scan_native, MAJ_TEXT};
             let record = bytes_of(&witnesses[1], "companion witness 1")?;
@@ -577,7 +658,27 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         topic0: &[u8],
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, emitter, topic0, None)
+        self.receipt_proof_mode(tx_hash, emitter, topic0, None, false)
+    }
+
+    pub fn check_mint_receipt(&self, proof: &DepositProof) -> Result<()> {
+        self.certificate_of_mode(
+            &super::header::decode_header(&proof.header)?,
+            &he(&[&proof.header]),
+            false,
+            Some(MintWitness::Embedded(&proof.uc)),
+        )?;
+        Ok(())
+    }
+
+    /// The paired profile selects the parent's UC from the canonical child's committed origin.
+    pub fn mint_receipt_proof(
+        &self,
+        tx_hash: &[u8],
+        vault: &[u8],
+        bound: bool,
+    ) -> Result<ReceiptProof> {
+        self.receipt_proof_mode(tx_hash, vault, &topic::deposited(), None, bound)
     }
 
     /// Rebuild a recovery proof with the child companion's committed technical record.
@@ -587,7 +688,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         event: &super::recovery::RecoveryEvent,
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, emitter, &event.topics[0], Some(event))
+        self.receipt_proof_mode(tx_hash, emitter, &event.topics[0], Some(event), false)
     }
 
     fn receipt_proof_mode(
@@ -596,6 +697,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         topic0: &[u8],
         event: Option<&super::recovery::RecoveryEvent>,
+        bind_mint_witness: bool,
     ) -> Result<ReceiptProof> {
         let Some(r) = self.receipt(tx_hash)? else {
             return refuse(
@@ -628,7 +730,12 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         };
         let block_hash = fixed_of(&json!(r.block_hash), 32, "blockHash")?;
         let (header, raw) = self.header_by_hash(&block_hash)?;
-        let uc = self.certificate_of_mode(&header, &block_hash, event.is_some())?;
+        let uc = self.certificate_of_mode(
+            &header,
+            &block_hash,
+            event.is_some(),
+            bind_mint_witness.then_some(MintWitness::Fetch),
+        )?;
         let tx_index = qty64(&json!(r.transaction_index), "transactionIndex")?;
         let nodes = self.receipt_path(&header, &block_hash, tx_index)?;
         let proof = DepositProof {
@@ -818,6 +925,73 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         )
     }
 
+    /// Simulate the exact return against the finalized state that supplied the registry tip.
+    pub fn check_return_import(
+        &self,
+        cfg: &super::config::Config,
+        epoch: u64,
+        tx: Option<&super::evm::DecodedTx>,
+    ) -> Result<()> {
+        let genesis = call(&*self.rpc, "eth_getBlockByNumber", json!(["0x0", false]))?;
+        if self.chain_id()? != cfg.chain_id
+            || bytes_of(&genesis["hash"], "genesis hash")? != cfg.execution_genesis
+        {
+            return refuse(
+                WalletReason::TrustInput,
+                "return RPC does not serve the pinned execution genesis",
+            );
+        }
+        let finalized = call(
+            &*self.rpc,
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+        )?;
+        if finalized.is_null() || bytes_of(&finalized["hash"], "finalized hash")?.len() != 32 {
+            return refuse(
+                WalletReason::ImportLag,
+                "waiting for a finalized execution block",
+            );
+        }
+        let at = json!({"blockHash": finalized["hash"], "requireCanonical": true});
+        let tip = call(
+            &*self.rpc,
+            "eth_getStorageAt",
+            json!([
+                "0xff00000000000000000000000000000000000002",
+                "0xefa6b7f0bacdcf81ddd8a710fb8420140ae07d47982dc167bb647c00d3f5f4fc",
+                at,
+            ]),
+        )?;
+        let tip = bytes_of(&tip, "B1 imported tip epoch")?;
+        if tip.len() != 32 || BigUint::from_bytes_be(&tip) < BigUint::from(epoch) {
+            return refuse(
+                WalletReason::ImportLag,
+                format!("waiting for finalized B1 import of epoch {epoch}"),
+            );
+        }
+        let Some(tx) = tx else {
+            return Ok(());
+        };
+        let req = &tx.request;
+        if let Err(error) = self.rpc.call(
+            "eth_call",
+            json!([{
+                "from": hex0x(&tx.from), "to": hex0x(&req.to), "data": hex0x(&req.data),
+                "gas": qty(req.gas), "value": format!("0x{:x}", req.value),
+            }, at]),
+        ) {
+            let rule = revert_data_of(&error).and_then(|raw| super::abi::decode_revert(&raw));
+            if rule.is_some_and(|decoded| decoded.rule == Rule::StaleEndpoint) {
+                return fail_d(
+                    Rule::StaleEndpoint,
+                    "payout history expired at the finalized head",
+                );
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub fn vault_state(&self, vault: &[u8]) -> Result<VaultState> {
         match decode_state_return(&self.call(vault, &selector::state(), None)?) {
             Some(s) => Ok(s),
@@ -979,6 +1153,67 @@ fn receipt_log_index(
 mod recovery_receipt_tests {
     use super::super::recovery::{EventKind, RecoveryEvent};
     use super::*;
+
+    #[test]
+    fn mint_witness_must_open_the_childs_committed_origin() {
+        use super::super::cbor::{c_arr, c_arr_v, c_bytes, c_uint};
+        use super::super::crypto::hu;
+        use super::super::deposit::decode_receipt_backing;
+        use super::super::header::decode_header;
+        use super::super::token::decode_token;
+        use super::super::trust::decode_uc;
+
+        let evidence = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../protocol/vectors/nb2-continuation-v1.1/transcripts/root/evidence.bin"
+        ));
+        let token = decode_token(evidence).unwrap();
+        let proof = decode_receipt_backing(token.mint.justification.as_deref().unwrap())
+            .unwrap()
+            .proof;
+        let mut uc = decode_uc(&proof.uc).unwrap();
+        let mut child = decode_header(&proof.header).unwrap();
+        child.parent_hash = he(&[&proof.header]).to_vec();
+        let seal = &uc.unicity_seal;
+        let origin = c_arr(&[
+            &c_uint(u64::from(seal.network_id.id())),
+            &c_uint(seal.root_chain_round_number),
+            &c_uint(seal.epoch),
+            &c_uint(seal.timestamp),
+            &c_bytes(&seal.hash),
+            &c_arr(&[]),
+            &c_bytes(uc.technical_record_hash.as_deref().unwrap()),
+            &c_bytes(&uc.shard_configuration_hash),
+        ]);
+        let mut root_input = vec![c_uint(0); 13];
+        root_input[0] = c_uint(2);
+        root_input[7] = c_bytes(&child.parent_hash);
+        root_input[8] = origin;
+        let raw = c_arr_v(&root_input);
+        child.extra_data = hu(&[&raw]).to_vec();
+        let committed = json!(hex0x(&raw));
+        check_mint_witness(&child, &committed, &proof.uc).unwrap();
+        uc.unicity_seal.root_chain_round_number += 50;
+        assert_eq!(
+            check_mint_witness(&child, &committed, &uc.to_cbor())
+                .unwrap_err()
+                .reason(),
+            Some(WalletReason::CompanionProvider)
+        );
+        assert_eq!(
+            check_mint_witness(&child, &Value::Null, &proof.uc)
+                .unwrap_err()
+                .reason(),
+            Some(WalletReason::CompanionUnknown)
+        );
+        child.extra_data[0] ^= 1;
+        assert_eq!(
+            check_mint_witness(&child, &committed, &proof.uc)
+                .unwrap_err()
+                .reason(),
+            Some(WalletReason::CompanionProvider)
+        );
+    }
 
     #[test]
     fn recovery_selects_the_receipt_local_index_of_the_exact_event() {

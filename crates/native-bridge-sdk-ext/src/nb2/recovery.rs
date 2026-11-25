@@ -169,6 +169,7 @@ impl Sparse {
 }
 
 struct ClaimOpening {
+    epoch: u64,
     key: Hash,
     full: Vec<u8>,
 }
@@ -257,7 +258,11 @@ fn claim_opening(
         Some(old) => cat(&[&[0, 1], &old, &opening]),
         None => cat(&[&[0, 0], &opening]),
     };
-    Ok(ClaimOpening { key, full })
+    Ok(ClaimOpening {
+        epoch: uc.unicity_seal.epoch,
+        key,
+        full,
+    })
 }
 
 /// Called only after the flat decoder has checked complete consumption and framing bounds.
@@ -399,6 +404,8 @@ pub struct RecoveryEvent {
 }
 
 pub struct RunPacket {
+    /// Greatest signer epoch in this packet, including its predecessor receipt.
+    pub required_signer_epoch: u64,
     pub shape: RecoveryShape,
     pub calldata: Vec<u8>,
     pub end: usize,
@@ -455,19 +462,15 @@ impl RecoveryAuthority {
         }
         let old = held.history().entries();
         let new = offered.history().entries();
-        let before = held.origin().unwrap();
-        let after = offered.origin().unwrap();
         if new.len() < old.len()
             || old
                 .iter()
                 .zip(new)
                 .any(|(a, b)| a.entry_id() != b.entry_id())
-            || after.usable_epoch < before.usable_epoch
-            || after.root_round < before.root_round
         {
             return refuse(
                 WalletReason::TrustInput,
-                "recovery authority rolls back the held history or origin",
+                "recovery authority rolls back the held history",
             );
         }
         (self.0.persist)(offered).map_err(|error| {
@@ -571,6 +574,7 @@ impl RecoverySession {
             return fail_d(Rule::Shape, "run cut");
         }
         let mut body = self.header.clone();
+        let mut required_signer_epoch = 0;
         let seq = if let Some((seq, receipt)) = prior {
             if seq == 0 || seq == u64::MAX {
                 return fail_d(Rule::Shape, "sequence");
@@ -581,6 +585,9 @@ impl RecoverySession {
                 cat(&[&u256_64(seq), &hash("STATE", &[&self.session, &state])]),
             );
             self.verify_event(trust, receipt, &event)?;
+            required_signer_epoch = decode_uc(&decode_deposit_proof(receipt)?.uc)?
+                .unicity_seal
+                .epoch;
             body.extend_from_slice(&cat(&[&[1], &state, &blob(receipt)]));
             seq + 1
         } else {
@@ -610,6 +617,7 @@ impl RecoverySession {
             body.push(op.code);
             body.extend_from_slice(&op.sid);
             for claim in &op.claims {
+                required_signer_epoch = required_signer_epoch.max(claim.epoch);
                 if used.insert(claim.key) {
                     body.extend_from_slice(&claim.full);
                 } else {
@@ -643,6 +651,7 @@ impl RecoverySession {
             opening_bytes,
         };
         Ok(RunPacket {
+            required_signer_epoch,
             shape,
             calldata,
             end,
@@ -779,10 +788,7 @@ impl RecoverySession {
                 let proof = source(&self.deployment.recovery, event)?;
                 let authority = self.authority.checkpoint()?;
                 match self.verify_event(&authority, &proof, event) {
-                    Err(e)
-                        if refresh.is_some()
-                            && (e.retryable() || ahead_of_origin(&authority, &proof)) =>
-                    {
+                    Err(e) if refresh.is_some() && e.retryable() => {
                         let fresh = refresh.unwrap()(&authority)?;
                         self.authority.accept(&fresh, &self.cfg)?;
                         self.verify_event(&self.authority.checkpoint()?, &proof, event)
@@ -814,18 +820,6 @@ impl RecoverySession {
         }
         refuse(WalletReason::EvidenceMissing, "no recovery receipt source")
     }
-}
-
-fn ahead_of_origin(trust: &TrustInput, receipt: &[u8]) -> bool {
-    let Some(origin) = trust.origin() else {
-        return false;
-    };
-    decode_deposit_proof(receipt)
-        .and_then(|p| decode_uc(&p.uc))
-        .is_ok_and(|uc| {
-            uc.unicity_seal.epoch > origin.usable_epoch
-                || uc.unicity_seal.root_chain_round_number > origin.root_round
-        })
 }
 
 pub type ReceiptSource<'a> = dyn Fn(&[u8; 20], &RecoveryEvent) -> Result<Vec<u8>> + 'a;
@@ -865,6 +859,8 @@ pub enum GapEntry {
     Redeem,
 }
 pub struct GapPacket {
+    /// Signer epoch of this packet’s certified predecessor receipt.
+    pub required_signer_epoch: u64,
     pub shape: RecoveryShape,
     pub calldata: Vec<u8>,
     pub event: Option<RecoveryEvent>,
@@ -1011,6 +1007,9 @@ impl RecoverySession {
             opening_bytes: 0,
         };
         Ok(GapPacket {
+            required_signer_epoch: decode_uc(&decode_deposit_proof(prior.receipt)?.uc)?
+                .unicity_seal
+                .epoch,
             shape,
             calldata,
             event,

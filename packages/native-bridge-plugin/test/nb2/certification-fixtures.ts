@@ -21,7 +21,7 @@ export async function withSeal(proof: Uint8Array, root: Root, round: bigint | un
 }
 
 export const withoutQuorum = (proof: Uint8Array, root: Root, future: boolean): Promise<Uint8Array> =>
-  withSeal(proof, root, future ? root.trust.origin!.rootRound + 100n : undefined, 1);
+  withSeal(proof, root, future ? 1_000_100n : undefined, 1);
 
 /** Exact outer framing and request binding, with deliberately invalid inner proof data. */
 export function framedProof(request: Uint8Array, length: number): Uint8Array {
