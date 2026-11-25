@@ -928,7 +928,9 @@ impl NativeBridgeV2 {
         self.locked(&format!("deposit/{intent}"), || {
             let mut rec = self.deposit_record(intent)?;
             if rec.status == "minted" {
-                return unhex(rec.token.as_deref().unwrap_or(""));
+                let token = unhex(rec.token.as_deref().unwrap_or(""))?;
+                self.verify_token(&token)?;
+                return Ok(token);
             }
             if rec.status != "proven" {
                 return refuse(
@@ -976,7 +978,9 @@ impl NativeBridgeV2 {
                 );
             };
             if let Some(t) = &x.token {
-                return unhex(t);
+                let token = unhex(t)?;
+                self.verify_token(&token)?;
+                return Ok(token);
             }
             // the entry's own first owner: another device may have deposited this rho to another key
             let first_owner = unhex(&x.first_owner)?;
@@ -1296,7 +1300,11 @@ impl NativeBridgeV2 {
         self.journal.put_split(&rec)?;
         rec.outputs
             .iter()
-            .map(|o| unhex(o.token.as_deref().unwrap_or("")))
+            .map(|o| {
+                let token = unhex(o.token.as_deref().unwrap_or(""))?;
+                self.verify_token(&token)?;
+                Ok(token)
+            })
             .collect()
     }
 

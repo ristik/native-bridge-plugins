@@ -10,6 +10,7 @@ import { evmAccount, key, roundNow, setup } from './world.js';
 test('freshness requires a successful coalesced UTB sync and never credits a replay', async () => {
   const w = await setup();
   const opts = w.options('freshness');
+  await assert.rejects(NativeBridgeV2.open({ ...opts, requireImportedTipProfile: true }), { reason: 'BadDeployment' });
   const first = await NativeBridgeV2.open(opts);
   const { intent } = await first.planDeposit(8n, localOwner(key('fresh owner')).publicKey);
   await first.submitDeposit(intent, evmAccount(w.chain, 'fresh payer'));
@@ -48,7 +49,7 @@ test('freshness requires a successful coalesced UTB sync and never credits a rep
   available = false;
   await assert.rejects(wallet.verifyToken(token), /UTB source unavailable/);
   const restarted = await open();
-  await assert.rejects(restarted.verifyToken(token), /UTB source unavailable/);
+  await assert.rejects(restarted.mint(intent), /UTB source unavailable/);
   assert.equal(await wallet.journal.store.get(syncKey), record);
   clock = 1;
   available = true;

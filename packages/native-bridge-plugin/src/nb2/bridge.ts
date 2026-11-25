@@ -457,8 +457,9 @@ export class NativeBridgeV2 {
     const recoverProof = options?.recoverProof;
     return this.locked(`deposit/${intent}`, async () => {
       const rec = await this.depositRecord(intent);
-      if (rec.status === 'minted') return unhex(rec.token!);
+      if (rec.status === 'minted') return this.verifiedTokenBytes(unhex(rec.token!));
       if (rec.status !== 'proven') refuse('NotPending', `intent ${intent} is ${rec.status}: collect the deposit proof first`);
+      const held = this.opts.trust;
       const token = await this.mintWith(unhex(rec.reason!), unhex(rec.ownerKey), undec(rec.amount), rec.mintProof, async (proof) => {
         rec.mintProof = proof;
         await this.journal.putDeposit(rec);
@@ -469,7 +470,7 @@ export class NativeBridgeV2 {
       const mine = rec.seenDeposits?.find((x) => x.depositNumber === rec.depositNumber);
       if (mine !== undefined) mine.token = rec.token;
       await this.journal.putDeposit(rec);
-      return token;
+      return held === this.opts.trust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
     });
   }
 
@@ -483,7 +484,8 @@ export class NativeBridgeV2 {
       const rec = await this.depositRecord(intent);
       const x = (rec.seenDeposits ?? []).find((s) => s.depositNumber === dec(depositNumber));
       if (x === undefined) refuse('NotPending', `no deposit number ${depositNumber} is journaled for intent ${intent}`);
-      if (x!.token !== undefined) return unhex(x!.token);
+      if (x!.token !== undefined) return this.verifiedTokenBytes(unhex(x!.token));
+      const held = this.opts.trust;
       // the entry's own first owner: another device may have deposited this rho to another key
       const firstOwner = unhex(x!.firstOwner);
       const reason = x!.reason === undefined ? (await this.proveDeposit(intent, unhex(x!.tx), depositNumber, undec(x!.amount), firstOwner)).reason : unhex(x!.reason);
@@ -496,7 +498,7 @@ export class NativeBridgeV2 {
       delete x!.reason;
       delete x!.mintProof;
       await this.journal.putDeposit(rec);
-      return token;
+      return held === this.opts.trust && !this.trustStale() ? token : this.verifiedTokenBytes(token);
     });
   }
 
@@ -537,6 +539,11 @@ export class NativeBridgeV2 {
   }
 
   // ==== circulation =====================================================================================================
+
+  private async verifiedTokenBytes(token: Uint8Array): Promise<Uint8Array> {
+    await this.verifyToken(token);
+    return token;
+  }
 
   /** Verify a held token fully offline (receipt origin, lineage, every certificate): its ID, amount, owner and spendable state. */
   public async verifyToken(token: Uint8Array): Promise<{ tokenId: Uint8Array; amount: bigint; owner: Uint8Array | null; state: Uint8Array }> {
@@ -647,6 +654,8 @@ export class NativeBridgeV2 {
       }
     }
     const { burned, split } = verified;
+    const held = this.opts.trust;
+    const cached = rec.outputs.some((output) => output.token !== null);
     for (let k = 0; k < rec.outputs.length; k++) {
       const output = rec.outputs[k];
       if (output.token !== null) continue;
@@ -667,7 +676,13 @@ export class NativeBridgeV2 {
     }
     rec.status = 'minted';
     await this.journal.putSplit(rec);
-    return rec.outputs.map((o) => unhex(o.token!));
+    const children = rec.outputs.map((o) => unhex(o.token!));
+    if (cached || held !== this.opts.trust || this.trustStale()) {
+      await this.retryingTrust(async (trust) => {
+        for (const token of children) await verifyHeld(this.cfg, this.domain, trust, decodeToken(token));
+      });
+    }
+    return children;
   }
 
   // ==== Unicity -> EVM ==================================================================================================
@@ -689,7 +704,7 @@ export class NativeBridgeV2 {
   private async retainedCertification<T>(request: Uint8Array, maxBytes: number, saved: string | undefined,
     save: (proof: string) => Promise<void>, verify: (proof: Uint8Array, trust: TrustInput) => Promise<T>,
     options: ProofRecoveryOptions & { beforeCertification?: () => Promise<void> } = {}): Promise<T> {
-    if (this.trustStale()) await this.refreshAuthority();
+    if (this.trustStale()) await this.syncTrust();
     let rejected = saved !== undefined;
     if (saved !== undefined && /^0x([0-9a-f]{2})*$/.test(saved)) {
       rejected = false;
@@ -735,7 +750,8 @@ export class NativeBridgeV2 {
       now - this.lastTrustSync >= this.opts.trustFreshnessMs;
   }
 
-  private refreshAuthority(): Promise<void> {
+  /** Synchronize through the same coalesced path used by verification. */
+  public syncTrust(): Promise<void> {
     if (this.refreshingTrust) return this.refreshingTrust;
     this.refreshingTrust = this.installRefreshedTrust().finally(() => { this.refreshingTrust = undefined; });
     return this.refreshingTrust;
@@ -781,7 +797,7 @@ export class NativeBridgeV2 {
 
   /** Verify one decision against a held snapshot, repeating if another decision installed its successor. */
   private async retryingTrust<T>(f: (trust: TrustInput) => Promise<T>, refreshOnMissing = true): Promise<T> {
-    if (this.trustStale()) await this.refreshAuthority();
+    if (this.trustStale()) await this.syncTrust();
     let refreshed = false;
     for (;;) {
       const held = this.opts.trust;
@@ -792,7 +808,7 @@ export class NativeBridgeV2 {
         if (held !== this.opts.trust) continue;
         if (refreshed || !refreshOnMissing || !this.trustBehind(error) || !this.opts.refreshTrust) throw error;
         refreshed = true;
-        await this.refreshAuthority();
+        await this.syncTrust();
       }
     }
   }
