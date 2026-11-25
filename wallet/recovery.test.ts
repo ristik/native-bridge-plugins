@@ -65,6 +65,13 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
       const { to, data } = params[0] as { to: string; data: string };
       const result = to === hx(cfg.vault) ? views.get(data) : to === hx(recovery) ? recoveryViews.get(data) : undefined;
       if (result) return result as T;
+      // The coldCall hook scripts mined events and late reverts. Keep finalized
+      // simulation from changing that script or consuming an injected failure.
+      if (view.coldCall && typeof params[1] === 'object' &&
+        (to === hx(recovery) || (to === hx(cfg.vault) &&
+          [hx(SELECTOR.redeem), selector('redeemRecovered(bytes)')].includes(data.slice(0, 10))))) {
+        return '0x' as T;
+      }
     }
     return view.call<T>(method, params);
   } });
