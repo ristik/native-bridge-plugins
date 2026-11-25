@@ -1,0 +1,83 @@
+{
+  "source": "ristik/bft-core#1299 b1ref/testdata/b1-vectors-anyage.json",
+  "sha256": "a149dd581aba95729421abe354f122249a87ea77b82a901f707fa11a4c428d31",
+  "cases": [
+    {
+      "id": "time.genesis.before-observation",
+      "tip": 0,
+      "epoch": 0,
+      "round": 500,
+      "accept": true
+    },
+    {
+      "id": "time.span-two.intermediate.before",
+      "tip": 6,
+      "epoch": 7,
+      "round": 7000,
+      "accept": false
+    },
+    {
+      "id": "time.span-two.tip.before",
+      "tip": 6,
+      "epoch": 8,
+      "round": 8001,
+      "accept": false
+    },
+    {
+      "id": "time.span-two.intermediate.after",
+      "tip": 8,
+      "epoch": 7,
+      "round": 7000,
+      "accept": true
+    },
+    {
+      "id": "time.span-two.intermediate.at-end",
+      "tip": 8,
+      "epoch": 7,
+      "round": 8000,
+      "accept": false
+    },
+    {
+      "id": "time.span-two.tip.after",
+      "tip": 8,
+      "epoch": 8,
+      "round": 8001,
+      "accept": true
+    },
+    {
+      "id": "time.span-two.retired.at-end",
+      "tip": 8,
+      "epoch": 6,
+      "round": 7000,
+      "accept": false
+    },
+    {
+      "id": "time.closed.start.ok",
+      "tip": 8,
+      "epoch": 1,
+      "round": 1000,
+      "accept": true
+    },
+    {
+      "id": "time.closed.last.ok",
+      "tip": 8,
+      "epoch": 1,
+      "round": 1999,
+      "accept": true
+    },
+    {
+      "id": "time.closed.before-start",
+      "tip": 8,
+      "epoch": 2,
+      "round": 1999,
+      "accept": false
+    },
+    {
+      "id": "time.closed.at-end",
+      "tip": 8,
+      "epoch": 2,
+      "round": 3000,
+      "accept": false
+    }
+  ]
+}

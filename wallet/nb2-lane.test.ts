@@ -105,22 +105,16 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
   }
   const start = await bridge.newestSealReceipt();
   assert.ok(start);
-  const sealRound = decodeUc(start.receipt.proof.uc).unicitySeal.rootChainRoundNumber;
   const root = await mint(21n);
   const dir = mkdtempSync(join(tmpdir(), 'nb2-lane-test-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const checkpoint = () => w.root.trust.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: roundNow() });
-  const initial = w.root.trust.withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: sealRound - 1n });
-  let reloads = 0;
   const opts = {
-    gamma: w.chain.gamma, params: TEST_PARAMS, trust: initial, root, owner, recipient: payer.address, startingSeal: start.encoded, history: 'depth-20' as const,
-    originPollMs: 0, refreshTrust: async () => { reloads++; return checkpoint(); },
+    gamma: w.chain.gamma, params: TEST_PARAMS, trust: w.root.trust, root, owner, recipient: payer.address, startingSeal: start.encoded, history: 'depth-20' as const,
   };
   const occupied = join(dir, 'occupied');
   writeFileSync(occupied, 'existing');
   const before = w.agg.calls;
   await assert.rejects(runLaneWorkload({ ...opts, output: occupied, aggregator: w.agg }), /output already exists/);
-  assert.equal(reloads, 1, 'the starting receipt needs a refresh before checking or spending the root');
   assert.equal(w.agg.calls, before);
   assert.equal(readFileSync(occupied, 'utf8'), 'existing');
 
@@ -133,7 +127,6 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
   let interruptedSplit: string | undefined;
   let interruptedReturn: string | undefined;
   const aggregator = { certify: async (cd: Uint8Array) => {
-    assert.ok(reloads > 1);
     assert.equal(statSync(join(journal, 'evidence')).size, 0);
     assert.equal(existsSync(output), false);
     const request = Buffer.from(cd).toString('hex');
@@ -168,7 +161,6 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
   writeFileSync(output, 'replacement');
   await assert.rejects(run(), /output already exists/);
   assert.equal(readFileSync(output, 'utf8'), 'replacement');
-  assert.ok(reloads >= 41, 'the initial checkpoint predates all certified spends');
   unlinkSync(output);
 
   const completed = state();
@@ -199,7 +191,7 @@ test('lane reloads authority for the starting seal and spends, resumes exact req
   assert.equal(finished.levels.length, 21);
   assert.equal(finished.evidenceBytes, statSync(output).size);
   assert.ok(finished.evidenceBytes > 0);
-  const verdict = await verifyReturn(opts.gamma, readFileSync(output), checkpoint(), opts.params);
+  const verdict = await verifyReturn(opts.gamma, readFileSync(output), opts.trust, opts.params);
   assert.equal(verdict.minSegment, start.receipt.segment.index + 1n);
   assert.equal(state().step, 41);
   assert.equal(state().pending, undefined);

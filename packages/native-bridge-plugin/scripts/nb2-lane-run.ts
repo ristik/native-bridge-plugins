@@ -13,7 +13,7 @@ import {
 } from '../src/nb2/tokenops.js';
 import { Nb2Error } from '../src/nb2/errors.js';
 import { burnIndex, verifySealReceipt } from '../src/nb2/rules.js';
-import { bindTrust, SealAheadOfOrigin, type TrustInput } from '../src/nb2/trust.js';
+import { bindTrust, type TrustInput } from '../src/nb2/trust.js';
 import { encodeReturnData, verdictAbi, verifyCertifiedStep, verifyHeld, verifyReturn, verifySplit } from '../src/nb2/verify.js';
 
 const workloads = {
@@ -29,7 +29,7 @@ interface Job {
   trust: TrustInput;
   /** Reload the operator-authenticated checkpoint and held UTB bundle. */
   refreshTrust?: () => Promise<TrustInput>;
-  originPollMs?: number;
+  trustPollMs?: number;
   root: Uint8Array;
   owner: OwnerSigner;
   aggregator: Aggregator;
@@ -62,7 +62,7 @@ function bytes(hex: string): Uint8Array {
 
 function pendingAuthority(error: unknown): boolean {
   for (let e = error; e instanceof Nb2Error; e = e.inner) {
-    if (e instanceof SealAheadOfOrigin || e.rule === 'NoEntryForEpoch') return true;
+    if (e.rule === 'NoEntryForEpoch') return true;
   }
   return false;
 }
@@ -93,13 +93,13 @@ export async function runLaneWorkload(job: Job) {
         return await check(trust);
       } catch (e) {
         if (!job.refreshTrust || !pendingAuthority(e) || Date.now() >= deadline) throw e;
-        await new Promise<void>((resolve) => setTimeout(resolve, job.originPollMs ?? 1_000));
+        await new Promise<void>((resolve) => setTimeout(resolve, job.trustPollMs ?? 1_000));
         const fresh = await job.refreshTrust();
         bindTrust(fresh, cfg);
         const tip = trust.history.tip!;
         const prefix = fresh.history.entryForEpoch(tip.epoch);
         if (prefix === null || !eq(await prefix.entryId(), await tip.entryId())
-          || fresh.origin!.usableEpoch < trust.origin!.usableEpoch || fresh.origin!.rootRound < trust.origin!.rootRound) {
+         ) {
           throw new Error('lane authority refresh does not extend the held checkpoint and history');
         }
         trust = fresh;

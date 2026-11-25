@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
@@ -86,6 +87,9 @@ pub struct DeploymentPins {
 type Callback<A, R> = Box<dyn Fn(A) -> R + Send + Sync>;
 
 /// The bridge's inputs.
+pub const TESTNET_TRUST_FRESHNESS_MS: u64 = 15 * 60 * 1000;
+pub const PRODUCTION_TRUST_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 pub struct BridgeOptions {
     pub pins: DeploymentPins,
     pub trust: TrustInput,
@@ -108,6 +112,9 @@ pub struct BridgeOptions {
     /// Extend the trust-base history when a certificate's epoch is not held yet: given the current input, return the extended
     /// one. A seal receipt or a token refused with the retryable NoEntryForEpoch is retried once after it.
     pub refresh_trust: Option<Callback<TrustInput, Result<TrustInput>>>,
+    /// Required successful UTB sync interval for wallet integrations.
+    pub trust_freshness_ms: Option<u64>,
+    pub require_imported_tip_profile: bool,
     /// Receipt polling.
     pub receipt_timeout_ms: Option<u64>,
     pub poll_ms: Option<u64>,
@@ -139,6 +146,8 @@ impl BridgeOptions {
             dead_after_blocks: None,
             max_seal_age_blocks: None,
             refresh_trust: None,
+            trust_freshness_ms: None,
+            require_imported_tip_profile: false,
             receipt_timeout_ms: None,
             poll_ms: None,
             sleep: None,
@@ -311,6 +320,8 @@ pub struct NativeBridgeV2 {
     dead_after_blocks: u64,
     max_seal_age_blocks: u64,
     refresh_trust: Option<Callback<TrustInput, Result<TrustInput>>>,
+    trust_freshness_ms: Option<u64>,
+    trust_sync: Mutex<Option<Instant>>,
     receipt_timeout_ms: u64,
     poll_ms: u64,
     sleep: Option<Callback<u64, ()>>,
@@ -326,6 +337,21 @@ impl NativeBridgeV2 {
         let cfg = decode_config(&o.pins.gamma, &build_params(o.pins.build))?;
         let domain = domain_of(&o.pins.gamma);
         bind_trust(&o.trust, &cfg)?;
+        if o.require_imported_tip_profile
+            && hex(&cfg.semantic_profile_hash)
+                != "0x63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e"
+        {
+            return refuse(
+                WalletReason::BadDeployment,
+                "the wallet requires the paired imported-tip NB2 semantic profile",
+            );
+        }
+        if o.trust_freshness_ms == Some(0) {
+            return refuse(
+                WalletReason::BadInput,
+                "the UTB freshness window must be positive",
+            );
+        }
         if o.bridge_key.len() != 32 {
             return refuse(WalletReason::BadInput, "k_w is 32 bytes");
         }
@@ -346,6 +372,8 @@ impl NativeBridgeV2 {
             dead_after_blocks: o.dead_after_blocks.unwrap_or(6),
             max_seal_age_blocks: o.max_seal_age_blocks.unwrap_or(7_200),
             refresh_trust: o.refresh_trust,
+            trust_freshness_ms: o.trust_freshness_ms,
+            trust_sync: Mutex::new(None),
             receipt_timeout_ms: o.receipt_timeout_ms.unwrap_or(60_000),
             poll_ms: o.poll_ms.unwrap_or(1_000),
             sleep: o.sleep,
@@ -423,44 +451,85 @@ impl NativeBridgeV2 {
         self.trust.read().expect("trust").clone()
     }
 
-    /// Run `f`; on a retryable NoEntryForEpoch extend the history (if the wallet gave a way) and run it once more.
-    fn retrying_trust<T>(&self, f: impl Fn(&TrustInput) -> Result<T>) -> Result<T> {
-        let t = self.trust();
-        match f(&t) {
-            Err(e) if e.retryable() && self.refresh_trust.is_some() => {
-                let offered = (self.refresh_trust.as_ref().expect("checked"))(t.clone())?;
-                let offered =
-                    offered.with_authenticated_origin(t.origin().expect("installed origin"));
-                bind_trust(&offered, &self.cfg)?;
-                let incoming = offered.history().entries();
-                if incoming.len() < t.history().entries().len() {
-                    return refuse(
-                        WalletReason::TrustInput,
-                        "trust refresh would roll back the held history",
-                    );
-                }
-                let fresh = {
-                    let mut held = self.trust.write().expect("trust");
-                    let entries = held.history().entries();
-                    if entries
-                        .iter()
-                        .zip(incoming)
-                        .any(|(left, right)| left.entry_id() != right.entry_id())
-                    {
-                        return refuse(
-                            WalletReason::TrustInput,
-                            "trust refresh conflicts with the held history",
-                        );
-                    }
-                    // A concurrent refresh might already have installed a longer prefix.
-                    if incoming.len() > entries.len() {
-                        *held = offered;
-                    }
-                    held.clone()
-                };
-                f(&fresh)
+    fn sync_trust(&self, seen: Option<&TrustInput>) -> Result<()> {
+        let mut sync = self.trust_sync.lock().expect("trust sync");
+        let held = self.trust();
+        if let Some(snapshot) = seen {
+            if snapshot != &held {
+                return Ok(());
             }
-            r => r,
+        } else if self.trust_freshness_ms.is_none()
+            || sync.is_some_and(|t| {
+                t.elapsed() < Duration::from_millis(self.trust_freshness_ms.unwrap())
+            })
+        {
+            return Ok(());
+        }
+        let Some(refresh) = &self.refresh_trust else {
+            return refuse(
+                WalletReason::TrustInput,
+                "a successful UTB sync is required",
+            );
+        };
+        let start = Instant::now();
+        let offered = refresh(held.clone())?;
+        bind_trust(&offered, &self.cfg)?;
+        let old = held.history().entries();
+        let incoming = offered.history().entries();
+        if incoming.len() < old.len()
+            || old
+                .iter()
+                .zip(incoming)
+                .any(|(a, b)| a.entry_id() != b.entry_id())
+        {
+            return refuse(
+                WalletReason::TrustInput,
+                "authority refresh does not extend the installed history",
+            );
+        }
+        if self.trust_freshness_ms.is_some() {
+            let end = offered.history().latest();
+            let Ok(time) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+                return refuse(WalletReason::TrustInput, "the UTB sync clock is uncertain");
+            };
+            let key = format!("{}trust-sync", self.journal.prefix);
+            let previous = self.journal.store.get(&key)?;
+            let record = json!({
+                "domain": hex(&self.domain), "genesis": hex(&offered.id()),
+                "tipEpoch": end.epoch.to_string(), "tipId": hex(&end.entry_id()),
+                "syncedAt": time.as_millis() as u64,
+            });
+            if !self
+                .journal
+                .store
+                .put_if(&key, previous.as_deref(), &record.to_string())?
+            {
+                return refuse(WalletReason::JournalConflict, "the UTB sync record changed");
+            }
+            *sync = Some(start);
+        }
+        *self.trust.write().expect("trust") = offered;
+        Ok(())
+    }
+
+    fn retrying_trust<T>(&self, f: impl Fn(&TrustInput) -> Result<T>) -> Result<T> {
+        self.sync_trust(None)?;
+        let mut refreshed = false;
+        loop {
+            let held = self.trust();
+            let result = f(&held);
+            if self.trust() != held {
+                continue;
+            }
+            if !refreshed
+                && self.refresh_trust.is_some()
+                && result.as_ref().is_err_and(|e| e.retryable())
+            {
+                self.sync_trust(Some(&held))?;
+                refreshed = true;
+                continue;
+            }
+            return result;
         }
     }
 
@@ -644,7 +713,7 @@ impl NativeBridgeV2 {
                 });
             }
             let mut sends = rec.sends.clone();
-            let landed = self.landed_send(&mut sends)?;
+            let landed = self.landed_send(&mut sends, None)?;
             if sends != rec.sends {
                 rec.sends = sends;
                 self.journal.put_deposit(&rec)?;
@@ -1711,6 +1780,25 @@ impl NativeBridgeV2 {
         })
     }
 
+    fn check_ordinary_import(&self, rec: &ReturnRecord, raw: &[u8]) -> Result<()> {
+        let part = decode_token(&unhex(rec.burned.as_deref().unwrap_or(""))?)?;
+        let tx = decode_signed_tx(raw).map_err(Error::Other)?;
+        self.retrying_trust(|trust| {
+            use super::trust::decode_uc;
+            super::verify::verify_part(&self.cfg, &self.domain, trust, &part)?;
+            let root = part.levels().next().expect("nonempty lineage");
+            let receipt =
+                decode_receipt_backing(root.mint.justification.as_deref().unwrap_or(&[]))?;
+            let mut epoch = decode_uc(&receipt.proof.uc)?.unicity_seal.epoch;
+            for level in part.levels() {
+                for proof in std::iter::once(&level.mint_proof).chain(&level.proofs) {
+                    epoch = epoch.max(decode_uc(&proof.uc)?.unicity_seal.epoch);
+                }
+            }
+            self.evm.check_return_import(&self.cfg, epoch, &tx)
+        })
+    }
+
     fn submit_redeem_inner(
         &self,
         return_id: &[u8; 32],
@@ -1738,6 +1826,7 @@ impl NativeBridgeV2 {
                 fresh.first_send_block = Some(dec(self.evm.block_number()?));
             }
             self.journal.put_return(&fresh)?;
+            self.check_ordinary_import(&fresh, &tx.raw)?;
             let Some(r) = self.broadcast_and_wait(&tx)? else {
                 return Ok(ReconcileResult::Pending {
                     tx_hash: tx.hash.to_vec(),
@@ -1832,7 +1921,7 @@ impl NativeBridgeV2 {
             }
         }
         let mut sends = rec.sends.clone();
-        let landed = self.landed_send(&mut sends)?;
+        let landed = self.landed_send(&mut sends, Some(&rec))?;
         if sends != rec.sends {
             rec.sends = sends;
             self.journal.put_return(&rec)?;
@@ -2010,7 +2099,11 @@ impl NativeBridgeV2 {
     /// since that was first seen (journaled in `nonceUsedAt`; the caller persists `sends` when this changes them), the block at
     /// `nonceUsedAt` has a certificate (a found companion), and every receipt is read again; until then it is pending. A send
     /// still in a pool is broadcast again (same bytes).
-    fn landed_send(&self, sends: &mut [SendRecord]) -> Result<Landed> {
+    fn landed_send(
+        &self,
+        sends: &mut [SendRecord],
+        return_record: Option<&ReturnRecord>,
+    ) -> Result<Landed> {
         let Some(last) = sends.last() else {
             return Ok(Landed::None);
         };
@@ -2028,7 +2121,11 @@ impl NativeBridgeV2 {
         }
         if mined <= last_nonce {
             // the nonce is unused by any mined transaction: the send is alive, in a pool or lost; offer the same bytes again
-            self.send_raw_tolerant(&unhex(&sends.last().expect("a send").raw)?)?;
+            let raw = unhex(&last.raw)?;
+            if let Some(rec) = return_record {
+                self.check_ordinary_import(rec, &raw)?;
+            }
+            self.send_raw_tolerant(&raw)?;
             return Ok(Landed::Pending);
         }
         // a mined transaction used the nonce, and no success receipt is visible: wait for depth before calling it dead

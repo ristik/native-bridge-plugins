@@ -32,7 +32,7 @@ use native_bridge_sdk_ext::nb2::rpc::{JsonRpc, RpcError};
 use native_bridge_sdk_ext::nb2::segment::segment_sealed_data;
 use native_bridge_sdk_ext::nb2::token::leaf_value;
 use native_bridge_sdk_ext::nb2::tokenops::Aggregator;
-use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+use native_bridge_sdk_ext::nb2::trust::TrustInput;
 use native_bridge_sdk_ext::nb2::util::{arr, be_int, from_hex, hex0x, to_u64, u256, u256_64};
 use native_bridge_sdk_ext::nb2::vaultmodel::{
     tag_words, RecipientBehaviour, VaultEvent, VaultModel, VerifierAnswer,
@@ -125,12 +125,7 @@ pub fn make_root(n: usize) -> Root {
     let bundle = TrustBaseHistory::from_trusted_chain(vec![entry])
         .unwrap()
         .to_bundle();
-    let trust = TrustInput::from_bundle(&bundle, &pin)
-        .unwrap()
-        .with_authenticated_origin(AuthenticatedOrigin {
-            usable_epoch: 1,
-            root_round: 1_000_000,
-        });
+    let trust = TrustInput::from_bundle(&bundle, &pin).unwrap();
     Root {
         signers,
         bundle,
@@ -145,12 +140,7 @@ pub fn root_of(bundle: &[u8], pin: [u8; 32], n: usize) -> Root {
         signers: signers_of(n),
         bundle: bundle.to_vec(),
         pin,
-        trust: TrustInput::from_bundle(bundle, &pin)
-            .unwrap()
-            .with_authenticated_origin(AuthenticatedOrigin {
-                usable_epoch: 1,
-                root_round: 1_000_000,
-            }),
+        trust: TrustInput::from_bundle(bundle, &pin).unwrap(),
     }
 }
 
@@ -763,12 +753,16 @@ impl FakeChain {
             "eth_blockNumber" => Ok(json!(q(top.header.number_u64()))),
             "eth_maxPriorityFeePerGas" => Ok(json!(q(1u8))),
             "eth_getBlockByNumber" => {
-                let b = if p[0] == "latest" {
+                let b = if p[0] == "latest" || p[0] == "finalized" {
                     Some(top)
                 } else {
                     st.blocks.get(qn(&p[0]) as usize)
                 };
-                Ok(b.map_or(Value::Null, Self::header_json))
+                let mut out = b.map_or(Value::Null, Self::header_json);
+                if p[0] == "0x0" {
+                    out["hash"] = json!(h(&self.cfg.execution_genesis));
+                }
+                Ok(out)
             }
             "eth_getBlockByHash" => {
                 if p.as_array().map(|a| a.len()) != Some(2) || p[1] != json!(false) {
@@ -906,6 +900,7 @@ impl FakeChain {
                     }),
                 }
             }
+            "eth_getStorageAt" => Ok(json!(h(&u256_64(100)))),
             "eth_getCode" => Ok(json!(h(st
                 .code
                 .get(&arr::<20>(&unh(&p[0])))

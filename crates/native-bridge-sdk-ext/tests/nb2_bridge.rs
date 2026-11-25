@@ -1666,10 +1666,10 @@ fn split_retries_the_exact_request_after_an_unusable_parent_proof_and_restart() 
 }
 
 #[test]
-fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
+fn history_refresh_extends_the_installed_pin() {
     use native_bridge_sdk_ext::nb2::config::Build;
     use native_bridge_sdk_ext::nb2::token::{decode_token, encode_token};
-    use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+    use native_bridge_sdk_ext::nb2::trust::TrustInput;
     use unicity_token::api::bft::TrustBaseHistory;
 
     const CORPUS: &str = concat!(
@@ -1689,10 +1689,6 @@ fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
     let lagging = TrustBaseHistory::from_trusted_chain(vec![extended.history().genesis().clone()])
         .unwrap()
         .to_bundle();
-    let origin = AuthenticatedOrigin {
-        usable_epoch: 2,
-        root_round: 1_005,
-    };
     let held = read("transcripts/held-sibling-0/evidence.bin");
     let mut future = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
     future.part.transfers.pop();
@@ -1700,34 +1696,24 @@ fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
     future.part.proofs.pop();
     let future = encode_token(&future);
 
-    for offers_origin in [false, true] {
+    {
         let world = setup();
         let foreign = world.root.trust.clone();
         let mut opts = world.options("authenticated refresh", World::store());
         opts.pins.gamma = gamma.clone();
         opts.pins.build = Build::Production;
-        opts.trust = TrustInput::from_bundle(&lagging, &pin)
-            .unwrap()
-            .with_authenticated_origin(origin);
+        opts.trust = TrustInput::from_bundle(&lagging, &pin).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let bundle = bundle.clone();
         opts.refresh_trust = Some(Box::new(move |current| {
             assert_eq!(current.id(), pin);
-            assert_eq!(current.origin(), Some(origin));
             assert_eq!(current.history().latest().epoch, 1);
             if count.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(foreign.clone());
             }
             let fresh = TrustInput::from_bundle(&bundle, &pin).unwrap();
-            Ok(if offers_origin {
-                fresh.with_authenticated_origin(AuthenticatedOrigin {
-                    usable_epoch: 2,
-                    root_round: 10_000,
-                })
-            } else {
-                fresh
-            })
+            Ok(fresh)
         }));
         let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
         assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
@@ -1743,10 +1729,7 @@ fn history_refresh_extends_the_installed_pin_and_preserves_the_origin() {
     let mut opts = world.options("trust rollback", World::store());
     opts.pins.gamma = gamma;
     opts.pins.build = Build::Production;
-    opts.trust = extended.with_authenticated_origin(AuthenticatedOrigin {
-        usable_epoch: 3,
-        root_round: 10_000,
-    });
+    opts.trust = extended;
     let rollback = TrustInput::from_bundle(&lagging, &pin).unwrap();
     opts.refresh_trust = Some(Box::new(move |_| Ok(rollback.clone())));
     let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();

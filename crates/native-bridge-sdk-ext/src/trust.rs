@@ -17,19 +17,11 @@ use unicity_token::verify::{verify_certificate_of_partition, SealSession, Verifi
 
 use crate::error::{NativeError as E, Result};
 
-/// An externally authenticated B1 evaluation origin for this history and deployment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthenticatedOrigin {
-    pub usable_epoch: u64,
-    pub root_round: u64,
-}
-
 /// The installed trust: the held SDK history and its genesis EntryID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustInput {
     history: TrustBaseHistory,
     id: [u8; 32],
-    origin: Option<AuthenticatedOrigin>,
 }
 
 impl TrustInput {
@@ -40,24 +32,10 @@ impl TrustInput {
             HistoryError::PinMismatch => E::TrustBaseDigest,
             _ => E::TrustBase,
         })?;
-        Ok(TrustInput {
-            history,
-            id: *pin,
-            origin: None,
-        })
+        Ok(TrustInput { history, id: *pin })
     }
 
-    /// Attach a checkpoint authenticated by the caller. Token evidence and UTB history do not establish this bound.
-    pub fn with_authenticated_origin(mut self, origin: AuthenticatedOrigin) -> Self {
-        self.origin = Some(origin);
-        self
-    }
-
-    pub fn origin(&self) -> Option<AuthenticatedOrigin> {
-        self.origin
-    }
-
-    /// The held history (the wallet appends newer entries to its own copy and reinstalls).
+    /// The held authenticated history.
     pub fn history(&self) -> &TrustBaseHistory {
         &self.history
     }
@@ -66,7 +44,6 @@ impl TrustInput {
         self.history.network_id()
     }
 
-    /// The genesis EntryID: the value a lock proof's `trustBaseId` and the manifest pin must equal.
     pub fn id(&self) -> [u8; 32] {
         self.id
     }

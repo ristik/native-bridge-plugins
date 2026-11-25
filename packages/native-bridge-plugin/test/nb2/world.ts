@@ -70,7 +70,7 @@ export async function makeRoot(n = 4): Promise<Root> {
   ));
   const pin = await RootTrustBaseV2.decode(entry).entryId();
   const bundle = await TrustBaseBundle.encode([RootTrustBaseV2.decode(entry)]);
-  return { signers, bundle, pin, trust: (await TrustInput.fromBundle(bundle, pin)).withAuthenticatedOrigin({ usableEpoch: 1n, rootRound: 1000000n }) };
+  return { signers, bundle, pin, trust: (await TrustInput.fromBundle(bundle, pin)) };
 }
 
 const TECHNICAL_RECORD = cArr(cUint(1), cUint(1), C.encodeTextString('leader'), cBytes(new Uint8Array(32)), cBytes(new Uint8Array(32)));
@@ -153,6 +153,7 @@ export interface Faults {
 }
 
 export class FakeChain implements JsonRpc {
+  public importedTipEpoch = 100n;
   public readonly blocks: Block[] = [];
   public readonly vault: VaultModel;
   public readonly balances = new Map<string, bigint>();
@@ -345,7 +346,8 @@ export class FakeChain implements JsonRpc {
             return { hash: h(tx.hash), to: h(tx.request.to), input: h(tx.request.data) };
           }) };
         }
-        const b = p[0] === 'latest' ? top : this.blocks[Number(BigInt(p[0]))];
+        if (p[0] === '0x0') return { ...this.headerJson(this.blocks[0]), hash: h(this.cfg.executionGenesis) };
+        const b = p[0] === 'latest' || p[0] === 'finalized' ? top : this.blocks[Number(BigInt(p[0]))];
         return b ? this.headerJson(b) : null;
       }
       case 'eth_getBlockByHash': {
@@ -408,6 +410,7 @@ export class FakeChain implements JsonRpc {
         if (!r.ok) throw new RpcError(200, 3, `execution reverted: ${h(r.revert)}`, h(r.revert));
         return method === 'eth_estimateGas' ? q(120_000n) : '0x';
       }
+      case 'eth_getStorageAt': return h(u256(this.importedTipEpoch));
       case 'eth_getCode': return h(this.code.get(p[0].slice(2)) ?? new Uint8Array());
       case 'eth_getBalance': return q(this.balanceOf(fromHex(p[0].slice(2))!));
       case 'eth_getTransactionCount': {

@@ -4,7 +4,7 @@
  *
  *   npx tsx wallet/nb2-wallet.ts [--wallet DIR] COMMAND ...      (DIR defaults to ./nb2-wallet)
  *
- *   init --release FILE --rpc URL [--aggregator URL] [--trust-bundle FILE] [--trust-pin FILE] [--trust-origin FILE] [--key-env NAME]
+ *   init --release FILE --rpc URL [--aggregator URL] [--trust-bundle FILE] [--trust-pin FILE] [--key-env NAME]
  *                              a new wallet for the deployment in FILE (nb2-release.json); the installation check; prints the EVM address to fund
  *   address                    the EVM address, its balance, and the wallet's Unicity owner key
  *   deposit NAME AMOUNT        plan a deposit of AMOUNT UCT (the secret and its backup first), then send it to the vault; again with
@@ -72,9 +72,9 @@ function address(s: string): Uint8Array {
 async function init(dir: string, args: string[]): Promise<void> {
   const release = option(args, '--release');
   const rpc = option(args, '--rpc');
-  if (!release || !rpc) throw new Error('usage: init --release FILE --rpc URL [--aggregator URL] [--trust-bundle FILE] [--trust-pin FILE] [--trust-origin FILE] [--key-env NAME]');
+  if (!release || !rpc) throw new Error('usage: init --release FILE --rpc URL [--aggregator URL] [--trust-bundle FILE] [--trust-pin FILE] [--key-env NAME]');
   const keyEnv = option(args, '--key-env');
-  const cfg: WalletConfig = { ...connectionOf({ release, rpc, aggregator: option(args, '--aggregator'), trustBundle: option(args, '--trust-bundle'), trustPin: option(args, '--trust-pin'), trustOrigin: option(args, '--trust-origin') }), ...(keyEnv ? { keyEnv } : {}) };
+  const cfg: WalletConfig = { ...connectionOf({ release, rpc, aggregator: option(args, '--aggregator'), trustBundle: option(args, '--trust-bundle'), trustPin: option(args, '--trust-pin') }), ...(keyEnv ? { keyEnv } : {}) };
   // the installation check (the chain ID, config() against the pinned Γ, the vault's runtime code hash) passes before anything is written
   const w = await Wallet.create(dir, cfg, () => Uint8Array.from(randomBytes(32)));
   say(`wallet ${resolve(dir)} for the ${w.pins.build} vault ${hx(w.bridge.cfg.vault)} on chain ${w.bridge.cfg.chainId}`);
@@ -112,7 +112,7 @@ async function relay(dir: string, args: string[], policy: PayerPolicy, ordinary:
   const key = payerEnv && process.env[payerEnv];
   if (!release || !rpc || !key) throw new Error('resume requires --release FILE --rpc URL --payer-env NAME with the relayer payer key');
   const conn = connectionOf({ release, rpc, trustBundle: option(args, '--trust-bundle'), trustPin: option(args, '--trust-pin'),
-    trustOrigin: option(args, '--trust-origin'), aggregator: option(args, '--aggregator') });
+    aggregator: option(args, '--aggregator') });
   need(args, 1, 'resume BACKUP --release FILE --rpc URL --payer-env NAME --return-policy FILE');
   const w = await new Wallet(dir, unhex(key), conn).open();
   const rec = await restoreReturn(w, resolve(args[0]), policy);

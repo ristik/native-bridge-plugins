@@ -13,7 +13,7 @@ use native_bridge_sdk_ext::nb2::token::{
     decode_token, encode_certification, encode_mint, encode_token, encode_transfer,
     signature_predicate, state_id, value_data, Token,
 };
-use native_bridge_sdk_ext::nb2::trust::{AuthenticatedOrigin, TrustInput};
+use native_bridge_sdk_ext::nb2::trust::TrustInput;
 use native_bridge_sdk_ext::nb2::util::{from_hex, u256};
 use native_bridge_sdk_ext::nb2::verify::{verdict_abi, verify_held, verify_return, verify_split};
 
@@ -83,11 +83,7 @@ fn independent_signed_transcripts() {
             &read(&format!("transcripts/{name}/utb.cbor")),
             &cfg.root_genesis,
         )
-        .unwrap()
-        .with_authenticated_origin(AuthenticatedOrigin {
-            usable_epoch: 2,
-            root_round: 10_000,
-        });
+        .unwrap();
         let expected = read(&format!("transcripts/{name}/verdict.bin"));
         let part = decode_token(&evidence).unwrap();
         assert_eq!(encode_token(&part), evidence, "{name}");
@@ -144,12 +140,8 @@ fn published_malformed_lineages_are_refused() {
     let gamma = read("gamma.bin");
     let params = production_params();
     let cfg = decode_config(&gamma, &params).unwrap();
-    let trust = TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis)
-        .unwrap()
-        .with_authenticated_origin(AuthenticatedOrigin {
-            usable_epoch: 2,
-            root_round: 10_000,
-        });
+    let trust =
+        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
     let cases = [
         ("continuing-transfer-data", Rule::TransferData),
         ("expired-transfer", Rule::DeadlineExpired),
@@ -185,11 +177,7 @@ fn held_siblings_require_their_allocation_and_their_certified_parent() {
         &read("transcripts/held-sibling-0/utb.cbor"),
         &cfg.root_genesis,
     )
-    .unwrap()
-    .with_authenticated_origin(AuthenticatedOrigin {
-        usable_epoch: 2,
-        root_round: 10_000,
-    });
+    .unwrap();
     let mut part = decode_token(&read("transcripts/held-sibling-0/evidence.bin")).unwrap();
     let sibling = decode_token(&read("transcripts/held-sibling-1/evidence.bin")).unwrap();
     let parent = Token {
@@ -310,11 +298,7 @@ fn equivalent_external_certificate_preserves_the_return_identity() {
     let params = production_params();
     let cfg = decode_config(&gamma, &params).unwrap();
     let trust = TrustInput::from_bundle(&read("transcripts/one-split/utb.cbor"), &cfg.root_genesis)
-        .unwrap()
-        .with_authenticated_origin(AuthenticatedOrigin {
-            usable_epoch: 2,
-            root_round: 10_000,
-        });
+        .unwrap();
     let original = read("transcripts/one-split/evidence.bin");
     let mut token = decode_token(&original).unwrap();
     let original_mint = token.mint_raw.clone();
@@ -335,76 +319,14 @@ fn equivalent_external_certificate_preserves_the_return_identity() {
 }
 
 #[test]
-fn authenticated_origin_bounds_usable_epoch_and_round() {
-    use native_bridge_sdk_ext::nb2::deposit::decode_receipt_backing;
-    use native_bridge_sdk_ext::nb2::trust::{decode_uc, shard_bytes, uc_check, verify_evm_uc};
-
-    let gamma = read("gamma.bin");
-    let cfg = decode_config(&gamma, &production_params()).unwrap();
-    let history =
-        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
-    let at = |usable_epoch, root_round| {
-        history
-            .clone()
-            .with_authenticated_origin(AuthenticatedOrigin {
-                usable_epoch,
-                root_round,
-            })
-    };
-    let root = decode_token(&read("transcripts/root/evidence.bin")).unwrap();
-    let receipt = decode_receipt_backing(root.mint.justification.as_deref().unwrap())
-        .unwrap()
-        .proof
-        .uc;
-    let round = decode_uc(&receipt)
-        .unwrap()
-        .unicity_seal
-        .root_chain_round_number;
-    assert!(verify_evm_uc(&at(2, round), &receipt, &cfg).is_ok());
-    assert!(verify_evm_uc(&at(2, round - 1), &receipt, &cfg).is_err());
-    assert!(verify_evm_uc(&history, &receipt, &cfg).is_err());
-
-    let token = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
-    let uc = token
-        .proofs
-        .iter()
-        .map(|p| decode_uc(&p.uc).unwrap())
-        .find(|uc| uc.unicity_seal.epoch == 2)
-        .unwrap();
-    assert!(history.history().get(2).is_some());
-    let round = uc.unicity_seal.root_chain_round_number;
-    let check = |epoch, round| {
-        uc_check(
-            &at(epoch, round),
-            &uc,
-            cfg.aggregator_partition,
-            &shard_bytes(&uc),
-        )
-    };
-    assert!(check(2, round).is_ok());
-    assert_eq!(
-        check(2, round - 1).unwrap_err().rule().unwrap().rule,
-        Rule::SealEpoch
-    );
-    assert_eq!(
-        check(1, 10_000).unwrap_err().rule().unwrap().rule,
-        Rule::SealEpoch
-    );
-}
-
-#[test]
 fn b1_signature_ceiling_applies_to_both_certificate_routes() {
     use native_bridge_sdk_ext::nb2::deposit::decode_receipt_backing;
     use native_bridge_sdk_ext::nb2::trust::{decode_uc, shard_bytes, uc_check, verify_evm_uc};
 
     let gamma = read("gamma.bin");
     let cfg = decode_config(&gamma, &production_params()).unwrap();
-    let trust = TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis)
-        .unwrap()
-        .with_authenticated_origin(AuthenticatedOrigin {
-            usable_epoch: 2,
-            root_round: 10_000,
-        });
+    let trust =
+        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
     let root = decode_token(&read("transcripts/root/evidence.bin")).unwrap();
     let evm = decode_receipt_backing(root.mint.justification.as_deref().unwrap())
         .unwrap()
@@ -546,7 +468,7 @@ fn receipt_and_allocation_counts_refuse_before_their_children() {
 }
 
 #[test]
-fn retired_seals_require_the_authenticated_successor_on_both_certificate_routes() {
+fn the_successor_closes_the_open_tip_on_both_certificate_routes() {
     use native_bridge_sdk_ext::nb2::trust::{uc_check, verify_evm_uc};
     use rootfixture::{make_root, make_uc, next_epoch, trust_input, UcSpec};
 
@@ -554,12 +476,8 @@ fn retired_seals_require_the_authenticated_successor_on_both_certificate_routes(
     let fresh = next_epoch(&old, 100, 4, 30);
     let mut cfg = decode_config(&read("gamma.bin"), &production_params()).unwrap();
     cfg.root_genesis = old.pin;
-    let checkpoint = AuthenticatedOrigin {
-        usable_epoch: 2,
-        root_round: 150,
-    };
-    let lagging = trust_input(&old).with_authenticated_origin(checkpoint);
-    let refreshed = trust_input(&fresh).with_authenticated_origin(checkpoint);
+    let lagging = trust_input(&old);
+    let refreshed = trust_input(&fresh);
     for partition in [cfg.evm_partition, cfg.aggregator_partition] {
         for round in [99, 100] {
             let uc = make_uc(
@@ -584,9 +502,7 @@ fn retired_seals_require_the_authenticated_successor_on_both_certificate_routes(
                     uc_check(trust, &uc, partition, &cfg.evm_shard)
                 }
             };
-            let provisional = check(&lagging).unwrap_err();
-            assert_eq!(provisional.rule().unwrap().rule, Rule::NoEntryForEpoch);
-            assert!(provisional.retryable());
+            check(&lagging).unwrap();
             if round == 99 {
                 check(&refreshed).unwrap();
             } else {
@@ -607,12 +523,8 @@ fn standalone_evm_and_receipt_verification_require_the_configured_genesis() {
     use native_bridge_sdk_ext::nb2::trust::verify_evm_uc;
 
     let mut cfg = decode_config(&read("gamma.bin"), &production_params()).unwrap();
-    let trust = TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis)
-        .unwrap()
-        .with_authenticated_origin(AuthenticatedOrigin {
-            usable_epoch: 2,
-            root_round: 10_000,
-        });
+    let trust =
+        TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
     let token = decode_token(&read("transcripts/root/evidence.bin")).unwrap();
     let proof = decode_receipt_backing(token.mint.justification.as_deref().unwrap())
         .unwrap()
@@ -628,4 +540,55 @@ fn standalone_evm_and_receipt_verification_require_the_configured_genesis() {
         verify_receipt_log(&cfg, &trust, &proof).unwrap_err().name(),
         "TrustInput"
     );
+}
+
+#[test]
+fn wallet_intervals_match_shared_b1_imported_tip_cases() {
+    use native_bridge_sdk_ext::nb2::trust::{uc_check, verify_evm_uc};
+    use rootfixture::{make_root, make_uc, next_epoch, trust_input, UcSpec};
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../protocol/vectors/b1-wallet-tip.json")).unwrap();
+    let mut roots = vec![make_root(0, 4, 10)];
+    for epoch in 1..=8 {
+        roots.push(next_epoch(
+            &roots[epoch - 1],
+            epoch as u64 * 1000,
+            4,
+            10 + epoch as u8 * 5,
+        ));
+    }
+    let mut cfg = decode_config(&read("gamma.bin"), &production_params()).unwrap();
+    cfg.root_genesis = roots[0].pin;
+    for case in fixture["cases"].as_array().unwrap() {
+        let tip = case["tip"].as_u64().unwrap() as usize;
+        let epoch = case["epoch"].as_u64().unwrap() as usize;
+        let trust = trust_input(&roots[tip]);
+        for partition in [cfg.evm_partition, cfg.aggregator_partition] {
+            let uc = make_uc(
+                &roots[epoch],
+                &UcSpec {
+                    partition,
+                    conf: vec![0; 32],
+                    epoch_ir: 1,
+                    root_epoch: epoch as u64,
+                    round: case["round"].as_u64().unwrap(),
+                    timestamp: 1_700_000_000,
+                    state_hash: vec![1; 32],
+                    block_hash: Some(vec![2; 32]),
+                    signers: 3,
+                },
+            );
+            let verified = if partition == cfg.evm_partition {
+                verify_evm_uc(&trust, &uc.to_cbor(), &cfg).map(|_| ())
+            } else {
+                uc_check(&trust, &uc, partition, &cfg.evm_shard)
+            };
+            assert_eq!(
+                verified.is_ok(),
+                case["accept"].as_bool().unwrap(),
+                "{case}: {verified:?}"
+            );
+        }
+    }
 }

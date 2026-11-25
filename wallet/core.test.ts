@@ -17,7 +17,6 @@ import { Nb2Error } from '../packages/native-bridge-plugin/src/nb2/errors.js';
 import { RpcError } from '../packages/native-bridge-plugin/src/nb2/rpc.js';
 import { MAX_TRANSFER_PAIR } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { type Aggregator } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
-import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { framedProof, successor, withSeal, withoutQuorum } from '../packages/native-bridge-plugin/test/nb2/certification-fixtures.js';
 import { WORLD_GAS, key, roundNow, setup } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { REGISTRY_LAG_MS, RegistryLagExpired, Wallet, burn, connectionOf, io, lockWallet, mint, planDeposit, planReturn, redeem, sendDeposit, split, transfer, type OpenOptions, type WalletConfig } from './core.js';
@@ -120,87 +119,11 @@ test('transfer: a crash after certification resumes from the journal with the sa
   assert.deepEqual(readFileSync(join(x.dir, 'tokens', 'coin2.cbor')), Buffer.from(t));
 });
 
-test('transfer: a retained proof survives an origin lag and a CLI reopen', async (t) => {
-  const x = await withCoin();
-  const before = x.agg.submitted;
-  const verify = x.w.bridge.verifyToken.bind(x.w.bridge);
-  let verifications = 0;
-  t.mock.method(x.w.bridge, 'verifyToken', async (token: Uint8Array) => {
-    if (++verifications === 2) throw new SealAheadOfOrigin();
-    return verify(token);
-  });
-  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), SealAheadOfOrigin);
-  const pending = JSON.parse(readFileSync(join(x.dir, 'tokens', 'coin2.pending.json'), 'utf8'));
-  assert.match(pending.proof, /^0x[0-9a-f]+$/);
-  const again = await x.openAt();
-  assert.equal((await again.bridge.verifyToken(await transfer(again, 'coin', 'coin2', 1))).amount, 10n);
-  assert.equal(x.agg.submitted, before + 1);
-});
-
-test('transfer: explicit recovery preserves an ahead candidate until a healthy proof verifies', async (t) => {
-  const x = await withCoin();
-  const certify = x.agg.certify.bind(x.agg);
-  let request: Uint8Array | undefined;
-  let healthy = false;
-  const before = x.agg.submitted;
-  t.mock.method(x.agg, 'certify', async (cd: Uint8Array) => {
-    if (request) assert.deepEqual(cd, request);
-    request ??= cd.slice();
-    const proof = await certify(cd);
-    return healthy ? proof : withoutQuorum(proof, x.root, x.agg.submitted === before + 1);
-  });
-  const path = x.w.pendingFile('coin2');
-  t.mock.method(x.w, 'refreshAuthority', async () => x.w.trust);
-  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), SealAheadOfOrigin);
-  const pending = readFileSync(path, 'utf8');
-  const resumed = await x.openAt();
-  t.mock.method(resumed, 'refreshAuthority', async () => resumed.trust);
-  await assert.rejects(transfer(resumed, 'coin', 'coin2', 1), SealAheadOfOrigin);
-  assert.equal(x.agg.submitted, before + 1);
-  await assert.rejects(transfer(resumed, 'coin', 'coin2', 1, undefined, true), { rule: 'QuorumNotMet' });
-  assert.equal(readFileSync(path, 'utf8'), pending);
-  healthy = true;
-  const token = await transfer(resumed, 'coin', 'coin2', 1, undefined, true);
-  assert.equal((await resumed.bridge.verifyToken(token)).amount, 10n);
-  assert.equal(x.agg.submitted, before + 3);
-});
-
-test('transfer: a rejected saved proof is replaced by a fixed ahead candidate across reopen', async (t) => {
-  const x = await withCoin();
-  t.mock.method(x.w, 'refreshAuthority', async () => x.w.trust);
-  const certify = x.agg.certify.bind(x.agg);
-  const origin = x.w.trust.origin!;
-  let calls = 0;
-  let request: Uint8Array | undefined;
-  let replacement: Uint8Array | undefined;
-  t.mock.method(x.agg, 'certify', async (cd: Uint8Array) => {
-    if (request) assert.deepEqual(cd, request);
-    request ??= cd.slice();
-    if (++calls === 1) return framedProof(cd, 512);
-    replacement = await withSeal(await certify(cd), x.root, origin.rootRound + BigInt(calls) + 3n, x.root.signers.length);
-    return replacement;
-  });
-  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), { rule: 'Length' });
-  await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), SealAheadOfOrigin);
-  const path = x.w.pendingFile('coin2');
-  assert.equal(JSON.parse(readFileSync(path, 'utf8')).proof, hex(replacement!));
-  const resumed = await x.openAt();
-  t.mock.method(resumed, 'refreshAuthority', async () => resumed.trust);
-  await assert.rejects(transfer(resumed, 'coin', 'coin2', 1), SealAheadOfOrigin);
-  assert.equal(calls, 2);
-  await resumed.persistAuthority(resumed.trust.withAuthenticatedOrigin({ ...origin, rootRound: origin.rootRound + 5n }));
-  const caughtUp = await x.openAt();
-  const token = await transfer(caughtUp, 'coin', 'coin2', 1);
-  assert.equal((await caughtUp.bridge.verifyToken(token)).amount, 10n);
-  assert.equal(calls, 2);
-});
-
 test('transfer: a replacement missing a UTB epoch is saved before refresh and reused across reopen', async (t) => {
   const x = await withCoin();
   const start = roundNow() + 1n;
   const next = await successor(x.root, start);
   const certify = x.agg.certify.bind(x.agg);
-  const origin = { ...x.w.trust.origin!, usableEpoch: 2n };
   const path = x.w.pendingFile('coin2');
   let calls = 0;
   let refreshes = 0;
@@ -225,10 +148,9 @@ test('transfer: a replacement missing a UTB epoch is saved before refresh and re
       entries: available ? [next.entries[1]] : [], status: BigInt(available ? TrustBaseStatus.OK : TrustBaseStatus.NOT_YET_AVAILABLE) });
   } };
   await assert.rejects(transfer(x.w, 'coin', 'coin2', 1), { rule: 'Length' });
-  await x.w.persistAuthority(x.w.trust.withAuthenticatedOrigin(origin));
   const waiting = await x.openAt(x.dir, { trustSource });
   await assert.rejects(transfer(waiting, 'coin', 'coin2', 1), (error: unknown) =>
-    error instanceof Nb2Error && error.rule === 'NoEntryForEpoch' && error.inner?.rule === 'DepositUC');
+    error instanceof Nb2Error && error.rule === 'NoEntryForEpoch');
   assert.equal(refreshes, 1);
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).proof, pendingProof);
   const resumed = await x.openAt(x.dir, { trustSource });

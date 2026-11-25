@@ -20,7 +20,7 @@ import { checkCompanion } from './rules.js';
 import { array, isBytes, isUint, scanNative, u256 } from './cbor.js';
 
 import type { RecoveryEvent, RecoveryReceiptSource } from './recovery.js';
-import { decodeUc, SealAheadOfOrigin, verifyEvmUc, type TrustInput } from './trust.js';
+import { decodeUc, verifyEvmUc, type TrustInput } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
 
@@ -52,7 +52,7 @@ async function proofFrom<T>(readers: readonly EvmReader[], component: string, re
       return await read(reader);
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
-      if (e instanceof Nb2Error && (e.retryable || e instanceof SealAheadOfOrigin)) refresh ??= e;
+      if (e instanceof Nb2Error && e.retryable) refresh ??= e;
       if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned' ||
         e instanceof RpcError && (e.status === 413 || e.code === -32601 || /unknown block|not found|pruned/i.test(e.message))) pruned = true;
     }
@@ -424,6 +424,33 @@ export class EvmReader {
 
   public async call(to: Uint8Array, data: Uint8Array, from?: Uint8Array): Promise<Uint8Array> {
     return bytesOf(await this.rpc.call('eth_call', [{ to: hexOf(to), data: hexOf(data), ...(from ? { from: hexOf(from) } : {}) }, 'latest']), 'eth_call');
+  }
+
+  /** Check imported authority and simulate the exact fee-bearing return at the same finalized block. */
+  public async checkReturnImport(cfg: Config, epoch: bigint, tx: {
+    from: Uint8Array; to: Uint8Array; data: Uint8Array; gas: bigint; value: bigint;
+  }): Promise<void> {
+    const [chain, genesis, finalized] = await Promise.all([
+      this.chainId(),
+      this.rpc.call<{ hash: string } | null>('eth_getBlockByNumber', ['0x0', false]),
+      this.rpc.call<{ hash: string } | null>('eth_getBlockByNumber', ['finalized', false]),
+    ]);
+    if (chain !== cfg.chainId || !genesis || !eq(bytesOf(genesis.hash, 'genesis hash'), cfg.executionGenesis)) {
+      refuse('TrustInput', 'return RPC does not serve the pinned execution genesis');
+    }
+    if (!finalized || bytesOf(finalized.hash, 'finalized hash').length !== 32) {
+      refuse('NotPending', 'waiting for a finalized execution block');
+    }
+    const at = { blockHash: finalized!.hash, requireCanonical: true };
+    const registry = '0xff00000000000000000000000000000000000002';
+    const slot = '0xefa6b7f0bacdcf81ddd8a710fb8420140ae07d47982dc167bb647c00d3f5f4fc';
+    const tip = bytesOf(await this.rpc.call('eth_getStorageAt', [registry, slot, at]), 'B1 imported tip epoch');
+    if (tip.length !== 32 || BigInt(hexOf(tip)) < epoch) {
+      refuse('NotPending', `waiting for finalized B1 import of epoch ${epoch}`);
+    }
+    await this.rpc.call('eth_call', [{
+      from: hexOf(tx.from), to: hexOf(tx.to), data: hexOf(tx.data), value: qty(tx.value), gas: qty(tx.gas),
+    }, at]);
   }
 
   public async vaultState(vault: Uint8Array): Promise<VaultState> {

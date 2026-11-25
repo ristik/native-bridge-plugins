@@ -818,6 +818,62 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         )
     }
 
+    /// Simulate the exact return against the finalized state that supplied the registry tip.
+    pub fn check_return_import(
+        &self,
+        cfg: &super::config::Config,
+        epoch: u64,
+        tx: &super::evm::DecodedTx,
+    ) -> Result<()> {
+        let genesis = call(&*self.rpc, "eth_getBlockByNumber", json!(["0x0", false]))?;
+        if self.chain_id()? != cfg.chain_id
+            || bytes_of(&genesis["hash"], "genesis hash")? != cfg.execution_genesis
+        {
+            return refuse(
+                WalletReason::TrustInput,
+                "return RPC does not serve the pinned execution genesis",
+            );
+        }
+        let finalized = call(
+            &*self.rpc,
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+        )?;
+        if finalized.is_null() || bytes_of(&finalized["hash"], "finalized hash")?.len() != 32 {
+            return refuse(
+                WalletReason::NotPending,
+                "waiting for a finalized execution block",
+            );
+        }
+        let at = json!({"blockHash": finalized["hash"], "requireCanonical": true});
+        let tip = call(
+            &*self.rpc,
+            "eth_getStorageAt",
+            json!([
+                "0xff00000000000000000000000000000000000002",
+                "0xefa6b7f0bacdcf81ddd8a710fb8420140ae07d47982dc167bb647c00d3f5f4fc",
+                at,
+            ]),
+        )?;
+        let tip = bytes_of(&tip, "B1 imported tip epoch")?;
+        if tip.len() != 32 || BigUint::from_bytes_be(&tip) < BigUint::from(epoch) {
+            return refuse(
+                WalletReason::NotPending,
+                format!("waiting for finalized B1 import of epoch {epoch}"),
+            );
+        }
+        let req = &tx.request;
+        call(
+            &*self.rpc,
+            "eth_call",
+            json!([{
+            "from": hex0x(&tx.from), "to": hex0x(&req.to), "data": hex0x(&req.data),
+            "gas": qty(req.gas), "value": format!("0x{:x}", req.value),
+        }, at]),
+        )?;
+        Ok(())
+    }
+
     pub fn vault_state(&self, vault: &[u8]) -> Result<VaultState> {
         match decode_state_return(&self.call(vault, &selector::state(), None)?) {
             Some(s) => Ok(s),

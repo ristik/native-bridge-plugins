@@ -10,7 +10,6 @@ import {
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
   type RedeemShape, type ReturnAdmission, type ReturnRecord, type ReconcileResult, type TrustInput, type SendRecord, type RedeemOptions, type ReturnEvidence,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
-import { SealAheadOfOrigin } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { beInt } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
 import { fsyncDir, hx, unhex, writeDurable, type Wallet } from './core.js';
@@ -403,7 +402,7 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
           if (local?.pending) superseded.push(local.pending.raw);
           const journal: RecoveryJournal = {
             ...initialJournal(session, incoming, release), complete: { seq: endpoint.seq, location: endpoint.location },
-            fees: local?.fees, attempts: local?.attempts, superseded: superseded.length ? superseded : undefined,
+            fees: local?.fees, attempts: local?.attempts, signerEpochs: local?.signerEpochs, superseded: superseded.length ? superseded : undefined,
           };
           if ((await w.bridge.journal.ret(verified.returnId))?.burnRequest) saveRecovery(w, verified, journal);
           else freshCheckpoint = journal;
@@ -469,6 +468,7 @@ interface RecoveryJournal {
   complete?: PortableComplete;
   fees?: string;
   attempts?: string[];
+  signerEpochs?: Record<string, string>;
   /** Signed local attempts whose work has been superseded by a certified peer cursor. */
   superseded?: string[];
   cuts: { cut: Exclude<Cut, { kind: 'settle' }>; location: Location; seq: string; nonce: string; priorSeq: string; state?: string; endpoint?: string; head?: string }[];
@@ -511,7 +511,7 @@ async function openSession(w: Wallet, release: ReleaseRecovery, rec: ReturnRecor
   const generation = hx(release.generation);
   if ((rec.recovery && rec.recovery.generation !== generation) || !rec.burned) throw new WalletError('BadDeployment', 'return belongs to another generation or is uncertified');
   const cached = sessions.get(w);
-  const trust = w.trust;
+  const trust = await w.bridge.verifyWithTrust(async (trust) => trust);
   let session = cached?.burned === rec.burned && cached.generation === generation && cached.trust === trust ? cached.session : undefined;
   if (session === undefined) {
     const authority = new RecoveryAuthority(trust, async (next) => w.persistAuthority(next));
@@ -560,7 +560,7 @@ function activeRecovery(rec: ReturnRecord, journal: RecoveryJournal): ReturnReco
 async function verifyComplete(w: Wallet, s: RecoverySession, endpoint: PortableComplete): Promise<Cursor> {
   bytes(endpoint.location.txHash, 32);
   const seq = uint(endpoint.seq);
-  const receipt = await withFreshAuthority(w, () => s.verifyComplete(w.trust, bytes(endpoint.location.proof), seq));
+  const receipt = await w.bridge.verifyWithTrust((trust) => s.verifyComplete(trust, bytes(endpoint.location.proof), seq));
   if (!matches(receipt, endpoint.location)) throw new Error('Complete locator disagrees with its authenticated receipt');
   return { from: s.operationCount, prior: { seq, receipt: receipt.encoded }, gap: { seq } };
 }
@@ -577,10 +577,10 @@ async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal:
     bytes(item.location.txHash, 32);
     if (uint(item.priorSeq) !== (cursor.prior?.seq ?? 0n)) throw new Error('checkpoint has the wrong preceding sequence');
     uint(item.nonce);
-    const packet = await withFreshAuthority(w, () => packetOf(s, w.trust, rec, cursor, item.cut));
+    const packet = await w.bridge.verifyWithTrust((trust) => packetOf(s, trust, rec, cursor, item.cut));
     if (!packet.event) throw new Error('settlement is reconciled through the vault Paid receipt');
     const event = packet.event;
-    const receipt = await withFreshAuthority(w, () => s.verifyEvent(w.trust, bytes(item.location.proof), event));
+    const receipt = await w.bridge.verifyWithTrust((trust) => s.verifyEvent(trust, bytes(item.location.proof), event));
     if (!matches(receipt, item.location)) throw new Error('checkpoint locator disagrees with its authenticated receipt');
     advanceCursor(cursor, packet, receipt.encoded);
     const state = 'state' in packet && packet.state ? hx(packet.state) : undefined;
@@ -606,18 +606,6 @@ function readers(w: Wallet, policy: PayerPolicy): EvmReader[] {
   return [w.bridge.evm, ...policy.archives.map((url) => new EvmReader(new HttpJsonRpc(url)))];
 }
 
-async function withFreshAuthority<T>(w: Wallet, f: () => Promise<T>): Promise<T> {
-  try {
-    return await f();
-  } catch (e) {
-    if (!(e instanceof Nb2Error)) throw e;
-    let cause = e;
-    while (cause.inner && !(cause instanceof SealAheadOfOrigin)) cause = cause.inner;
-    if (!e.retryable && !(cause instanceof SealAheadOfOrigin)) throw e;
-    await w.refreshAuthority();
-    return f();
-  }
-}
 
 async function segmentProofs(reader: EvmReader, w: Wallet, rec: ReturnRecord, start: bigint, end: bigint): Promise<Uint8Array[]> {
   const rows = await reader.segmentLogs(w.bridge.cfg.vault, uint(rec.fromBlock), start, end);
@@ -716,6 +704,9 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
       return { record: rec, result };
     }
     if (resubmit) {
+      const epoch = journal?.signerEpochs?.[hx(lower.hash)];
+      if (epoch === undefined) throw new WalletError('NotPending', 'retry needs the authenticated cut for the prior signed packet');
+      await w.bridge.evm.checkReturnImport(w.bridge.cfg, uint(epoch), { ...lower.request, from: lower.from });
       try { await w.bridge.evm.sendRaw(lower.raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
@@ -791,7 +782,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       for (const reader of archive) {
         try {
           const proofs = await segmentProofs(reader, w, rec, start, end);
-          gaps = await withFreshAuthority(w, () => s.certifiedGaps(w.trust, start, head, proofs));
+          gaps = await w.bridge.verifyWithTrust((trust) => s.certifiedGaps(trust, start, head, proofs));
           break;
         } catch (e) { error = e; }
       }
@@ -838,14 +829,14 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
 async function openPendingPacket(w: Wallet, rec: ReturnRecord, release: ReleaseRecovery, s: RecoverySession,
   cursor: Cursor, pending: NonNullable<RecoveryJournal['pending']>) {
   const raw = bytes(pending.raw);
-  const { request, hash } = decodeSignedTx(raw);
-  const packet = await withFreshAuthority(w, () => packetOf(s, w.trust, rec, cursor, pending.cut));
+  const { request, from, hash } = decodeSignedTx(raw);
+  const packet = await w.bridge.verifyWithTrust((trust) => packetOf(s, trust, rec, cursor, pending.cut));
   if (hx(hash) !== pending.txHash || String(request.nonce) !== pending.nonce || String(cursor.prior?.seq ?? 0n) !== pending.priorSeq ||
     request.value !== 0n || request.chainId !== w.bridge.cfg.chainId || !eq(request.data, packet.calldata) ||
     !eq(request.to, pending.cut.kind === 'settle' ? w.bridge.cfg.vault : release.deployment.recovery)) {
     throw new Error('pending transaction does not match the authenticated cut');
   }
-  return { raw, hash, packet };
+  return { raw, hash, packet, request, from };
 }
 
 /** Reconcile a durable send without signing. Restore only reads receipts. */
@@ -853,7 +844,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   journal: RecoveryJournal, cursor: Cursor, archive: readonly EvmReader[],
   reconcile?: () => Promise<ReconcileResult>): Promise<RecoveryResult> {
   const pending = journal.pending!;
-  const { raw, hash, packet } = await openPendingPacket(w, rec, release, s, cursor, pending);
+  const { raw, hash, packet, request, from } = await openPendingPacket(w, rec, release, s, cursor, pending);
   const confirm = (receipt: RecoveryReceipt, txHint = hx(hash)): RecoveryResult => {
     if (pending.cut.kind === 'settle') throw new Error('settlement requires a certified Paid receipt');
     advanceCursor(cursor, packet, receipt.encoded);
@@ -881,7 +872,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
           continue;
         }
         failed = true;
-        await withFreshAuthority(w, () => reader.verifyFailedReceipt(hash, w.bridge.cfg, w.trust, receipt, archive));
+        await w.bridge.verifyWithTrust((trust) => reader.verifyFailedReceipt(hash, w.bridge.cfg, trust, receipt, archive));
         return 'failed';
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
@@ -893,6 +884,9 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   };
   let mined = await outcome();
   if (mined === 'missing' && reconcile && pending.failureProofReads === undefined) {
+    await w.bridge.evm.checkReturnImport(w.bridge.cfg, packet.requiredSignerEpoch, { ...request, from });
+    (journal.signerEpochs ??= {})[hx(hash)] = String(packet.requiredSignerEpoch);
+    saveRecovery(w, rec, journal);
     try { await w.bridge.evm.sendRaw(raw); }
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     mined = await outcome();
@@ -921,7 +915,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   }
   let acquired;
   try {
-    acquired = await s.acquire(w.trust, packet.event!, archive.map((r) => recoveryRpcSource(r, hash)), () => w.refreshAuthority());
+    acquired = await w.bridge.verifyWithTrust((trust) => s.acquire(trust, packet.event!, archive.map((r) => recoveryRpcSource(r, hash))));
   } catch (e) {
     if (e instanceof WalletError && (e.reason === 'CompanionUnknown' || e.reason === 'EvidenceMissing')) {
       return unresolved();

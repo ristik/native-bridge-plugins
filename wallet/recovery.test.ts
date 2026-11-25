@@ -74,7 +74,7 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
     pins: { gamma: hx(chain.gamma), build: 'test', vaultRuntimeCodeHash: hx(deployment.vaultRuntimeHash),
       maxEncodedTxBytes: 524288, userGasLimit: '24000000', gasReserve: '500000', returnReserveSegments: 64, deploymentBlock: 1,
       stateReadOnly: false },
-    trust: { origin: { usableEpoch: '1', rootRound: '1000000' } },
+    trust: {},
     recovery: { salt: hx(deployment.salt), address: hx(recovery), runtimeHash: hx(deployment.runtimeHash), pins: hx(deployment.pins),
       ...(includeOrdinaryRange ? { ordinaryRanges: [{ maxEvidenceBytes: 100_000, maxOperations: 10, maxGaps: '64', execution: '1000000' }] } : {}),
       ranges: [
@@ -89,8 +89,8 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   writeFileSync(join(dir, 'trust-base.bundle.cbor'), root.bundle);
   writeFileSync(join(dir, 'trust-base.genesis.entryid'), hx(root.pin));
   const conn = connectionOf({ release: manifest, rpc: 'http://127.0.0.1:9' });
-  const open = (name: string, override: JsonRpc = rpc, opts: { aggregator?: Aggregator; trustSource?: ITrustBaseSource; origin?: string; seed?: Uint8Array } = {}) =>
-    new Wallet(join(dir, name), opts.seed ?? key(name), { ...conn, trustOrigin: opts.origin }).open({
+  const open = (name: string, override: JsonRpc = rpc, opts: { aggregator?: Aggregator; trustSource?: ITrustBaseSource; seed?: Uint8Array } = {}) =>
+    new Wallet(join(dir, name), opts.seed ?? key(name), conn).open({
       lock: false, rpc: override, aggregator: opts.aggregator ?? aggregator, gas, trustSource: opts.trustSource,
     });
   const w = await open('holder');
@@ -568,10 +568,6 @@ test('portable replay refreshes for later certified cuts and reopening preserves
   const rec = await w.returnRecord('coin');
   const oldRelease = readFileSync(manifest);
   const bundleFile = join(dir, 'trust-base.bundle.cbor');
-  const originFile = join(dir, 'origin.json');
-  const oldOrigin = { usableEpoch: '1', rootRound: '1000000' };
-  const freshOrigin = { usableEpoch: '2', rootRound: '1000010' };
-  writeFileSync(originFile, JSON.stringify(oldOrigin));
   const next = await nextEpoch({ ...root, entries: [root.trust.history.tip!.encode()] }, roundNow() + 1n, 1, 55);
   const offline = { certify: async () => { throw new Error('certifier is offline'); } };
   let requests = 0;
@@ -581,13 +577,12 @@ test('portable replay refreshes for later certified cuts and reopening preserves
     return encodeTrustBaseResponse({ effectiveEnd: 2n, endEntryId: await next.trust.history.tip!.entryId(),
       entries: [next.entries[1]], fromEpoch: 2n, network: w.bridge.cfg.network, nextEpoch: null, status: BigInt(TrustBaseStatus.OK) });
   } };
-  const relay = await open('epoch-relay', rpc, { aggregator: offline, trustSource: source, origin: originFile });
+  const relay = await open('epoch-relay', rpc, { aggregator: offline, trustSource: source });
   const originallyHeld = readFileSync(join(relay.dir, 'recovery-authority.json'));
 
-  // Accept the newer shipped bundle and origin, then restart against the original deployment files.
+  // Accept the newer shipped bundle, then restart against the original deployment files.
   writeFileSync(bundleFile, next.bundle);
   const changed = JSON.parse(oldRelease.toString());
-  changed.trust.origin = freshOrigin;
   writeFileSync(manifest, JSON.stringify(changed));
   const advanced = await open('holder');
   assert.equal(advanced.trust.history.tip?.epoch, 2n);
@@ -595,7 +590,6 @@ test('portable replay refreshes for later certified cuts and reopening preserves
   writeFileSync(manifest, oldRelease);
   const author = await open('holder');
   assert.equal(author.trust.history.tip?.epoch, 2n);
-  assert.equal(author.trust.origin?.usableEpoch, 2n);
 
   const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!), new RecoveryAuthority(author.trust, async () => undefined), TEST_PARAMS, deployment);
   const packet = await session.run(0, session.operationCount, author.trust);
@@ -607,19 +601,15 @@ test('portable replay refreshes for later certified cuts and reopening preserves
 
   const backup = join(dir, 'epoch-portable.json');
   publishReturnBackup(author, rec, backup);
-  writeFileSync(originFile, JSON.stringify(freshOrigin));
   const restored = await restoreReturn(relay, backup);
   assert.equal(restored.eta, rec.eta);
   assert.equal(requests, 1, 'the later cut fetched the successor during restore');
-  writeFileSync(originFile, JSON.stringify(oldOrigin));
-  const restarted = await open('epoch-relay', rpc, { aggregator: offline, origin: originFile });
+  const restarted = await open('epoch-relay', rpc, { aggregator: offline });
   assert.equal(restarted.trust.history.tip?.epoch, 2n);
-  assert.equal(restarted.trust.origin?.rootRound, BigInt(freshOrigin.rootRound));
 
   // The local cut survives on its own as well, with an older authority copied alongside it.
   writeFileSync(join(relay.dir, 'recovery-authority.json'), originallyHeld);
-  const local = await open('epoch-relay', rpc, { aggregator: offline, trustSource: source, origin: originFile });
-  writeFileSync(originFile, JSON.stringify(freshOrigin));
+  const local = await open('epoch-relay', rpc, { aggregator: offline, trustSource: source });
   chain.fund(local.signer.address, 10n ** 18n);
   chain.autoMine = false;
   assert.equal((await recoverStep(local, restored, caps)).state, 'pending');

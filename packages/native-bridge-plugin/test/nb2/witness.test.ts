@@ -108,6 +108,22 @@ test('a deployed quorum refusal is retryable and the same certified burn pays af
   assert.equal(sends, 1);
 });
 
+test('a finalized import lag preserves the exact signed return and sends once after import', async () => {
+  const { w, payer, burned, chain } = await world();
+  const id = await burned();
+  chain.importedTipEpoch = 0n;
+  const firstSendCount = chain.calls.filter((call) => call === 'eth_sendRawTransaction').length;
+  await assert.rejects(w.submitRedeem(id, payer), { reason: 'NotPending' });
+  const pending = await w.journal.ret('0x' + toHex(id));
+  assert.equal(pending?.sends.length, 1);
+  assert.equal(chain.calls.filter((call) => call === 'eth_sendRawTransaction').length, firstSendCount);
+  chain.importedTipEpoch = 1n;
+  assert.equal((await w.submitRedeem(id, payer)).state, 'pending');
+  assert.equal((await w.reconcile(id)).state, 'paid');
+  assert.equal((await w.journal.ret('0x' + toHex(id)))?.sends[0].raw, pending?.sends[0].raw);
+  assert.equal(chain.calls.filter((call) => call === 'eth_sendRawTransaction').length, firstSendCount + 1);
+});
+
 test('a final refusal after a mined revert preserves the decoded inner rule', async () => {
   const { w, payer, burned, chain } = await world();
   const id = await burned();
@@ -122,6 +138,7 @@ test('a final refusal after a mined revert preserves the decoded inner rule', as
       if (++estimates === 1) return '0x1d4c0' as T;
       throw new RpcError(200, 3, 'execution reverted', `0x${toHex(refusal)}`);
     }
+    if (method === 'eth_call' && typeof params[1] === 'object') return '0x' as T;
     const result = await rpc<T>(method, params);
     if (method === 'eth_sendRawTransaction') hashes.push(result as string);
     return result;

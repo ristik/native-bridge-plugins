@@ -10,7 +10,7 @@ use native_bridge_sdk_ext::nb2::{
         GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoveryEvent,
         RecoverySession,
     },
-    trust::{AuthenticatedOrigin, TrustInput},
+    trust::TrustInput,
     util::{arr, from_hex},
     Rule, WalletReason,
 };
@@ -40,11 +40,7 @@ fn load(base: &str, lineage: &str) -> (RecoverySession, TrustInput, Vec<u8>, [u8
         &read(base, &format!("{lineage}/utb.cbor")),
         &cfg.root_genesis,
     )
-    .unwrap()
-    .with_authenticated_origin(AuthenticatedOrigin {
-        usable_epoch: 2,
-        root_round: 10_000,
-    });
+    .unwrap();
     let context = json(base, &format!("{lineage}/context.json"));
     let recovery = hex(&context["RecoveryAddress"]);
     let pins = if base == BASE {
@@ -267,11 +263,7 @@ fn cold_admission_prices_the_terminal_bound_and_refuses_one_unit_over() {
     let path = "transcripts/held-sibling-0";
     let trust =
         TrustInput::from_bundle(&read(BASE, &format!("{path}/utb.cbor")), &cfg.root_genesis)
-            .unwrap()
-            .with_authenticated_origin(AuthenticatedOrigin {
-                usable_epoch: 2,
-                root_round: 10_000,
-            });
+            .unwrap();
     let context = json(BASE, &format!("{path}/context.json"));
     let deployment = RecoveryDeployment {
         salt: arr(&read(BASE, "generation-salt.bin")),
@@ -505,13 +497,8 @@ fn authority_refresh_persists_and_reconstructed_sessions_refuse_rollbacks() {
         .unwrap()
         .to_bundle();
     let short = TrustInput::from_bundle(&short_bundle, &full.id()).unwrap();
-    let lagging = short
-        .clone()
-        .with_authenticated_origin(full.origin().unwrap());
-    let previous = short.with_authenticated_origin(AuthenticatedOrigin {
-        usable_epoch: 1,
-        root_round: 10_000,
-    });
+    let lagging = short.clone();
+    let previous = short;
     let persisted = Rc::new(RefCell::new(previous.clone()));
     let store = persisted.clone();
     let authority = RecoveryAuthority::new(previous.clone(), move |next| {
@@ -533,29 +520,15 @@ fn authority_refresh_persists_and_reconstructed_sessions_refuse_rollbacks() {
     });
     let receipt = fields[5];
     let source = |_: &[u8; 20], _: &RecoveryEvent| Ok(receipt.to_vec());
-    let pending = session
+    session
+        .acquire(&full, &run.event, &[&source], None)
+        .unwrap();
+    assert_eq!(*persisted.borrow(), full);
+    let error = session
         .acquire(&lagging, &run.event, &[&source], None)
         .err()
         .unwrap();
-    assert_eq!(pending.rule().unwrap().rule, Rule::NoEntryForEpoch);
-    let refresh = |held: &TrustInput| {
-        assert_eq!(*held, lagging);
-        Ok(full.clone())
-    };
-    session
-        .acquire(&lagging, &run.event, &[&source], Some(&refresh))
-        .unwrap();
-    assert_eq!(*persisted.borrow(), full);
-    let lower_origin = full
-        .clone()
-        .with_authenticated_origin(previous.origin().unwrap());
-    for stale in [&lagging, &lower_origin] {
-        let error = session
-            .acquire(stale, &run.event, &[&source], None)
-            .err()
-            .unwrap();
-        assert_eq!(error.reason(), Some(WalletReason::TrustInput));
-    }
+    assert_eq!(error.reason(), Some(WalletReason::TrustInput));
     let reopened = RecoverySession::create(
         &gamma,
         &evidence,

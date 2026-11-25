@@ -55,7 +55,7 @@ for (const name of scenarios) {
   test(`T1 flat transcript ${name}`, async () => {
     const path = `transcripts/${name}/`;
     const evidence = read(path + 'evidence.bin');
-    const trust = (await TrustInput.fromBundle(read(path + 'utb.cbor'), cfg.rootGenesis)).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+    const trust = (await TrustInput.fromBundle(read(path + 'utb.cbor'), cfg.rootGenesis));
     const expected = read(path + 'verdict.bin');
     const context = JSON.parse(new TextDecoder().decode(read(path + 'context.json'))) as { PageRoot: string };
     assert.equal(Buffer.from(pageRoot(evidence)).toString('hex'), context.PageRoot);
@@ -98,7 +98,7 @@ test('published alternate certificate preserves the shared claim return', () => 
 });
 
 test('published malformed lineages are refused', async () => {
-  const trust = (await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis)).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const trust = (await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis));
   const cases = {
     'continuing-transfer-data': 'TransferData', 'expired-transfer': 'DeadlineExpired',
     'recursive-reason': 'InputTooLarge', 'repeated-mint-sid': 'RepeatedSID',
@@ -114,7 +114,7 @@ test('published malformed lineages are refused', async () => {
 
 test('held siblings require their own allocation and a verified parent spend', async () => {
   const dir = 'transcripts/held-sibling-0/';
-  const trust = (await TrustInput.fromBundle(read(dir + 'utb.cbor'), cfg.rootGenesis)).withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const trust = (await TrustInput.fromBundle(read(dir + 'utb.cbor'), cfg.rootGenesis));
   const part = decodeToken(read(dir + 'evidence.bin'));
   const sibling = decodeToken(read('transcripts/held-sibling-1/evidence.bin'));
   const parent = { ...part.ancestors[0], ancestors: [] };
@@ -238,28 +238,6 @@ test('a valid allocation root with the wrong total cannot authorize a child', as
   const req = mintRequest(child.mint);
   const token = tokenOfChild(parent, child.allocation, req.tx, await certifyChecked(w.agg, req.cd));
   await assert.rejects(bridge.verifyToken(token), { rule: 'SplitSum' });
-});
-
-test('the authenticated origin bounds both round and usable epoch', async () => {
-  const { decodeUc, ucCheck, verifyEvmUc } = await import('../../src/nb2/trust.js');
-  const { decodeReceiptBacking } = await import('../../src/nb2/deposit.js');
-  const history = await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis);
-  const root = decodeToken(read('transcripts/root/evidence.bin'));
-  const receipt = decodeReceiptBacking(root.mint.justification!).proof.uc;
-  const round = decodeUc(receipt).unicitySeal.rootChainRoundNumber;
-  await verifyEvmUc(history.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: round }), receipt, cfg);
-  await assert.rejects(verifyEvmUc(history.withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: round - 1n }), receipt, cfg), { rule: 'DepositUC' });
-  await assert.rejects(verifyEvmUc(history, receipt, cfg));
-
-  const rotated = lineageOf(decodeToken(read('transcripts/transfers/evidence.bin')))
-    .flatMap((level) => [level.mintProof, ...level.proofs]).map((proof) => decodeUc(proof.uc))
-    .find((uc) => uc.unicitySeal.epoch === 2n)!;
-  assert.ok(history.history.entryForEpoch(2n));
-  const check = (epoch: bigint, rootRound: bigint) => ucCheck(history.withAuthenticatedOrigin({ usableEpoch: epoch, rootRound }),
-    rotated, cfg.aggregatorPartition, rotated.shardTreeCertificate.shard.encode());
-  await check(2n, rotated.unicitySeal.rootChainRoundNumber);
-  await assert.rejects(check(2n, rotated.unicitySeal.rootChainRoundNumber - 1n), { rule: 'SealEpoch' });
-  await assert.rejects(check(1n, 10_000n), { rule: 'SealEpoch' });
 });
 
 test('the B1 seal signature ceiling applies to both certificate routes', async () => {
@@ -388,16 +366,15 @@ test('transfer, split and return planning use the caller bytes captured at entry
   assert.equal(decodeToken(burned).ancestors.length, 1);
 });
 
-test('a retired seal requires its authenticated successor on both certificate routes', async () => {
+test('the held tip is open and a successor closes it exclusively on both certificate routes', async () => {
   const { makeRoot, makeUc, nextEpoch } = await import('../rootfixture.js');
   const { makeConfig } = await import('./world.js');
   const { ucCheck, verifyEvmUc } = await import('../../src/nb2/trust.js');
   const old = await makeRoot(1, 4, 10);
   const current = await nextEpoch(old, 100n, 4, 30);
   const c = makeConfig(old);
-  const checkpoint = { usableEpoch: 2n, rootRound: 150n };
-  const lagging = old.trust.withAuthenticatedOrigin(checkpoint);
-  const fresh = current.trust.withAuthenticatedOrigin(checkpoint);
+  const lagging = old.trust;
+  const fresh = current.trust;
   for (const partition of [c.evmPartition, c.aggregatorPartition]) {
     for (const round of [99n, 100n]) {
       const uc = await makeUc(old, {
@@ -406,7 +383,7 @@ test('a retired seal requires its authenticated successor on both certificate ro
       });
       const isEvm = partition === c.evmPartition;
       const check = (t: TrustInput) => isEvm ? verifyEvmUc(t, uc.toCBOR(), c) : ucCheck(t, uc, partition, c.evmShard);
-      await assert.rejects(check(lagging), { rule: 'NoEntryForEpoch' });
+      await check(lagging);
       if (round === 99n) await check(fresh);
       else await assert.rejects(check(fresh), { rule: isEvm ? 'DepositUC' : 'SealEpoch' });
     }
@@ -418,8 +395,7 @@ test('standalone EVM and receipt verification require the configured genesis', a
   const { verifyEvmUc } = await import('../../src/nb2/trust.js');
   const evidence = decodeToken(read('transcripts/root/evidence.bin'));
   const { proof } = decodeReceiptBacking(evidence.mint.justification!);
-  const trust = (await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis))
-    .withAuthenticatedOrigin({ usableEpoch: 2n, rootRound: 10_000n });
+  const trust = (await TrustInput.fromBundle(read('transcripts/root/utb.cbor'), cfg.rootGenesis));
   await verifyEvmUc(trust, proof.uc, cfg);
   await verifyReceiptLog(cfg, trust, proof);
   const otherGenesis = { ...cfg, rootGenesis: new Uint8Array(32) };
@@ -465,4 +441,26 @@ test('burn and redeem submission retain the same return ID through lock and sign
   assert.equal(firstRecord.sends.length, 1);
   assert.deepEqual(unhex(firstRecord.eta!), first.eta);
   assert.equal((await bridge.journal.retForUpdate(hex(b.returnId)))!.sends.length, 0);
+});
+
+test('wallet intervals agree with the shared B1 imported-tip cases', async () => {
+  const { makeRoot, makeUc, nextEpoch } = await import('../rootfixture.js');
+  const { makeConfig } = await import('./world.js');
+  const { ucCheck, verifyEvmUc } = await import('../../src/nb2/trust.js');
+  const fixture = JSON.parse(String(readFileSync(new URL('../../../../protocol/vectors/b1-wallet-tip.json', import.meta.url)))) as {
+    cases: { id: string; tip: number; epoch: number; round: number; accept: boolean }[];
+  };
+  const roots = [await makeRoot(0, 4, 10)];
+  for (let epoch = 1; epoch <= 8; epoch++) roots.push(await nextEpoch(roots[epoch - 1], BigInt(epoch * 1000), 4, 10 + epoch * 5));
+  const c = makeConfig(roots[0]);
+  for (const { id, tip, epoch, round, accept } of fixture.cases) {
+    for (const partition of [c.evmPartition, c.aggregatorPartition]) {
+      const uc = await makeUc(roots[epoch], { partition, conf: new Uint8Array(32), rootEpoch: BigInt(epoch), epochIr: 1n,
+        round: BigInt(round), timestamp: 1_700_000_000n, stateHash: new Uint8Array(32).fill(1), blockHash: new Uint8Array(32).fill(2), signers: 3 });
+      const trust = roots[tip].trust;
+      const outcome = partition === c.evmPartition ? verifyEvmUc(trust, uc.toCBOR(), c) : ucCheck(trust, uc, partition, c.evmShard);
+      if (accept) await outcome;
+      else await assert.rejects(outcome, { rule: epoch > tip ? 'NoEntryForEpoch' : partition === c.evmPartition ? 'DepositUC' : 'SealEpoch' }, id);
+    }
+  }
 });

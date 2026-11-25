@@ -455,19 +455,15 @@ impl RecoveryAuthority {
         }
         let old = held.history().entries();
         let new = offered.history().entries();
-        let before = held.origin().unwrap();
-        let after = offered.origin().unwrap();
         if new.len() < old.len()
             || old
                 .iter()
                 .zip(new)
                 .any(|(a, b)| a.entry_id() != b.entry_id())
-            || after.usable_epoch < before.usable_epoch
-            || after.root_round < before.root_round
         {
             return refuse(
                 WalletReason::TrustInput,
-                "recovery authority rolls back the held history or origin",
+                "recovery authority rolls back the held history",
             );
         }
         (self.0.persist)(offered).map_err(|error| {
@@ -779,10 +775,7 @@ impl RecoverySession {
                 let proof = source(&self.deployment.recovery, event)?;
                 let authority = self.authority.checkpoint()?;
                 match self.verify_event(&authority, &proof, event) {
-                    Err(e)
-                        if refresh.is_some()
-                            && (e.retryable() || ahead_of_origin(&authority, &proof)) =>
-                    {
+                    Err(e) if refresh.is_some() && e.retryable() => {
                         let fresh = refresh.unwrap()(&authority)?;
                         self.authority.accept(&fresh, &self.cfg)?;
                         self.verify_event(&self.authority.checkpoint()?, &proof, event)
@@ -814,18 +807,6 @@ impl RecoverySession {
         }
         refuse(WalletReason::EvidenceMissing, "no recovery receipt source")
     }
-}
-
-fn ahead_of_origin(trust: &TrustInput, receipt: &[u8]) -> bool {
-    let Some(origin) = trust.origin() else {
-        return false;
-    };
-    decode_deposit_proof(receipt)
-        .and_then(|p| decode_uc(&p.uc))
-        .is_ok_and(|uc| {
-            uc.unicity_seal.epoch > origin.usable_epoch
-                || uc.unicity_seal.root_chain_round_number > origin.root_round
-        })
 }
 
 pub type ReceiptSource<'a> = dyn Fn(&[u8; 20], &RecoveryEvent) -> Result<Vec<u8>> + 'a;
