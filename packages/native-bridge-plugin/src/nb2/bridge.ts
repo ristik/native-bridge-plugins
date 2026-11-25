@@ -1261,7 +1261,7 @@ export class NativeBridgeV2 {
     let expired: TxRequest | undefined;
     let pooled = false;
     const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending },
-      (request, underpriced) => { expired = request; pooled = underpriced; });
+      different ? undefined : (request, underpriced) => { expired = request; pooled = underpriced; });
     if (prior.state === 'paid' || prior.state === 'needs-archive') return prior;
     if (different) return { state: 'route-blocked', route: 'ordinary', txHash: first?.hash ?? returnId, payer };
     if (prior.state !== 'not-paid') return prior;

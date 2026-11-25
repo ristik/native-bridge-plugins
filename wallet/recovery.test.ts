@@ -281,7 +281,7 @@ test('a private backup made before submission restores the exact signed burn wit
   assert.equal(existsSync(backup), false);
   const reopened = await open('holder');
   // Publish the pending authorization from disk without making another signed request.
-  publishReturnBackup(reopened, rec, backup);
+  await publishReturnBackup(reopened, rec, backup);
   assert.equal(statSync(backup).mode & 0o777, 0o600);
   const relay = await open('second-device');
   const copy = JSON.parse(readFileSync(backup, 'utf8'));
@@ -485,7 +485,7 @@ test('a certified alternate archive carries a recovered payment through a pruned
   assert.equal((await recoverStep(relay, rec, alternate)).state, 'checkpoint');
   assert.ok(alternateReads > 0);
   const portable = join(dir, 'certified-cut.private.json');
-  publishReturnBackup(relay, rec, portable);
+  await publishReturnBackup(relay, rec, portable);
   const offline = { certify: async () => { throw new Error('certification service offline'); } };
   // The certified Complete remains usable even if its old run class is no longer priced.
   const release = JSON.parse(readFileSync(manifest, 'utf8'));
@@ -550,7 +550,7 @@ test('admission and restore use the same maximum-width signed envelope at a tigh
   assert.equal(plan!.record.recovery!.advanceGaps, 1023, 'the next smaller batch fits the portable envelope');
   const file = join(dir, 'width-boundary.json');
   const rec = await holder.returnRecord('coin');
-  publishReturnBackup(holder, rec, file);
+  await publishReturnBackup(holder, rec, file);
   const relay = await open('width-relayer', backlog);
   assert.equal((await restoreReturn(relay, file)).recovery, undefined);
   assert.equal((await restoreReturn(holder, file, caps)).recovery!.advanceGaps, 1023);
@@ -562,7 +562,7 @@ test('restore qualifies the receiving payer without using a legacy unsigned sche
   await burn(w, 'coin', undefined, undefined, caps);
   const rec = await w.returnRecord('coin');
   const file = join(dir, 'legacy-peer-plan.json');
-  publishReturnBackup(w, rec, file);
+  await publishReturnBackup(w, rec, file);
   const backup = JSON.parse(readFileSync(file, 'utf8'));
   backup.pending.recovery = { ...rec.recovery, runCuts: [2], advanceGaps: 1 };
   const release = JSON.parse(readFileSync(manifest, 'utf8'));
@@ -613,7 +613,7 @@ test('portable replay refreshes for later certified cuts and reopening preserves
   assert.equal((await recoverStep(author, rec, caps)).state, 'checkpoint');
 
   const backup = join(dir, 'epoch-portable.json');
-  publishReturnBackup(author, rec, backup);
+  await publishReturnBackup(author, rec, backup);
   const restored = await restoreReturn(relay, backup);
   assert.equal(restored.eta, rec.eta);
   assert.equal(requests, 1, 'the later cut fetched the successor during restore');
@@ -631,7 +631,7 @@ test('portable replay refreshes for later certified cuts and reopening preserves
 });
 
 test('an ordinary send lost at the gap limit hands its nonce to continuation and pays once', async (t) => {
-  const { w, open, chain, deployment, cfg, rpc, manifest } = await setup(t, true);
+  const { w, open, chain, deployment, cfg, rpc, manifest, dir } = await setup(t, true);
   const release = JSON.parse(readFileSync(manifest, 'utf8'));
   for (const entry of ['advanceGaps', 'redeemRecovered']) {
     const last = release.recovery.ranges.filter((range: { max: { entry: string } }) => range.max.entry === entry).at(-1);
@@ -720,11 +720,20 @@ test('an ordinary send lost at the gap limit hands its nonce to continuation and
   assert.equal((await resumePayout(payer, rec, caps, false, true)).state, 'checkpoint');
   assert.equal(journal().ordinaryHandoff, original.hash);
   payer = await open('holder', interrupted);
-  assert.equal((await resumePayout(payer, rec, caps, false, true)).state, 'paid');
+  const holder = payer;
+  const saved = (await holder.bridge.journal.ret(rec.returnId))!;
+  const backup = join(dir, 'resolved-complete.json');
+  await publishReturnBackup(holder, saved, backup);
+  assert.equal(JSON.parse(readFileSync(backup, 'utf8')).handoff, undefined);
+  assert.deepEqual((await holder.bridge.journal.ret(rec.returnId))?.sends, [original]);
+
+  payer = await open('fresh relayer', interrupted);
+  chain.fund(payer.signer.address, 10n ** 18n);
+  const restored = await restoreReturn(payer, backup, caps);
+  assert.equal((await resumePayout(payer, restored, caps)).state, 'paid');
   const paid = (await payer.bridge.journal.ret(rec.returnId))!;
   assert.ok(paid.paid?.receipt);
   assert.equal(paid.burned, rec.burned);
-  assert.deepEqual(paid.sends, [original]);
   assert.equal(await rpc.call('eth_getTransactionReceipt', [original.hash]), null);
   assert.equal(chain.vault.events.filter((e) => e.name === 'Paid' && eq(e.eta, eta)).length, 1);
 });
@@ -881,7 +890,7 @@ test('restore qualifies and keeps the same checkpoint that will execute across b
   refuseProgress = false;
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   const portable = join(dir, 'certified-complete.json');
-  publishReturnBackup(w, rec, portable);
+  await publishReturnBackup(w, rec, portable);
   await restoreReturn(withPending, original);
   assert.equal(readFileSync(localFile(withPending), 'utf8'), pending, 'a signing backup keeps the pending packet at its exact predecessor');
 
@@ -953,7 +962,7 @@ test('restore reconciles certified Paid before qualifying future packets', async
   const pending = JSON.parse(readFileSync(original, 'utf8')).pending;
   assert.equal((await signed.bridge.importPendingReturn(pending)).status, 'burn-requested');
   const certified = join(dir, 'paid-from-certified-backup.json');
-  publishReturnBackup(w, rec, certified);
+  await publishReturnBackup(w, rec, certified);
 
   const paid = await resumePayout(w, rec, caps, true);
   assert.equal(paid.state, 'paid');
@@ -1018,7 +1027,7 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   const complete = await recoverStep(w, cold, caps);
   assert.equal(complete.state, 'checkpoint');
   const portable = join(dir, 'ordinary-later-complete.json');
-  publishReturnBackup(w, cold, portable);
+  await publishReturnBackup(w, cold, portable);
 
   const restarted = await open('ordinary-relayer', rpc);
   const file = join(restarted.dir, `recovery-${rec.returnId.slice(2)}.json`);
@@ -1087,7 +1096,7 @@ test('a holder reopens its burn after learning Paid before certification', async
   const relayer = await open('receipt-relayer');
   const certified = await restoreReturn(relayer, signed);
   const terminal = join(dir, 'relayer-certified.json');
-  publishReturnBackup(relayer, certified, terminal);
+  await publishReturnBackup(relayer, certified, terminal);
   const payer = await open('receipt-payer');
   chain.fund(payer.signer.address, 10n ** 18n);
   await restoreReturn(payer, terminal);
@@ -1158,7 +1167,7 @@ test('wallet-backup reconciliation matrix, in both holder and relayer orderings'
       if (holderFirst) await burn(producer, 'coin');
       else await restoreReturn(producer, backup('signed'), caps);
       const rec = (await producer.bridge.journal.ret(id))!;
-      publishReturnBackup(producer, rec, backup('terminal'));
+      await publishReturnBackup(producer, rec, backup('terminal'));
       snapshot('terminal', producer);
 
       // Interrupt an ordinary send after its signed bytes are durable.
@@ -1195,7 +1204,7 @@ test('wallet-backup reconciliation matrix, in both holder and relayer orderings'
         assert.equal((await recoverStep(producer, rec, caps)).state, 'checkpoint');
         const certified = journal(producer).cuts.at(-1);
         pruned.add(certified.location.blockHash);
-        publishReturnBackup(producer, rec, backup(name));
+        await publishReturnBackup(producer, rec, backup(name));
         snapshot(name, producer);
         return { seq: BigInt(certified.seq), receipt: unhex(certified.location.proof) };
       };
@@ -1424,7 +1433,7 @@ test('local Complete wins over peer Progress and peer Complete installs no unsig
   assert.deepEqual(refusal.payer, peer.signer.address);
   assert.equal(readFileSync(saved(peer), 'utf8'), heldProgress);
   const file = join(dir, 'peer-incomplete.json');
-  publishReturnBackup(peer, split, file);
+  await publishReturnBackup(peer, split, file);
   const incomplete = JSON.parse(readFileSync(file, 'utf8'));
   assert.equal(incomplete.handoff, 'active');
   assert.equal(incomplete.complete, undefined);
@@ -1446,7 +1455,7 @@ test('local Complete wins over peer Progress and peer Complete installs no unsig
   events.set(hx(tail.calldata), tail.event);
   assert.equal((await recoverStep(peer, split, caps)).state, 'checkpoint');
   const terminal = join(dir, 'peer-complete.json');
-  publishReturnBackup(peer, split, terminal);
+  await publishReturnBackup(peer, split, terminal);
   const offered = JSON.parse(readFileSync(terminal, 'utf8'));
   assert.equal(offered.handoff, undefined);
   assert.equal(offered.pending.recovery, undefined);
@@ -1485,7 +1494,7 @@ test('Paid proof matrix closes every wallet entry point with a lagging log index
   await burn(w, 'coin', undefined, undefined, caps);
   const rec = await w.returnRecord('coin');
   const initial = join(dir, 'paid-proof-terminal.json');
-  publishReturnBackup(w, rec, initial);
+  await publishReturnBackup(w, rec, initial);
   const id = rec.returnId;
   const file = (device: Wallet) => join(device.dir, `recovery-${id.slice(2)}.json`);
   const journal = (device: Wallet) => JSON.parse(readFileSync(file(device), 'utf8'));
@@ -1536,7 +1545,7 @@ test('Paid proof matrix closes every wallet entry point with a lagging log index
     assert.equal(journal(device).settled.submitted.raw, exact.raw, name);
     if (name === 'restore') {
       const portable = join(dir, 'portable-paid.json');
-      publishReturnBackup(device, paid, portable);
+      await publishReturnBackup(device, paid, portable);
       const unavailable: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
         if (/eth_getLogs|eth_getTransactionReceipt|eth_getBlockByHash/.test(method)) throw new Error('no archive');
         return lagging.call<T>(method, params);
@@ -1576,7 +1585,7 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
       const submitted = await resumePayout(first, rec, caps, route === 'ordinary');
       assert.equal(submitted.state, 'pending', route);
       const activeBackup = join(dir, 'active-return.json');
-      publishReturnBackup(first, await first.returnRecord('coin'), activeBackup);
+      await publishReturnBackup(first, await first.returnRecord('coin'), activeBackup);
       const exported = JSON.parse(readFileSync(activeBackup, 'utf8'));
       await chain.mine([]);
       cpSync(first.dir, join(dir, 'missing-raw'), { recursive: true });
@@ -1610,7 +1619,7 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
       if (route === 'ordinary') assert.ok((await restoreReturn(restored, activeBackup, caps)).sends.at(-1)!.failed);
       else assert.equal((await run(restored)).state, 'retry');
       const failureExport = join(dir, 'verified-failure.json');
-      publishReturnBackup(restored, await restored.returnRecord('coin'), failureExport);
+      await publishReturnBackup(restored, await restored.returnRecord('coin'), failureExport);
       const failed = JSON.parse(readFileSync(failureExport, 'utf8'));
       assert.equal(failed.handoff, 'active');
       assert.equal(failed.activePayer, hx(restored.signer.address));
@@ -1631,7 +1640,7 @@ test('peer ordinary Paid crosses reader capabilities and preempts cold admission
   await burn(w, 'coin', undefined, undefined, caps);
   const ordinary = await w.returnRecord('coin');
   const backup = join(dir, 'paid-by-ordinary-peer.json');
-  publishReturnBackup(w, ordinary, backup);
+  await publishReturnBackup(w, ordinary, backup);
   assert.equal(ordinary.recovery, undefined);
   const peer = await open('ordinary-peer');
   chain.fund(peer.signer.address, 10n ** 18n);
@@ -1717,7 +1726,7 @@ test('each mined Paid proof component escalates when absent and works with split
         assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
       }
       const backup = join(dir, 'before-payout.json');
-      publishReturnBackup(w, rec, backup);
+      await publishReturnBackup(w, rec, backup);
       let raw!: Uint8Array;
       const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
         if (method === 'eth_sendRawTransaction') {
@@ -1856,7 +1865,7 @@ async function pendingPeerSettlement(t: TestContext) {
 test('a visible peer settlement stops both routes before signing, and hidden concurrent sends pay once', async (t) => {
   const { w, chain, dir, open, rpc, relay, remote, other } = await pendingPeerSettlement(t);
   const active = join(dir, 'peer-active.json');
-  publishReturnBackup(relay, remote, active);
+  await publishReturnBackup(relay, remote, active);
   const held = await restoreReturn(w, active);
   const saved = () => JSON.parse(readFileSync(join(w.dir, `recovery-${held.returnId.slice(2)}.json`), 'utf8'));
   assert.ok(saved().complete);
@@ -1893,7 +1902,7 @@ test('a certified exact failure retires a stale remembered Paid hint on reconcil
   await burn(w, 'coin', undefined, undefined, caps);
   const rec = await w.returnRecord('coin');
   const original = join(dir, 'before-fork-payment.json');
-  publishReturnBackup(w, rec, original);
+  await publishReturnBackup(w, rec, original);
   let raw!: Uint8Array;
   const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]) => {
     if (method === 'eth_sendRawTransaction') {
@@ -1933,7 +1942,7 @@ test('Paid tries every eligible child header with every available companion sour
   await burn(w, 'coin', undefined, undefined, caps);
   const rec = await w.returnRecord('coin');
   const backup = join(dir, 'child-branch.json');
-  publishReturnBackup(w, rec, backup);
+  await publishReturnBackup(w, rec, backup);
   const relay = await open('child-branch-payer');
   chain.fund(relay.signer.address, 10n ** 18n);
   await restoreReturn(relay, backup);

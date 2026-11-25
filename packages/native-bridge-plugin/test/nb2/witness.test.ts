@@ -137,6 +137,27 @@ test('a never-broadcast return rebuilds after two rollovers during finalized imp
   assert.equal(sends(), beforeResume + 1);
 });
 
+test('a different signer is route-blocked while the bound payer is waiting for finalized import', async () => {
+  const { w, payer, burned, chain } = await world();
+  const id = await burned();
+  const call = chain.call.bind(chain);
+  chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') throw new Error('transport before delivery');
+    return call<T>(method, params);
+  };
+  await assert.rejects(w.submitRedeem(id, payer), /transport before delivery/);
+  chain.call = call;
+  const pending = (await w.journal.ret('0x' + toHex(id)))!.sends[0];
+  chain.importedTipEpoch = 0n;
+  const calls = chain.calls.length;
+  const other = await w.submitRedeem(id, evmAccount(chain, 'different signer'));
+  assert.deepEqual(other, {
+    state: 'route-blocked', route: 'ordinary', payer: payer.address, txHash: fromHex(pending.hash.slice(2))!,
+  });
+  assert.ok(!chain.calls.slice(calls).includes('eth_getStorageAt'));
+  await assert.rejects(w.submitRedeem(id, payer), { reason: 'ImportLag', retryable: true });
+});
+
 for (const pooled of [false, true]) test(`an expired payout reuses the nonce and certifies Paid after restart (pool race: ${pooled})`, async () => {
   const { w, payer, burned, chain, pay, options, store } = await world();
   const id = await burned();

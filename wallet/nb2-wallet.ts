@@ -227,7 +227,7 @@ async function main(): Promise<void> {
     }
     case 'backup-return': {
       need(rest, 2, 'backup-return NAME FILE');
-      publishReturnBackup(w, await w.returnRecord(rest[0]), resolve(rest[1]));
+      await publishReturnBackup(w, await w.returnRecord(rest[0]), resolve(rest[1]));
       say('private return backup saved');
       return;
     }

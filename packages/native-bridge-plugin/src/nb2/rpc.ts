@@ -331,12 +331,23 @@ export class EvmReader {
     if (!eq(mptVerify(header.receiptsRoot, rlpIndexKey(idx), path), encodeReceiptJson(receipt))) {
       refuse('ProviderFault', 'failed receipt is not committed in the certified block');
     }
-    await proofFrom(sources, 'the failed transaction block body', async (r) => {
+    await this.transactionIn(header, hash, idx, txHash, sources);
+  }
+
+  /** Read the exact signed transaction committed at an independently certified block and receipt index. */
+  public async transactionAt(blockHash: Uint8Array, index: bigint, txHash: Uint8Array): Promise<Uint8Array> {
+    const { header } = await this.headerByHash(blockHash);
+    return this.transactionIn(header, blockHash, index, txHash, [this]);
+  }
+
+  private transactionIn(header: Header, hash: Uint8Array, idx: bigint, txHash: Uint8Array,
+    sources: readonly EvmReader[]): Promise<Uint8Array> {
+    return proofFrom(sources, 'the certified transaction block body', async (r) => {
       const body = await r.rpc.call<{ transactions?: string[] } | null>('eth_getBlockByHash', [hexOf(hash), false]);
       if (!Array.isArray(body?.transactions)) fail('EvidencePruned', 'the certified block body is unavailable');
       if (BigInt(body.transactions.length) > header.gasLimit / 21_000n + 16n || idx >= BigInt(body.transactions.length) ||
         !eq(fixedOf(body.transactions[Number(idx)], 32, 'transaction hash'), txHash)) {
-        return refuse('ProviderFault', 'failed receipt has no matching transaction in the block body');
+        return refuse('ProviderFault', 'certified receipt has no matching transaction in the block body');
       }
       const entries: [Uint8Array, Uint8Array][] = [];
       for (const [i, tx] of body.transactions.entries()) {
@@ -350,6 +361,7 @@ export class EvmReader {
         entries.push([rlpIndexKey(i), raw]);
       }
       if (!eq(buildTrie(entries, null).root, header.transactionsRoot)) refuse('ProviderFault', 'transactions root mismatch');
+      return entries[Number(idx)][1];
     });
   }
 

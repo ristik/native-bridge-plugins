@@ -284,7 +284,7 @@ interface Backup {
 }
 
 /** A holder-selected private file. Hard-link publication cannot clobber a changed destination. */
-export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string): void {
+export async function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string): Promise<void> {
   if (!rec.burnRequest || !rec.certificationLocator) throw new Error('sign the return before exporting a relayer backup');
   const saved = loadRecovery(w, rec);
   const { source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator } = rec;
@@ -293,7 +293,9 @@ export function publishReturnBackup(w: Wallet, rec: ReturnRecord, file: string):
   const endpoint = saved?.complete ?? saved?.cuts.find((item) => item.cut.kind === 'run' && item.state === undefined);
   const complete = endpoint && { seq: endpoint.seq, location: endpoint.location };
   const payer = boundPayer(rec, saved);
-  const active = !rec.paid && (blockedOrdinary(rec) || saved?.pending || saved?.superseded?.length || (!complete && payer));
+  const ordinary = blockedOrdinary(rec);
+  const active = !rec.paid && (saved?.pending || saved?.superseded?.length || (!complete && payer) ||
+    (ordinary && (!complete || !saved || !await completedOrdinaryHandoff(w, rec, saved, ordinary.txHash))));
   const copy: Backup = { version: 1, gamma: hx(w.pins.gamma), vaultRuntimeHash: hx(w.pins.vaultRuntimeCodeHash), pending,
     recover: rec.recovery ? true : undefined, handoff: active ? 'active' : undefined,
     activePayer: active && payer ? hx(payer.address) : undefined, terminal: complete ? saved!.evidence : rec.burned, complete,
@@ -592,6 +594,28 @@ async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal:
       item.head !== (cursor.gap?.cursor && hx(cursor.gap.cursor.head))) throw new Error('saved checkpoint disagrees with the authenticated cut');
   }
   return cursor;
+}
+
+/** A receipt authenticates the cursor; its transaction must separately prove who used the nonce. */
+async function completedOrdinaryHandoff(w: Wallet, rec: ReturnRecord, saved: RecoveryJournal, hash: Uint8Array): Promise<boolean> {
+  if (saved.ordinaryHandoff !== hx(hash)) return false;
+  try {
+    const old = decodeSignedTx(bytes(rec.sends.at(-1)!.raw));
+    const cut = saved.cuts.find((item) => item.nonce === String(old.request.nonce));
+    if (!cut) return false;
+    const release = recoveryRelease(w);
+    const active = activeRecovery(rec, saved);
+    const session = await openSession(w, release, active);
+    if (!(await replay(w, session, active, saved)).gap) return false;
+    const { blockHash, txHash, txIndex } = cut.location;
+    const raw = await w.bridge.evm.transactionAt(bytes(blockHash, 32), uint(txIndex), bytes(txHash, 32));
+    const mined = decodeSignedTx(raw);
+    return eq(mined.from, old.from) && mined.request.nonce === old.request.nonce &&
+      eq(mined.request.to, release.deployment.recovery);
+  } catch {
+    // Keep the export payer-bound if the proof or exact transaction is unavailable.
+    return false;
+  }
 }
 
 function advanceCursor(cursor: Cursor, packet: Awaited<ReturnType<typeof packetOf>>, receipt: Uint8Array): void {
