@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { decodeReceiptBacking } from '../../src/nb2/deposit.js';
+import { decodeUc } from '../../src/nb2/trust.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { successor } from './certification-fixtures.js';
@@ -52,4 +54,24 @@ test('freshness requires a successful coalesced UTB sync and never credits a rep
   available = true;
   await assert.rejects(wallet.verifyToken(token), { reason: 'TrustInput' });
   await wallet.verifyToken(token);
+});
+
+test('a frozen predecessor receipt needs an in-term witness for historical Mint verification', async () => {
+  const w = await setup();
+  const opts = w.options('frozen handoff fixture');
+  const predecessor = await NativeBridgeV2.open(opts);
+  const { intent } = await predecessor.planDeposit(8n, localOwner(key('frozen owner')).publicKey);
+  await predecessor.submitDeposit(intent, evmAccount(w.chain, 'frozen payer'));
+  const { reason } = await predecessor.collectDepositProof(intent);
+  const receiptRound = decodeUc(decodeReceiptBacking(reason).proof.uc).unicitySeal.rootChainRoundNumber;
+  const token = await predecessor.mint(intent);
+  assert.equal((await predecessor.verifyToken(token)).amount, 8n);
+
+  const closesAtReceipt = await successor(w.root, receiptRound);
+  const afterDelayedSuffix = await NativeBridgeV2.open({ ...opts, trust: closesAtReceipt.trust });
+  await assert.rejects(afterDelayedSuffix.verifyToken(token), { rule: 'DepositUC' });
+
+  const closesAfterMint = await successor(w.root, roundNow() + 1n);
+  const afterDurableWitness = await NativeBridgeV2.open({ ...opts, trust: closesAfterMint.trust });
+  assert.equal((await afterDurableWitness.verifyToken(token)).amount, 8n);
 });
