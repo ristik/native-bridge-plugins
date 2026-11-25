@@ -169,6 +169,7 @@ impl Sparse {
 }
 
 struct ClaimOpening {
+    epoch: u64,
     key: Hash,
     full: Vec<u8>,
 }
@@ -257,7 +258,11 @@ fn claim_opening(
         Some(old) => cat(&[&[0, 1], &old, &opening]),
         None => cat(&[&[0, 0], &opening]),
     };
-    Ok(ClaimOpening { key, full })
+    Ok(ClaimOpening {
+        epoch: uc.unicity_seal.epoch,
+        key,
+        full,
+    })
 }
 
 /// Called only after the flat decoder has checked complete consumption and framing bounds.
@@ -399,6 +404,8 @@ pub struct RecoveryEvent {
 }
 
 pub struct RunPacket {
+    /// Greatest signer epoch in this packet, including its predecessor receipt.
+    pub required_signer_epoch: u64,
     pub shape: RecoveryShape,
     pub calldata: Vec<u8>,
     pub end: usize,
@@ -567,6 +574,7 @@ impl RecoverySession {
             return fail_d(Rule::Shape, "run cut");
         }
         let mut body = self.header.clone();
+        let mut required_signer_epoch = 0;
         let seq = if let Some((seq, receipt)) = prior {
             if seq == 0 || seq == u64::MAX {
                 return fail_d(Rule::Shape, "sequence");
@@ -577,6 +585,9 @@ impl RecoverySession {
                 cat(&[&u256_64(seq), &hash("STATE", &[&self.session, &state])]),
             );
             self.verify_event(trust, receipt, &event)?;
+            required_signer_epoch = decode_uc(&decode_deposit_proof(receipt)?.uc)?
+                .unicity_seal
+                .epoch;
             body.extend_from_slice(&cat(&[&[1], &state, &blob(receipt)]));
             seq + 1
         } else {
@@ -606,6 +617,7 @@ impl RecoverySession {
             body.push(op.code);
             body.extend_from_slice(&op.sid);
             for claim in &op.claims {
+                required_signer_epoch = required_signer_epoch.max(claim.epoch);
                 if used.insert(claim.key) {
                     body.extend_from_slice(&claim.full);
                 } else {
@@ -639,6 +651,7 @@ impl RecoverySession {
             opening_bytes,
         };
         Ok(RunPacket {
+            required_signer_epoch,
             shape,
             calldata,
             end,
@@ -846,6 +859,8 @@ pub enum GapEntry {
     Redeem,
 }
 pub struct GapPacket {
+    /// Signer epoch of this packet’s certified predecessor receipt.
+    pub required_signer_epoch: u64,
     pub shape: RecoveryShape,
     pub calldata: Vec<u8>,
     pub event: Option<RecoveryEvent>,
@@ -992,6 +1007,9 @@ impl RecoverySession {
             opening_bytes: 0,
         };
         Ok(GapPacket {
+            required_signer_epoch: decode_uc(&decode_deposit_proof(prior.receipt)?.uc)?
+                .unicity_seal
+                .epoch,
             shape,
             calldata,
             event,

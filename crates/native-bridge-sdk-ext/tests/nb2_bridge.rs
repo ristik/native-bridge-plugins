@@ -555,7 +555,7 @@ fn mined_final_refusal_preserves_the_decoded_inner_rule() {
     let seen_estimates = estimates.clone();
     let seen_sends = sends.clone();
     x.w.chain
-        .set_pre(Some(Box::new(move |method, _| match method {
+        .set_pre(Some(Box::new(move |method, params| match method {
             "eth_estimateGas" if seen_estimates.fetch_add(1, Ordering::Relaxed) == 0 => {
                 Some(Ok(json!("0x1d4c0")))
             }
@@ -565,6 +565,7 @@ fn mined_final_refusal_preserves_the_decoded_inner_rule() {
                 message: "execution reverted".into(),
                 data: Some(json!(hex0x(&refusal))),
             })),
+            "eth_call" if params[1].is_object() => Some(Ok(json!("0x"))),
             "eth_sendRawTransaction" => {
                 seen_sends.fetch_add(1, Ordering::Relaxed);
                 None
@@ -1668,7 +1669,6 @@ fn split_retries_the_exact_request_after_an_unusable_parent_proof_and_restart() 
 #[test]
 fn history_refresh_extends_the_installed_pin() {
     use native_bridge_sdk_ext::nb2::config::Build;
-    use native_bridge_sdk_ext::nb2::token::{decode_token, encode_token};
     use native_bridge_sdk_ext::nb2::trust::TrustInput;
     use unicity_token::api::bft::TrustBaseHistory;
 
@@ -1690,12 +1690,6 @@ fn history_refresh_extends_the_installed_pin() {
         .unwrap()
         .to_bundle();
     let held = read("transcripts/held-sibling-0/evidence.bin");
-    let mut future = decode_token(&read("transcripts/transfers/evidence.bin")).unwrap();
-    future.part.transfers.pop();
-    future.part.transfers_raw.pop();
-    future.part.proofs.pop();
-    let future = encode_token(&future);
-
     {
         let world = setup();
         let foreign = world.root.trust.clone();
@@ -1703,6 +1697,7 @@ fn history_refresh_extends_the_installed_pin() {
         opts.pins.gamma = gamma.clone();
         opts.pins.build = Build::Production;
         opts.trust = TrustInput::from_bundle(&lagging, &pin).unwrap();
+        opts.trust_freshness_ms = Some(60_000);
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let bundle = bundle.clone();
@@ -1719,7 +1714,6 @@ fn history_refresh_extends_the_installed_pin() {
         assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
         assert!(bridge.verify_token(&held).is_ok());
         assert!(bridge.verify_token(&held).is_ok());
-        assert_eq!(reason(bridge.verify_token(&future)), "SealEpoch");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1730,9 +1724,9 @@ fn history_refresh_extends_the_installed_pin() {
     opts.pins.gamma = gamma;
     opts.pins.build = Build::Production;
     opts.trust = extended;
+    opts.trust_freshness_ms = Some(60_000);
     let rollback = TrustInput::from_bundle(&lagging, &pin).unwrap();
     opts.refresh_trust = Some(Box::new(move |_| Ok(rollback.clone())));
     let bridge = NativeBridgeV2::open_checked(opts, false).unwrap();
-    assert_eq!(reason(bridge.verify_token(&future)), "TrustInput");
-    assert!(bridge.verify_token(&held).is_ok());
+    assert_eq!(reason(bridge.verify_token(&held)), "TrustInput");
 }

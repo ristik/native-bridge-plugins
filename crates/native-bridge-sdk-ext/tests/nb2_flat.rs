@@ -549,7 +549,8 @@ fn wallet_intervals_match_shared_b1_imported_tip_cases() {
 
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../../../protocol/vectors/b1-wallet-tip.json")).unwrap();
-    let mut roots = vec![make_root(0, 4, 10)];
+    // Wallet UTB encodings number genesis from 1. Re-sign the projection with every epoch shifted by one.
+    let mut roots = vec![make_root(1, 4, 10)];
     for epoch in 1..=8 {
         roots.push(next_epoch(
             &roots[epoch - 1],
@@ -571,7 +572,7 @@ fn wallet_intervals_match_shared_b1_imported_tip_cases() {
                     partition,
                     conf: vec![0; 32],
                     epoch_ir: 1,
-                    root_epoch: epoch as u64,
+                    root_epoch: epoch as u64 + 1,
                     round: case["round"].as_u64().unwrap(),
                     timestamp: 1_700_000_000,
                     state_hash: vec![1; 32],

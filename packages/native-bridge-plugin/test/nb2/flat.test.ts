@@ -450,12 +450,13 @@ test('wallet intervals agree with the shared B1 imported-tip cases', async () =>
   const fixture = JSON.parse(String(readFileSync(new URL('../../../../protocol/vectors/b1-wallet-tip.json', import.meta.url)))) as {
     cases: { id: string; tip: number; epoch: number; round: number; accept: boolean }[];
   };
-  const roots = [await makeRoot(0, 4, 10)];
+  // Wallet UTB encodings number genesis from 1. Re-sign the projection with every epoch shifted by one.
+  const roots = [await makeRoot(1, 4, 10)];
   for (let epoch = 1; epoch <= 8; epoch++) roots.push(await nextEpoch(roots[epoch - 1], BigInt(epoch * 1000), 4, 10 + epoch * 5));
   const c = makeConfig(roots[0]);
   for (const { id, tip, epoch, round, accept } of fixture.cases) {
     for (const partition of [c.evmPartition, c.aggregatorPartition]) {
-      const uc = await makeUc(roots[epoch], { partition, conf: new Uint8Array(32), rootEpoch: BigInt(epoch), epochIr: 1n,
+      const uc = await makeUc(roots[epoch], { partition, conf: new Uint8Array(32), rootEpoch: BigInt(epoch + 1), epochIr: 1n,
         round: BigInt(round), timestamp: 1_700_000_000n, stateHash: new Uint8Array(32).fill(1), blockHash: new Uint8Array(32).fill(2), signers: 3 });
       const trust = roots[tip].trust;
       const outcome = partition === c.evmPartition ? verifyEvmUc(trust, uc.toCBOR(), c) : ucCheck(trust, uc, partition, c.evmShard);
