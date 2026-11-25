@@ -296,7 +296,7 @@ struct SeenLog {
 }
 
 enum Landed {
-    Expired(Box<DecodedTx>),
+    Replace(Box<DecodedTx>, bool),
     Receipt(Box<ReceiptJson>),
     Pending,
     None,
@@ -767,7 +767,7 @@ impl NativeBridgeV2 {
                 self.journal.put_deposit(&rec)?;
             }
             match landed {
-                Landed::Pending | Landed::Expired(_) => return refuse(WalletReason::Unconfirmed, "an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly"),
+                Landed::Pending | Landed::Replace(..) => return refuse(WalletReason::Unconfirmed, "an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly"),
                 Landed::Receipt(r) => return self.record_deposit(&mut rec, &r),
                 Landed::None => {}
             }
@@ -1892,7 +1892,7 @@ impl NativeBridgeV2 {
         if !matches!(prior, ReconcileResult::NotPaid { .. })
             && !expired
                 .as_ref()
-                .is_some_and(|tx| tx.from == signer.address())
+                .is_some_and(|(tx, _)| tx.from == signer.address())
         {
             return Ok(prior);
         }
@@ -1907,16 +1907,31 @@ impl NativeBridgeV2 {
                 other => other?,
             };
             let gas = (rtx.gas_limit.saturating_mul(gas_bump)).min(self.pins.user_gas_limit);
+            let replacement = if let Some((old, underpriced)) = &expired {
+                let mut bid = old.request.clone();
+                let nonce = dec(bid.nonce);
+                for send in fresh.sends.iter().filter(|send| send.nonce == nonce) {
+                    let candidate = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
+                    bid.max_fee_per_gas =
+                        bid.max_fee_per_gas.max(candidate.request.max_fee_per_gas);
+                    bid.max_priority_fee_per_gas = bid
+                        .max_priority_fee_per_gas
+                        .max(candidate.request.max_priority_fee_per_gas);
+                }
+                Some((bid, *underpriced))
+            } else {
+                None
+            };
             let tx = self.signed_with_replacement(
                 signer,
                 &self.cfg.vault,
                 &rtx.calldata,
                 BigUint::default(),
                 gas,
-                expired.as_ref().map(|tx| &tx.request),
+                replacement.as_ref(),
             )?;
             self.check_ordinary_import(&fresh, Some(&tx.raw))?;
-            if let Some(old) = &expired {
+            if let Some((old, _)) = &expired {
                 if self.evm.nonce(&old.from, "latest")? != old.request.nonce {
                     return Ok(ReconcileResult::Pending {
                         tx_hash: old.hash.to_vec(),
@@ -2005,7 +2020,7 @@ impl NativeBridgeV2 {
     fn reconcile_inner_with_expiry(
         &self,
         return_id: &[u8; 32],
-        expired: &mut Option<DecodedTx>,
+        expired: &mut Option<(DecodedTx, bool)>,
     ) -> Result<ReconcileResult> {
         let mut rec = self.return_record(return_id)?;
         if rec.status == "paid" {
@@ -2038,9 +2053,9 @@ impl NativeBridgeV2 {
             self.journal.put_return(&rec)?;
         }
         match landed {
-            Landed::Expired(tx) => {
+            Landed::Replace(tx, pooled) => {
                 let tx_hash = tx.hash.to_vec();
-                *expired = Some(*tx);
+                *expired = Some((*tx, pooled));
                 Ok(ReconcileResult::Pending { tx_hash })
             }
             Landed::Pending => Ok(ReconcileResult::Pending {
@@ -2167,20 +2182,22 @@ impl NativeBridgeV2 {
         data: &[u8],
         value: BigUint,
         gas: u64,
-        replace: Option<&TxRequest>,
+        replace: Option<&(TxRequest, bool)>,
     ) -> Result<SignedTx> {
         let (base_fee, mut priority) = self.evm.fees()?;
         let mut max_fee = BigUint::from(2u8) * base_fee + &priority;
-        let nonce = if let Some(prior) = replace {
+        let nonce = if let Some((prior, pooled)) = replace {
             if self.evm.nonce(&signer.address(), "latest")? != prior.nonce {
                 return refuse(
                     WalletReason::NotPending,
                     "payout nonce changed during replacement",
                 );
             }
-            let bump = |bid: &BigUint| bid + bid / 10u8 + 1u8;
-            max_fee = max_fee.max(bump(&prior.max_fee_per_gas));
-            priority = priority.max(bump(&prior.max_priority_fee_per_gas));
+            if *pooled || self.evm.nonce(&signer.address(), "pending")? > prior.nonce {
+                let bump = |bid: &BigUint| bid + bid / 10u8 + 1u8;
+                max_fee = max_fee.max(bump(&prior.max_fee_per_gas));
+                priority = priority.max(bump(&prior.max_priority_fee_per_gas));
+            }
             prior.nonce
         } else {
             self.evm.nonce(&signer.address(), "pending")?
@@ -2274,7 +2291,7 @@ impl NativeBridgeV2 {
                                 && mined == last_nonce
                                 && self.evm.nonce(&tx.from, "latest")? == last_nonce
                             {
-                                Landed::Expired(Box::new(tx))
+                                Landed::Replace(Box::new(tx), false)
                             } else {
                                 Landed::Pending
                             },
@@ -2283,7 +2300,16 @@ impl NativeBridgeV2 {
                     return Err(error);
                 }
             }
-            self.send_raw_tolerant(&raw)?;
+            if let Err(error) = self.send_raw_tolerant(&raw) {
+                if return_record.is_some()
+                    && !seen
+                    && matches!(&error, Error::Other(message) if message.to_ascii_lowercase().contains("replacement transaction underpriced"))
+                    && self.evm.nonce(&tx.from, "latest")? == tx.request.nonce
+                {
+                    return Ok(Landed::Replace(Box::new(tx), true));
+                }
+                return Err(error);
+            }
             return Ok(Landed::Pending);
         }
         // a mined transaction used the nonce, and no success receipt is visible: wait for depth before calling it dead

@@ -15,7 +15,9 @@ use native_bridge_sdk_ext::nb2::bridge::{NativeBridgeV2, ReconcileResult};
 use native_bridge_sdk_ext::nb2::crypto::{he, public_key, sign_unlock, verify_unlock};
 use native_bridge_sdk_ext::nb2::deposit::{first_owner_of, topic};
 use native_bridge_sdk_ext::nb2::errors::{Error, Nb2Error, Result, Rule, WalletReason};
-use native_bridge_sdk_ext::nb2::evm::{sign_tx, EvmSigner, LocalKeySigner, TxRequest};
+use native_bridge_sdk_ext::nb2::evm::{
+    decode_signed_tx, sign_tx, EvmSigner, LocalKeySigner, TxRequest,
+};
 use native_bridge_sdk_ext::nb2::gas::{GasModel, RedeemShape};
 use native_bridge_sdk_ext::nb2::journal::{hex, unhex, MemoryJournalStore, JOURNAL_FORMAT};
 use native_bridge_sdk_ext::nb2::rpc::{Estimate, EvmReader, JsonRpc, RpcError};
@@ -515,6 +517,16 @@ fn expired_payout_after_transport_loss_reuses_nonce_after_restart() {
     assert_eq!(paid.sends[0], pending.sends[0]);
     assert_eq!(paid.sends[1].nonce, pending.sends[0].nonce);
     assert_ne!(paid.sends[1].raw, pending.sends[0].raw);
+    let old = decode_signed_tx(&unhex(&paid.sends[0].raw).unwrap()).unwrap();
+    let replacement = decode_signed_tx(&unhex(&paid.sends[1].raw).unwrap()).unwrap();
+    assert_eq!(
+        old.request.max_fee_per_gas,
+        replacement.request.max_fee_per_gas
+    );
+    assert_eq!(
+        old.request.max_priority_fee_per_gas,
+        replacement.request.max_priority_fee_per_gas
+    );
 }
 
 #[test]

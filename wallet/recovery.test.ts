@@ -8,8 +8,8 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  EvmReader, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
-  evidenceOf, quoteRecoveryGapBatch, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
+  EvmReader, GapTree, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
+  evidenceOf, firstOwnerOf, quoteRecoveryGapBatch, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
@@ -628,6 +628,105 @@ test('portable replay refreshes for later certified cuts and reopening preserves
   assert.equal((await recoverStep(local, restored, caps)).state, 'pending');
   assert.equal(requests, 2, 'local replay fetched and installed the successor before signing');
   assert.equal((await open('epoch-relay', rpc, { aggregator: offline })).trust.history.tip?.epoch, 2n);
+});
+
+test('an ordinary send lost at the gap limit hands its nonce to continuation and pays once', async (t) => {
+  const { w, open, chain, deployment, cfg, rpc, manifest } = await setup(t, true);
+  const release = JSON.parse(readFileSync(manifest, 'utf8'));
+  for (const entry of ['advanceGaps', 'redeemRecovered']) {
+    const last = release.recovery.ranges.filter((range: { max: { entry: string } }) => range.max.entry === entry).at(-1);
+    for (const gaps of [65, 66]) release.recovery.ranges.push({ ...last, max: { ...last.max, gaps } });
+  }
+  writeFileSync(manifest, JSON.stringify(release));
+  const { eta } = await burn(w, 'coin', undefined, undefined, caps);
+  const [rec] = await w.bridge.journal.returns();
+  const evidence = evidenceOf(unhex(rec.burned!));
+  const verdict = await verifyReturn(chain.gamma, evidence, w.trust, TEST_PARAMS);
+  const other = await open('gap-producer');
+  chain.fund(other.signer.address, 10n ** 18n);
+  const owner = firstOwnerOf(w.owner(0).publicKey);
+  const roll = async (count: number) => {
+    chain.coldCall = async (vault, to, data) => {
+      if (!eq(to, deployment.recovery) || data.length !== 0) return undefined;
+      const segment = vault.c;
+      for (let j = 0n; j < cfg.K; j++) {
+        const id = HE(u256(segment * cfg.K + j + 1n));
+        vault.deposit(1n, owner, id);
+        vault.redeem(id, segment, new Uint8Array(), { ret: verdictAbi({
+          ...verdict, eta: id, minSegment: segment, amount: 1n, recipient: other.signer.address,
+        }) });
+      }
+      return [];
+    };
+    for (let i = 0; i < count; i++) {
+      const tx = await signTx(other.signer, { chainId: cfg.chainId, nonce: chain.vault.c, maxFeePerGas: 15n,
+        maxPriorityFeePerGas: 1n, gas: 1_000_000n, to: deployment.recovery, value: 0n, data: new Uint8Array() });
+      await rpc.call('eth_sendRawTransaction', [hx(tx.raw)]);
+    }
+    chain.coldCall = undefined;
+  };
+  await roll(63);
+  let drop = true;
+  let pooled = false;
+  const interrupted: JsonRpc = { async call<T>(method: string, params: unknown[]): Promise<T> {
+    if (method === 'eth_sendRawTransaction' && drop) {
+      drop = false;
+      throw new Error('ordinary transport failed before delivery');
+    }
+    if (method === 'eth_getTransactionCount' && params[1] === 'pending' && pooled) {
+      return ('0x' + (BigInt(await rpc.call<string>(method, params)) + 1n).toString(16)) as T;
+    }
+    if (method === 'eth_call' && (params[0] as { data: string }).data.startsWith(hx(SELECTOR.redeem))) {
+      return chain.call<T>(method, params);
+    }
+    return rpc.call<T>(method, params);
+  } };
+  let payer = await open('holder', interrupted);
+  await assert.rejects(resumePayout(payer, rec, caps, true), /ordinary transport failed before delivery/);
+  const original = (await payer.bridge.journal.ret(rec.returnId))!.sends[0];
+  await roll(2);
+  payer = await open('holder', interrupted);
+  await assert.rejects(resumePayout(payer, rec, caps, true), { rule: 'CapacityExceeded' });
+  assert.equal(await payer.bridge.evm.nonce(payer.signer.address), BigInt(original.nonce));
+  pooled = true;
+  await assert.rejects(resumePayout(payer, rec, caps, false, true), { reason: 'NotPending' });
+  pooled = false;
+  const journal = () => JSON.parse(readFileSync(join(payer.dir, `recovery-${rec.returnId.slice(2)}.json`), 'utf8'));
+  const session = await RecoverySession.create(chain.gamma, evidence, new RecoveryAuthority(payer.trust, async () => undefined), TEST_PARAMS, deployment);
+  const complete = await session.run(0, session.operationCount, payer.trust);
+  const segments = chain.vault.events.flatMap((event) => event.name === 'SegmentSealed' ?
+    [{ index: event.segment, before: event.before, after: event.after, z: event.ids, root: GapTree.build(event.ids)!.root }] : []);
+  let completion: Uint8Array | undefined;
+  chain.coldCall = async (vault, to, data) => {
+    if (eq(to, deployment.recovery)) {
+      assert.deepEqual(data, complete.calldata);
+      const pending = journal().pending;
+      assert.equal(pending.nonce, original.nonce);
+      completion = unhex(pending.txHash);
+      return [{ address: to, topics: complete.event.topics, data: complete.event.data }];
+    }
+    if (eq(to, cfg.vault) && hx(data.subarray(0, 4)) === selector('redeemRecovered(bytes)')) {
+      assert.ok(completion);
+      const proof = await recoveryRpcSource(new EvmReader(rpc), completion)(deployment.recovery, complete.event);
+      const gaps = journal().pending.cut.gaps.map((gap: string) => unhex(gap));
+      const settlement = await session.gaps('redeemRecovered', payer.trust, proof, { seq: 1n }, gaps, unhex(rec.startHead));
+      assert.deepEqual(data, settlement.calldata);
+      const history = buildHistory(segments, eta, verdict.minSegment, vault.c, unhex(rec.startHead));
+      vault.redeem(eta, verdict.minSegment, history.history, { ret: verdictAbi(verdict) });
+      return [];
+    }
+    return undefined;
+  };
+  assert.equal((await resumePayout(payer, rec, caps, false, true)).state, 'checkpoint');
+  assert.equal(journal().ordinaryHandoff, original.hash);
+  payer = await open('holder', interrupted);
+  assert.equal((await resumePayout(payer, rec, caps, false, true)).state, 'paid');
+  const paid = (await payer.bridge.journal.ret(rec.returnId))!;
+  assert.ok(paid.paid?.receipt);
+  assert.equal(paid.burned, rec.burned);
+  assert.deepEqual(paid.sends, [original]);
+  assert.equal(await rpc.call('eth_getTransactionReceipt', [original.hash]), null);
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid' && eq(e.eta, eta)).length, 1);
 });
 
 test('route switching refuses unresolved signed sends in either direction after pool eviction', async (t) => {

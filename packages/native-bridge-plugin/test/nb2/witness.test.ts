@@ -137,7 +137,7 @@ test('a never-broadcast return rebuilds after two rollovers during finalized imp
   assert.equal(sends(), beforeResume + 1);
 });
 
-test('an expired payout after a lost send rebuilds at the same nonce and certifies Paid after restart', async () => {
+for (const pooled of [false, true]) test(`an expired payout reuses the nonce and certifies Paid after restart (pool race: ${pooled})`, async () => {
   const { w, payer, burned, chain, pay, options, store } = await world();
   const id = await burned();
   const keyOf = '0x' + toHex(id);
@@ -152,16 +152,39 @@ test('an expired payout after a lost send rebuilds at the same nonce and certifi
   chain.call = call;
   await pay(8, evmAccount(chain, 'independent payer'));
   const reopened = await NativeBridgeV2.open(options('w', store));
-  assert.equal((await reopened.submitRedeem(id, payer)).state, 'paid');
+  const budget = { admit: async ({ maxFeePerGas, maxPriorityFeePerGas }: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }) => {
+    assert.equal(maxFeePerGas, 15n);
+    assert.equal(maxPriorityFeePerGas, 1n);
+  } };
+  if (pooled) {
+    chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_sendRawTransaction') {
+        const { request } = decodeSignedTx(fromHex(String(params[0]).slice(2))!);
+        if (request.maxFeePerGas === 15n) throw new RpcError(200, -32000, 'replacement transaction underpriced');
+      }
+      return call<T>(method, params);
+    };
+    await assert.rejects(reopened.submitRedeem(id, payer, budget), /replacement transaction underpriced/);
+  }
+  assert.equal((await reopened.submitRedeem(id, payer, pooled ? {} : budget)).state, 'paid');
   const paid = (await reopened.journal.ret(keyOf))!;
   assert.ok(paid.paid?.receipt);
   assert.equal(paid.burned, pending.burned);
-  assert.equal(paid.sends.length, 2);
+  assert.equal(paid.sends.length, pooled ? 3 : 2);
   assert.deepEqual(paid.sends[0], pending.sends[0]);
   const [old, replacement] = paid.sends.map(({ raw }) => decodeSignedTx(fromHex(raw.slice(2))!));
   assert.equal(replacement.request.nonce, old.request.nonce);
   assert.deepEqual(replacement.from, old.from);
   assert.notDeepEqual(replacement.request.data, old.request.data);
+  assert.equal(replacement.request.maxFeePerGas, old.request.maxFeePerGas);
+  assert.equal(replacement.request.maxPriorityFeePerGas, old.request.maxPriorityFeePerGas);
+  if (pooled) {
+    const bumped = decodeSignedTx(fromHex(paid.sends[2].raw.slice(2))!);
+    assert.equal(bumped.request.nonce, old.request.nonce);
+    assert.equal(bumped.request.maxFeePerGas, 17n);
+    assert.equal(bumped.request.maxPriorityFeePerGas, 2n);
+    assert.equal(new Set(paid.sends.map((send) => send.hash)).size, 3);
+  }
   assert.equal(await call('eth_getTransactionReceipt', [paid.sends[0].hash]), null);
   assert.equal(chain.vault.events.filter((e) => e.name === 'Paid').length, 9);
 });
