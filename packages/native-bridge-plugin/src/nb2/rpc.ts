@@ -8,7 +8,7 @@
  * still land, #1121), so it is reported as such and the caller polls for the receipt of the locally computed hash.
  */
 import { concat, eq, fromHex, toHex } from '../bytes.js';
-import { decodeBytesReturn, decodeStateReturn, SELECTOR, type RawLog, type VaultState } from './abi.js';
+import { decodeRevert, decodeBytesReturn, decodeStateReturn, SELECTOR, type RawLog, type VaultState } from './abi.js';
 import { TOPIC, encodeDepositProof, type DepositProof } from './deposit.js';
 import { Nb2Error, WalletError, fail, refuse } from './errors.js';
 import { bindHeader, decodeHeader, encodeHeader, type Header } from './header.js';
@@ -487,9 +487,17 @@ export class EvmReader {
       refuse('ImportLag', `waiting for finalized B1 import of epoch ${epoch}`);
     }
     if (!tx) return;
-    await this.rpc.call('eth_call', [{
-      from: hexOf(tx.from), to: hexOf(tx.to), data: hexOf(tx.data), value: qty(tx.value), gas: qty(tx.gas),
-    }, at]);
+    try {
+      await this.rpc.call('eth_call', [{
+        from: hexOf(tx.from), to: hexOf(tx.to), data: hexOf(tx.data), value: qty(tx.value), gas: qty(tx.gas),
+      }, at]);
+    } catch (error) {
+      if (error instanceof RpcError && typeof error.data === 'string' && error.data.startsWith('0x')) {
+        const raw = fromHex(error.data.slice(2));
+        if (raw && decodeRevert(raw)?.rule === 'StaleEndpoint') fail('StaleEndpoint', 'payout history expired at the finalized head');
+      }
+      throw error;
+    }
   }
 
   public async vaultState(vault: Uint8Array): Promise<VaultState> {

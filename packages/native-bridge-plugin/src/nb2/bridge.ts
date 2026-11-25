@@ -22,7 +22,7 @@ import {
   TOPIC, decodeDepositProof, decodeReceiptBacking, depositIntentSecret, depositSalt, encodeReceiptBacking, firstOwnerOf, rhoOf, verifyDepositEvidence, verifyReceiptLog,
 } from './deposit.js';
 import { Nb2Error, WalletError, fail, refuse } from './errors.js';
-import { decodeSignedTx, signTx, type EvmSigner, type SignedTx, type TxRequest } from './evm.js';
+import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, type TxRequest } from './evm.js';
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
@@ -1258,14 +1258,17 @@ export class NativeBridgeV2 {
     const payer = fresh.executionPayer ? unhex(fresh.executionPayer) : first?.from;
     const different = payer && !eq(payer, signer.address);
     const pending = { recovery: options.recovery };
-    const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending });
+    let expired: TxRequest | undefined;
+    const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending },
+      (request) => { expired = request; });
     if (prior.state === 'paid' || prior.state === 'needs-archive') return prior;
     if (different) return { state: 'route-blocked', route: 'ordinary', txHash: first?.hash ?? returnId, payer };
     if (prior.state !== 'not-paid') return prior;
     let gasBump = 1n;
     for (let attempt = 0; attempt < 4; attempt++) {
       this.requireRedeemable(fresh);
-      const competing = await this.settlementGate(fresh, archives, options.recovery);
+      const superseded = expired ? fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce).map((send) => unhex(send.hash)) : [];
+      const competing = await this.settlementGate(fresh, archives, options.recovery, undefined, superseded);
       if (competing) return competing;
       let rtx: RedeemTx;
       try {
@@ -1277,15 +1280,19 @@ export class NativeBridgeV2 {
       }
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
-        options.admit && ((request) => options.admit!(request, fresh.sends)));
+        options.admit && ((request) => options.admit!(request, fresh.sends)), expired);
       // Until the exact call passes preflight it has never been broadcast. Leave
       // the burn rebuildable, including its history and route, on any refusal.
       await this.checkOrdinaryImport(fresh, tx.raw);
+      if (expired && await this.evm.nonce(signer.address, 'latest') !== tx.request.nonce) {
+        return { state: 'pending', txHash: unhex(fresh.sends.at(-1)!.hash) };
+      }
       fresh.executionPayer ??= hex(signer.address);
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.blockNumber());
       await this.journal.putReturn(fresh);
+      expired = undefined;
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
       const outcome = await this.reconcileRecord(fresh, archives, { readOnly: true, pending });
@@ -1320,25 +1327,25 @@ export class NativeBridgeV2 {
   }
 
   /** A final read-only check before signing a new settlement. */
-  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array, observed?: Uint8Array): Promise<ReconcileResult> {
+  public checkSettlement(returnId: Uint8Array, archives: readonly EvmReader[], recovery?: Uint8Array, observed?: Uint8Array, replacing: readonly Uint8Array[] = []): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const rec = await this.returnRecord(returnId);
       if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
       if (!rec.eta) return { state: 'not-paid' };
-      return (await this.settlementGate(rec, archives, recovery, observed)) ?? { state: 'not-paid' };
+      return (await this.settlementGate(rec, archives, recovery, observed, replacing)) ?? { state: 'not-paid' };
     });
   }
 
   private async settlementGate(rec: ReturnRecord, archives: readonly EvmReader[], recovery?: Uint8Array,
-    observed?: Uint8Array): Promise<ReconcileResult | undefined> {
+    observed?: Uint8Array, replacing: readonly Uint8Array[] = []): Promise<ReconcileResult | undefined> {
     const pending = await this.pendingSettlements(rec, archives, recovery);
     const settlements = [...pending.values()].filter((hash) => !observed || !eq(hash, observed));
     if (observed) settlements.unshift(observed);
-    const proof = await this.findPaid(rec, archives, true, { settlements });
+    const proof = await this.findPaid(rec, archives, true, { settlements: [...settlements, ...replacing] });
     if (proof) return proof;
     for (const hash of settlements) {
-      if (pending.has(hex(hash)) && !(await this.exactFailure(hash, archives)).failed) {
+      if (pending.has(hex(hash)) && !replacing.some((prior) => eq(prior, hash)) && !(await this.exactFailure(hash, archives)).failed) {
         return { state: 'pending', txHash: hash };
       }
     }
@@ -1376,7 +1383,7 @@ export class NativeBridgeV2 {
     return this.reconcileRecord(await this.returnRecord(returnId), archives, evidence);
   }
 
-  private async reconcileRecord(rec: ReturnRecord, archives: readonly EvmReader[], evidence?: ReturnEvidence): Promise<ReconcileResult> {
+  private async reconcileRecord(rec: ReturnRecord, archives: readonly EvmReader[], evidence?: ReturnEvidence, onExpired?: (tx: TxRequest) => void): Promise<ReconcileResult> {
     if (rec.status === 'paid') return { state: 'paid', txHash: unhex(rec.paid!.txHash), blockNumber: undec(rec.paid!.blockNumber) };
     if (rec.status === 'burn-requested') {
       const eta = hex(await this.validatePendingReturn(rec));
@@ -1384,7 +1391,7 @@ export class NativeBridgeV2 {
     }
     if (rec.eta === undefined) return { state: 'not-paid' };
     const paid = await this.findPaid(rec, archives, true, evidence);
-    return paid ?? this.reconcileSend(rec, archives, evidence?.readOnly !== true);
+    return paid ?? this.reconcileSend(rec, archives, evidence?.readOnly !== true, onExpired);
   }
 
   private async findPaid(rec: ReturnRecord, archives: readonly EvmReader[], persist = true, evidence?: ReturnEvidence): Promise<ReconcileResult | undefined> {
@@ -1484,24 +1491,39 @@ export class NativeBridgeV2 {
     if (!available && unavailable) throw unavailable;
   }
 
-  /** A return may sign again only after authenticating failure of its last exact send. */
-  private async reconcileSend(rec: ReturnRecord, archives: readonly EvmReader[], resubmit: boolean): Promise<ReconcileResult> {
+  /** Before signing again, reconcile the exact send. A finalized stale call may only be replaced at its unused nonce. */
+  private async reconcileSend(rec: ReturnRecord, archives: readonly EvmReader[], resubmit: boolean, onExpired?: (tx: TxRequest) => void): Promise<ReconcileResult> {
     const send = rec.sends.at(-1);
     if (!send) return { state: 'not-paid' };
     const raw = unhex(send.raw);
-    const { hash: txHash } = decodeSignedTx(raw);
-    if (hex(txHash) !== send.hash) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
-    if (send.failed) {
-      if (send.failed.txHash !== hex(txHash) || unhex(send.failed.blockHash).length !== 32) refuse('BadInput', 'certified failure disagrees with its signed transaction');
-      return { state: 'not-paid' };
+    const { hash: txHash, from, request } = decodeSignedTx(raw);
+    if (hex(txHash) !== send.hash || request.nonce !== undec(send.nonce)) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
+    // A certified failure of any replacement at this nonce rules out all the others.
+    const sameNonce = rec.sends.filter((prior) => prior.nonce === send.nonce).reverse();
+    let evidence: { seen: boolean; pruned: boolean; attempted: boolean } | undefined;
+    for (const prior of sameNonce) {
+      const signed = decodeSignedTx(unhex(prior.raw));
+      if (!eq(signed.from, from) || signed.request.nonce !== request.nonce || hex(signed.hash) !== prior.hash) {
+        refuse('BadInput', 'ordinary replacement disagrees with its signed transaction');
+      }
+      if (prior.failed) {
+        if (prior.failed.txHash !== prior.hash || unhex(prior.failed.blockHash).length !== 32) refuse('BadInput', 'certified failure disagrees with its signed transaction');
+        return { state: 'not-paid' };
+      }
+      const outcome = await this.exactFailure(signed.hash, archives);
+      if (outcome.failed) {
+        prior.failed = outcome.failed;
+        delete send.failureProofReads;
+        await this.journal.putReturn(rec);
+        return { state: 'not-paid' };
+      }
+      evidence = {
+        seen: Boolean(evidence?.seen || outcome.seen),
+        pruned: Boolean(evidence?.pruned || outcome.pruned),
+        attempted: Boolean(evidence?.attempted || outcome.attempted),
+      };
     }
-    const { seen, pruned, attempted, failed } = await this.exactFailure(txHash, archives);
-    if (failed) {
-      send.failed = failed;
-      delete send.failureProofReads;
-      await this.journal.putReturn(rec);
-      return { state: 'not-paid' };
-    }
+    const { seen, pruned, attempted } = evidence!;
     if (attempted || send.failureProofReads !== undefined) {
       const reads = pruned ? FAILURE_PROOF_READS : Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
       if (reads !== send.failureProofReads) {
@@ -1511,7 +1533,15 @@ export class NativeBridgeV2 {
     }
     if (send.failureProofReads === FAILURE_PROOF_READS) return { state: 'needs-archive', txHash };
     if (!seen && resubmit && send.failureProofReads === undefined) {
-      await this.checkOrdinaryImport(rec, raw);
+      try { await this.checkOrdinaryImport(rec, raw); }
+      catch (error) {
+        if (!(error instanceof Nb2Error) || error.rule !== 'StaleEndpoint') throw error;
+        if (onExpired && await this.evm.nonce(from, 'latest') === request.nonce) {
+          onExpired(request);
+          return { state: 'not-paid' };
+        }
+        return { state: 'pending', txHash };
+      }
       try { await this.evm.sendRaw(raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
@@ -1627,9 +1657,17 @@ export class NativeBridgeV2 {
 
   // ==== EVM plumbing ====================================================================================================
 
-  private async signed(signer: EvmSigner, to: Uint8Array, data: Uint8Array, value: bigint, gas: bigint, admit?: (request: TxRequest) => Promise<void>): Promise<SignedTx> {
+  private async signed(signer: EvmSigner, to: Uint8Array, data: Uint8Array, value: bigint, gas: bigint, admit?: (request: TxRequest) => Promise<void>, replace?: TxRequest): Promise<SignedTx> {
     const [nonce, fees] = await Promise.all([this.evm.nonce(signer.address), this.evm.fees()]);
     const request = { chainId: this.cfg.chainId, nonce, maxPriorityFeePerGas: fees.priority, maxFeePerGas: 2n * fees.baseFee + fees.priority, gas, to, value, data };
+    if (replace) {
+      if (await this.evm.nonce(signer.address, 'latest') !== replace.nonce) refuse('NotPending', 'payout nonce changed during replacement');
+      request.nonce = replace.nonce;
+      const fee = replacementBid(replace.maxFeePerGas);
+      if (fee > request.maxFeePerGas) request.maxFeePerGas = fee;
+      const priority = replacementBid(replace.maxPriorityFeePerGas);
+      if (priority > request.maxPriorityFeePerGas) request.maxPriorityFeePerGas = priority;
+    }
     await admit?.(request);
     return signTx(signer, request);
   }

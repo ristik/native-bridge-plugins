@@ -973,14 +973,22 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
             return Ok(());
         };
         let req = &tx.request;
-        call(
-            &*self.rpc,
+        if let Err(error) = self.rpc.call(
             "eth_call",
             json!([{
-            "from": hex0x(&tx.from), "to": hex0x(&req.to), "data": hex0x(&req.data),
-            "gas": qty(req.gas), "value": format!("0x{:x}", req.value),
-        }, at]),
-        )?;
+                "from": hex0x(&tx.from), "to": hex0x(&req.to), "data": hex0x(&req.data),
+                "gas": qty(req.gas), "value": format!("0x{:x}", req.value),
+            }, at]),
+        ) {
+            let rule = revert_data_of(&error).and_then(|raw| super::abi::decode_revert(&raw));
+            if rule.is_some_and(|decoded| decoded.rule == Rule::StaleEndpoint) {
+                return fail_d(
+                    Rule::StaleEndpoint,
+                    "payout history expired at the finalized head",
+                );
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 

@@ -7,11 +7,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { toHex } from '../../src/bytes.js';
+import { fromHex, toHex } from '../../src/bytes.js';
 import { classifyRedeemError, decodeRevert, revertData } from '../../src/nb2/abi.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
+import { decodeSignedTx } from '../../src/nb2/evm.js';
 import { Nb2Error, WalletError } from '../../src/nb2/errors.js';
+import { MemoryJournalStore } from '../../src/nb2/journal.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, setup, VAULT } from './world.js';
 import { EvmReader, RpcError } from '../../src/nb2/rpc.js';
@@ -20,18 +22,19 @@ async function world() {
   const s = await setup();
   const payer = evmAccount(s.chain, 'p');
   const owner = localOwner(key('o'));
-  const w = await NativeBridgeV2.open(s.options('w'));
-  const token = async (v: bigint): Promise<Uint8Array> => {
+  const store = new MemoryJournalStore();
+  const w = await NativeBridgeV2.open(s.options('w', store));
+  const token = async (v: bigint, actor = payer): Promise<Uint8Array> => {
     const p = await w.planDeposit(v, owner.publicKey);
-    await w.submitDeposit(p, payer);
+    await w.submitDeposit(p, actor);
     await w.collectDepositProof(p.intent);
     return w.mint(p.intent);
   };
-  const pay = async (n: number): Promise<void> => {
+  const pay = async (n: number, actor = payer): Promise<void> => {
     for (let k = 0; k < n; k++) {
-      const rp = await w.planReturn(await token(1n), HE(key('x')).slice(12), payer.address);
+      const rp = await w.planReturn(await token(1n, actor), HE(key('x')).slice(12), actor.address);
       await w.burn(rp.returnId, owner);
-      assert.equal((await w.submitRedeem(rp.returnId, payer)).state, 'paid');
+      assert.equal((await w.submitRedeem(rp.returnId, actor)).state, 'paid');
     }
   };
   const burned = async (): Promise<Uint8Array> => {
@@ -39,7 +42,7 @@ async function world() {
     await w.burn(rp.returnId, owner);
     return rp.returnId;
   };
-  return { ...s, w, payer, pay, burned };
+  return { ...s, w, payer, pay, burned, store };
 }
 
 test('history of zero, one and several segments; one rollover in flight is tolerated', async () => {
@@ -132,6 +135,35 @@ test('a never-broadcast return rebuilds after two rollovers during finalized imp
   assert.equal(paid?.burned, pending?.burned);
   assert.equal(paid?.sends.length, 1);
   assert.equal(sends(), beforeResume + 1);
+});
+
+test('an expired payout after a lost send rebuilds at the same nonce and certifies Paid after restart', async () => {
+  const { w, payer, burned, chain, pay, options, store } = await world();
+  const id = await burned();
+  const keyOf = '0x' + toHex(id);
+  const call = chain.call.bind(chain);
+  chain.call = async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') throw new Error('transport before delivery');
+    return call<T>(method, params);
+  };
+  await assert.rejects(w.submitRedeem(id, payer), /transport before delivery/);
+  const pending = (await w.journal.ret(keyOf))!;
+  assert.equal(pending.sends.length, 1);
+  chain.call = call;
+  await pay(8, evmAccount(chain, 'independent payer'));
+  const reopened = await NativeBridgeV2.open(options('w', store));
+  assert.equal((await reopened.submitRedeem(id, payer)).state, 'paid');
+  const paid = (await reopened.journal.ret(keyOf))!;
+  assert.ok(paid.paid?.receipt);
+  assert.equal(paid.burned, pending.burned);
+  assert.equal(paid.sends.length, 2);
+  assert.deepEqual(paid.sends[0], pending.sends[0]);
+  const [old, replacement] = paid.sends.map(({ raw }) => decodeSignedTx(fromHex(raw.slice(2))!));
+  assert.equal(replacement.request.nonce, old.request.nonce);
+  assert.deepEqual(replacement.from, old.from);
+  assert.notDeepEqual(replacement.request.data, old.request.data);
+  assert.equal(await call('eth_getTransactionReceipt', [paid.sends[0].hash]), null);
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid').length, 9);
 });
 
 test('a final refusal after a mined revert preserves the decoded inner rule', async () => {

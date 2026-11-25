@@ -436,34 +436,38 @@ struct WitnessWorld {
     b: NativeBridgeV2,
     payer: LocalKeySigner,
     owner: LocalOwner,
+    store: Arc<MemoryJournalStore>,
 }
 
 impl WitnessWorld {
     fn new() -> Self {
         let w = setup();
         let payer = w.evm_account("p");
-        let b = open(&w, "w", World::store());
+        let store = World::store();
+        let b = open(&w, "w", store.clone());
         WitnessWorld {
             w,
             b,
             payer,
             owner: local_owner(&key("o")),
+            store,
         }
     }
 
     fn pay(&self, n: usize) {
+        self.pay_as(n, &self.payer);
+    }
+
+    fn pay_as(&self, n: usize, payer: &LocalKeySigner) {
         for _ in 0..n {
-            let t = minted(&self.b, &self.payer, &self.owner, 1);
+            let t = minted(&self.b, payer, &self.owner, 1);
             let rp = self
                 .b
-                .plan_return(&t, &recipient("x"), &self.payer.address(), None)
+                .plan_return(&t, &recipient("x"), &payer.address(), None)
                 .unwrap();
             self.b.burn(&rp.return_id, &self.owner).unwrap();
             assert_eq!(
-                self.b
-                    .submit_redeem(&rp.return_id, &self.payer)
-                    .unwrap()
-                    .state(),
+                self.b.submit_redeem(&rp.return_id, payer).unwrap().state(),
                 "paid"
             );
         }
@@ -478,6 +482,39 @@ impl WitnessWorld {
         self.b.burn(&rp.return_id, &self.owner).unwrap();
         rp.return_id
     }
+}
+
+#[test]
+fn expired_payout_after_transport_loss_reuses_nonce_after_restart() {
+    let x = WitnessWorld::new();
+    let id = x.burned();
+    x.w.chain.set_pre(Some(Box::new(|method, _| {
+        (method == "eth_sendRawTransaction").then(|| {
+            Err(RpcError {
+                status: 503,
+                code: 0,
+                message: "transport before delivery".into(),
+                data: None,
+            })
+        })
+    })));
+    assert_eq!(x.b.submit_redeem(&id, &x.payer).unwrap().state(), "pending");
+    let pending = x.b.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert_eq!(pending.sends.len(), 1);
+    x.w.chain.set_pre(None);
+    x.pay_as(8, &x.w.evm_account("independent payer"));
+    let reopened = open(&x.w, "w", x.store.clone());
+    assert_eq!(
+        reopened.submit_redeem(&id, &x.payer).unwrap().state(),
+        "paid"
+    );
+    let paid = reopened.journal.ret(&hex(&id)).unwrap().unwrap();
+    assert!(paid.paid.is_some());
+    assert_eq!(paid.burned, pending.burned);
+    assert_eq!(paid.sends.len(), 2);
+    assert_eq!(paid.sends[0], pending.sends[0]);
+    assert_eq!(paid.sends[1].nonce, pending.sends[0].nonce);
+    assert_ne!(paid.sends[1].raw, pending.sends[0].raw);
 }
 
 #[test]

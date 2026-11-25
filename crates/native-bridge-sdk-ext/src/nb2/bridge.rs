@@ -40,7 +40,7 @@ use super::deposit::{
     first_owner_of, rho_of, topic, verify_deposit_evidence, verify_receipt_log, ReceiptBacking,
 };
 use super::errors::{fail_d, refuse, Error, Nb2Error, Result, Rule, WalletReason};
-use super::evm::{decode_signed_tx, sign_tx, EvmSigner, SignedTx, TxRequest};
+use super::evm::{decode_signed_tx, sign_tx, DecodedTx, EvmSigner, SignedTx, TxRequest};
 use super::gas::{
     create_address, redeem_tx_framing, DeploymentCode, GasModel, MeasuredGasModel, RedeemShape,
 };
@@ -296,6 +296,7 @@ struct SeenLog {
 }
 
 enum Landed {
+    Expired(Box<DecodedTx>),
     Receipt(Box<ReceiptJson>),
     Pending,
     None,
@@ -766,7 +767,7 @@ impl NativeBridgeV2 {
                 self.journal.put_deposit(&rec)?;
             }
             match landed {
-                Landed::Pending => return refuse(WalletReason::Unconfirmed, "an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly"),
+                Landed::Pending | Landed::Expired(_) => return refuse(WalletReason::Unconfirmed, "an earlier deposit transaction may still be pending: wait or reconcile, never resend blindly"),
                 Landed::Receipt(r) => return self.record_deposit(&mut rec, &r),
                 Landed::None => {}
             }
@@ -1886,8 +1887,13 @@ impl NativeBridgeV2 {
         return_id: &[u8; 32],
         signer: &dyn EvmSigner,
     ) -> Result<ReconcileResult> {
-        let prior = self.reconcile_inner(return_id)?;
-        if !matches!(prior, ReconcileResult::NotPaid { .. }) {
+        let mut expired = None;
+        let prior = self.reconcile_inner_with_expiry(return_id, &mut expired)?;
+        if !matches!(prior, ReconcileResult::NotPaid { .. })
+            && !expired
+                .as_ref()
+                .is_some_and(|tx| tx.from == signer.address())
+        {
             return Ok(prior);
         }
         let mut gas_bump = 1u64;
@@ -1901,20 +1907,29 @@ impl NativeBridgeV2 {
                 other => other?,
             };
             let gas = (rtx.gas_limit.saturating_mul(gas_bump)).min(self.pins.user_gas_limit);
-            let tx = self.signed(
+            let tx = self.signed_with_replacement(
                 signer,
                 &self.cfg.vault,
                 &rtx.calldata,
                 BigUint::default(),
                 gas,
+                expired.as_ref().map(|tx| &tx.request),
             )?;
             self.check_ordinary_import(&fresh, Some(&tx.raw))?;
+            if let Some(old) = &expired {
+                if self.evm.nonce(&old.from, "latest")? != old.request.nonce {
+                    return Ok(ReconcileResult::Pending {
+                        tx_hash: old.hash.to_vec(),
+                    });
+                }
+            }
             fresh.sends.push(self.send_record(&tx));
             fresh.status = "submitted".into();
             if fresh.first_send_block.is_none() {
                 fresh.first_send_block = Some(dec(self.evm.block_number()?));
             }
             self.journal.put_return(&fresh)?;
+            expired = None;
             let Some(r) = self.broadcast_and_wait(&tx)? else {
                 return Ok(ReconcileResult::Pending {
                     tx_hash: tx.hash.to_vec(),
@@ -1984,6 +1999,14 @@ impl NativeBridgeV2 {
     }
 
     fn reconcile_inner(&self, return_id: &[u8; 32]) -> Result<ReconcileResult> {
+        self.reconcile_inner_with_expiry(return_id, &mut None)
+    }
+
+    fn reconcile_inner_with_expiry(
+        &self,
+        return_id: &[u8; 32],
+        expired: &mut Option<DecodedTx>,
+    ) -> Result<ReconcileResult> {
         let mut rec = self.return_record(return_id)?;
         if rec.status == "paid" {
             let p = rec.paid.as_ref().expect("a paid record has paid");
@@ -2015,6 +2038,11 @@ impl NativeBridgeV2 {
             self.journal.put_return(&rec)?;
         }
         match landed {
+            Landed::Expired(tx) => {
+                let tx_hash = tx.hash.to_vec();
+                *expired = Some(*tx);
+                Ok(ReconcileResult::Pending { tx_hash })
+            }
             Landed::Pending => Ok(ReconcileResult::Pending {
                 tx_hash: unhex(&rec.sends.last().expect("a send").hash)?,
             }),
@@ -2129,9 +2157,34 @@ impl NativeBridgeV2 {
         value: BigUint,
         gas: u64,
     ) -> Result<SignedTx> {
-        let nonce = self.evm.nonce(&signer.address(), "pending")?;
-        let (base_fee, priority) = self.evm.fees()?;
-        let max_fee = BigUint::from(2u8) * base_fee + &priority;
+        self.signed_with_replacement(signer, to, data, value, gas, None)
+    }
+
+    fn signed_with_replacement(
+        &self,
+        signer: &dyn EvmSigner,
+        to: &[u8; 20],
+        data: &[u8],
+        value: BigUint,
+        gas: u64,
+        replace: Option<&TxRequest>,
+    ) -> Result<SignedTx> {
+        let (base_fee, mut priority) = self.evm.fees()?;
+        let mut max_fee = BigUint::from(2u8) * base_fee + &priority;
+        let nonce = if let Some(prior) = replace {
+            if self.evm.nonce(&signer.address(), "latest")? != prior.nonce {
+                return refuse(
+                    WalletReason::NotPending,
+                    "payout nonce changed during replacement",
+                );
+            }
+            let bump = |bid: &BigUint| bid + bid / 10u8 + 1u8;
+            max_fee = max_fee.max(bump(&prior.max_fee_per_gas));
+            priority = priority.max(bump(&prior.max_priority_fee_per_gas));
+            prior.nonce
+        } else {
+            self.evm.nonce(&signer.address(), "pending")?
+        };
         sign_tx(
             signer,
             &TxRequest {
@@ -2195,23 +2248,40 @@ impl NativeBridgeV2 {
         let Some(last) = sends.last() else {
             return Ok(Landed::None);
         };
-        let from = decode_signed_tx(&unhex(&last.raw)?)
-            .map_err(Error::Other)?
-            .from;
+        let raw = unhex(&last.raw)?;
+        let tx = decode_signed_tx(&raw).map_err(Error::Other)?;
         let last_nonce = undec64(&last.nonce)?;
-        let mined = self.evm.nonce(&from, "latest")?;
+        let mined = self.evm.nonce(&tx.from, "latest")?;
+        let mut seen = false;
         for s in sends.iter() {
             if let Some(r) = self.evm.receipt(&unhex(&s.hash)?)? {
                 if status_is_ok(&r) {
                     return Ok(Landed::Receipt(Box::new(r)));
                 }
+                seen |= s.nonce == last.nonce;
             }
         }
         if mined <= last_nonce {
-            // the nonce is unused by any mined transaction: the send is alive, in a pool or lost; offer the same bytes again
-            let raw = unhex(&last.raw)?;
             if let Some(rec) = return_record {
-                self.check_ordinary_import(rec, Some(&raw))?;
+                if let Err(error) = self.check_ordinary_import(rec, Some(&raw)) {
+                    if error
+                        .rule()
+                        .is_some_and(|rule| rule.rule == Rule::StaleEndpoint)
+                    {
+                        return Ok(
+                            if !seen
+                                && mined == tx.request.nonce
+                                && mined == last_nonce
+                                && self.evm.nonce(&tx.from, "latest")? == last_nonce
+                            {
+                                Landed::Expired(Box::new(tx))
+                            } else {
+                                Landed::Pending
+                            },
+                        );
+                    }
+                    return Err(error);
+                }
             }
             self.send_raw_tolerant(&raw)?;
             return Ok(Landed::Pending);

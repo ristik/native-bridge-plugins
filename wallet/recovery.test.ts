@@ -504,7 +504,13 @@ test('a certified alternate archive carries a recovered payment through a pruned
   assert.equal(await other.bridge.journal.ret(rec.returnId), null);
   chain.fund(other.signer.address, 10n ** 18n);
   const restored = await restoreReturn(other, portable);
+  const settlementJournal = join(other.dir, `recovery-${restored.returnId.slice(2)}.json`);
   const balance = chain.balanceOf(w.signer.address);
+  chain.importedTipEpoch = 0n;
+  await assert.rejects(recoverStep(other, restored, alternate), { reason: 'ImportLag', retryable: true });
+  assert.equal(JSON.parse(readFileSync(settlementJournal, 'utf8')).pending, undefined);
+  assert.equal(chain.balanceOf(w.signer.address), balance);
+  chain.importedTipEpoch = 1n;
   assert.equal((await recoverStep(other, restored, alternate)).state, 'paid');
   assert.equal(chain.balanceOf(w.signer.address) - balance, 19n);
   assert.equal(chain.vault.q, 0n);
