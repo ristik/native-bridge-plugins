@@ -453,7 +453,7 @@ export class Wallet {
     const http = new HttpJsonRpc(this.conn.rpc, { timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);
     this.bridge = await NativeBridgeV2.open({
-      pins: this.pins, trust: this.trust, rpc: opts.rpc ?? (opts.wrapRpc ? opts.wrapRpc(http) : http), aggregator: this.aggregator,
+      pins: this.pins, trust: this.trust, rpc: opts.rpc ?? readRetrying(opts.wrapRpc ? opts.wrapRpc(http) : http), aggregator: this.aggregator,
       journal: new FileJournalStore(join(this.dir, 'journal.json')),
       bridgeKey: deriveBridgeKey(sha256(concat(tag('nb2-reference-wallet/seed/'), this.secret))),
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
@@ -552,6 +552,22 @@ export const RETRYABLE = ['CompanionUnknown', 'Unconfirmed', 'NotPending', 'NoEn
 const NOT_YET = ['CompanionUnknown', 'Unconfirmed', 'NoEntryForEpoch'];
 
 export interface TransportRetryOptions { budgetMs?: number; baseMs?: number; capMs?: number; sleep?: (ms: number) => Promise<void>; random?: () => number }
+
+/** The methods that change the chain: never retried by readRetrying (an HTTP 503 from a send is ambiguous, #1121). */
+const SENDS = new Set(['eth_sendRawTransaction', 'eth_sendTransaction']);
+
+/**
+ * The wallet's RPC with every read waited out on a retryable transport error (`transportRetry`: HTTP 429/502/503/504 or no answer) and
+ * every send passed through once. The gateway rate-limits per client, and a step's parallel reads (deposit gas estimation, a return's
+ * graph and admission reads, a recovery step's archive receipt reads) can exceed it: a read is idempotent, so it waits; a send never
+ * repeats here (the bridge reconciles it by its hash).
+ */
+export function readRetrying(rpc: JsonRpc, note?: (reason: string) => void, o?: TransportRetryOptions): JsonRpc {
+  return {
+    call: <T>(method: string, params: unknown[]): Promise<T> =>
+      SENDS.has(method) ? rpc.call<T>(method, params) : transportRetry(() => rpc.call<T>(method, params), note, o),
+  };
+}
 
 /**
  * F again while it fails with a retryable transport error (HTTP 429/502/503/504, a network failure), with exponential backoff and jitter,

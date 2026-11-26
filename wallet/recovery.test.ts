@@ -17,7 +17,7 @@ import { ascii, u256 } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
-import { Wallet, burn, connectionOf, retry, transportRetry, hx, io, mint, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, transfer, unhex } from './core.js';
+import { Wallet, burn, connectionOf, readRetrying, retry, transportRetry, hx, io, mint, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, transfer, unhex } from './core.js';
 import { importReturn, ordinaryPayout, publishReturnBackup, reconcileReturn, qualifyExistingRecovery, recoverStep, restoreReturn, walletAdmission, type PayerPolicy } from './recovery.js';
 
 const caps: PayerPolicy = { signedBytes: 524_288, calldataBytes: 524_288, gas: 24_000_000n, maxNonce: 10_000n,
@@ -2248,6 +2248,72 @@ test('a missing payer policy is PolicyRequired, distinct from exceeded limits', 
   await assert.rejects(planReturn(w, 'coin', undefined, undefined, undefined), (e: unknown) =>
     e instanceof WalletError && e.reason === 'PolicyRequired' && /payer limits are required/.test(e.message));
   await assert.rejects(burn(w, 'coin', undefined, undefined, { ...caps, gas: 1n }), { rule: 'CapacityPreflight' });
+});
+
+test('readRetrying waits out 429/503 on reads and never repeats a send', async () => {
+  const calls: string[] = [];
+  let busy = 2;
+  const inner: JsonRpc = { call: async <T>(method: string): Promise<T> => {
+    calls.push(method);
+    if (method === 'eth_estimateGas' && busy-- > 0) throw new RpcError(429, 0, 'rate limit');
+    if (method === 'eth_getTransactionReceipt' && calls.filter((m) => m === method).length === 1) throw new RpcError(503, 0, 'RPC unavailable');
+    if (method === 'eth_sendRawTransaction') throw new RpcError(503, 0, 'No transaction acknowledgement');
+    if (method === 'eth_call') throw new RpcError(200, 3, 'execution reverted');
+    return '0x1' as T;
+  } };
+  const sleeps: number[] = [];
+  const rpc = readRetrying(inner, undefined, { sleep: async (ms) => { sleeps.push(ms); }, random: () => 0 });
+  assert.equal(await rpc.call('eth_estimateGas', [{}]), '0x1');
+  assert.equal(await rpc.call('eth_getTransactionReceipt', ['0x00']), '0x1');
+  await assert.rejects(rpc.call('eth_sendRawTransaction', ['0x00']), (e: unknown) => e instanceof RpcError && e.status === 503);
+  await assert.rejects(rpc.call('eth_call', [{}, 'latest']), (e: unknown) => e instanceof RpcError && e.code === 3);
+  assert.deepEqual(calls, ['eth_estimateGas', 'eth_estimateGas', 'eth_estimateGas', 'eth_getTransactionReceipt', 'eth_getTransactionReceipt',
+    'eth_sendRawTransaction', 'eth_call'], 'reads repeat until answered; a send and a refusal are tried once');
+  assert.equal(sleeps.length, 3);
+});
+
+test('a recovery archive reader rate-limited (HTTP 429) on the payout receipt is waited out, not thrown', async (t) => {
+  const { createServer } = await import('node:http');
+  const { w, chain, open, rpc } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  let raw!: Uint8Array;
+  const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') {
+      raw = unhex(params[0] as string);
+      throw new Error('offline after signing payout');
+    }
+    return rpc.call<T>(method, params);
+  } };
+  await assert.rejects(resumePayout(await open('holder', interrupted), rec, caps, true), /offline after signing payout/);
+  await chain.mine([raw]);
+  await chain.mine([]);
+  // the gateway's per-client limit: the archive's first receipt reads answer HTTP 429, more often than the transport retries itself
+  let limited = 4;
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const { id, method, params } = JSON.parse(Buffer.concat(chunks).toString());
+    if (method === 'eth_getTransactionReceipt' && limited-- > 0) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '0' }).end(JSON.stringify({ error: 'rate limit' }));
+      return;
+    }
+    try {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id, result: await rpc.call(method, params) }));
+    } catch (e) {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message: String(e) } }));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const archive = { ...caps, archives: [`http://127.0.0.1:${(server.address() as { port: number }).port}`] };
+  // the primary has no receipts: only the archive can prove the payout
+  const primary: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
+    method === 'eth_getTransactionReceipt' ? Promise.reject(new Error('no receipts here')) : rpc.call<T>(method, params) };
+  const holder = await open('holder', primary);
+  const { result } = await reconcileReturn(holder, rec, archive);
+  assert.equal(result.state, 'paid');
+  assert.ok(limited < 0, 'the archive was rate-limited and then answered');
 });
 
 test('a 429 burst on the mined Paid proof read propagates and never counts toward needs-archive', async (t) => {

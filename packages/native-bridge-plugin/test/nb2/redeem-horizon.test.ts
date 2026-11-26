@@ -156,7 +156,8 @@ test('a lying head of 0xffffffff with an invented peer Paid, then honest readers
   };
   const lied = await NativeBridgeV2.open({ ...options('high head', store), rpc: liar });
   assert.notEqual((await lied.reconcile(returnId)).state, 'not-paid');
-  assert.equal((await record(store)).peerClaimSince, String(0xffffffff), 'the only reader claimed a far head');
+  // the far head is not a served block: saneHead bounds it to the chain's (and peerClaimSince would only ever move down from it)
+  assert.equal((await record(store)).peerClaimSince, String(chain.blocks.length - 1));
   const w = await NativeBridgeV2.open(options('high head', store));
   const honestStart = BigInt(chain.blocks.length - 1);
   assert.equal((await w.reconcile(returnId)).state, 'pending', 'honestly, the claim is fresh');
