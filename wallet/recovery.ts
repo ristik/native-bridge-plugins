@@ -110,7 +110,7 @@ interface FeeReservations { total: bigint; attempts: { nonce: bigint; fee: bigin
 
 async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations, replacementNonce?: bigint): Promise<RecoveryLimits & { currentBid: bigint }> {
   const evm = w.bridge.evm;
-  const block = reserved?.attempts.length ? await evm.blockNumber() : undefined;
+  const block = reserved?.attempts.length ? await evm.saneHead() : undefined;
   const [balance, minedNonce, nonce, fees] = await Promise.all([
     evm.balance(payer, block), block === undefined ? 0n : evm.nonce(payer, block), evm.nonce(payer), evm.fees(),
   ]);
@@ -689,7 +689,7 @@ async function lowerRecoverySend(w: Wallet, rec: ReturnRecord, journal?: Recover
   const raw = [...(journal?.superseded ?? []), ...(journal?.attempts ?? [])];
   if (!raw.length) return;
   const evm = w.bridge.evm;
-  const block = await evm.blockNumber();
+  const block = await evm.saneHead();
   const sends = raw.map((signed) => ({ ...decodeSignedTx(bytes(signed)), raw: bytes(signed) }))
     .sort((a, b) => a.request.nonce < b.request.nonce ? -1 : a.request.nonce > b.request.nonce ? 1 : 0);
   const mined = new Map<string, bigint>();
@@ -981,7 +981,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   let mined = await outcome();
   // A failed receipt seen before and gone from the chain CERTIFICATION_DEPTH blocks on, its nonce unused: the packet is alive again
   if (mined === 'missing' && pending.failureProofReads !== undefined && pending.failureBlock !== undefined &&
-      await w.bridge.evm.blockNumber() >= BigInt(pending.failureBlock) + CERTIFICATION_DEPTH && await w.bridge.evm.nonce(from, 'latest') <= request.nonce) {
+      await w.bridge.evm.saneHead() >= BigInt(pending.failureBlock) + CERTIFICATION_DEPTH && await w.bridge.evm.nonce(from, 'latest') <= request.nonce) {
     delete pending.failureProofReads;
     delete pending.failureBlock;
     saveRecovery(w, rec, journal);

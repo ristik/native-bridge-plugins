@@ -287,6 +287,31 @@ export class EvmReader {
     return qtyOf(await this.rpc.call('eth_blockNumber', []), 'eth_blockNumber');
   }
 
+  /** The highest block this reader has served a header for: where a later sane-head search may start. */
+  private confirmedHead = -1n;
+
+  /**
+   * The head every height-driven loop runs to (log scans, depth and horizon checks): this reader's `eth_blockNumber`, trusted only as
+   * far as the reader serves the block at that height. A claimed head it does not serve (a lying or broken answer such as 0xffffffff)
+   * is replaced by the highest block it does serve, found by a binary search from the last confirmed one: O(log) header reads, never
+   * a scan of the claimed range. An honest reader costs one header read more. The gateway refuses a log window above its head, so
+   * there is no margin above the confirmed block.
+   */
+  public async saneHead(): Promise<bigint> {
+    const claimed = await this.blockNumber();
+    if (claimed <= this.confirmedHead) return claimed; // a lower answer (a lagging backend) only shortens a scan
+    if (await this.headerByNumber(claimed) !== null) return this.confirmedHead = claimed;
+    let lo = this.confirmedHead < 0n ? 0n : this.confirmedHead;
+    let hi = claimed;
+    while (hi - lo > 1n) {
+      const mid = lo + (hi - lo) / 2n;
+      if (await this.headerByNumber(mid) !== null) lo = mid;
+      else hi = mid;
+    }
+    if (lo > this.confirmedHead) this.confirmedHead = lo;
+    return lo;
+  }
+
   public async chainId(): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_chainId', []), 'eth_chainId');
   }
@@ -321,7 +346,7 @@ export class EvmReader {
     sources?: readonly EvmReader[], authenticate?: (uc: Uint8Array) => Promise<void>, mintWitness: boolean | Uint8Array = false): Promise<Uint8Array> {
     // a gap the reader's own head has long passed is its answer that it does not hold the evidence; near the head it is a wait
     const settledGap = async (reader: EvmReader, n: bigint, what: string) => {
-      const head = await reader.blockNumber();
+      const head = await reader.saneHead();
       if (head >= n + CERTIFICATION_DEPTH) fail('EvidencePruned', `${what} is not served, though this node's head is block ${head}`);
     };
     const childOf = async (reader: EvmReader) => {
@@ -506,7 +531,7 @@ export class EvmReader {
 
   /** The newest SegmentSealed log of the vault at or after `from`, paging backwards from the head; null when it never sealed. */
   public async newestSeal(vault: Uint8Array, from: bigint): Promise<RawLog | null> {
-    const top = await this.blockNumber();
+    const top = await this.saneHead();
     for (let hi = top; hi >= from;) {
       const lo = hi >= from + LOG_BLOCK_RANGE ? hi - LOG_BLOCK_RANGE + 1n : from;
       const page = await this.logs(vault, [hexOf(TOPIC.SegmentSealed)], lo, hi);
@@ -520,7 +545,7 @@ export class EvmReader {
   /** The SegmentSealed logs of segments [start, end) in order, paging forwards from `from` (a block at or before segment `start`'s seal). */
   public async segmentLogs(vault: Uint8Array, from: bigint, start: bigint, end: bigint): Promise<RawLog[]> {
     if (end <= start) return [];
-    const top = await this.blockNumber();
+    const top = await this.saneHead();
     const want = new Map<bigint, RawLog>();
     for (let lo = from; lo <= top && BigInt(want.size) < end - start; lo += LOG_BLOCK_RANGE) {
       const hi = lo + LOG_BLOCK_RANGE - 1n < top ? lo + LOG_BLOCK_RANGE - 1n : top;
@@ -543,7 +568,7 @@ export class EvmReader {
 
   /** `Paid(eta)` logs of the vault from block `from`. */
   public async paid(vault: Uint8Array, eta: Uint8Array, from: bigint): Promise<RawLog[]> {
-    const top = await this.blockNumber();
+    const top = await this.saneHead();
     if (top < from) return [];
     return this.logs(vault, [hexOf(TOPIC.Paid), hexOf(eta)], from, top);
   }

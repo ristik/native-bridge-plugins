@@ -322,7 +322,7 @@ export class NativeBridgeV2 {
       const firstOwner = firstOwnerOf(ownerKey);
       const rec: DepositRecord = {
         ...this.journal.base(), kind: 'deposit', keyScheme: this.keyScheme, intent: dec(i), amount: dec(amount), ownerKey: hex(ownerKey),
-        firstOwner: hex(firstOwner), rho: hex(rho), status: 'planned', backedUp: false, sends: [], plannedBlock: dec(await this.evm.blockNumber()),
+        firstOwner: hex(firstOwner), rho: hex(rho), status: 'planned', backedUp: false, sends: [], plannedBlock: dec(await this.evm.saneHead()),
       };
       await this.journal.putDeposit(rec);
       if (this.opts.backup) {
@@ -350,7 +350,7 @@ export class NativeBridgeV2 {
   /** Every Deposited event of the vault carrying `rho`, from block `from`, in chain order. */
   private async depositsWithRho(rho: Uint8Array, from: bigint): Promise<{ l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[]> {
     const out: { l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[] = [];
-    for (const l of await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], from, await this.evm.blockNumber())) {
+    for (const l of await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], from, await this.evm.saneHead())) {
       const d = decodeDeposited(l);
       if (d !== null && eq(l.address, this.cfg.vault) && eq(d.domain, this.domain) && eq(d.rho, rho)) out.push({ l, n: d.n, amount: d.amount, firstOwner: d.firstOwner });
     }
@@ -556,7 +556,7 @@ export class NativeBridgeV2 {
     const want = new Map<string, bigint>();
     for (let i = 0n; i < next; i++) want.set(toHex(rhoOf(this.domain, this.secretOf(i))), i);
     const byIntent = new Map<bigint, { l: RawLog; n: bigint; amount: bigint; firstOwner: Uint8Array }[]>();
-    for (const l of await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], this.opts.pins.deploymentBlock, await this.evm.blockNumber())) {
+    for (const l of await this.evm.logs(this.cfg.vault, [hexq(TOPIC.Deposited)], this.opts.pins.deploymentBlock, await this.evm.saneHead())) {
       const d = decodeDeposited(l);
       if (d === null || !eq(l.address, this.cfg.vault) || !eq(d.domain, this.domain)) continue;
       const i = want.get(toHex(d.rho));
@@ -938,7 +938,7 @@ export class NativeBridgeV2 {
           fromBlock = sr.receipt.blockNumber;
           sealReceipt = sr.encoded;
           // availability, not safety: an old receipt anchors the burn low (more history to prove), never in the future
-          const age = (await this.evm.blockNumber()) - sr.receipt.blockNumber;
+          const age = (await this.evm.saneHead()) - sr.receipt.blockNumber;
           if (age > (this.opts.maxSealAgeBlocks ?? 7_200n)) warnings.push(`the newest seal receipt served is ${age} blocks old: the provider may be hiding newer seals; the burn then owes more history`);
         }
       }
@@ -1331,7 +1331,7 @@ export class NativeBridgeV2 {
       fresh.executionPayer ??= hex(signer.address);
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
-      fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.blockNumber());
+      fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.saneHead());
       await this.journal.putReturn(fresh);
       expired = undefined;
       const r = await this.broadcastAndWait(tx);
@@ -1525,7 +1525,7 @@ export class NativeBridgeV2 {
       let low: bigint | undefined;
       for (const reader of archives) {
         let h = heads.get(reader);
-        if (h === undefined) heads.set(reader, h = await reader.blockNumber());
+        if (h === undefined) heads.set(reader, h = await reader.saneHead());
         if (low === undefined || h < low) low = h;
       }
       return low!;
@@ -1751,7 +1751,7 @@ export class NativeBridgeV2 {
     if (since === undefined) return false;
     for (const reader of archives) {
       let h = heads.get(reader);
-      if (h === undefined) heads.set(reader, h = await reader.blockNumber());
+      if (h === undefined) heads.set(reader, h = await reader.saneHead());
       if (h < since + VANISHED_CLAIM_HORIZON) return false;
     }
     for (const { reader, number, hash } of at) {
@@ -1769,7 +1769,7 @@ export class NativeBridgeV2 {
   private async claimGone(at: readonly SeenReceipt[], ref: bigint | undefined, archives: readonly EvmReader[], heads: Map<EvmReader, bigint>): Promise<boolean> {
     const head = async (reader: EvmReader) => {
       let h = heads.get(reader);
-      if (h === undefined) heads.set(reader, h = await reader.blockNumber());
+      if (h === undefined) heads.set(reader, h = await reader.saneHead());
       return h;
     };
     const seenAt = at.reduce<bigint | undefined>((m, r) => (m === undefined || r.number > m ? r.number : m), ref);
@@ -1921,7 +1921,7 @@ export class NativeBridgeV2 {
       return 'pending';
     }
     // a mined transaction used the nonce, and no success receipt is visible: wait for depth before calling it dead
-    const head = await this.evm.blockNumber();
+    const head = await this.evm.saneHead();
     if (last.nonceUsedAt === undefined) {
       last.nonceUsedAt = dec(head);
       await save();

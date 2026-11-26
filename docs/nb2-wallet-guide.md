@@ -214,7 +214,12 @@ and it is paid if that transaction lands again. Once every reader's own head is
 `VANISHED_CLAIM_HORIZON` (64) blocks past the first unproven peer claim this return saw, a peer
 claim that no reader holds canonically is dropped and the wallet proceeds with its own payout.
 A provider that invents a Paid can delay a redemption, never stop it, and the vault's
-`AlreadyPaid` refuses a second payout if the claim was real after all. A holder who learned of Paid before
+`AlreadyPaid` refuses a second payout if the claim was real after all.
+
+Every height-driven loop (log scans, depth and horizon checks) runs to `EvmReader.saneHead()`:
+the reader's `eth_blockNumber`, trusted only as far as the reader serves the block at that
+height. A head it does not serve (a lying `0xffffffff`) is bounded by a binary search for the
+highest served block, so it costs a few header reads, not a scan of the claimed range. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 
