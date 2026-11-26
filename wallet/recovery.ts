@@ -235,7 +235,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
 /** Qualify a late ordinary burn for cold continuation under this payer's limits. */
 export async function qualifyExistingRecovery(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): Promise<ReturnRecord> {
   const { result, handoff } = await reconcileForPayout(w, rec, 'recovery', policy, false);
-  if (result.state === 'needs-archive') archiveRequired(result.txHash);
+  if (result.state === 'needs-archive') archiveRequired(result.txHash, result.missing);
   if (result.state === 'route-blocked') routeRequired(result);
   const current = await w.bridge.journal.retForUpdate(rec.returnId);
   if (current?.status === 'paid') return current;
@@ -384,7 +384,7 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
         if (local.pending) {
           try {
             const outcome = await reconcilePendingPacket(w, held, release, session, local, cursor, archive);
-            if (outcome.state === 'needs-archive' && !endpoint) archiveRequired(outcome.txHash);
+            if (outcome.state === 'needs-archive' && !endpoint) archiveRequired(outcome.txHash, outcome.missing);
           } catch (e) {
             if (!endpoint || !(e instanceof Nb2Error && e.rule === 'EvidencePruned')) throw e;
           }
@@ -431,8 +431,8 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
   return confirmed;
 }
 
-export function archiveRequired(hash: Uint8Array): never {
-  throw new WalletError('EvidenceMissing', `needs archive for exact transaction ${hx(hash)}. Add an archive reader with the certified block, receipts and raw transactions, then resume`);
+export function archiveRequired(hash: Uint8Array, missing?: string): never {
+  throw new WalletError('EvidenceMissing', `needs archive for exact transaction ${hx(hash)}: the node no longer serves ${missing ?? 'its certified block, receipts or raw transactions'}. Add an archive reader that does, then resume`);
 }
 
 async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec: ReturnRecord,
@@ -938,6 +938,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   const earlier = [...(journal.replacedSettlements ?? []), ...ordinary].map((signed) => decodeSignedTx(bytes(signed)))
     .filter((tx) => eq(tx.from, from) && tx.request.nonce === request.nonce);
   let pruned = false;
+  let missing: string | undefined;
   let failed = false;
   const outcome = async (): Promise<'missing' | 'pending' | 'success' | 'earlier-paid' | 'failed'> => {
     let seen = false;
@@ -958,7 +959,10 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
         if (e instanceof RpcError && e.retryable) throw e; // a transport failure is not an absence of evidence
-        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
+        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') {
+          pruned = true; // the node's own answer, in this read, that it no longer holds part of the proof
+          missing ??= e instanceof ProofUnavailable ? e.missing : (e as Nb2Error).detail ?? 'certified evidence';
+        }
         // Metadata is only a hint. Try the next reader's complete proof.
       }
     }
@@ -976,14 +980,15 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     mined = await outcome();
   }
   const unresolved = (): RecoveryResult => {
+    // a marker that a failed receipt was seen (no blind resend), not a budget: a failure not certified yet stays pending
     if (failed || pending.failureProofReads !== undefined) {
-      const reads = pruned ? FAILURE_PROOF_READS : Math.min((pending.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
+      const reads = Math.min((pending.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
       if (reads !== pending.failureProofReads) {
         pending.failureProofReads = reads;
         saveRecovery(w, rec, journal);
       }
     }
-    if (pending.failureProofReads === FAILURE_PROOF_READS) return { state: 'needs-archive', txHash: hash };
+    if (pruned) return { state: 'needs-archive', txHash: hash, missing };
     return { state: 'pending', txHash: hash };
   };
   if (mined === 'missing' || mined === 'pending') return unresolved();

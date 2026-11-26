@@ -148,7 +148,11 @@ export interface RedeemTx { returnId: Uint8Array; calldata: Uint8Array; gasLimit
 export type ReconcileResult =
   | { state: 'paid'; txHash: Uint8Array; blockNumber: bigint }
   | { state: 'pending'; txHash: Uint8Array }
-  | { state: 'needs-archive'; txHash: Uint8Array }
+  /**
+   * The node answered, in this read, that it no longer holds part of the proof (`missing` names it): read it from an archive. Never a
+   * verdict on a block that is merely not certified yet, and never reached by counting reads.
+   */
+  | { state: 'needs-archive'; txHash: Uint8Array; missing?: string }
   | { state: 'route-blocked'; txHash: Uint8Array; route: 'ordinary' | 'recovery'; payer?: Uint8Array }
   | { state: 'not-paid'; lastFailure?: { txHash: Uint8Array; action: RedeemAction; error: DecodedError | null } };
 
@@ -162,7 +166,15 @@ export interface ReturnEvidence {
   readOnly?: boolean;
 }
 
+/**
+ * The cap of the `paidProof.reads` and `failureProofReads` markers. They only remember that a proof read was tried (a resend waits for
+ * it); reaching the cap never means needs-archive. A payout block not yet certified stays pending for as long as it takes.
+ */
 export const FAILURE_PROOF_READS = 3;
+
+/** What a pruned answer says is missing. */
+const missingOf = (e: unknown): string | undefined =>
+  e instanceof ProofUnavailable ? e.missing : e instanceof Nb2Error ? e.detail ?? 'certified evidence' : undefined;
 
 const hexq = (b: Uint8Array): string => `0x${toHex(b)}`;
 
@@ -1071,7 +1083,7 @@ export class NativeBridgeV2 {
       selected = payment;
       if (payout) {
         await this.journal.putReturn(payment);
-        if (payout.state === 'needs-archive') this.requireReturnArchive(payout.txHash);
+        if (payout.state === 'needs-archive') this.requireReturnArchive(payout.txHash, payout.missing);
         return payment;
       }
       if (action === 'certify') {
@@ -1081,7 +1093,7 @@ export class NativeBridgeV2 {
       }
       if (beforeCommit && selected.sends.length) {
         const exact = await this.reconcileSend(selected, archives, false);
-        if (exact.state === 'needs-archive') this.requireReturnArchive(exact.txHash);
+        if (exact.state === 'needs-archive') this.requireReturnArchive(exact.txHash, exact.missing);
       }
       if (selected.status === 'paid') return selected;
       const localPlan = await beforeCommit?.(structuredClone(selected), structuredClone(verified));
@@ -1091,8 +1103,8 @@ export class NativeBridgeV2 {
     });
   }
 
-  private requireReturnArchive(tx: Uint8Array): never {
-    return refuse('EvidenceMissing', `needs archive for payment or exact failure ${hexq(tx)}. Add a reader that serves the certified block and receipt, then resume`);
+  private requireReturnArchive(tx: Uint8Array, missing?: string): never {
+    return refuse('EvidenceMissing', `needs archive for payment or exact failure ${hexq(tx)}: the node no longer serves ${missing ?? 'its certified block and receipt'}. Add a reader that does, then resume`);
   }
 
   private async returnRecord(id: Uint8Array): Promise<ReturnRecord> {
@@ -1420,10 +1432,12 @@ export class NativeBridgeV2 {
     let available = false;
     let unavailable: unknown;
     const candidates = new Map<string, Uint8Array>();
-    const hinted = new Map<string, { tx: Uint8Array; pruned: boolean }>();
-    const addHint = (tx: Uint8Array, pruned = false) => {
+    // pruned: a reader answered in this call that it no longer holds part of the proof (missing names it)
+    const hinted = new Map<string, { tx: Uint8Array; pruned: boolean; missing?: string }>();
+    const addHint = (tx: Uint8Array, pruned = false, missing?: string) => {
       const key = hex(tx);
-      hinted.set(key, { tx, pruned: pruned || hinted.get(key)?.pruned === true });
+      const prior = hinted.get(key);
+      hinted.set(key, { tx, pruned: pruned || prior?.pruned === true, missing: prior?.missing ?? missing });
     };
     if (rec.paidProof) {
       const tx = unhex(rec.paidProof.txHash);
@@ -1443,7 +1457,8 @@ export class NativeBridgeV2 {
         for (const reader of archives) {
           const result = await this.verifiedPaid(rec, tx, reader, persist, archives);
           if (result?.state === 'paid') return result;
-          if (result?.state === 'pending' || result?.state === 'needs-archive') addHint(tx, result.state === 'needs-archive');
+          if (result?.state === 'pending') addHint(tx);
+          if (result?.state === 'needs-archive') addHint(tx, true, result.missing);
         }
       }
     };
@@ -1495,13 +1510,14 @@ export class NativeBridgeV2 {
     const next = [...hinted.values()].find(({ pruned }) => pruned) ?? hinted.values().next().value;
     if (next) {
       const txHash = hex(next.tx);
-      const reads = next.pruned ? FAILURE_PROOF_READS : Math.min(FAILURE_PROOF_READS, (rec.paidProof?.txHash === txHash ? rec.paidProof.reads : 0) + 1);
+      // A marker of the claim under proof (a resend waits for it), not a budget: only this read's pruned answer means needs-archive.
+      const reads = Math.min(FAILURE_PROOF_READS, (rec.paidProof?.txHash === txHash ? rec.paidProof.reads : 0) + 1);
       if (rec.paidProof?.txHash !== txHash || rec.paidProof.reads !== reads) {
         rec.paidProof = { txHash, reads };
         changed = true;
       }
       if (changed && persist) await this.journal.putReturn(rec);
-      return { state: reads >= FAILURE_PROOF_READS ? 'needs-archive' : 'pending', txHash: next.tx };
+      return next.pruned ? { state: 'needs-archive', txHash: next.tx, missing: next.missing } : { state: 'pending', txHash: next.tx };
     }
     if (changed && persist) await this.journal.putReturn(rec);
     if (!available && unavailable) throw unavailable;
@@ -1516,7 +1532,7 @@ export class NativeBridgeV2 {
     if (hex(txHash) !== send.hash || request.nonce !== undec(send.nonce)) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
     // A certified failure of any replacement at this nonce rules out all the others.
     const sameNonce = rec.sends.filter((prior) => prior.nonce === send.nonce).reverse();
-    let evidence: { seen: boolean; pruned: boolean; attempted: boolean } | undefined;
+    let evidence: { seen: boolean; pruned: boolean; attempted: boolean; missing?: string } | undefined;
     for (const prior of sameNonce) {
       const signed = decodeSignedTx(unhex(prior.raw));
       if (!eq(signed.from, from) || signed.request.nonce !== request.nonce || hex(signed.hash) !== prior.hash) {
@@ -1537,17 +1553,19 @@ export class NativeBridgeV2 {
         seen: Boolean(evidence?.seen || outcome.seen),
         pruned: Boolean(evidence?.pruned || outcome.pruned),
         attempted: Boolean(evidence?.attempted || outcome.attempted),
+        missing: evidence?.missing ?? outcome.missing,
       };
     }
-    const { seen, pruned, attempted } = evidence!;
+    const { seen, pruned, attempted, missing } = evidence!;
     if (attempted || send.failureProofReads !== undefined) {
-      const reads = pruned ? FAILURE_PROOF_READS : Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
+      // A marker that a failed receipt was seen (no blind resend), not a budget: a failure not certified yet stays pending.
+      const reads = Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
       if (reads !== send.failureProofReads) {
         send.failureProofReads = reads;
         await this.journal.putReturn(rec);
       }
     }
-    if (send.failureProofReads === FAILURE_PROOF_READS) return { state: 'needs-archive', txHash };
+    if (pruned) return { state: 'needs-archive', txHash, missing };
     if (!seen && (resubmit || onExpired) && send.failureProofReads === undefined) {
       try { await this.checkOrdinaryImport(rec, raw); }
       catch (error) {
@@ -1595,6 +1613,7 @@ export class NativeBridgeV2 {
     let seen = false;
     let attempted = false;
     let pruned = false;
+    let missing: string | undefined;
     for (const reader of archives) {
       try {
         const receipt = await reader.receipt(txHash);
@@ -1603,14 +1622,17 @@ export class NativeBridgeV2 {
         if (BigInt(receipt.status) !== 0n) continue;
         attempted = true;
         await this.retryingTrust((trust) => reader.verifyFailedReceipt(txHash, this.cfg, trust, receipt, archives));
-        return { seen, attempted, pruned, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
+        return { seen, attempted, pruned, missing, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
         if (e instanceof RpcError && e.retryable) throw e; // a transport failure is not an absence of evidence
-        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
+        if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') {
+          pruned = true;
+          missing ??= missingOf(e);
+        }
       }
     }
-    return { seen, attempted, pruned, failed: undefined };
+    return { seen, attempted, pruned, missing, failed: undefined };
   }
 
   /**
@@ -1633,9 +1655,10 @@ export class NativeBridgeV2 {
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
       if (e instanceof RpcError && e.retryable) throw e;
-      if (e instanceof ProofUnavailable) return { state: e.pruned ? 'needs-archive' : 'pending', txHash: tx };
+      // not certified yet (no child, companion unknown) is pending; only a node's pruned answer is needs-archive
+      if (e instanceof ProofUnavailable) return e.pruned ? { state: 'needs-archive', txHash: tx, missing: missingOf(e) } : { state: 'pending', txHash: tx };
       if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };
-      if (e instanceof Nb2Error && e.rule === 'EvidencePruned') return { state: 'needs-archive', txHash: tx };
+      if (e instanceof Nb2Error && e.rule === 'EvidencePruned') return { state: 'needs-archive', txHash: tx, missing: missingOf(e) };
       return null; // unavailable from this reader, with no authenticated effect
     }
     try {
