@@ -1606,6 +1606,7 @@ export class NativeBridgeV2 {
         return { seen, attempted, pruned, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+        if (e instanceof RpcError && e.retryable) throw e; // a transport failure is not an absence of evidence
         if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
       }
     }
@@ -1631,6 +1632,7 @@ export class NativeBridgeV2 {
       receipt = rp.encoded;
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+      if (e instanceof RpcError && e.retryable) throw e;
       if (e instanceof ProofUnavailable) return { state: e.pruned ? 'needs-archive' : 'pending', txHash: tx };
       if (e instanceof WalletError && e.reason === 'CompanionUnknown') return { state: 'pending', txHash: tx };
       if (e instanceof Nb2Error && e.rule === 'EvidencePruned') return { state: 'needs-archive', txHash: tx };

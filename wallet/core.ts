@@ -33,7 +33,7 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, PRODUCTION_TRUST_FRESHNESS_MS, TESTNET_TRUST_FRESHNESS_MS, Nb2Error, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
+  HttpJsonRpc, LocalKeySigner, NativeBridgeV2, PRODUCTION_TRUST_FRESHNESS_MS, TESTNET_TRUST_FRESHNESS_MS, Nb2Error, RpcError, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
   freshMask, localOwner, transferRequest, verifyHeld,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
   type ReturnRecord,
@@ -450,7 +450,7 @@ export class Wallet {
     if (saved) for (const entry of saved.entries) await this.trust.history.append(RootTrustBaseV2.decode(unhex(entry)));
     if (saved?.entries.length !== this.trust.history.entries.length) await this.persistAuthority(this.trust);
     this.source = opts.trustSource ?? new AggregatorClient(this.conn.aggregator);
-    const http = new HttpJsonRpc(this.conn.rpc, { retries: 20, timeoutMs: 120_000 });
+    const http = new HttpJsonRpc(this.conn.rpc, { timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);
     this.bridge = await NativeBridgeV2.open({
       pins: this.pins, trust: this.trust, rpc: opts.rpc ?? (opts.wrapRpc ? opts.wrapRpc(http) : http), aggregator: this.aggregator,
@@ -551,11 +551,41 @@ export const RETRYABLE = ['CompanionUnknown', 'Unconfirmed', 'NotPending', 'NoEn
 /** The ones a step that reads chain evidence waits out (a certificate not served yet, a trust history to extend). */
 const NOT_YET = ['CompanionUnknown', 'Unconfirmed', 'NoEntryForEpoch'];
 
-/** F again while it refuses with a reason in WHICH, up to TRIES times; NOTE is told the first time and every tenth. */
-export async function retry<T>(f: () => Promise<T>, note: (reason: string) => void = () => undefined, tries = 120, ms = 2_000, which = RETRYABLE): Promise<T> {
+export interface TransportRetryOptions { budgetMs?: number; baseMs?: number; capMs?: number; sleep?: (ms: number) => Promise<void>; random?: () => number }
+
+/**
+ * F again while it fails with a retryable transport error (HTTP 429/502/503/504, a network failure), with exponential backoff and jitter,
+ * for about 100 s in all (the old per-call absorption). Anything else, and a retryable error after the budget, is thrown at once. The
+ * transport itself retries only briefly; this is the one outer loop, and it is only for idempotent reads and polls.
+ */
+export async function transportRetry<T>(f: () => Promise<T>, note: (reason: string) => void = () => undefined, o: TransportRetryOptions = {}): Promise<T> {
+  const nap = o.sleep ?? sleep;
+  const random = o.random ?? Math.random;
+  const budget = o.budgetMs ?? 100_000;
+  let waited = 0;
   for (let i = 0; ; i++) {
     try {
       return await f();
+    } catch (e) {
+      if (!(e instanceof RpcError && e.retryable)) throw e;
+      const step = Math.min(o.capMs ?? 20_000, (o.baseMs ?? 2_000) * 2 ** i);
+      const delay = Math.max(e.retryAfterMs ?? 0, Math.round(step / 2 + random() * step / 2));
+      if (waited + delay > budget) throw e;
+      if (i % 5 === 0) note('RPC rate-limited, waiting');
+      waited += delay;
+      await nap(delay);
+    }
+  }
+}
+
+/**
+ * F again while it refuses with a reason in WHICH, up to TRIES times; NOTE is told the first time and every tenth. A retryable transport
+ * error is waited out separately (`transportRetry`, its own budget) unless TRANSPORT is false, and never counts as a refusal.
+ */
+export async function retry<T>(f: () => Promise<T>, note: (reason: string) => void = () => undefined, tries = 120, ms = 2_000, which = RETRYABLE, transport = true): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await (transport ? transportRetry(f, note) : f());
     } catch (e) {
       const reason = reasonOf(e);
       if (i >= tries || !which.includes(reason)) throw e;
@@ -691,7 +721,7 @@ export async function planReturn(w: Wallet, label: string, recipient?: Uint8Arra
   const e = w.entry(label);
   if (e.spent && !burnMark(e.spent)) throw new Error(`${label} is spent (${e.spent})`);
   const target = Uint8Array.from(recipient ?? w.signer.address);
-  const plan = await retry(() => w.bridge.planReturn(w.token(label), target, w.signer.address, { admission: walletAdmission(w, policy) }), note, 30, 2_000, NOT_YET);
+  const plan = await retry(() => w.bridge.planReturn(w.token(label), target, w.signer.address, { admission: walletAdmission(w, policy) }), note, 30, 2_000, NOT_YET, false);
   w.update(label, { returnId: hx(plan.returnId), authorizedRecipient: hx(target) });
   return plan;
 }
@@ -738,7 +768,7 @@ export async function burn(w: Wallet, label: string, recipient?: Uint8Array, not
   w.update(label, { spent: BURNING });
   let b: Awaited<ReturnType<typeof w.bridge.burn>>;
   try {
-    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized), expectedRecipient), note);
+    b = await retry(() => w.bridge.burn(unhex(id), w.owner(e.owner), walletAdmission(w, policy, authorized), expectedRecipient), note, 120, 2_000, RETRYABLE, false);
   } catch (err) {
     const r = await w.bridge.journal.ret(id);
     if (r === null || r.status === 'planned') w.update(label, { spent: undefined });
@@ -787,7 +817,7 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
       if (performance.now() >= deadline) throw new RegistryLagExpired(label, lastRefusal);
     }
     try {
-      r = await redeemOrdinary(w, rec, policy);
+      r = await transportRetry(() => redeemOrdinary(w, rec, policy), note);
       break;
     } catch (e) {
       if (!isRegistryLag(e)) throw e;
@@ -800,7 +830,8 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
   if (lastRefusal !== undefined) lag?.(performance.now() - started);
   for (let i = 0; r.state === 'pending' && i < polls; i++) {
     await sleep(pollMs);
-    r = await pollOrdinaryPayout(w, rec, r.txHash, policy);
+    const txHash = r.txHash;
+    r = await transportRetry(() => pollOrdinaryPayout(w, rec, txHash, policy), note);
   }
   if (r.state === 'paid') w.update(label, { note: 'paid' });
   return r;

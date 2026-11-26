@@ -17,7 +17,7 @@ import { ascii, u256 } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
-import { Wallet, burn, connectionOf, hx, io, mint, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, transfer, unhex } from './core.js';
+import { Wallet, burn, connectionOf, retry, transportRetry, hx, io, mint, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, transfer, unhex } from './core.js';
 import { importReturn, ordinaryPayout, publishReturnBackup, reconcileReturn, qualifyExistingRecovery, recoverStep, restoreReturn, walletAdmission, type PayerPolicy } from './recovery.js';
 
 const caps: PayerPolicy = { signedBytes: 524_288, calldataBytes: 524_288, gas: 24_000_000n, maxNonce: 10_000n,
@@ -2124,4 +2124,90 @@ test('ordinary redeem refuses a planned return with NotPending before looking fo
   await assert.rejects(redeem(holder, 'coin', 0), (err: unknown) => err instanceof WalletError && err.reason === 'NotPending');
   assert.equal(pendingReads, 0);
   assert.equal((await holder.returnRecord('coin')).status, 'planned');
+});
+
+test('a 429 on the priority fee surfaces as a retryable RPC error, never as a preflight verdict', async (t) => {
+  const { open, rpc } = await setup(t, true);
+  const fail = { on: false };
+  const limited: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (fail.on && method === 'eth_maxPriorityFeePerGas') throw new RpcError(429, 0, 'rate limited');
+    return rpc.call<T>(method, params);
+  } };
+  const w = await open('holder', limited);
+  fail.on = true;
+  await assert.rejects(planReturn(w, 'coin', undefined, undefined, caps), (e: unknown) =>
+    e instanceof RpcError && e.status === 429 && e.retryable && !(e instanceof Nb2Error));
+  assert.equal(w.entry('coin').spent, undefined);
+  fail.on = false;
+  assert.equal((await planReturn(w, 'coin', undefined, undefined, caps)).record.recovery, undefined);
+});
+
+test('a missing payer policy is PolicyRequired, distinct from exceeded limits', async (t) => {
+  const { w } = await setup(t, true);
+  await assert.rejects(planReturn(w, 'coin', undefined, undefined, undefined), (e: unknown) =>
+    e instanceof WalletError && e.reason === 'PolicyRequired' && /payer limits are required/.test(e.message));
+  await assert.rejects(burn(w, 'coin', undefined, undefined, { ...caps, gas: 1n }), { rule: 'CapacityPreflight' });
+});
+
+test('a 429 burst on the mined Paid proof read propagates and never counts toward needs-archive', async (t) => {
+  const { w, chain, open, rpc } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  let raw!: Uint8Array;
+  const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') {
+      raw = unhex(params[0] as string);
+      throw new Error('offline after signing payout');
+    }
+    return rpc.call<T>(method, params);
+  } };
+  await assert.rejects(resumePayout(await open('holder', interrupted), rec, caps, true), /offline after signing payout/);
+  const tx = decodeSignedTx(raw).hash;
+  await chain.mine([raw]);
+  await chain.mine([]);
+  const receipt = (await w.bridge.evm.receipt(tx))!;
+  let limited = true;
+  const burst: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+    if (limited && method === 'eth_getBlockByHash' && params[0] === receipt.blockHash) return Promise.reject(new RpcError(429, 0, 'rate limit'));
+    return rpc.call<T>(method, params);
+  } };
+  const holder = await open('holder', burst);
+  for (let i = 0; i < 4; i++) {
+    await assert.rejects(resumePayout(holder, rec, caps, true), (e: unknown) => e instanceof RpcError && e.retryable);
+  }
+  limited = false;
+  const result = await resumePayout(holder, rec, caps, true);
+  assert.notEqual(result.state, 'needs-archive');
+});
+
+test('transportRetry waits out a burst with backoff, fails fast on other errors, and gives up after its budget', async () => {
+  const sleeps: number[] = [];
+  const opts = { sleep: async (ms: number) => { sleeps.push(ms); }, random: () => 0 };
+  let n = 0;
+  assert.equal(await transportRetry(async () => {
+    if (n++ < 3) throw new RpcError(429, 0, 'rate limit');
+    return 'ok';
+  }, undefined, opts), 'ok');
+  assert.deepEqual(sleeps, [1000, 2000, 4000]);
+
+  let calls = 0;
+  await assert.rejects(transportRetry(async () => { calls++; throw new RpcError(200, -32000, 'execution reverted'); }, undefined, opts), RpcError);
+  await assert.rejects(transportRetry(async () => { calls++; throw new Nb2Error('CapacityPreflight', 'x'); }, undefined, opts), Nb2Error);
+  assert.equal(calls, 2);
+
+  sleeps.length = 0;
+  calls = 0;
+  await assert.rejects(transportRetry(async () => { calls++; throw new RpcError(503, 0, 'busy'); }, undefined, { ...opts, random: () => 1 }),
+    (e: unknown) => e instanceof RpcError && e.retryable);
+  assert.ok(sleeps.reduce((a, b) => a + b, 0) <= 100_000 && sleeps.length >= 5 && calls === sleeps.length + 1);
+});
+
+test('retry waits out a transport burst without spending its not-yet tries, and a polled burst is retried', async () => {
+  let n = 0;
+  const out = await retry(async () => {
+    n++;
+    if (n === 1) throw new RpcError(0, 0, 'fetch failed');
+    return 'done';
+  }, undefined, 0, 1);
+  assert.equal(out, 'done');
 });

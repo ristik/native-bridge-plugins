@@ -31,9 +31,25 @@ export interface JsonRpc {
 
 /** A JSON-RPC error object, or a gateway refusal (HTTP status and its error text). */
 export class RpcError extends Error {
+  /** Milliseconds the gateway asked us to wait (`Retry-After`), when it did. */
+  public retryAfterMs?: number;
+
   public constructor(public readonly status: number, public readonly code: number, message: string, public readonly data?: unknown) {
-    super(code !== 0 ? `rpc error ${code}: ${message}` : `gateway HTTP ${status}: ${message}`);
+    super(code !== 0 ? `rpc error ${code}: ${message}` : status === 0 ? `network error: ${message}` : `gateway HTTP ${status}: ${message}`);
     this.name = 'RpcError';
+  }
+
+  /**
+   * A transport condition, not an answer about the request: HTTP 429, 502, 503 or 504, or no HTTP answer at all (status 0: network
+   * failure or timeout). Nothing was learned about the chain; the caller may run the same read again later. It is never a verdict.
+   */
+  public get retryable(): boolean {
+    return this.code === 0 && (this.status === 0 || this.status === 429 || this.status === 502 || this.status === 503 || this.status === 504);
+  }
+
+  /** The node does not implement the method (JSON-RPC -32601), as opposed to a transport failure. */
+  public get methodNotFound(): boolean {
+    return this.code === -32601;
   }
 }
 
@@ -47,17 +63,20 @@ export class ProofUnavailable extends Error {
 async function proofFrom<T>(readers: readonly EvmReader[], component: string, read: (reader: EvmReader) => Promise<T>): Promise<T> {
   let pruned = false;
   let refresh: Nb2Error | undefined;
+  let transient: RpcError | undefined;
   for (const reader of readers) {
     try {
       return await read(reader);
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
       if (e instanceof Nb2Error && e.retryable) refresh ??= e;
+      if (e instanceof RpcError && e.retryable) transient ??= e; // a rate limit says nothing about the evidence
       if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned' ||
         e instanceof RpcError && (e.status === 413 || e.code === -32601 || /unknown block|not found|pruned/i.test(e.message))) pruned = true;
     }
   }
   if (refresh) throw refresh;
+  if (transient && !pruned) throw transient;
   throw new ProofUnavailable(component, pruned);
 }
 
@@ -71,10 +90,26 @@ export class AmbiguousBroadcast extends Error {
 
 export interface HttpRpcOptions {
   fetch?: typeof fetch;
-  /** Retries of a 429 or busy 503 (not of a send); default 10. */
+  /** Retries of a 429 or busy 503 (not of a send); default 2 (three attempts). Outer loops must not multiply this. */
   retries?: number;
+  /** Total time spent waiting between attempts of one call; default 5,000 ms. A longer `Retry-After` is not waited out. */
+  maxWaitMs?: number;
+  /** Uniform [0, 1) source for jitter. */
+  random?: () => number;
   sleep?: (ms: number) => Promise<void>;
   timeoutMs?: number;
+}
+
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_STEP_CAP_MS = 2_000;
+
+/** `Retry-After` as milliseconds: delta-seconds or an HTTP date. */
+function retryAfterOf(value: string | null | undefined): number | undefined {
+  if (!value) return undefined;
+  const t = value.trim();
+  if (/^\d+(\.\d+)?$/.test(t)) return Math.round(Number(t) * 1000);
+  const at = Date.parse(t);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -86,13 +121,21 @@ export class HttpJsonRpc implements JsonRpc {
 
   public async call<T>(method: string, params: unknown[]): Promise<T> {
     const sleep = this.opts.sleep ?? realSleep;
+    const random = this.opts.random ?? Math.random;
+    const budget = this.opts.maxWaitMs ?? 5_000;
+    let waited = 0;
     for (let attempt = 0; ; attempt++) {
       try {
         return await this.once<T>(method, params);
       } catch (e) {
-        const retryable = e instanceof RpcError && (e.status === 429 || (e.status === 503 && method !== 'eth_sendRawTransaction'));
-        if (!retryable || attempt >= (this.opts.retries ?? 10)) throw e;
-        await sleep((attempt + 1) * 500);
+        const wait = e instanceof RpcError && (e.status === 429 || (e.status === 503 && method !== 'eth_sendRawTransaction'));
+        if (!wait || attempt >= (this.opts.retries ?? 2)) throw e;
+        // exponential backoff with full jitter; a `Retry-After` replaces it, and one that does not fit the budget is surfaced
+        const ask = (e as RpcError).retryAfterMs;
+        const delay = ask ?? Math.floor(random() * Math.min(BACKOFF_STEP_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt));
+        if (waited + delay > budget) throw e;
+        waited += delay;
+        await sleep(delay);
       }
     }
   }
@@ -102,17 +145,26 @@ export class HttpJsonRpc implements JsonRpc {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.opts.timeoutMs ?? 45_000);
     try {
-      const resp = await f(this.url, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, signal: ctl.signal,
-        body: JSON.stringify({ jsonrpc: '2.0', id: ++this.id, method, params }),
-      });
-      const text = await resp.text();
+      let resp: Response;
+      let text: string;
+      try {
+        resp = await f(this.url, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, signal: ctl.signal,
+          body: JSON.stringify({ jsonrpc: '2.0', id: ++this.id, method, params }),
+        });
+        text = await resp.text();
+      } catch (e) {
+        if (e instanceof RpcError) throw e;
+        throw new RpcError(0, 0, e instanceof Error ? e.message : String(e)); // network failure or timeout: retryable, not a verdict
+      }
       if (resp.status !== 200) {
         let msg = text.slice(0, 200);
         try {
           msg = (JSON.parse(text) as { error?: string }).error ?? msg;
         } catch { /* not JSON */ }
-        throw new RpcError(resp.status, 0, msg);
+        const err = new RpcError(resp.status, 0, msg);
+        err.retryAfterMs = retryAfterOf(resp.headers?.get?.('retry-after'));
+        throw err;
       }
       const env = JSON.parse(text) as { result?: T; error?: { code: number; message: string; data?: unknown } };
       if (env.error) throw new RpcError(200, env.error.code, env.error.message, env.error.data);
@@ -558,7 +610,10 @@ export class EvmReader {
     let priority = 1_000_000_000n;
     try {
       priority = qtyOf(await this.rpc.call('eth_maxPriorityFeePerGas', []), 'eth_maxPriorityFeePerGas');
-    } catch { /* optional on the gateway */ }
+    } catch (e) {
+      // only a node without the method falls back; a rate limit or transport failure must not become a guessed fee
+      if (!(e instanceof RpcError && e.methodNotFound)) throw e;
+    }
     return { baseFee, priority };
   }
 

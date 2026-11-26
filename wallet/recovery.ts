@@ -4,7 +4,7 @@ import { existsSync, linkSync, lstatSync, readFileSync, unlinkSync } from 'node:
 import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  AmbiguousBroadcast, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
+  AmbiguousBroadcast, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryCatchUpCalls, recoveryGeneration,
   recoveryRpcSource, replacementBid, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
@@ -199,7 +199,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
   return {
     ordinaryEnvelope: policy && ordinaryEnvelope(w, policy),
     checkOrdinary: w.release.recovery === undefined && policy === undefined ? undefined : async (rec, gas) => {
-      if (!policy) throw new Nb2Error('CapacityPreflight', 'explicit payer limits are required');
+      if (!policy) throw new WalletError('PolicyRequired', 'explicit payer limits are required');
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, bytes(rec.payer ?? rec.recipient, 20));
       const fee = gas * limits.currentBid;
@@ -209,7 +209,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
       }
     },
     recover: w.release.recovery === undefined ? undefined : async (rec) => {
-      if (!policy) throw new Nb2Error('CapacityPreflight', 'explicit payer limits are required');
+      if (!policy) throw new WalletError('PolicyRequired', 'explicit payer limits are required');
       const release = recoveryRelease(w);
       await checkGraph(w, release);
       const payer = bytes(rec.payer ?? rec.recipient, 20);
@@ -957,6 +957,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
         return 'failed';
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
+        if (e instanceof RpcError && e.retryable) throw e; // a transport failure is not an absence of evidence
         if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned') pruned = true;
         // Metadata is only a hint. Try the next reader's complete proof.
       }
