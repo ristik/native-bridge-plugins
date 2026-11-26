@@ -1570,10 +1570,12 @@ test('cold and ordinary sends stay pending on an incomplete failure proof, repor
         if (eq(to, destination)) throw new Nb2Error('PayoutFailed');
         return undefined;
       };
+      const sentRaws: string[] = [];
       const archive: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
         if (method === 'eth_estimateGas') return '0x1d4c0' as T;
         if (method === 'eth_sendRawTransaction') {
           const raw = unhex(params[0] as string);
+          sentRaws.push(params[0] as string);
           await chain.mine([raw]);
           return hx(decodeSignedTx(raw).hash) as T;
         }
@@ -1612,6 +1614,29 @@ test('cold and ordinary sends stay pending on an incomplete failure proof, repor
       const lagging: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getTransactionReceipt' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
       assert.equal((await run(await open('holder', lagging))).state, 'pending', 'a reader that lost the failure metadata proves nothing');
+      {
+        // the failed receipt's block is rolled back (review P2-1): 20 blocks on, the send is gone and its nonce unused, so the identical
+        // signed bytes are offered again; nothing new is signed
+        const failedRaw = sentRaws.at(-1)!;
+        const failed = decodeSignedTx(unhex(failedRaw));
+        cpSync(first.dir, join(dir, 'rolled-back'), { recursive: true });
+        const offered: string[] = [];
+        const rolled: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+          if (method === 'eth_getTransactionReceipt' && params[0] === hx(failed.hash)) return null as T;
+          if (method === 'eth_getTransactionCount' && params[1] === 'latest' && params[0] === hx(failed.from)) return `0x${failed.request.nonce.toString(16)}` as T;
+          if (method === 'eth_call' && (params[0] as { data?: string }).data === hx(failed.request.data)) return '0x' as T;
+          if (method === 'eth_sendRawTransaction') { offered.push(params[0] as string); return hx(HE(unhex(params[0] as string))) as T; }
+          return incomplete.call<T>(method, params);
+        } };
+        const early = await open('rolled-back', rolled, { seed: key('holder') });
+        assert.equal((await run(early)).state, 'pending');
+        assert.deepEqual(offered, [], 'near the head nothing is offered again');
+        for (let i = 0; i < 20; i++) await chain.mine([]);
+        const late = await open('rolled-back', rolled, { seed: key('holder') });
+        assert.equal((await run(late)).state, 'pending');
+        assert.ok(offered.length >= 1 && offered.every((raw) => raw === failedRaw), 'only the identical signed bytes');
+        if (route === 'ordinary') assert.equal((await late.returnRecord('coin')).sends.length, (await first.returnRecord('coin')).sends.length);
+      }
       const missing: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getRawTransactionByBlockHashAndIndex' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
       const pruned = await open('missing-raw', missing, { seed: key('holder') });

@@ -30,7 +30,7 @@ import {
 } from './journal.js';
 import { recoveredSettlementEta } from './recovery.js';
 import { burnIndex, capacityExceeded, capacityPreflight, maxProofs, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
-import { AmbiguousBroadcast, EvmReader, ProofUnavailable, RpcError, type JsonRpc, type ReceiptJson } from './rpc.js';
+import { AmbiguousBroadcast, CERTIFICATION_DEPTH, EvmReader, ProofUnavailable, RpcError, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
 import { buildHistory, checkSegmentLog, gapProofLen, genesisHead, type Segment } from './segment.js';
 import { MAX_MINT_PROOF, encodeToken, decodeToken, burnPredicate, signaturePredicate, tokenIdOf, valueData, lineageOf, parseTransfer, parseCertification, stateId, encodePredicate, encodeProof, encodeCertification } from './token.js';
@@ -153,6 +153,12 @@ export type ReconcileResult =
    * verdict on a block that is merely not certified yet, and never reached by counting reads.
    */
   | { state: 'needs-archive'; txHash: Uint8Array; missing?: string }
+  /**
+   * A payment by another party (an indexed or remembered claim, not one of this wallet's sends) was seen and is gone: no reader serves its
+   * receipt, or only in a block that is not canonical, though every reader's head is CERTIFICATION_DEPTH past it. Not pruned and not
+   * pending: the claim is not on the chain. Nothing is signed while it is held; it is paid if the transaction lands again.
+   */
+  | { state: 'vanished'; txHash: Uint8Array }
   | { state: 'route-blocked'; txHash: Uint8Array; route: 'ordinary' | 'recovery'; payer?: Uint8Array }
   | { state: 'not-paid'; lastFailure?: { txHash: Uint8Array; action: RedeemAction; error: DecodedError | null } };
 
@@ -173,6 +179,11 @@ export interface ReturnEvidence {
 export const FAILURE_PROOF_READS = 3;
 
 /** What a pruned answer says is missing. */
+/** Where a receipt of a claim was served: by which reader, in which block. */
+interface SeenReceipt { reader: EvmReader; number: bigint; hash: Uint8Array }
+
+const optional = (d: string | undefined): bigint | undefined => (d === undefined ? undefined : undec(d));
+
 const missingOf = (e: unknown): string | undefined =>
   e instanceof ProofUnavailable ? e.missing : e instanceof Nb2Error ? e.detail ?? 'certified evidence' : undefined;
 
@@ -1274,7 +1285,7 @@ export class NativeBridgeV2 {
     let pooled = false;
     const prior = await this.reconcileRecord(fresh, archives, { readOnly: Boolean(different), pending },
       different ? undefined : (request, underpriced) => { expired = request; pooled = underpriced; });
-    if (prior.state === 'paid' || prior.state === 'needs-archive') return prior;
+    if (prior.state === 'paid' || prior.state === 'needs-archive' || prior.state === 'vanished') return prior;
     if (different) return { state: 'route-blocked', route: 'ordinary', txHash: first?.hash ?? returnId, payer };
     if (prior.state !== 'not-paid') return prior;
     let gasBump = 1n;
@@ -1433,16 +1444,18 @@ export class NativeBridgeV2 {
     let unavailable: unknown;
     const candidates = new Map<string, Uint8Array>();
     // pruned: a reader answered in this call that it no longer holds part of the proof (missing names it)
-    const hinted = new Map<string, { tx: Uint8Array; pruned: boolean; missing?: string }>();
-    const addHint = (tx: Uint8Array, pruned = false, missing?: string) => {
+    // block: the latest block the claim was seen in (receipt or log); gone: a peer claim no reader holds on its canonical chain any more
+    const hinted = new Map<string, { tx: Uint8Array; pruned: boolean; missing?: string; block?: bigint; gone?: boolean }>();
+    const addHint = (tx: Uint8Array, pruned = false, missing?: string, block?: bigint) => {
       const key = hex(tx);
       const prior = hinted.get(key);
-      hinted.set(key, { tx, pruned: pruned || prior?.pruned === true, missing: prior?.missing ?? missing });
+      const seen = prior?.block === undefined || (block !== undefined && block > prior.block) ? block : prior.block;
+      hinted.set(key, { tx, pruned: pruned || prior?.pruned === true, missing: prior?.missing ?? missing, block: seen ?? prior?.block });
     };
     if (rec.paidProof) {
       const tx = unhex(rec.paidProof.txHash);
       candidates.set(rec.paidProof.txHash, tx);
-      addHint(tx);
+      addHint(tx, false, undefined, rec.paidProof.block === undefined ? undefined : undec(rec.paidProof.block));
     }
     for (const tx of evidence?.settlements ?? []) candidates.set(hex(tx), tx);
     for (const send of rec.sends) {
@@ -1472,7 +1485,7 @@ export class NativeBridgeV2 {
           const p = decodePaid(l);
           if (p === null || !eq(l.address, this.cfg.vault) || !eq(p.eta, eta) ||
             !eq(p.recipient, unhex(rec.recipient)) || p.amount !== undec(rec.amount) || l.blockNumber < undec(rec.fromBlock)) continue;
-          addHint(l.transactionHash);
+          addHint(l.transactionHash, false, undefined, l.blockNumber);
           candidates.set(hex(l.transactionHash), l.transactionHash);
         }
         available = true;
@@ -1491,10 +1504,27 @@ export class NativeBridgeV2 {
 
     let changed = false;
     // Indexed or remembered claims trigger proof reads. A certified failure retires only that exact claim.
-    for (const [hash, { tx }] of hinted) {
+    const heads = new Map<EvmReader, bigint>();
+    for (const [hash, hint] of hinted) {
+      const { tx } = hint;
       const send = rec.sends.find((s) => hex(decodeSignedTx(unhex(s.raw)).hash) === hash);
-      const failure = send?.failed ?? (await this.exactFailure(tx, archives)).failed;
-      if (!failure) continue;
+      const outcome = send?.failed ? undefined : await this.exactFailure(tx, archives);
+      const failure = send?.failed ?? outcome?.failed;
+      if (!failure) {
+        for (const at of outcome?.at ?? []) if (hint.block === undefined || at.number > hint.block) hint.block = at.number;
+        if (!outcome || !await this.claimGone(outcome.at, hint.block ?? (send ? optional(rec.firstSendBlock) : undefined), archives, heads)) continue;
+        if (!send) {
+          hint.gone = true; // another party's payment: report it, sign nothing
+          continue;
+        }
+        // this wallet's own send is gone from the chain: forget the observation; reconcileSend offers the identical bytes again
+        const signed = decodeSignedTx(unhex(send.raw));
+        if (await this.evm.nonce(signed.from, 'latest') > signed.request.nonce) continue; // its nonce is used: not gone, wait
+        if (rec.paidProof?.txHash === hash) delete rec.paidProof;
+        changed = true;
+        hinted.delete(hash);
+        continue;
+      }
       if (send && !send.failed) {
         if (send.hash !== hash) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
         send.failed = failure;
@@ -1507,16 +1537,19 @@ export class NativeBridgeV2 {
       }
       hinted.delete(hash);
     }
-    const next = [...hinted.values()].find(({ pruned }) => pruned) ?? hinted.values().next().value;
+    const live = [...hinted.values()].filter(({ gone }) => !gone);
+    const next = live.find(({ pruned }) => pruned) ?? live[0] ?? [...hinted.values()][0];
     if (next) {
       const txHash = hex(next.tx);
       // A marker of the claim under proof (a resend waits for it), not a budget: only this read's pruned answer means needs-archive.
       const reads = Math.min(FAILURE_PROOF_READS, (rec.paidProof?.txHash === txHash ? rec.paidProof.reads : 0) + 1);
-      if (rec.paidProof?.txHash !== txHash || rec.paidProof.reads !== reads) {
-        rec.paidProof = { txHash, reads };
+      const block = next.block === undefined ? undefined : dec(next.block);
+      if (rec.paidProof?.txHash !== txHash || rec.paidProof.reads !== reads || rec.paidProof.block !== block) {
+        rec.paidProof = { txHash, reads, ...(block === undefined ? {} : { block }) };
         changed = true;
       }
       if (changed && persist) await this.journal.putReturn(rec);
+      if (next.gone) return { state: 'vanished', txHash: next.tx };
       return next.pruned ? { state: 'needs-archive', txHash: next.tx, missing: next.missing } : { state: 'pending', txHash: next.tx };
     }
     if (changed && persist) await this.journal.putReturn(rec);
@@ -1532,7 +1565,7 @@ export class NativeBridgeV2 {
     if (hex(txHash) !== send.hash || request.nonce !== undec(send.nonce)) refuse('BadInput', 'ordinary send hash does not match its signed transaction');
     // A certified failure of any replacement at this nonce rules out all the others.
     const sameNonce = rec.sends.filter((prior) => prior.nonce === send.nonce).reverse();
-    let evidence: { seen: boolean; pruned: boolean; attempted: boolean; missing?: string } | undefined;
+    let evidence: { seen: boolean; pruned: boolean; attempted: boolean; missing?: string; at: SeenReceipt[] } | undefined;
     for (const prior of sameNonce) {
       const signed = decodeSignedTx(unhex(prior.raw));
       if (!eq(signed.from, from) || signed.request.nonce !== request.nonce || hex(signed.hash) !== prior.hash) {
@@ -1554,14 +1587,32 @@ export class NativeBridgeV2 {
         pruned: Boolean(evidence?.pruned || outcome.pruned),
         attempted: Boolean(evidence?.attempted || outcome.attempted),
         missing: evidence?.missing ?? outcome.missing,
+        at: [...(evidence?.at ?? []), ...outcome.at],
       };
     }
-    const { seen, pruned, attempted, missing } = evidence!;
+    let { seen, pruned, attempted } = evidence!;
+    const { missing, at } = evidence!;
+    // A receipt seen before and gone from the chain (rolled back, or only in a block that is not canonical; its nonce unused): the send
+    // is alive again, and the same bytes are offered again
+    if (seen || send.failureProofReads !== undefined) {
+      const ref = send.failureBlock !== undefined ? undec(send.failureBlock) : optional(rec.firstSendBlock);
+      if (await this.claimGone(at, ref, archives, new Map()) && await this.evm.nonce(from, 'latest') <= request.nonce) {
+        if (send.failureProofReads !== undefined || send.failureBlock !== undefined) {
+          delete send.failureProofReads;
+          delete send.failureBlock;
+          await this.journal.putReturn(rec);
+        }
+        seen = pruned = attempted = false;
+      }
+    }
+    const failedAt = at.reduce<bigint | undefined>((m, r) => (m === undefined || r.number > m ? r.number : m), undefined);
     if (attempted || send.failureProofReads !== undefined) {
       // A marker that a failed receipt was seen (no blind resend), not a budget: a failure not certified yet stays pending.
       const reads = Math.min((send.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
-      if (reads !== send.failureProofReads) {
+      const block = attempted && failedAt !== undefined ? dec(failedAt) : send.failureBlock;
+      if (reads !== send.failureProofReads || block !== send.failureBlock) {
         send.failureProofReads = reads;
+        if (block !== undefined) send.failureBlock = block;
         await this.journal.putReturn(rec);
       }
     }
@@ -1614,15 +1665,17 @@ export class NativeBridgeV2 {
     let attempted = false;
     let pruned = false;
     let missing: string | undefined;
+    const at: SeenReceipt[] = [];
     for (const reader of archives) {
       try {
         const receipt = await reader.receipt(txHash);
         if (!receipt) continue;
         seen = true;
+        at.push({ reader, number: BigInt(receipt.blockNumber), hash: unhex(receipt.blockHash) });
         if (BigInt(receipt.status) !== 0n) continue;
         attempted = true;
         await this.retryingTrust((trust) => reader.verifyFailedReceipt(txHash, this.cfg, trust, receipt, archives));
-        return { seen, attempted, pruned, missing, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
+        return { seen, attempted, pruned, missing, at, failed: { txHash: hex(txHash), blockHash: hex(unhex(receipt.blockHash)) } };
       } catch (e) {
         if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
         if (e instanceof RpcError && e.retryable) throw e; // a transport failure is not an absence of evidence
@@ -1632,7 +1685,31 @@ export class NativeBridgeV2 {
         }
       }
     }
-    return { seen, attempted, pruned, missing, failed: undefined };
+    return { seen, attempted, pruned, missing, at, failed: undefined };
+  }
+
+  /**
+   * Whether a claim seen before is gone from the chain, by each reader's own head: every receipt still served is in a block that is not
+   * canonical on that reader, and every reader's head is CERTIFICATION_DEPTH past it (`ref`, the block it was seen in, when no reader
+   * serves a receipt any more). Near the head nothing is gone: a block not certified yet may still be replaced by its repeat.
+   */
+  private async claimGone(at: readonly SeenReceipt[], ref: bigint | undefined, archives: readonly EvmReader[], heads: Map<EvmReader, bigint>): Promise<boolean> {
+    const head = async (reader: EvmReader) => {
+      let h = heads.get(reader);
+      if (h === undefined) heads.set(reader, h = await reader.blockNumber());
+      return h;
+    };
+    if (at.length === 0) {
+      if (ref === undefined) return false;
+      for (const reader of archives) if (await head(reader) < ref + CERTIFICATION_DEPTH) return false;
+      return true;
+    }
+    for (const { reader, number, hash } of at) {
+      if (await head(reader) < number + CERTIFICATION_DEPTH) return false;
+      const canonical = await reader.headerByNumber(number);
+      if (!canonical || eq(canonical.hash, hash)) return false;
+    }
+    return true;
   }
 
   /**

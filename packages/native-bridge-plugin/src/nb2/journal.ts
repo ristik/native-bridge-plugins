@@ -56,8 +56,10 @@ export interface SendRecord {
   at: Dec;
   /** The head block when a mined transaction of the account was first seen past this nonce without this send's success receipt. */
   nonceUsedAt?: Dec;
-  /** Bounded attempts to obtain an exact certified failure proof. */
+  /** Marks that a failed receipt of this send was seen (no blind resend); capped, never a verdict. */
   failureProofReads?: number;
+  /** The block that failed receipt was last seen in: a receipt gone CERTIFICATION_DEPTH past it was rolled back. */
+  failureBlock?: Dec;
   /** Certified exact failure, verified before the send became eligible for retry. */
   failed?: { txHash: Hex; blockHash: Hex };
 }
@@ -169,7 +171,7 @@ export interface ReturnRecord extends Base {
   /** The payer of the first durable payout send, shared by both routes. */
   executionPayer?: Hex;
   /** A mined payment hint whose certified proof is still being fetched. */
-  paidProof?: { txHash: Hex; reads: number };
+  paidProof?: { txHash: Hex; reads: number; block?: Dec };
   /** The EVM account that pays the redeem's gas (its funds are checked before the burn). */
   payer?: Hex;
   /** The first block at which a redeem was broadcast: Paid(eta) cannot appear before it. */

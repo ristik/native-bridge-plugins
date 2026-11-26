@@ -4,7 +4,7 @@ import { existsSync, linkSync, lstatSync, readFileSync, unlinkSync } from 'node:
 import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  AmbiguousBroadcast, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
+  AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryCatchUpCalls, recoveryGeneration,
   recoveryRpcSource, replacementBid, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
@@ -236,6 +236,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
 export async function qualifyExistingRecovery(w: Wallet, rec: ReturnRecord, policy: PayerPolicy): Promise<ReturnRecord> {
   const { result, handoff } = await reconcileForPayout(w, rec, 'recovery', policy, false);
   if (result.state === 'needs-archive') archiveRequired(result.txHash, result.missing);
+  if (result.state === 'vanished') paymentVanished(result.txHash);
   if (result.state === 'route-blocked') routeRequired(result);
   const current = await w.bridge.journal.retForUpdate(rec.returnId);
   if (current?.status === 'paid') return current;
@@ -431,6 +432,11 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
   return confirmed;
 }
 
+/** Another party's payment was seen and is gone from the chain (not pruned): nothing is signed while it is held. */
+export function paymentVanished(hash: Uint8Array): never {
+  throw new WalletError('EvidenceMissing', `payment ${hx(hash)} by another party was seen and is no longer on the chain (no reader serves it on its canonical chain, ${CERTIFICATION_DEPTH} blocks on); nothing is signed while it is held: it is paid if that transaction lands again`);
+}
+
 export function archiveRequired(hash: Uint8Array, missing?: string): never {
   throw new WalletError('EvidenceMissing', `needs archive for exact transaction ${hx(hash)}: the node no longer serves ${missing ?? 'its certified block, receipts or raw transactions'}. Add an archive reader that does, then resume`);
 }
@@ -477,7 +483,7 @@ interface RecoveryJournal {
   /** Signed local attempts whose work has been superseded by a certified peer cursor. */
   superseded?: string[];
   cuts: { cut: Exclude<Cut, { kind: 'settle' }>; location: Location; seq: string; nonce: string; priorSeq: string; state?: string; endpoint?: string; head?: string }[];
-  pending?: { cut: Cut; raw: string; txHash: string; nonce: string; priorSeq: string; failureProofReads?: number };
+  pending?: { cut: Cut; raw: string; txHash: string; nonce: string; priorSeq: string; failureProofReads?: number; failureBlock?: string };
   settled?: { paidTx: string; submitted?: RecoveryJournal['pending'] };
 }
 const pathOf = (w: Wallet, rec: ReturnRecord): string => {
@@ -701,7 +707,7 @@ async function lowerRecoverySend(w: Wallet, rec: ReturnRecord, journal?: Recover
 async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary' | 'recovery', policy?: PayerPolicy, resubmit = true): Promise<{ record: ReturnRecord; result: ReconcileResult;
   handoff?: { hash: Uint8Array; nonce: bigint } }> {
   const first = await reconcileReturn(w, rec, policy, undefined, false);
-  if (first.result.state === 'paid' || first.result.state === 'needs-archive') return first;
+  if (first.result.state === 'paid' || first.result.state === 'needs-archive' || first.result.state === 'vanished') return first;
   rec = first.record;
   const journal = loadRecovery(w, rec);
   const payer = boundPayer(rec, journal);
@@ -940,6 +946,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   let pruned = false;
   let missing: string | undefined;
   let failed = false;
+  let failedAt: bigint | undefined;
   const outcome = async (): Promise<'missing' | 'pending' | 'success' | 'earlier-paid' | 'failed'> => {
     let seen = false;
     let success = false;
@@ -954,6 +961,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
           continue;
         }
         failed = true;
+        failedAt = BigInt(receipt.blockNumber);
         await w.bridge.verifyWithTrust((trust) => reader.verifyFailedReceipt(tx, w.bridge.cfg, trust, receipt, archive));
         return 'failed';
       } catch (e) {
@@ -969,6 +977,13 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     return success ? 'success' : seen ? 'pending' : 'missing';
   };
   let mined = await outcome();
+  // A failed receipt seen before and gone from the chain CERTIFICATION_DEPTH blocks on, its nonce unused: the packet is alive again
+  if (mined === 'missing' && pending.failureProofReads !== undefined && pending.failureBlock !== undefined &&
+      await w.bridge.evm.blockNumber() >= BigInt(pending.failureBlock) + CERTIFICATION_DEPTH && await w.bridge.evm.nonce(from, 'latest') <= request.nonce) {
+    delete pending.failureProofReads;
+    delete pending.failureBlock;
+    saveRecovery(w, rec, journal);
+  }
   if (mined === 'missing' && reconcile && pending.failureProofReads === undefined) {
     if (!preflighted) {
       await w.bridge.evm.checkReturnImport(w.bridge.cfg, packet.requiredSignerEpoch, { ...request, from });
@@ -983,8 +998,10 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     // a marker that a failed receipt was seen (no blind resend), not a budget: a failure not certified yet stays pending
     if (failed || pending.failureProofReads !== undefined) {
       const reads = Math.min((pending.failureProofReads ?? 0) + 1, FAILURE_PROOF_READS);
-      if (reads !== pending.failureProofReads) {
+      const block = failed && failedAt !== undefined ? String(failedAt) : pending.failureBlock;
+      if (reads !== pending.failureProofReads || block !== pending.failureBlock) {
         pending.failureProofReads = reads;
+        if (block !== undefined) pending.failureBlock = block;
         saveRecovery(w, rec, journal);
       }
     }
