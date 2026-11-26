@@ -101,7 +101,7 @@ export interface WalletConfig extends Connection {
   keyEnv?: string;
 }
 
-/** A connection with the manifest's neighbours as defaults: the bundle and pin the manifest names, the gateway's /aggregator route. */
+/** A connection with the manifest's neighbours as defaults: the bundle and pin the manifest names, the gateway's /aggregator route, a sibling of the RPC path (the release names no aggregator URL). */
 export function connectionOf(o: { release: string; rpc: string; trustBundle?: string; trustPin?: string; aggregator?: string }): Connection {
   const release = resolve(o.release);
   const m = JSON.parse(readFileSync(release, 'utf8')) as { trust?: { bundle?: string } };
@@ -111,7 +111,7 @@ export function connectionOf(o: { release: string; rpc: string; trustBundle?: st
     trustBundle: resolve(o.trustBundle ?? join(here, m.trust?.bundle ?? 'trust-base.bundle.cbor')),
     trustPin: resolve(o.trustPin ?? join(here, 'trust-base.genesis.entryid')),
     rpc: o.rpc,
-    aggregator: o.aggregator ?? `${o.rpc.replace(/\/+$/, '')}/aggregator`,
+    aggregator: o.aggregator ?? `${new URL(o.rpc).origin}/aggregator`,
   };
 }
 

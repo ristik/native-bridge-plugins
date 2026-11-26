@@ -47,12 +47,28 @@ every run.
 
 ### What you need
 
-- **The deployment's public files**, from its operator (a bft-core testnet package publishes them from `GENERATION/bridge/nb2/public/`):
+The public testnet is `tn-public-20261128` at `https://pos.staging.unicity.network`. A testnet regeneration replaces the chain ID, the
+contract addresses and the manifest, and the chain ID is random each time. **Never copy them from this guide.** Read them from the release
+the deployment publishes; the wallet's installation check refuses a mismatch.
+
+- **The deployment's public files**, under `https://pos.staging.unicity.network/release/` (a bft-core testnet package publishes them from
+  `GENERATION/bridge/nb2/public/`; `SHA256SUMS` there lists every file):
   - `nb2-release.json`, the release manifest. It holds the pins the wallet checks the deployment against (Γ, the vault's runtime code hash, the
-    limits, the deployment block), the operating envelope, and the plug-in commit it was released with (`bridge.sources`).
+    limits, the deployment block), the operating envelope, and the plug-in commit it was released with (`bridge.sources`). The chain ID is
+    `package.chainId` (it is also `eth_chainId` and `/api/network`), and the vault is `deployment.fields.vault`.
   - `trust-base.bundle.cbor` and `trust-base.genesis.entryid`: the network's trust-base history and its pin.
-- **The deployment's public gateway URL.** It is the ordinary JSON-RPC endpoint; the aggregator is its `/aggregator` route.
-- **A checkout of this repository** at the commit the manifest names, with Node 22:
+
+  ```sh
+  R=https://pos.staging.unicity.network
+  REL=$PWD/release && mkdir -p $REL
+  for f in nb2-release.json trust-base.bundle.cbor trust-base.genesis.entryid; do curl -fs $R/release/$f -o $REL/$f; done
+  grep nb2-release.json <(curl -fs $R/release/SHA256SUMS); shasum -a 256 $REL/nb2-release.json   # the two digests must match
+  ```
+
+- **The deployment's public endpoints.** The JSON-RPC gateway is `https://pos.staging.unicity.network/rpc` and the aggregator is
+  `https://pos.staging.unicity.network/aggregator`. `init` derives the aggregator from the RPC URL's origin (`<origin>/aggregator`); pass
+  `--aggregator URL` only when your deployment serves it elsewhere.
+- **A checkout of this repository** at the commit the manifest names, with Node 22 or later:
 
   ```sh
   git clone https://github.com/ristik/native-bridge-plugins && cd native-bridge-plugins
@@ -60,7 +76,11 @@ every run.
   npm ci
   ```
 
-- **Some UCT on the EVM chain** for the deposit itself and for gas (the faucet of a test deployment).
+  A checkout older than the origin-derived aggregator default (the manifest of `tn-public-20261128` names such a commit) needs
+  `--aggregator https://pos.staging.unicity.network/aggregator` on `init`; the default there is `<rpc>/aggregator`, which does not exist.
+
+- **Some UCT on the EVM chain** for the deposit itself and for gas. The deployment's faucet page is `https://pos.staging.unicity.network/faucet/`
+  and needs a human CAPTCHA. Run `init` first: it prints the address to fund.
 
 Every command is `npx tsx wallet/nb2-wallet.ts [--wallet DIR] COMMAND ...`, written `nb2-wallet` below. The wallet directory defaults to
 `./nb2-wallet`. It holds an **unencrypted** secret: this is a test wallet.
@@ -194,9 +214,49 @@ Use `redeem --recover` or `resume --recover` to select recovery once outstanding
 are resolved. Use `--ordinary` to select ordinary after any recovery send resolves. Both routes
 settle the same redemption ID.
 
+### Walkthrough on the public testnet
+
+This is the guide's flow run against `tn-public-20261128` from a clean checkout of this change, with a fresh wallet and public
+URLs only (2026-11-26). The full transcript, with the transaction hashes, is
+[`nb2-public-testnet-transcript.md`](nb2-public-testnet-transcript.md). The deployment is a production-build vault, so one thing differs from
+the lane transcript below:
+
+- **`plan-return`, `burn` and `redeem` need a payer policy** (`--return-policy FILE`): the production build refuses to plan a return without
+  explicit payer limits (`CapacityPreflight: explicit payer limits are required`). A policy for the public testnet, read off the release
+  (`pins.userGasLimit` 24,000,000, `limits.maxEncodedTxBytes` 524,288, `limits.calldataBytes` 393,216) and the gateway's `eth_gasPrice`
+  (10^6 wei):
+
+  ```json
+  {
+    "gas": "24000000",
+    "signedBytes": 524288,
+    "calldataBytes": 393216,
+    "maxNonce": "100",
+    "maxFeePerGas": "10000000",
+    "maxPriorityFeePerGas": "1000000",
+    "maxTransactionFee": "240000000000000",
+    "feeBudget": "500000000000000000",
+    "archives": []
+  }
+  ```
+
+```sh
+RPC=https://pos.staging.unicity.network/rpc
+nb2-wallet init --release $REL/nb2-release.json --rpc $RPC   # makes a new secret in the wallet directory
+# to use an existing funded key instead: export NB2_KEY=<64 hex digits> and add --key-env NB2_KEY (the transcript did this)
+nb2-wallet address                       # fund the printed EVM address with UCT, then run it again
+nb2-wallet deposit coin 0.1
+nb2-wallet mint coin                     # retries CompanionUnknown until the next certificate: minutes, not seconds
+nb2-wallet split coin keep=0.06 back=0.04
+nb2-wallet plan-return back --return-policy payer.json
+nb2-wallet burn back --return-policy payer.json --backup back.private.json
+nb2-wallet redeem back --return-policy payer.json   # "waiting for certification ...; repeat this command": repeat until it prints "paid"
+nb2-wallet status
+```
+
 ### Earlier ordinary-only walkthrough
 
-The transcript below is the `walkthrough` stage of the bft-core testnet lane (`deploy/testnet/bridge/nb2/rehearse_nb2.py`). It comes from
+The transcript below (with a test vault, which needs no payer policy) is the `walkthrough` stage of the bft-core testnet lane (`deploy/testnet/bridge/nb2/rehearse_nb2.py`). It comes from
 a full lane run on a throwaway four-validator package generation on the dev server, 2026-11-17, where every stage passed. The vault is the
 K = 4 test build (see [Limits](#limits)), and the walkthrough ran after the lane's other stages, so the vault had already sealed seven
 segments and taken 32 deposits.
@@ -357,7 +417,7 @@ const bridge = await NativeBridgeV2.open({
   pins,                                  // the manifest's pins (nb2-release.json "pins"; wallet/core.ts pinsOf reads them)
   trust,                                 // the pinned UTB history
   rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway: nothing bridge-specific
-  aggregator: new SdkAggregator(`${gatewayUrl}/aggregator`),
+  aggregator: new SdkAggregator(`${new URL(gatewayUrl).origin}/aggregator`), // a sibling of the gateway path, e.g. /rpc and /aggregator
   journal: store,                        // your key-value store; its putIf MUST be atomic and durable (nb2-journal.md)
   bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
   backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
