@@ -76,6 +76,9 @@ the deployment publishes; the wallet's installation check refuses a mismatch.
   npm ci
   ```
 
+  A checkout older than the origin-derived aggregator default (the manifest of `tn-public-20261128` names such a commit) needs
+  `--aggregator https://pos.staging.unicity.network/aggregator` on `init`; the default there is `<rpc>/aggregator`, which does not exist.
+
 - **Some UCT on the EVM chain** for the deposit itself and for gas. The deployment's faucet page is `https://pos.staging.unicity.network/faucet/`
   and needs a human CAPTCHA. Run `init` first: it prints the address to fund.
 
