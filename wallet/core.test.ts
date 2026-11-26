@@ -319,3 +319,11 @@ test('redeem opens no retry at the registry wait deadline', async (t) => {
   await result;
   assert.deepEqual(attempts, [0]);
 });
+
+test('connectionOf derives the aggregator from the RPC origin, and --aggregator overrides it', () => {
+  const release = join(mkdtempSync(join(tmpdir(), 'nb2-conn-')), 'nb2-release.json');
+  writeFileSync(release, '{}');
+  assert.equal(connectionOf({ release, rpc: 'https://pos.example.net/rpc' }).aggregator, 'https://pos.example.net/aggregator');
+  assert.equal(connectionOf({ release, rpc: 'http://rpc:8545/' }).aggregator, 'http://rpc:8545/aggregator');
+  assert.equal(connectionOf({ release, rpc: 'https://pos.example.net/rpc', aggregator: 'https://agg.example.net/x' }).aggregator, 'https://agg.example.net/x');
+});

@@ -60,15 +60,14 @@ the deployment publishes; the wallet's installation check refuses a mismatch.
 
   ```sh
   R=https://pos.staging.unicity.network
-  mkdir release && cd release
-  for f in nb2-release.json trust-base.bundle.cbor trust-base.genesis.entryid; do curl -fsSO $R/release/$f; done
-  grep nb2-release.json <(curl -fs $R/release/SHA256SUMS) && sha256sum nb2-release.json   # the two digests must match
+  REL=$PWD/release && mkdir -p $REL
+  for f in nb2-release.json trust-base.bundle.cbor trust-base.genesis.entryid; do curl -fs $R/release/$f -o $REL/$f; done
+  grep nb2-release.json <(curl -fs $R/release/SHA256SUMS); shasum -a 256 $REL/nb2-release.json   # the two digests must match
   ```
 
-- **The deployment's public endpoints.** Two routes are used, and they are siblings, not nested: the JSON-RPC gateway is
-  `https://pos.staging.unicity.network/rpc` and the aggregator is `https://pos.staging.unicity.network/aggregator`. The wallet's default
-  aggregator is `<rpc>/aggregator`, which is right only when the gateway is a path prefix of the aggregator route. On the public testnet it
-  is not, so **always pass `--aggregator`** to `init`.
+- **The deployment's public endpoints.** The JSON-RPC gateway is `https://pos.staging.unicity.network/rpc` and the aggregator is
+  `https://pos.staging.unicity.network/aggregator`. `init` derives the aggregator from the RPC URL's origin (`<origin>/aggregator`); pass
+  `--aggregator URL` only when your deployment serves it elsewhere.
 - **A checkout of this repository** at the commit the manifest names, with Node 22 or later:
 
   ```sh
@@ -216,10 +215,9 @@ settle the same redemption ID.
 
 This is the guide's flow run against `tn-public-20261128` from a clean checkout at the manifest's commit, with a fresh wallet and public
 URLs only (2026-11-26). The full transcript, with the transaction hashes, is
-[`nb2-public-testnet-transcript.md`](nb2-public-testnet-transcript.md). The deployment is a production-build vault, so two things differ from
+[`nb2-public-testnet-transcript.md`](nb2-public-testnet-transcript.md). The deployment is a production-build vault, so one thing differs from
 the lane transcript below:
 
-- **`--aggregator`** is required on `init` (see [What you need](#what-you-need)).
 - **`plan-return`, `burn` and `redeem` need a payer policy** (`--return-policy FILE`): the production build refuses to plan a return without
   explicit payer limits (`CapacityPreflight: explicit payer limits are required`). A policy for the public testnet, read off the release
   (`pins.userGasLimit` 24,000,000, `limits.maxEncodedTxBytes` 524,288, `limits.calldataBytes` 393,216) and the gateway's `eth_gasPrice`
@@ -241,7 +239,7 @@ the lane transcript below:
 
 ```sh
 RPC=https://pos.staging.unicity.network/rpc
-nb2-wallet init --release release/nb2-release.json --rpc $RPC --aggregator https://pos.staging.unicity.network/aggregator
+nb2-wallet init --release $REL/nb2-release.json --rpc $RPC
 nb2-wallet address                       # fund the printed EVM address with UCT, then run it again
 nb2-wallet deposit coin 0.1
 nb2-wallet mint coin                     # retries CompanionUnknown until the next certificate: minutes, not seconds
