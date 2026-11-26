@@ -12,7 +12,7 @@ import {
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { beInt } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
-import { fsyncDir, hx, unhex, writeDurable, type Wallet } from './core.js';
+import { fsyncDir, hx, readRetrying, unhex, writeDurable, type Wallet } from './core.js';
 
 const uint = (s: unknown): bigint => {
   if (typeof s !== 'string' || !/^(0|[1-9][0-9]*)$/.test(s)) throw new Error('expected an unsigned decimal string');
@@ -638,7 +638,7 @@ function advanceCursor(cursor: Cursor, packet: Awaited<ReturnType<typeof packetO
 }
 
 function readers(w: Wallet, policy: PayerPolicy): EvmReader[] {
-  return [w.bridge.evm, ...policy.archives.map((url) => new EvmReader(new HttpJsonRpc(url)))];
+  return [w.bridge.evm, ...policy.archives.map((url) => new EvmReader(readRetrying(new HttpJsonRpc(url))))];
 }
 
 
