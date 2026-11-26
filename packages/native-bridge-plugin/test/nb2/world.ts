@@ -458,6 +458,13 @@ export class FakeChain implements JsonRpc {
     await this.mine([]);
   }
 
+  /** Mine the pool into one block without its certifying child: the payout is mined, its block not yet certified (a real chain's next block is seconds away). */
+  public async mineUncertified(): Promise<void> {
+    const raws = this.pool;
+    this.pool = [];
+    await this.mine(raws);
+  }
+
   public dropPool(): void {
     this.pool = [];
   }

@@ -24,6 +24,12 @@ import { decodeUc, verifyEvmUc, type TrustInput } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
 
+/**
+ * Blocks the reader's head must be past a block's child before a missing child or seal companion is the node's answer that it does not
+ * hold them (EvidencePruned). Closer to the head the certificate is only not out yet (CompanionUnknown: pending, however often it is read).
+ */
+export const CERTIFICATION_DEPTH = 16n;
+
 /** A JSON-RPC transport: one method call. */
 export interface JsonRpc {
   call<T = unknown>(method: string, params: unknown[]): Promise<T>;
@@ -55,13 +61,18 @@ export class RpcError extends Error {
 
 /** Readers exhausted for a component of an identified transaction's certificate. */
 export class ProofUnavailable extends Error {
-  public constructor(public readonly component: string, public readonly pruned: boolean) {
+  /** When pruned: the innermost component a node said it no longer holds, with its answer. */
+  public readonly missing: string;
+
+  public constructor(public readonly component: string, public readonly pruned: boolean, missing?: string) {
     super(`no configured reader supplied ${component}`);
+    this.missing = missing ?? component;
   }
 }
 
 async function proofFrom<T>(readers: readonly EvmReader[], component: string, read: (reader: EvmReader) => Promise<T>): Promise<T> {
   let pruned = false;
+  let missing: string | undefined;
   let refresh: Nb2Error | undefined;
   let transient: RpcError | undefined;
   for (const reader of readers) {
@@ -72,12 +83,15 @@ async function proofFrom<T>(readers: readonly EvmReader[], component: string, re
       if (e instanceof Nb2Error && e.retryable) refresh ??= e;
       if (e instanceof RpcError && e.retryable) transient ??= e; // a rate limit says nothing about the evidence
       if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned' ||
-        e instanceof RpcError && (e.status === 413 || e.code === -32601 || /unknown block|not found|pruned/i.test(e.message))) pruned = true;
+        e instanceof RpcError && (e.status === 413 || e.code === -32601 || /unknown block|not found|pruned/i.test(e.message))) {
+        pruned = true;
+        missing ??= e instanceof ProofUnavailable ? e.missing : `${component} (${e instanceof Nb2Error ? e.detail ?? e.rule : e.message})`;
+      }
     }
   }
   if (refresh) throw refresh;
   if (transient && !pruned) throw transient;
-  throw new ProofUnavailable(component, pruned);
+  throw new ProofUnavailable(component, pruned, missing);
 }
 
 /** An `eth_sendRawTransaction` answered with HTTP 503 ("broadcast may be partial"): the transaction may still be included. */
@@ -305,15 +319,25 @@ export class EvmReader {
    */
   public async certificateOf(header: Header, hash: Uint8Array, bindTechnicalRecord = false,
     sources?: readonly EvmReader[], authenticate?: (uc: Uint8Array) => Promise<void>, mintWitness: boolean | Uint8Array = false): Promise<Uint8Array> {
+    // a gap the reader's own head has long passed is its answer that it does not hold the evidence; near the head it is a wait
+    const settledGap = async (reader: EvmReader, n: bigint, what: string) => {
+      const head = await reader.blockNumber();
+      if (head >= n + CERTIFICATION_DEPTH) fail('EvidencePruned', `${what} is not served, though this node's head is block ${head}`);
+    };
     const childOf = async (reader: EvmReader) => {
       const child = await reader.headerByNumber(header.number + 1n);
+      if (!child) await settledGap(reader, header.number + 1n, `block ${header.number + 1n} (the child that carries the certificate of block ${header.number})`);
       if (!child || child.header.number !== header.number + 1n || !eq(child.header.parentHash, hash)) {
         refuse('CompanionUnknown', `block ${header.number} has no canonical child on this reader`);
       }
       return child;
     };
     const companion = async (reader: EvmReader, child: { header: Header; hash: Uint8Array }) => {
-      const l = await reader.rpc.call<{ status: string; companion?: { rootInput?: unknown; witnesses?: string[] }; witnesses?: string[] }>('unicity_getSealCompanionV1', [hexOf(child.hash)]);
+      const l = await reader.rpc.call<{ status: string; companion?: { rootInput?: unknown; witnesses?: string[] }; witnesses?: string[] } | null>('unicity_getSealCompanionV1', [hexOf(child.hash)]);
+      if (!l || l.status === 'unknown') {
+        await settledGap(reader, child.header.number, `the seal companion of block ${child.header.number} (the certificate of block ${header.number})`);
+        refuse('CompanionUnknown', `the seal companion of block ${child.header.number} is not served yet`);
+      }
       const witnesses = l.companion?.witnesses ?? l.witnesses ?? [];
       if (mintWitness && l.status === 'found' && witnesses.length === 0) {
         refuse('CompanionUnknown', 'the canonical child has no committed witness available');

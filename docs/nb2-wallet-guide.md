@@ -192,14 +192,18 @@ same archive requirement as redeem. Fee history survives either route.
 | Certified local Run or Advance | Record the local checkpoint and keep fee history |
 | Certified exact failure | Record the failure and keep fee history. The wallet can retry |
 | Certified Paid | Verify the pinned vault event, redemption ID, recipient and amount. Close both routes |
-| Missing proof for mined Paid, or exact failure proof unavailable after bounded reads | Report **needs archive** with the exact transaction hash and retain signed bytes |
+| A node answers that it no longer holds part of the proof of a mined Paid or exact failure | Report **needs archive** with the exact transaction hash and the missing component, and retain signed bytes |
 
 Wallets can verify Paid from a portable receipt or by exact settlement hash. An indexed
 `Paid` log can supply a hash for discovery. Readers can supply individual proof components. The wallet checks the transaction receipt,
 block header, child header, seal companion and block receipts across readers. Exact failure
-also requires the certified transaction body and raw transactions. If a component is pruned,
-or three reads of the configured sources leave the proof unavailable, **needs archive** reports
-the transaction that needs a complete proof. A holder who learned of Paid before
+also requires the certified transaction body and raw transactions. A block's certificate is in
+the seal companion of its child, so a just-mined payout is **pending** until the child is out,
+however often it is read: no count of reads ever escalates it. **Needs archive** is reported
+only when, in the current read, a node answers that it no longer holds a component (a pruned
+answer, a companion below its horizon, a null header, receipts or body, or a missing child or
+companion although its head is `CERTIFICATION_DEPTH` (16) blocks past it). The report names
+the transaction and the missing component, and the next read recovers once a reader serves it. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 
@@ -207,8 +211,9 @@ Indexed logs and remembered hints identify transactions for proof retrieval. A m
 certified vault receipt establishes Paid on either route. The wallet tries every eligible
 child header with the companion sources. A verified exact failure clears any older Paid hint
 for that transaction and the wallet continues looking for a certified payout on the same
-redemption ID. An indexed peer payment without available proof stays pending during bounded
-reads and then reports **needs archive** with the peer transaction hash.
+redemption ID. An indexed peer payment without available proof stays pending until a reader
+serves its proof, or reports **needs archive** with the peer transaction hash when a node says
+the proof is gone.
 
 Use `redeem --recover` or `resume --recover` to select recovery once outstanding ordinary sends
 are resolved. Use `--ordinary` to select ordinary after any recovery send resolves. Both routes

@@ -8,7 +8,7 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  EvmReader, GapTree, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
+  CERTIFICATION_DEPTH, EvmReader, GapTree, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
   evidenceOf, firstOwnerOf, quoteRecoveryGapBatch, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
@@ -1559,7 +1559,7 @@ test('Paid proof matrix closes every wallet entry point with a lagging log index
   }
 });
 
-test('cold and ordinary sends report a bounded needs-archive state and recover with a complete reader', async (t) => {
+test('cold and ordinary sends stay pending on an incomplete failure proof, report needs-archive on a pruned answer, and recover with a complete reader', async (t) => {
   for (const route of ['cold', 'ordinary'] as const) {
     await t.test(route, async (t) => {
       const { w, chain, cfg, deployment, dir, open, rpc } = await setup(t, route === 'ordinary');
@@ -1595,26 +1595,30 @@ test('cold and ordinary sends report a bounded needs-archive state and recover w
         if (method === 'eth_sendRawTransaction') throw new Error('do not replace an unproved failure');
         return archive.call<T>(method, params);
       } };
-      for (let i = 0; i < 3; i++) {
+      // a corrupt raw transaction is no pruned answer: the failure stays pending (no blind resend), however often it is read
+      for (let i = 0; i < 4; i++) {
         const restart = await open('holder', incomplete);
         if (route === 'ordinary') {
-          if (i === 0) assert.equal((await restoreReturn(restart, activeBackup, caps)).sends.at(-1)!.failureProofReads, 2);
-          else if (i === 1) await assert.rejects(importReturn(restart, exported, caps), /needs archive/);
-          else await assert.rejects(restoreReturn(restart, activeBackup, caps), /needs archive/);
-          assert.equal((await restart.returnRecord('coin')).sends.at(-1)!.failureProofReads, i === 0 ? 2 : 3);
+          if (i === 1) await importReturn(restart, exported, caps);
+          else await restoreReturn(restart, activeBackup, caps);
+          assert.equal((await restart.returnRecord('coin')).sends.at(-1)!.failureProofReads, Math.min(i + 2, 3));
+          assert.equal((await run(restart)).state, 'pending');
         } else {
           const outcome = await run(restart);
-          assert.equal(outcome.state, i === 0 ? 'pending' : 'needs-archive');
+          assert.equal(outcome.state, 'pending');
         }
       }
       assert.ok(rawReads >= 3);
       const lagging: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getTransactionReceipt' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
-      assert.equal((await run(await open('holder', lagging))).state, 'needs-archive', 'a reader may lose even the failure metadata');
+      assert.equal((await run(await open('holder', lagging))).state, 'pending', 'a reader that lost the failure metadata proves nothing');
       const missing: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getRawTransactionByBlockHashAndIndex' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
       const pruned = await open('missing-raw', missing, { seed: key('holder') });
-      assert.equal((await run(pruned)).state, 'needs-archive');
+      const archived = await run(pruned);
+      assert.equal(archived.state, 'needs-archive');
+      assert.match(archived.state === 'needs-archive' ? archived.missing ?? '' : '', /raw transaction/);
+      if (route === 'ordinary') await assert.rejects(restoreReturn(pruned, activeBackup, caps), /needs archive.*raw transaction/);
       const restored = await open('holder', archive);
       if (route === 'ordinary') assert.ok((await restoreReturn(restored, activeBackup, caps)).sends.at(-1)!.failed);
       else assert.equal((await run(restored)).state, 'retry');
@@ -1673,12 +1677,12 @@ test('peer ordinary Paid crosses reader capabilities and preempts cold admission
     return rpc.call<T>(method, params);
   } };
   const holder = await open('holder', discoveryOnly);
-  for (const expected of ['pending', 'pending', 'needs-archive']) {
+  // a reader that indexes the peer's Paid but serves no receipt proves nothing: pending, never escalated by a count of reads
+  for (let i = 0; i < 4; i++) {
     const reopened = await open('holder', discoveryOnly);
     assert.deepEqual((await reconcileReturn(reopened, ordinary, caps, undefined, false)).result,
-      { state: expected, txHash: paid.txHash });
+      { state: 'pending', txHash: paid.txHash });
   }
-  await assert.rejects(restoreReturn(holder, backup), /needs archive/);
   const result = await resumePayout(holder, ordinary, archive, false, true);
   assert.equal(result.state, 'paid');
   assert.ok(proofs > 0, 'the reader with the proof need not index the event');
@@ -1706,7 +1710,7 @@ async function partialProofReader(t: TestContext, read: (method: string, params:
   return { policy: { ...caps, archives: [`http://127.0.0.1:${(server.address() as { port: number }).port}`] }, requests: () => requests };
 }
 
-test('each mined Paid proof component escalates when absent and works with split readers', async (t) => {
+test('a mined Paid proof component is needs-archive only on the node\'s own answer, and works with split readers', async (t) => {
   for (const route of ['ordinary', 'recovery'] as const) {
     await t.test(route, async (t) => {
       const { w, chain, dir, cfg, deployment, open, rpc } = await setup(t, route === 'ordinary');
@@ -1742,13 +1746,16 @@ test('each mined Paid proof component escalates when absent and works with split
       const receipt = (await w.bridge.evm.receipt(tx))!;
       const childNumber = `0x${(BigInt(receipt.blockNumber) + 1n).toString(16)}`;
       const child = await rpc.call<{ hash: string }>('eth_getBlockByNumber', [childNumber, false]);
+      // hard: a pruned answer (needs-archive at once); deep: a missing child or companion, pending until the head is
+      // CERTIFICATION_DEPTH past it; neither: a missing receipt proves nothing (pending)
       const kinds = [
-        { name: 'transaction receipt', method: 'eth_getTransactionReceipt', arg: hx(tx), hard: false },
-        { name: 'block header', method: 'eth_getBlockByHash', arg: receipt.blockHash, hard: true },
-        { name: 'child header', method: 'eth_getBlockByNumber', arg: childNumber, hard: false },
-        { name: 'seal companion', method: 'unicity_getSealCompanionV1', arg: child.hash, hard: false },
-        { name: 'block receipts', method: 'eth_getBlockReceipts', arg: receipt.blockHash, hard: true },
+        { name: 'transaction receipt', method: 'eth_getTransactionReceipt', arg: hx(tx), hard: false, deep: false },
+        { name: 'block header', method: 'eth_getBlockByHash', arg: receipt.blockHash, hard: true, deep: false },
+        { name: 'child header', method: 'eth_getBlockByNumber', arg: childNumber, hard: false, deep: true },
+        { name: 'seal companion', method: 'unicity_getSealCompanionV1', arg: child.hash, hard: false, deep: true },
+        { name: 'block receipts', method: 'eth_getBlockReceipts', arg: receipt.blockHash, hard: true, deep: false },
       ];
+      let settled = false;
       for (const kind of kinds) {
         await t.test(kind.name, async (t) => {
           const name = kind.method;
@@ -1764,13 +1771,19 @@ test('each mined Paid proof component escalates when absent and works with split
             return rpc.call<T>(method, params);
           } };
           const reopened = () => open(name, absent, { seed: key('holder') });
-          for (let i = 0; i < 3; i++) {
+          const strip = (r: unknown) => { const { missing: _m, ...rest } = r as { missing?: string }; return rest; };
+          for (let i = 0; i < 4; i++) {
             const rejoined = await reopened();
-            const expected = kind.hard || i === 2 ? 'needs-archive' : 'pending';
-            assert.deepEqual(await resumePayout(rejoined, rec, caps, route === 'ordinary'), { state: expected, txHash: tx });
-            assert.equal((await rejoined.returnRecord('coin')).paidProof?.reads, kind.hard ? 3 : i + 1);
+            const expected = kind.hard || kind.deep && settled ? 'needs-archive' : 'pending';
+            assert.deepEqual(strip(await resumePayout(rejoined, rec, caps, route === 'ordinary')), { state: expected, txHash: tx });
+            assert.equal((await rejoined.returnRecord('coin')).paidProof?.reads, Math.min(i + 1, 3));
           }
-          await assert.rejects(restoreReturn(await reopened(), backup), /needs archive/);
+          if (kind.deep && !settled) {
+            for (let i = 0n; i < CERTIFICATION_DEPTH; i++) await chain.mine([]);
+            settled = true;
+            assert.equal((await resumePayout(await reopened(), rec, caps, route === 'ordinary')).state, 'needs-archive');
+          }
+          if (kind.hard || kind.deep) await assert.rejects(restoreReturn(await reopened(), backup), /needs archive/);
           let componentReads = 0;
           const partial = await partialProofReader(t, async (method, params) => {
             if (!matches(method, params)) return null;
@@ -1821,7 +1834,9 @@ test('exact failed sends can combine a retained header with a body-only or raw-o
         return header as T;
       } };
       const holder = await open(method, primary, { seed: key('holder') });
-      assert.deepEqual((await reconcileReturn(holder, rec, caps)).result, { state: 'needs-archive', txHash: hash });
+      const archived = (await reconcileReturn(holder, rec, caps)).result;
+      assert.deepEqual({ state: archived.state, txHash: 'txHash' in archived ? archived.txHash : undefined }, { state: 'needs-archive', txHash: hash });
+      assert.ok(archived.state === 'needs-archive' && archived.missing, 'names the missing component');
       const partial = await partialProofReader(t, async (query, params) => {
         if (!matches(query, params)) return null;
         const value = await rpc.call(query, params);
@@ -2097,8 +2112,9 @@ test('ordinary and recovery resume prefer a certified pending candidate over a s
   } };
   for (const ordinary of [true, false]) {
     if (!ordinary) {
+      // a receipt whose block has no certifying child yet is a wait, however often it is read (the demo's needs-archive of 2026-11-26)
       await reconcileReturn(speculative, rec, caps, undefined, false);
-      assert.equal((await reconcileReturn(speculative, rec, caps, undefined, false)).result.state, 'needs-archive');
+      assert.equal((await reconcileReturn(speculative, rec, caps, undefined, false)).result.state, 'pending');
     }
     const name = ordinary ? 'ordinary-hint' : 'recovery-hint';
     cpSync(w.dir, join(dir, name), { recursive: true });
