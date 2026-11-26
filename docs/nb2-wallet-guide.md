@@ -207,7 +207,7 @@ the transaction and the missing component, and the next read recovers once a rea
 A claim seen before can also leave the chain: its block is replaced by a repeat certificate and
 the transaction is not mined again, or its receipt is served only in a block that is not
 canonical. Once every reader's own head is `CERTIFICATION_DEPTH` past the block it was seen in,
-the wallet's own send (its nonce unused) is offered again as the identical signed bytes, which
+the wallet's own send or continuation settle packet (its nonce unused) is offered again as the identical signed bytes, which
 cannot compete with anything; a failed receipt that left the chain clears its marker the same
 way. Another party's payment is reported as **vanished**: nothing is signed while it is held,
 and it is paid if that transaction lands again. A holder who learned of Paid before

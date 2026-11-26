@@ -169,6 +169,12 @@ export interface ReturnEvidence {
   pending?: { recovery?: Uint8Array };
   /** A certified vault receipt. Its transaction hash is a lookup hint. */
   paid?: ReturnRecord['paid'];
+  /**
+   * This wallet's own signed transactions outside `sends` (a continuation route's settle packet and its replaced or superseded copies), as
+   * raw bytes. A claim among them that left the chain is the wallet's own: its observation is dropped so the route offers the same bytes
+   * again, never reported as another party's `vanished` payment.
+   */
+  own?: readonly Uint8Array[];
   readOnly?: boolean;
 }
 
@@ -178,12 +184,12 @@ export interface ReturnEvidence {
  */
 export const FAILURE_PROOF_READS = 3;
 
-/** What a pruned answer says is missing. */
 /** Where a receipt of a claim was served: by which reader, in which block. */
 interface SeenReceipt { reader: EvmReader; number: bigint; hash: Uint8Array }
 
 const optional = (d: string | undefined): bigint | undefined => (d === undefined ? undefined : undec(d));
 
+/** What a pruned answer says is missing. */
 const missingOf = (e: unknown): string | undefined =>
   e instanceof ProofUnavailable ? e.missing : e instanceof Nb2Error ? e.detail ?? 'certified evidence' : undefined;
 
@@ -1505,6 +1511,7 @@ export class NativeBridgeV2 {
     let changed = false;
     // Indexed or remembered claims trigger proof reads. A certified failure retires only that exact claim.
     const heads = new Map<EvmReader, bigint>();
+    const own = new Map((evidence?.own ?? []).map((raw) => { const signed = decodeSignedTx(raw); return [hex(signed.hash), signed] as const; }));
     for (const [hash, hint] of hinted) {
       const { tx } = hint;
       const send = rec.sends.find((s) => hex(decodeSignedTx(unhex(s.raw)).hash) === hash);
@@ -1512,13 +1519,15 @@ export class NativeBridgeV2 {
       const failure = send?.failed ?? outcome?.failed;
       if (!failure) {
         for (const at of outcome?.at ?? []) if (hint.block === undefined || at.number > hint.block) hint.block = at.number;
-        if (!outcome || !await this.claimGone(outcome.at, hint.block ?? (send ? optional(rec.firstSendBlock) : undefined), archives, heads)) continue;
-        if (!send) {
+        const mine = send ? decodeSignedTx(unhex(send.raw)) : own.get(hash);
+        if (!outcome || !await this.claimGone(outcome.at, hint.block ?? (mine ? optional(rec.firstSendBlock) : undefined), archives, heads)) continue;
+        if (!mine) {
           hint.gone = true; // another party's payment: report it, sign nothing
           continue;
         }
-        // this wallet's own send is gone from the chain: forget the observation; reconcileSend offers the identical bytes again
-        const signed = decodeSignedTx(unhex(send.raw));
+        // this wallet's own send or packet is gone from the chain: forget the observation; reconcileSend (or the continuation route's
+        // pending packet) offers the identical bytes again
+        const signed = mine;
         if (await this.evm.nonce(signed.from, 'latest') > signed.request.nonce) continue; // its nonce is used: not gone, wait
         if (rec.paidProof?.txHash === hash) delete rec.paidProof;
         changed = true;
@@ -1699,11 +1708,9 @@ export class NativeBridgeV2 {
       if (h === undefined) heads.set(reader, h = await reader.blockNumber());
       return h;
     };
-    if (at.length === 0) {
-      if (ref === undefined) return false;
-      for (const reader of archives) if (await head(reader) < ref + CERTIFICATION_DEPTH) return false;
-      return true;
-    }
+    const seenAt = at.reduce<bigint | undefined>((m, r) => (m === undefined || r.number > m ? r.number : m), ref);
+    if (seenAt === undefined) return false;
+    for (const reader of archives) if (await head(reader) < seenAt + CERTIFICATION_DEPTH) return false;
     for (const { reader, number, hash } of at) {
       if (await head(reader) < number + CERTIFICATION_DEPTH) return false;
       const canonical = await reader.headerByNumber(number);
