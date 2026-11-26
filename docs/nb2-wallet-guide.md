@@ -203,7 +203,14 @@ however often it is read: no count of reads ever escalates it. **Needs archive**
 only when, in the current read, a node answers that it no longer holds a component (a pruned
 answer, a companion below its horizon, a null header, receipts or body, or a missing child or
 companion although its head is `CERTIFICATION_DEPTH` (16) blocks past it). The report names
-the transaction and the missing component, and the next read recovers once a reader serves it. A holder who learned of Paid before
+the transaction and the missing component, and the next read recovers once a reader serves it.
+A claim seen before can also leave the chain: its block is replaced by a repeat certificate and
+the transaction is not mined again, or its receipt is served only in a block that is not
+canonical. Once every reader's own head is `CERTIFICATION_DEPTH` past the block it was seen in,
+the wallet's own send or continuation settle packet (its nonce unused) is offered again as the identical signed bytes, which
+cannot compete with anything; a failed receipt that left the chain clears its marker the same
+way. Another party's payment is reported as **vanished**: nothing is signed while it is held,
+and it is paid if that transaction lands again. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 

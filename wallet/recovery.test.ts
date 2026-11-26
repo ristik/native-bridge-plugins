@@ -1570,10 +1570,12 @@ test('cold and ordinary sends stay pending on an incomplete failure proof, repor
         if (eq(to, destination)) throw new Nb2Error('PayoutFailed');
         return undefined;
       };
+      const sentRaws: string[] = [];
       const archive: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
         if (method === 'eth_estimateGas') return '0x1d4c0' as T;
         if (method === 'eth_sendRawTransaction') {
           const raw = unhex(params[0] as string);
+          sentRaws.push(params[0] as string);
           await chain.mine([raw]);
           return hx(decodeSignedTx(raw).hash) as T;
         }
@@ -1612,6 +1614,29 @@ test('cold and ordinary sends stay pending on an incomplete failure proof, repor
       const lagging: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getTransactionReceipt' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
       assert.equal((await run(await open('holder', lagging))).state, 'pending', 'a reader that lost the failure metadata proves nothing');
+      {
+        // the failed receipt's block is rolled back (review P2-1): 20 blocks on, the send is gone and its nonce unused, so the identical
+        // signed bytes are offered again; nothing new is signed
+        const failedRaw = sentRaws.at(-1)!;
+        const failed = decodeSignedTx(unhex(failedRaw));
+        cpSync(first.dir, join(dir, 'rolled-back'), { recursive: true });
+        const offered: string[] = [];
+        const rolled: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+          if (method === 'eth_getTransactionReceipt' && params[0] === hx(failed.hash)) return null as T;
+          if (method === 'eth_getTransactionCount' && params[1] === 'latest' && params[0] === hx(failed.from)) return `0x${failed.request.nonce.toString(16)}` as T;
+          if (method === 'eth_call' && (params[0] as { data?: string }).data === hx(failed.request.data)) return '0x' as T;
+          if (method === 'eth_sendRawTransaction') { offered.push(params[0] as string); return hx(HE(unhex(params[0] as string))) as T; }
+          return incomplete.call<T>(method, params);
+        } };
+        const early = await open('rolled-back', rolled, { seed: key('holder') });
+        assert.equal((await run(early)).state, 'pending');
+        assert.deepEqual(offered, [], 'near the head nothing is offered again');
+        for (let i = 0; i < 20; i++) await chain.mine([]);
+        const late = await open('rolled-back', rolled, { seed: key('holder') });
+        assert.equal((await run(late)).state, 'pending');
+        assert.ok(offered.length >= 1 && offered.every((raw) => raw === failedRaw), 'only the identical signed bytes');
+        if (route === 'ordinary') assert.equal((await late.returnRecord('coin')).sends.length, (await first.returnRecord('coin')).sends.length);
+      }
       const missing: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> =>
         method === 'eth_getRawTransactionByBlockHashAndIndex' ? Promise.resolve(null as T) : incomplete.call<T>(method, params) };
       const pruned = await open('missing-raw', missing, { seed: key('holder') });
@@ -1709,6 +1734,66 @@ async function partialProofReader(t: TestContext, read: (method: string, params:
   t.after(() => { server.closeAllConnections(); server.close(); });
   return { policy: { ...caps, archives: [`http://127.0.0.1:${(server.address() as { port: number }).port}`] }, requests: () => requests };
 }
+
+test('the wallet\'s own cold-route settle packet whose seen Paid block is replaced is offered again as the same bytes, never vanished', async (t) => {
+  const { w, chain, cfg, deployment, open, rpc } = await setup(t, false);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const complete = await session.run(0, 2, w.trust);
+  const verdict = await verifyReturn(chain.gamma, evidenceOf(unhex(rec.burned!)), w.trust, TEST_PARAMS);
+  chain.coldCall = async (vault, to) => {
+    if (eq(to, deployment.recovery)) return [{ address: to, topics: complete.event.topics, data: complete.event.data }];
+    if (!eq(to, cfg.vault)) return undefined;
+    vault.redeem(verdict.eta, 0n, new Uint8Array(), { ret: verdictAbi(verdict) });
+    return [];
+  };
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  let raw!: Uint8Array;
+  const interrupted: JsonRpc = { call: <T>(method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') {
+      raw = unhex(params[0] as string);
+      throw new Error('offline after signing payout');
+    }
+    return rpc.call<T>(method, params);
+  } };
+  await assert.rejects(resumePayout(await open('holder', interrupted), rec, caps, false), /offline after signing payout/);
+  const settle = decodeSignedTx(raw);
+  await chain.mineUncertified(); // nothing pooled: the packet was never broadcast
+  await chain.mine([raw]); // the settle packet pays, in a block not certified yet
+  const state = { rollback: false, offered: [] as string[] };
+  const rolled: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (!state.rollback) {
+      if (method === 'eth_sendRawTransaction') throw new Error('nothing is sent before the rollback');
+      return rpc.call<T>(method, params);
+    }
+    if (method === 'eth_getTransactionReceipt' && params[0] === hx(settle.hash)) return null as T;
+    if (method === 'eth_getLogs') return (await rpc.call<{ transactionHash: string }[]>(method, params)).filter((l) => l.transactionHash !== hx(settle.hash)) as T;
+    if (method === 'eth_getTransactionCount' && params[1] === 'latest' && params[0] === hx(settle.from)) return `0x${settle.request.nonce.toString(16)}` as T;
+    if (method === 'eth_call' && (params[0] as { data?: string }).data === hx(settle.request.data)) return '0x' as T;
+    if (method === 'eth_estimateGas') return '0x1d4c0' as T;
+    if (method === 'eth_sendRawTransaction') { state.offered.push(params[0] as string); return hx(settle.hash) as T; }
+    return rpc.call<T>(method, params);
+  } };
+  const holder = await open('holder', rolled);
+  assert.deepEqual(await resumePayout(holder, rec, caps, false), { state: 'pending', txHash: settle.hash });
+  const seen = await holder.returnRecord('coin');
+  assert.equal(seen.paidProof?.txHash, hx(settle.hash));
+  assert.ok(seen.paidProof?.block, 'the block the packet paid in is remembered');
+  state.rollback = true;
+  for (let i = 0; i < 5; i++) await chain.mine([]);
+  assert.equal((await resumePayout(await open('holder', rolled), rec, caps, false)).state, 'pending');
+  assert.deepEqual(state.offered, [], 'near the head nothing is offered again');
+  for (let i = 5; i < 20; i++) await chain.mine([]);
+  const late = await resumePayout(await open('holder', rolled), rec, caps, false);
+  assert.notEqual(late.state, 'vanished', 'the wallet\'s own packet is never another party\'s payment');
+  assert.equal(late.state, 'pending');
+  assert.ok(state.offered.length >= 1 && state.offered.every((sent) => sent === hx(raw)), 'only the identical settle bytes');
+  assert.equal((await holder.returnRecord('coin')).paidProof, undefined);
+  state.rollback = false; // it lands again (the original block is still the fake chain's)
+  assert.equal((await resumePayout(await open('holder', rolled), rec, caps, false)).state, 'paid');
+});
 
 test('a mined Paid proof component is needs-archive only on the node\'s own answer, and works with split readers', async (t) => {
   for (const route of ['ordinary', 'recovery'] as const) {

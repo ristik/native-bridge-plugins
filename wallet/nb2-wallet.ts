@@ -31,7 +31,7 @@ import {
   RegistryLagExpired, Wallet, burn, connectionOf, hx, mint, parseAmount, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, split, status, transfer, uct, unhex,
   type WalletConfig,
 } from './core.js';
-import { archiveRequired, publishReturnBackup, reconcileReturn, readPayerPolicy, restoreReturn, returnHeadroom, routeRequired, type PayerPolicy } from './recovery.js';
+import { archiveRequired, paymentVanished, publishReturnBackup, reconcileReturn, readPayerPolicy, restoreReturn, returnHeadroom, routeRequired, type PayerPolicy } from './recovery.js';
 import type { ReturnRecord } from '../packages/native-bridge-plugin/src/nb2/journal.js';
 
 const formatAmount = (wei: bigint | string): string => `${uct(wei)} UCT`;
@@ -93,6 +93,7 @@ async function continueReturn(w: Wallet, rec: ReturnRecord, policy: PayerPolicy,
       return;
     }
     if (result.state === 'needs-archive') archiveRequired(result.txHash, result.missing);
+    if (result.state === 'vanished') paymentVanished(result.txHash);
     if (result.state === 'route-blocked') routeRequired(result);
     if (result.state === 'not-paid') throw new Error('no certified payment is available');
     if (result.state === 'checkpoint') {
@@ -239,6 +240,7 @@ async function main(): Promise<void> {
         else {
           const { result } = await reconcileReturn(w, ret, undefined, undefined, false);
           if (result.state === 'needs-archive') archiveRequired(result.txHash, result.missing);
+          if (result.state === 'vanished') paymentVanished(result.txHash);
           if (result.state === 'route-blocked') routeRequired(result);
           if (result.state !== 'paid') throw new Error('redeem requires --return-policy FILE');
           say(`paid ${formatAmount(ret.amount)} to ${ret.recipient} in block ${result.blockNumber}, tx ${hx(result.txHash)}`);
@@ -250,6 +252,7 @@ async function main(): Promise<void> {
       const rec = await w.returnRecord(rest[0]);
       if (r.state === 'paid') say(`paid ${formatAmount(rec.amount)} to ${rec.recipient} in block ${r.blockNumber} (tx ${hx(r.txHash)}); ${rec.sends.length} redeem transaction${rec.sends.length === 1 ? '' : 's'} sent`);
       else if (r.state === 'needs-archive') archiveRequired(r.txHash, r.missing);
+      else if (r.state === 'vanished') paymentVanished(r.txHash);
       else if (r.state === 'route-blocked') routeRequired(r);
       else if (r.state === 'pending') say(`sent (tx ${hx(r.txHash)}), not certified yet: run redeem ${rest[0]} again to reconcile`);
       else throw new Error(`${rest[0]} is not paid${r.lastFailure ? `: ${r.lastFailure.action}, ${r.lastFailure.error?.rule ?? 'no revert data'}` : ''}. The burn is intact; see status`);
