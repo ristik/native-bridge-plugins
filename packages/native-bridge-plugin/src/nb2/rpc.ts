@@ -63,17 +63,20 @@ export class ProofUnavailable extends Error {
 async function proofFrom<T>(readers: readonly EvmReader[], component: string, read: (reader: EvmReader) => Promise<T>): Promise<T> {
   let pruned = false;
   let refresh: Nb2Error | undefined;
+  let transient: RpcError | undefined;
   for (const reader of readers) {
     try {
       return await read(reader);
     } catch (e) {
       if (e instanceof WalletError && e.reason === 'TrustInput') throw e;
       if (e instanceof Nb2Error && e.retryable) refresh ??= e;
+      if (e instanceof RpcError && e.retryable) transient ??= e; // a rate limit says nothing about the evidence
       if (e instanceof ProofUnavailable && e.pruned || e instanceof Nb2Error && e.rule === 'EvidencePruned' ||
         e instanceof RpcError && (e.status === 413 || e.code === -32601 || /unknown block|not found|pruned/i.test(e.message))) pruned = true;
     }
   }
   if (refresh) throw refresh;
+  if (transient && !pruned) throw transient;
   throw new ProofUnavailable(component, pruned);
 }
 
