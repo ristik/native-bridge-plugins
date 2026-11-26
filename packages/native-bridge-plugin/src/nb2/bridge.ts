@@ -156,7 +156,8 @@ export type ReconcileResult =
   /**
    * A payment by another party (an indexed or remembered claim, not one of this wallet's sends) was seen and is gone: no reader serves its
    * receipt, or only in a block that is not canonical, though every reader's head is CERTIFICATION_DEPTH past it. Not pruned and not
-   * pending: the claim is not on the chain. Nothing is signed while it is held; it is paid if the transaction lands again.
+   * pending: the claim is not on the chain. Nothing is signed while it is held; it is paid if the transaction lands again. Once every
+   * reader's head is VANISHED_CLAIM_HORIZON past the return's first unproven peer claim, it is dropped and the own payout proceeds.
    */
   | { state: 'vanished'; txHash: Uint8Array }
   | { state: 'route-blocked'; txHash: Uint8Array; route: 'ordinary' | 'recovery'; payer?: Uint8Array }
@@ -183,6 +184,13 @@ export interface ReturnEvidence {
  * it); reaching the cap never means needs-archive. A payout block not yet certified stays pending for as long as it takes.
  */
 export const FAILURE_PROOF_READS = 3;
+
+/**
+ * Blocks, on every reader's own head, after this return first saw an unproven claim of another party's payment, before such a claim no
+ * reader holds canonically is dropped and the wallet proceeds with its own payout (the vault's AlreadyPaid refuses a double payment).
+ * Between CERTIFICATION_DEPTH and this horizon the claim is reported as `vanished`.
+ */
+export const VANISHED_CLAIM_HORIZON = 64n;
 
 /** Where a receipt of a claim was served: by which reader, in which block. */
 interface SeenReceipt { reader: EvmReader; number: bigint; hash: Uint8Array }
@@ -1511,6 +1519,7 @@ export class NativeBridgeV2 {
     let changed = false;
     // Indexed or remembered claims trigger proof reads. A certified failure retires only that exact claim.
     const heads = new Map<EvmReader, bigint>();
+    let peerSeen = false;
     const own = new Map((evidence?.own ?? []).map((raw) => { const signed = decodeSignedTx(raw); return [hex(signed.hash), signed] as const; }));
     for (const [hash, hint] of hinted) {
       const { tx } = hint;
@@ -1520,6 +1529,18 @@ export class NativeBridgeV2 {
       if (!failure) {
         for (const at of outcome?.at ?? []) if (hint.block === undefined || at.number > hint.block) hint.block = at.number;
         const mine = send ? decodeSignedTx(unhex(send.raw)) : own.get(hash);
+        if (!mine && outcome) {
+          peerSeen = true;
+          // Another party's claim that no reader holds on its canonical chain VANISHED_CLAIM_HORIZON blocks after this return first saw
+          // such a claim is dropped: a provider that invents Paid can delay the redemption, never stop it. The vault's AlreadyPaid refuses
+          // a second payout of eta, so if the claim was real after all, this wallet's own payout is refused, never paid twice.
+          if (await this.peerClaimExpired(outcome.at, optional(rec.peerClaimSince), archives, heads)) {
+            if (rec.paidProof?.txHash === hash) delete rec.paidProof;
+            changed = true;
+            hinted.delete(hash);
+            continue;
+          }
+        }
         if (!outcome || !await this.claimGone(outcome.at, hint.block ?? (mine ? optional(rec.firstSendBlock) : undefined), archives, heads)) continue;
         if (!mine) {
           hint.gone = true; // another party's payment: report it, sign nothing
@@ -1545,6 +1566,12 @@ export class NativeBridgeV2 {
         changed = true;
       }
       hinted.delete(hash);
+    }
+    // The horizon runs from the first unproven peer claim this return saw (any hash: a provider rotating invented claims gains nothing)
+    // (kept once set: a later claim no reader holds canonically gets no fresh delay; a real one is canonical and is never dropped)
+    if (peerSeen && rec.peerClaimSince === undefined) {
+      rec.peerClaimSince = dec(await this.evm.blockNumber());
+      changed = true;
     }
     const live = [...hinted.values()].filter(({ gone }) => !gone);
     const next = live.find(({ pruned }) => pruned) ?? live[0] ?? [...hinted.values()][0];
@@ -1695,6 +1722,25 @@ export class NativeBridgeV2 {
       }
     }
     return { seen, attempted, pruned, missing, at, failed: undefined };
+  }
+
+  /**
+   * Whether another party's unproven claim has outlived the horizon: every reader's own head is VANISHED_CLAIM_HORIZON past `since` (when
+   * this return first saw an unproven peer claim) and no reader serves its receipt in a block that is canonical on that reader. Block
+   * numbers a provider attaches to the claim are not trusted here: an invented claim may name any block.
+   */
+  private async peerClaimExpired(at: readonly SeenReceipt[], since: bigint | undefined, archives: readonly EvmReader[], heads: Map<EvmReader, bigint>): Promise<boolean> {
+    if (since === undefined) return false;
+    for (const reader of archives) {
+      let h = heads.get(reader);
+      if (h === undefined) heads.set(reader, h = await reader.blockNumber());
+      if (h < since + VANISHED_CLAIM_HORIZON) return false;
+    }
+    for (const { reader, number, hash } of at) {
+      const canonical = await reader.headerByNumber(number);
+      if (canonical && eq(canonical.hash, hash)) return false;
+    }
+    return true;
   }
 
   /**

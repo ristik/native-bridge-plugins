@@ -172,6 +172,8 @@ export interface ReturnRecord extends Base {
   executionPayer?: Hex;
   /** A mined payment hint whose certified proof is still being fetched. */
   paidProof?: { txHash: Hex; reads: number; block?: Dec };
+  /** The head when this return first saw an unproven claim of another party's payment: the start of VANISHED_CLAIM_HORIZON. */
+  peerClaimSince?: Dec;
   /** The EVM account that pays the redeem's gas (its funds are checked before the burn). */
   payer?: Hex;
   /** The first block at which a redeem was broadcast: Paid(eta) cannot appear before it. */
