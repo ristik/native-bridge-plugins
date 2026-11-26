@@ -450,7 +450,7 @@ export class Wallet {
     if (saved) for (const entry of saved.entries) await this.trust.history.append(RootTrustBaseV2.decode(unhex(entry)));
     if (saved?.entries.length !== this.trust.history.entries.length) await this.persistAuthority(this.trust);
     this.source = opts.trustSource ?? new AggregatorClient(this.conn.aggregator);
-    const http = new HttpJsonRpc(this.conn.rpc, { retries: 20, timeoutMs: 120_000 });
+    const http = new HttpJsonRpc(this.conn.rpc, { timeoutMs: 120_000 });
     this.aggregator = opts.aggregator ?? new GatewayAggregator(this.conn.aggregator);
     this.bridge = await NativeBridgeV2.open({
       pins: this.pins, trust: this.trust, rpc: opts.rpc ?? (opts.wrapRpc ? opts.wrapRpc(http) : http), aggregator: this.aggregator,

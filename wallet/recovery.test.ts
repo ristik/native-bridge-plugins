@@ -2125,3 +2125,26 @@ test('ordinary redeem refuses a planned return with NotPending before looking fo
   assert.equal(pendingReads, 0);
   assert.equal((await holder.returnRecord('coin')).status, 'planned');
 });
+
+test('a 429 on the priority fee surfaces as a retryable RPC error, never as a preflight verdict', async (t) => {
+  const { open, rpc } = await setup(t, true);
+  const fail = { on: false };
+  const limited: JsonRpc = { call: async <T>(method: string, params: unknown[]): Promise<T> => {
+    if (fail.on && method === 'eth_maxPriorityFeePerGas') throw new RpcError(429, 0, 'rate limited');
+    return rpc.call<T>(method, params);
+  } };
+  const w = await open('holder', limited);
+  fail.on = true;
+  await assert.rejects(planReturn(w, 'coin', undefined, undefined, caps), (e: unknown) =>
+    e instanceof RpcError && e.status === 429 && e.retryable && !(e instanceof Nb2Error));
+  assert.equal(w.entry('coin').spent, undefined);
+  fail.on = false;
+  assert.equal((await planReturn(w, 'coin', undefined, undefined, caps)).record.recovery, undefined);
+});
+
+test('a missing payer policy is PolicyRequired, distinct from exceeded limits', async (t) => {
+  const { w } = await setup(t, true);
+  await assert.rejects(planReturn(w, 'coin', undefined, undefined, undefined), (e: unknown) =>
+    e instanceof WalletError && e.reason === 'PolicyRequired' && /payer limits are required/.test(e.message));
+  await assert.rejects(burn(w, 'coin', undefined, undefined, { ...caps, gas: 1n }), { rule: 'CapacityPreflight' });
+});

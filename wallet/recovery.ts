@@ -199,7 +199,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
   return {
     ordinaryEnvelope: policy && ordinaryEnvelope(w, policy),
     checkOrdinary: w.release.recovery === undefined && policy === undefined ? undefined : async (rec, gas) => {
-      if (!policy) throw new Nb2Error('CapacityPreflight', 'explicit payer limits are required');
+      if (!policy) throw new WalletError('PolicyRequired', 'explicit payer limits are required');
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, bytes(rec.payer ?? rec.recipient, 20));
       const fee = gas * limits.currentBid;
@@ -209,7 +209,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
       }
     },
     recover: w.release.recovery === undefined ? undefined : async (rec) => {
-      if (!policy) throw new Nb2Error('CapacityPreflight', 'explicit payer limits are required');
+      if (!policy) throw new WalletError('PolicyRequired', 'explicit payer limits are required');
       const release = recoveryRelease(w);
       await checkGraph(w, release);
       const payer = bytes(rec.payer ?? rec.recipient, 20);

@@ -96,6 +96,7 @@ export type WalletReason =
   | 'Reverted' // the transaction was mined and reverted (the classification says what to do)
   | 'InsufficientFunds' // the paying EVM account cannot fund the worst-case gas limit of the return
   | 'BadDeployment' // the vault's config(), chain ID or runtime code is not the pinned deployment
+  | 'PolicyRequired' // the wallet has no payer policy (explicit limits) but the route needs one: enter it; nothing was read or signed
   | 'BadInput'; // a caller argument outside the API's contract
 
 export class WalletError extends Error {
