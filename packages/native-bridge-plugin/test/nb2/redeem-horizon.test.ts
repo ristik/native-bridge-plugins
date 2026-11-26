@@ -137,3 +137,33 @@ test('a reader that keeps inventing a new peer Paid every read, alongside an hon
   assert.equal((await w.submitRedeem(returnId, payer, { archives: readers })).state, 'paid');
   assert.equal(chain.balanceOf(recipient), 4n);
 });
+
+test('a lying head of 0xffffffff with an invented peer Paid, then honest readers: the own payout after 64 honest blocks', async () => {
+  const { chain, cfg, options, store, payer, recipient, returnId } = await burned('high head');
+  const rec = await record(store);
+  const liar: JsonRpc = {
+    call: async <T>(method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_blockNumber') return '0xffffffff' as T;
+      if (method === 'eth_getLogs' && (params[0] as { topics: string[] }).topics[0] === h(TOPIC.Paid)) {
+        return [{
+          address: h(cfg.vault), topics: [h(TOPIC.Paid), rec.eta, `0x${'00'.repeat(12)}${toHex(recipient)}`],
+          data: `0x${BigInt(rec.amount).toString(16).padStart(64, '0')}`, blockNumber: `0x${(chain.blocks.length - 1).toString(16)}`,
+          blockHash: `0x${'cd'.repeat(32)}`, transactionHash: `0x${'ee'.repeat(32)}`, logIndex: '0x0',
+        }] as T;
+      }
+      return chain.call<T>(method, params);
+    },
+  };
+  const lied = await NativeBridgeV2.open({ ...options('high head', store), rpc: liar });
+  assert.notEqual((await lied.reconcile(returnId)).state, 'not-paid');
+  assert.equal((await record(store)).peerClaimSince, String(0xffffffff), 'the only reader claimed a far head');
+  const w = await NativeBridgeV2.open(options('high head', store));
+  const honestStart = BigInt(chain.blocks.length - 1);
+  assert.equal((await w.reconcile(returnId)).state, 'pending', 'honestly, the claim is fresh');
+  assert.equal(BigInt((await record(store)).peerClaimSince!), honestStart, 'an honest head lowers it, never raises it');
+  for (let i = 0n; i < VANISHED_CLAIM_HORIZON - 1n; i++) await chain.mine([]);
+  assert.equal((await w.reconcile(returnId)).state, 'vanished', 'one block short of the horizon');
+  await chain.mine([]);
+  assert.equal((await w.submitRedeem(returnId, payer)).state, 'paid');
+  assert.equal(chain.balanceOf(recipient), 4n);
+});

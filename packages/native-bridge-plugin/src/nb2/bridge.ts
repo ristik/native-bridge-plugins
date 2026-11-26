@@ -1516,10 +1516,27 @@ export class NativeBridgeV2 {
       if (pendingPaid) return pendingPaid;
     }
 
-    let changed = false;
     // Indexed or remembered claims trigger proof reads. A certified failure retires only that exact claim.
+    let changed = false;
     const heads = new Map<EvmReader, bigint>();
     let peerSeen = false;
+    // The lowest head any reader reports: peerClaimSince only ever moves down to it, so one spurious high head cannot push the horizon away
+    const lowestHead = async () => {
+      let low: bigint | undefined;
+      for (const reader of archives) {
+        let h = heads.get(reader);
+        if (h === undefined) heads.set(reader, h = await reader.blockNumber());
+        if (low === undefined || h < low) low = h;
+      }
+      return low!;
+    };
+    if (rec.peerClaimSince !== undefined && hinted.size) {
+      const low = await lowestHead();
+      if (low < undec(rec.peerClaimSince)) {
+        rec.peerClaimSince = dec(low);
+        changed = true;
+      }
+    }
     const own = new Map((evidence?.own ?? []).map((raw) => { const signed = decodeSignedTx(raw); return [hex(signed.hash), signed] as const; }));
     for (const [hash, hint] of hinted) {
       const { tx } = hint;
@@ -1568,9 +1585,10 @@ export class NativeBridgeV2 {
       hinted.delete(hash);
     }
     // The horizon runs from the first unproven peer claim this return saw (any hash: a provider rotating invented claims gains nothing)
-    // (kept once set: a later claim no reader holds canonically gets no fresh delay; a real one is canonical and is never dropped)
+    // (kept once set, never raised: a later claim no reader holds canonically gets no fresh delay; a real one is canonical and is never
+    // dropped; a lower head reported later lowers it, so a lying high head delays at most until an honest reader is consulted)
     if (peerSeen && rec.peerClaimSince === undefined) {
-      rec.peerClaimSince = dec(await this.evm.blockNumber());
+      rec.peerClaimSince = dec(await lowestHead());
       changed = true;
     }
     const live = [...hinted.values()].filter(({ gone }) => !gone);
