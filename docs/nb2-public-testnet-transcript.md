@@ -1,5 +1,7 @@
 # Wallet guide transcript: public testnet `tn-public-20261128`
 
+> The values below are from generation `tn-public-20261128` and change on regeneration.
+
 Run on 2026-11-26 (UTC) by following the guide ([`nb2-wallet-guide.md`](nb2-wallet-guide.md), "Try it: the reference wallet") literally:
 
 - A clean clone of `ristik/native-bridge-plugins` at PR #92 at `399ecb74ca2db63ce81e2509e1cef8456d1e70f5` (the final head differs only in this transcript and the report; it has the origin-derived aggregator

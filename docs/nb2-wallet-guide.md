@@ -242,7 +242,8 @@ the lane transcript below:
 
 ```sh
 RPC=https://pos.staging.unicity.network/rpc
-nb2-wallet init --release $REL/nb2-release.json --rpc $RPC
+nb2-wallet init --release $REL/nb2-release.json --rpc $RPC   # makes a new secret in the wallet directory
+# to use an existing funded key instead: export NB2_KEY=<64 hex digits> and add --key-env NB2_KEY (the transcript did this)
 nb2-wallet address                       # fund the printed EVM address with UCT, then run it again
 nb2-wallet deposit coin 0.1
 nb2-wallet mint coin                     # retries CompanionUnknown until the next certificate: minutes, not seconds
@@ -416,7 +417,7 @@ const bridge = await NativeBridgeV2.open({
   pins,                                  // the manifest's pins (nb2-release.json "pins"; wallet/core.ts pinsOf reads them)
   trust,                                 // the pinned UTB history
   rpc: new HttpJsonRpc(gatewayUrl),      // the deployment's public gateway: nothing bridge-specific
-  aggregator: new SdkAggregator(`${gatewayUrl}/aggregator`),
+  aggregator: new SdkAggregator(`${new URL(gatewayUrl).origin}/aggregator`), // a sibling of the gateway path, e.g. /rpc and /aggregator
   journal: store,                        // your key-value store; its putIf MUST be atomic and durable (nb2-journal.md)
   bridgeKey: deriveBridgeKey(seed),      // k_w, from the wallet seed
   backup: async (intents) => { /* store the intent high-water mark with the seed backup */ },
