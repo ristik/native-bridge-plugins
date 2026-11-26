@@ -4,7 +4,7 @@ import { existsSync, linkSync, lstatSync, readFileSync, unlinkSync } from 'node:
 import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
+  AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, VANISHED_CLAIM_HORIZON, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryCatchUpCalls, recoveryGeneration,
   recoveryRpcSource, replacementBid, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
@@ -436,7 +436,7 @@ export async function importReturn(w: Wallet, backup: Backup, policy?: PayerPoli
 
 /** Another party's payment was seen and is gone from the chain (not pruned): nothing is signed while it is held. */
 export function paymentVanished(hash: Uint8Array): never {
-  throw new WalletError('EvidenceMissing', `payment ${hx(hash)} by another party was seen and is no longer on the chain (no reader serves it on its canonical chain, ${CERTIFICATION_DEPTH} blocks on); nothing is signed while it is held: it is paid if that transaction lands again`);
+  throw new WalletError('EvidenceMissing', `payment ${hx(hash)} by another party was seen and is no longer on the chain (no reader serves it on its canonical chain, ${CERTIFICATION_DEPTH} blocks on); nothing is signed while it is held: it is paid if that transaction lands again, and ${VANISHED_CLAIM_HORIZON} blocks after it was first seen the own payout proceeds`);
 }
 
 export function archiveRequired(hash: Uint8Array, missing?: string): never {

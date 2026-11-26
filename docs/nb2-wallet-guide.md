@@ -210,7 +210,11 @@ canonical. Once every reader's own head is `CERTIFICATION_DEPTH` past the block 
 the wallet's own send or continuation settle packet (its nonce unused) is offered again as the identical signed bytes, which
 cannot compete with anything; a failed receipt that left the chain clears its marker the same
 way. Another party's payment is reported as **vanished**: nothing is signed while it is held,
-and it is paid if that transaction lands again. A holder who learned of Paid before
+and it is paid if that transaction lands again. Once every reader's own head is
+`VANISHED_CLAIM_HORIZON` (64) blocks past the first unproven peer claim this return saw, a peer
+claim that no reader holds canonically is dropped and the wallet proceeds with its own payout.
+A provider that invents a Paid can delay a redemption, never stop it, and the vault's
+`AlreadyPaid` refuses a second payout if the claim was real after all. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 
