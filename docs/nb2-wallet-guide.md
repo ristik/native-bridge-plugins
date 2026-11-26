@@ -216,7 +216,7 @@ settle the same redemption ID.
 
 ### Walkthrough on the public testnet
 
-This is the guide's flow run against `tn-public-20261128` from a clean checkout at the manifest's commit, with a fresh wallet and public
+This is the guide's flow run against `tn-public-20261128` from a clean checkout of this change, with a fresh wallet and public
 URLs only (2026-11-26). The full transcript, with the transaction hashes, is
 [`nb2-public-testnet-transcript.md`](nb2-public-testnet-transcript.md). The deployment is a production-build vault, so one thing differs from
 the lane transcript below:
