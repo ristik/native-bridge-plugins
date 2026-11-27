@@ -18,6 +18,6 @@
   },
   "normativeArtifactSha256": {
     "protocol/interop.md": "60b3abaef0679548bef1368fe30463e921aa9c0e86dc5be294f208caa4ea2a66",
-    "protocol/abi-erc20.json": "e8b608bb2844833d7f023643b8a70324d17ca5315ceaf7c2bf9c31789d7cb2ca"
+    "protocol/abi-erc20.json": "b016d9205fe0c28277ca0fbf2d47a443f40840e28a3c5e6c7a128e9afea2b0c3"
   }
 }

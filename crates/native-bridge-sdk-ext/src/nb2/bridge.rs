@@ -121,7 +121,7 @@ pub struct Erc20ReturnRecovery {
 const IMPORTED_TIP_PROFILE_HASH: &str =
     "0x63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e";
 const ERC20_PROFILE_HASH: &str =
-    "0x99773bbdfde2fa77cf43e029b61086a7eb121adfe57097872fc6ea9f0497e4d9";
+    "0xf05dd5c3563165d73c1cf91a5af79ec7afcaa77edc90061c6e7666bf53a8b0b6";
 pub const TESTNET_TRUST_FRESHNESS_MS: u64 = 15 * 60 * 1000;
 pub const PRODUCTION_TRUST_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -261,10 +261,13 @@ pub struct ReturnPlan {
     /// The endpoint estimate and the history already owed from a.
     pub c_obs: u64,
     pub p_now: u64,
-    /// The proofs that fit beside the evidence (bytes) and the remaining margin: pMax - (pNow + returnReserveSegments).
+    /// Ordinary proof capacity and margin. Both are zero on a continuation-only plan.
     pub p_max: u64,
     pub margin_segments: i128,
+    /// The ordinary gas quote, or zero when continuation is the only admitted route.
     pub gas_limit: u64,
+    /// The bounded continuation is the available route at the observed state.
+    pub continuation_only: bool,
     pub warnings: Vec<String>,
     pub record: ReturnRecord,
 }
@@ -1766,10 +1769,9 @@ impl NativeBridgeV2 {
     }
 
     /// Plan the return of a whole held part to `recipient` on the EVM: verify its full provenance, pick the index from a verified
-    /// seal receipt, and run the capacity preflight (section 12.5): the complete prospective return with the history already
-    /// owed from `a` plus `returnReserveSegments` must fit the encoded-transaction limit and `userGasLimit`, and `payer` must fund
-    /// that gas limit. Journals the plan; nothing irreversible happens here. `state_read` is the stateReadOnly substitute
-    /// (Some(verified index)).
+    /// seal receipt, and price the history owed from `a` plus the reserve under the transaction and payer limits.
+    /// ERC20 requires a bounded continuation quote and can use it when ordinary capacity or funding is insufficient.
+    /// Journals the plan. `state_read` is the stateReadOnly substitute (Some(verified index)).
     pub fn plan_return(
         &self,
         token: &[u8],
@@ -1818,12 +1820,6 @@ impl NativeBridgeV2 {
                     }
                 }
             }
-            let (c_obs, pf) = self.preflight(token, &held.amount, &recipient, a, payer)?;
-            if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
-                if existing.status != "planned" {
-                    return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
-                }
-            }
             let record = ReturnRecord {
                 base: self.journal.base("return"),
                 return_id: hex(&return_id),
@@ -1845,7 +1841,12 @@ impl NativeBridgeV2 {
                 paid: None,
                 extra: Default::default(),
             };
-            self.quote_erc20_continuation(&record, token, a, c_obs, payer)?;
+            let (c_obs, ordinary) = self.admit_return(&record, token, &held.amount, &recipient, a, payer)?;
+            if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
+                if existing.status != "planned" {
+                    return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
+                }
+            }
             self.journal.put_return(&record)?;
             Ok(ReturnPlan {
                 return_id,
@@ -1853,10 +1854,11 @@ impl NativeBridgeV2 {
                 recipient,
                 a,
                 c_obs,
-                p_now: pf.p_now,
-                p_max: pf.p_max,
-                margin_segments: pf.p_max as i128 - pf.need as i128,
-                gas_limit: pf.gas,
+                p_now: c_obs - a,
+                p_max: ordinary.map_or(0, |pf| pf.p_max),
+                margin_segments: ordinary.map_or(0, |pf| pf.p_max as i128 - pf.need as i128),
+                gas_limit: ordinary.map_or(0, |pf| pf.gas),
+                continuation_only: ordinary.is_none(),
                 warnings,
                 record,
             })
@@ -1951,7 +1953,6 @@ impl NativeBridgeV2 {
         a: u64,
         payer: &[u8],
     ) -> Result<(u64, PreflightResult)> {
-        self.require_erc20_qualification()?;
         if !self.gas_applies()? {
             return fail_d(
                 Rule::CapacityPreflight,
@@ -2005,6 +2006,33 @@ impl NativeBridgeV2 {
             );
         }
         Ok((c_obs, pf))
+    }
+
+    fn admit_return(
+        &self,
+        record: &ReturnRecord,
+        source: &[u8],
+        amount: &BigUint,
+        recipient: &[u8; 20],
+        a: u64,
+        payer: &[u8],
+    ) -> Result<(u64, Option<PreflightResult>)> {
+        self.require_erc20_qualification()?;
+        let (observed, ordinary) = match self.preflight(source, amount, recipient, a, payer) {
+            Ok((observed, preflight)) => (observed, Some(preflight)),
+            Err(error)
+                if self.cfg.erc20.is_some()
+                    && (error
+                        .rule()
+                        .is_some_and(|e| e.rule == Rule::CapacityPreflight)
+                        || error.reason() == Some(WalletReason::InsufficientFunds)) =>
+            {
+                (self.evm.vault_state(&self.cfg.vault)?.segment.max(a), None)
+            }
+            Err(error) => return Err(error),
+        };
+        self.quote_erc20_continuation(record, source, a, observed, payer)?;
+        Ok((observed, ordinary))
     }
 
     fn return_record(&self, id: &[u8; 32]) -> Result<ReturnRecord> {
@@ -2158,8 +2186,7 @@ impl NativeBridgeV2 {
                 Some(p) => unhex(p)?,
             };
             let source = unhex(&rec.source)?;
-            let (observed, _) = self.preflight(&source, &amount, &recipient, a, &payer)?;
-            self.quote_erc20_continuation(&rec, &source, a, observed, &payer)?;
+            self.admit_return(&rec, &source, &amount, &recipient, a, &payer)?;
             self.preview_erc20_recipient(&recipient, &amount)?;
             let r = encode_return_data(&ReturnData {
                 d: self.domain,

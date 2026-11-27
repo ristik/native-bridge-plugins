@@ -186,7 +186,7 @@ export interface BridgeOptions {
 /** SHA-256 of the revision-2 NB2 semantic descriptor shipped by bft-core#1299. */
 export const IMPORTED_TIP_PROFILE_HASH = '63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e';
 
-export const ERC20_PROFILE_HASH = '99773bbdfde2fa77cf43e029b61086a7eb121adfe57097872fc6ea9f0497e4d9';
+export const ERC20_PROFILE_HASH = 'f05dd5c3563165d73c1cf91a5af79ec7afcaa77edc90061c6e7666bf53a8b0b6';
 
 export const TESTNET_TRUST_FRESHNESS_MS = 15 * 60_000;
 export const PRODUCTION_TRUST_FRESHNESS_MS = 7 * 24 * 60 * 60_000;

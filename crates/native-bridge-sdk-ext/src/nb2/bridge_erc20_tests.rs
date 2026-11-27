@@ -3,10 +3,12 @@ use crate::nb2::{
     recovery::{RecoveryAuthority, RecoverySession},
     recovery_cost::{RecoveryCalibrationRange, RecoveryEntry, RecoveryShape},
     rpc::RpcError,
-    util::{from_hex, hex0x},
+    token::token_id_of,
+    tokenops::local_owner,
+    util::{from_hex, hex0x, to_hex},
 };
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../protocol/vectors/");
 
@@ -14,6 +16,7 @@ struct Chain {
     recovery: [u8; 20],
     blocked: AtomicBool,
     probes: AtomicUsize,
+    balance: AtomicU64,
 }
 
 impl JsonRpc for Chain {
@@ -25,7 +28,7 @@ impl JsonRpc for Chain {
                 "0x"
             }),
             "eth_getBlockByNumber" => json!({"baseFeePerGas": "0x3"}),
-            "eth_getBalance" => json!("0x100000000000"),
+            "eth_getBalance" => json!(format!("0x{:x}", self.balance.load(Ordering::SeqCst))),
             "eth_getTransactionCount" => json!("0x1"),
             "eth_maxPriorityFeePerGas" => json!("0x1"),
             "eth_call" if params[0]["data"] == hex0x(&sel("state()")) => json!(hex0x(&[0; 192])),
@@ -68,13 +71,13 @@ impl Aggregator for NeverSign {
     }
 }
 
-struct OrdinaryGas;
+struct OrdinaryGas(u64);
 impl GasModel for OrdinaryGas {
     fn name(&self) -> &str {
         "ordinary fixture"
     }
     fn redeem_gas_limit(&self, _: &RedeemShape<'_>) -> Option<u64> {
-        Some(1_000_000)
+        Some(self.0)
     }
     fn deposit_gas_limit(&self) -> u64 {
         400_000
@@ -172,8 +175,12 @@ fn continuation(cfg: &Config, recovery: [u8; 20], fee_budget: u64) -> Erc20Retur
     }
 }
 
-#[test]
-fn return_requires_affordable_continuation_and_reprobes_before_signing() {
+fn return_bridge(
+    ordinary_gas: u64,
+    balance: u64,
+    fee_budget: u64,
+    aggregator: Arc<dyn Aggregator + Send + Sync>,
+) -> (NativeBridgeV2, Arc<Chain>, Vec<u8>) {
     let (doc, gamma, trust) = vector();
     let cfg = decode_config(&gamma, &build_params(Build::Production)).unwrap();
     let recovery = arr(&bytes(&doc["Assets"][0]["Recovery"]));
@@ -181,6 +188,7 @@ fn return_requires_affordable_continuation_and_reprobes_before_signing() {
         recovery,
         blocked: AtomicBool::new(false),
         probes: AtomicUsize::new(0),
+        balance: AtomicU64::new(balance),
     });
     let pins = DeploymentPins {
         gamma,
@@ -207,16 +215,23 @@ fn return_requires_affordable_continuation_and_reprobes_before_signing() {
         pins,
         trust,
         rpc.clone(),
-        Arc::new(NeverSign),
+        aggregator,
         Arc::new(MemoryJournalStore::default()),
         &[1; 32],
     );
     options.require_backup = Some(false);
-    options.gas = Some(Box::new(OrdinaryGas));
+    options.gas = Some(Box::new(OrdinaryGas(ordinary_gas)));
     options.unsafe_test_trust = true;
-    options.erc20_return_recovery = Some(continuation(&cfg, recovery, 8_000_000));
-    let mut bridge = NativeBridgeV2::construct(options).unwrap();
+    options.erc20_return_recovery = Some(continuation(&cfg, recovery, fee_budget));
+    let bridge = NativeBridgeV2::construct(options).unwrap();
     let held = bytes(&doc["Assets"][0]["Held"]);
+    (bridge, rpc, held)
+}
+
+#[test]
+fn return_requires_affordable_continuation_and_reprobes_before_signing() {
+    let (mut bridge, rpc, held) =
+        return_bridge(1_000_000, 1_000_000_000_000, 8_000_000, Arc::new(NeverSign));
     let recipient = [0xab; 20];
     let payer = [0xcd; 20];
     assert!(bridge
@@ -232,10 +247,16 @@ fn return_requires_affordable_continuation_and_reprobes_before_signing() {
         "{err}"
     );
 
-    bridge.erc20_return_recovery = Some(continuation(&cfg, recovery, 1_000_000_000_000));
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = 1_000_000_000_000u64.into();
     let plan = bridge
         .plan_return(&held, &recipient, &payer, Some(0))
         .unwrap();
+    assert!(!plan.continuation_only);
     rpc.blocked.store(true, Ordering::SeqCst);
     let err = bridge.burn(&plan.return_id, &NeverSign).err().unwrap();
     assert_eq!(err.reason(), Some(WalletReason::RecipientRefused));
@@ -243,6 +264,109 @@ fn return_requires_affordable_continuation_and_reprobes_before_signing() {
     assert_eq!(
         bridge.return_record(&plan.return_id).unwrap().status,
         "planned"
+    );
+}
+
+const CERTIFICATION_PAUSED: &str = "fixture paused certification";
+
+struct PauseCertification;
+impl Aggregator for PauseCertification {
+    fn certify(&self, _: &[u8]) -> Result<Vec<u8>> {
+        Err(Error::Other(CERTIFICATION_PAUSED.into()))
+    }
+}
+
+#[test]
+fn continuation_only_admits_planning_and_signing_after_capacity_or_funds_refusal() {
+    let recipient = [0xab; 20];
+    let payer = [0xcd; 20];
+    for (gas, balance, ordinary_refusal) in [
+        (24_000_001, 1_000_000_000_000, "CapacityPreflight"),
+        (24_000_000, 150_000_000, "InsufficientFunds"),
+    ] {
+        let (bridge, rpc, held) = return_bridge(
+            gas,
+            balance,
+            1_000_000_000_000,
+            Arc::new(PauseCertification),
+        );
+        let error = bridge
+            .preflight(&held, &40u8.into(), &recipient, 0, &payer)
+            .unwrap_err();
+        assert_eq!(error.name(), ordinary_refusal);
+        let plan = bridge
+            .plan_return(&held, &recipient, &payer, Some(0))
+            .unwrap();
+        assert!(plan.continuation_only);
+        assert_eq!(plan.gas_limit, 0);
+
+        rpc.balance.store(1, Ordering::SeqCst);
+        let error = bridge.burn(&plan.return_id, &NeverSign).unwrap_err();
+        assert_eq!(error.rule().unwrap().rule, Rule::CapacityPreflight);
+        assert!(
+            error
+                .to_string()
+                .contains("insufficient recovery fee budget"),
+            "{error}"
+        );
+        assert_eq!(
+            bridge.return_record(&plan.return_id).unwrap().status,
+            "planned"
+        );
+
+        rpc.balance.store(balance, Ordering::SeqCst);
+        rpc.blocked.store(true, Ordering::SeqCst);
+        let error = bridge.burn(&plan.return_id, &NeverSign).unwrap_err();
+        assert_eq!(error.reason(), Some(WalletReason::RecipientRefused));
+
+        rpc.blocked.store(false, Ordering::SeqCst);
+        let token = decode_token(&held).unwrap();
+        let parent = &token.ancestors[0].mint;
+        let parent_id = token_id_of(&parent.salt, parent.network);
+        // Same fixture key derivation as Go's flatFixtureSplit.
+        let seed = format!("nb2-key:flat-child-0-{}", to_hex(&parent_id[..4]));
+        let owner = local_owner(&hu(&[seed.as_bytes(), &[0]]));
+        let error = bridge.burn(&plan.return_id, &owner).unwrap_err();
+        assert!(matches!(error, Error::Other(detail) if detail == CERTIFICATION_PAUSED));
+        let record = bridge.return_record(&plan.return_id).unwrap();
+        assert_eq!(record.status, "burn-requested");
+        assert!(record.burn_request.is_some());
+        assert_eq!(rpc.probes.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[test]
+fn continuation_only_refuses_an_unaffordable_or_unqualified_plan() {
+    let (mut bridge, _, held) =
+        return_bridge(24_000_001, 1_000_000_000_000, 1, Arc::new(NeverSign));
+    let recipient = [0xab; 20];
+    let payer = [0xcd; 20];
+    let error = bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap_err();
+    assert_eq!(error.rule().unwrap().rule, Rule::CapacityPreflight);
+    assert!(
+        error
+            .to_string()
+            .contains("insufficient recovery fee budget"),
+        "{error}"
+    );
+    assert!(bridge
+        .journal
+        .ret_for_update(&hex(&hu(&[&held])))
+        .unwrap()
+        .is_none());
+
+    bridge.unsafe_test_trust = false;
+    bridge.pins.erc20.as_mut().unwrap().funding_qualified = false;
+    let error = bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("awaiting real-value qualification"),
+        "{error}"
     );
 }
 

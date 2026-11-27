@@ -50,6 +50,8 @@ def check_erc20_profile():
     abi = load('protocol/abi-erc20.json')
     assert abi['nativeBridgeProtocolVersion'] == 11
     assert abi['vault']['depositEvent']['indexed'] == ['nonce', 'token']
+    assert 'previewPayout(address,uint256)' in abi['vault']['functions']
+    assert abi['vault']['payoutPreview'] == {'gasLimit': 350_000, 'successRevert': 'PayoutPreviewPassed()'}
     digest = hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
     for impl in ('packages/native-bridge-plugin/src/nb2/bridge.ts', 'crates/native-bridge-sdk-ext/src/nb2/bridge.rs'):
         assert digest in (ROOT / impl).read_text(), f'ERC20 semantic profile digest mismatch: {impl}'

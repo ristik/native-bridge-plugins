@@ -19,6 +19,7 @@
   "vault": {
     "functions": [
       "depositERC20(uint256 requested,uint256 minCredit,bytes firstOwner,bytes32 rho)",
+      "previewPayout(address,uint256)",
       "redeem(bytes,bytes32,uint64,bytes)",
       "redeemRecovered(bytes)",
       "domain() returns (bytes32)",
@@ -32,7 +33,11 @@
       "indexed": ["nonce", "token"],
       "data": ["domain", "credit", "rho", "firstOwner"]
     },
-    "tokenErrors": ["BadCredit()", "ExcessDebit()", "InsufficientBacking()", "TokenCallFailed()"]
+    "tokenErrors": ["BadCredit()", "ExcessDebit()", "InsufficientBacking()", "TokenCallFailed()"],
+    "payoutPreview": {
+      "gasLimit": 350000,
+      "successRevert": "PayoutPreviewPassed()"
+    }
   },
   "settlementAndRecoveryAbi": "protocol 10 NB2 v1.1"
 }
