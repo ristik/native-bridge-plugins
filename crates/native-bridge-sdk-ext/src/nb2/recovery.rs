@@ -379,6 +379,14 @@ pub struct RecoveryDeployment {
     pub vault_runtime_hash: Option<Hash>,
 }
 
+impl RecoveryDeployment {
+    pub(crate) fn matches_config(&self, cfg: &Config) -> bool {
+        cfg.erc20
+            .as_ref()
+            .map_or(true, |e| self.salt == e.generation && self.pins == e.pins)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     Progress,
@@ -504,6 +512,12 @@ impl RecoverySession {
         deployment: RecoveryDeployment,
     ) -> Result<Self> {
         let cfg = decode_config(gamma, params)?;
+        if !deployment.matches_config(&cfg) {
+            return fail_d(
+                Rule::ConfigShape,
+                "recovery deployment differs from ERC20 config",
+            );
+        }
         let domain = domain_of(gamma);
         let token = decode_token(evidence)?;
         let verdict = verify_part(&cfg, &domain, &authority.checkpoint()?, &token)?;

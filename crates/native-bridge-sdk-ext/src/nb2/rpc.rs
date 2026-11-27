@@ -658,7 +658,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         topic0: &[u8],
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, emitter, topic0, None, false)
+        self.receipt_proof_mode(tx_hash, emitter, topic0, None, ReceiptWitness::Default)
     }
 
     pub fn check_mint_receipt(&self, proof: &DepositProof) -> Result<()> {
@@ -678,16 +678,30 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         vault: &[u8],
         bound: bool,
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, vault, &topic::deposited(), None, bound)
+        self.receipt_proof_mode(
+            tx_hash,
+            vault,
+            &topic::deposited(),
+            None,
+            ReceiptWitness::mint(bound),
+        )
     }
 
-    pub(crate) fn bound_receipt_proof(
+    pub(crate) fn matching_mint_receipt_proof(
         &self,
         tx: &[u8],
         emitter: &[u8],
-        topic: &[u8],
+        topics: &[[u8; 32]],
+        data: Option<&[u8]>,
+        bound: bool,
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx, emitter, topic, None, true)
+        self.receipt_proof_mode(
+            tx,
+            emitter,
+            &topics[0],
+            Some(ReceiptLogMatch { topics, data }),
+            ReceiptWitness::mint(bound),
+        )
     }
 
     /// Rebuild a recovery proof with the child companion's committed technical record.
@@ -697,7 +711,16 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         emitter: &[u8],
         event: &super::recovery::RecoveryEvent,
     ) -> Result<ReceiptProof> {
-        self.receipt_proof_mode(tx_hash, emitter, &event.topics[0], Some(event), false)
+        self.receipt_proof_mode(
+            tx_hash,
+            emitter,
+            &event.topics[0],
+            Some(ReceiptLogMatch {
+                topics: &event.topics,
+                data: Some(&event.data),
+            }),
+            ReceiptWitness::Recovery,
+        )
     }
 
     fn receipt_proof_mode(
@@ -705,8 +728,8 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         tx_hash: &[u8],
         emitter: &[u8],
         topic0: &[u8],
-        event: Option<&super::recovery::RecoveryEvent>,
-        bind_mint_witness: bool,
+        expected: Option<ReceiptLogMatch<'_>>,
+        witness: ReceiptWitness,
     ) -> Result<ReceiptProof> {
         let Some(r) = self.receipt(tx_hash)? else {
             return refuse(
@@ -726,7 +749,7 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
                 ),
             );
         }
-        let idx = receipt_log_index(&r.logs, emitter, topic0, event)?;
+        let idx = receipt_log_index(&r.logs, emitter, topic0, expected)?;
         let Some(idx) = idx else {
             return refuse(
                 WalletReason::EvidenceMissing,
@@ -742,8 +765,8 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         let uc = self.certificate_of_mode(
             &header,
             &block_hash,
-            event.is_some(),
-            bind_mint_witness.then_some(MintWitness::Fetch),
+            matches!(witness, ReceiptWitness::Recovery),
+            matches!(witness, ReceiptWitness::Mint).then_some(MintWitness::Fetch),
         )?;
         let tx_index = qty64(&json!(r.transaction_index), "transactionIndex")?;
         let nodes = self.receipt_path(&header, &block_hash, tx_index)?;
@@ -932,6 +955,21 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
             &call(&*self.rpc, "eth_call", json!([tx, "latest"]))?,
             "eth_call",
         )
+    }
+
+    pub(crate) fn call_reverts_with(
+        &self,
+        to: &[u8],
+        data: &[u8],
+        gas: u64,
+        marker: &[u8],
+    ) -> bool {
+        let tx = json!({"to": hex0x(to), "data": hex0x(data), "gas": qty(gas)});
+        self.rpc
+            .call("eth_call", json!([tx, "latest"]))
+            .is_err_and(|error| {
+                error.code != 0 && revert_data_of(&error).as_deref() == Some(marker)
+            })
     }
 
     /// Simulate the exact return against the finalized state that supplied the registry tip.
@@ -1132,11 +1170,32 @@ pub fn revert_data_of(e: &RpcError) -> Option<Vec<u8>> {
     None
 }
 
+enum ReceiptWitness {
+    Default,
+    Mint,
+    Recovery,
+}
+
+impl ReceiptWitness {
+    fn mint(bound: bool) -> Self {
+        if bound {
+            Self::Mint
+        } else {
+            Self::Default
+        }
+    }
+}
+
+struct ReceiptLogMatch<'a> {
+    topics: &'a [[u8; 32]],
+    data: Option<&'a [u8]>,
+}
+
 fn receipt_log_index(
     logs: &[ReceiptLogJson],
     emitter: &[u8],
     topic0: &[u8],
-    event: Option<&super::recovery::RecoveryEvent>,
+    expected: Option<ReceiptLogMatch<'_>>,
 ) -> Result<Option<usize>> {
     for (i, log) in logs.iter().enumerate() {
         if bytes_of(&json!(log.address), "address")? != emitter
@@ -1145,12 +1204,26 @@ fn receipt_log_index(
         {
             continue;
         }
-        if let Some(event) = event {
-            if log.topics.len() != event.topics.len()
-                || bytes_of(&json!(log.topics[1]), "topic")? != event.topics[1]
-                || bytes_of(&json!(log.data), "log data")? != event.data
+        if let Some(expected) = &expected {
+            if log.topics.len() != expected.topics.len() {
+                continue;
+            }
+            let topics = log
+                .topics
+                .iter()
+                .map(|topic| fixed_of(&json!(topic), 32, "topic"))
+                .collect::<Result<Vec<_>>>()?;
+            if !topics
+                .iter()
+                .map(Vec::as_slice)
+                .eq(expected.topics.iter().map(|t| t.as_slice()))
             {
                 continue;
+            }
+            if let Some(data) = expected.data {
+                if bytes_of(&json!(log.data), "log data")? != data {
+                    continue;
+                }
             }
         }
         return Ok(Some(i));
@@ -1240,12 +1313,117 @@ mod recovery_receipt_tests {
         };
         let logs = [log(5, 23), log(4, 24)];
         assert_eq!(
-            receipt_log_index(&logs, &emitter, &event.topics[0], Some(&event)).unwrap(),
+            receipt_log_index(
+                &logs,
+                &emitter,
+                &event.topics[0],
+                Some(ReceiptLogMatch {
+                    topics: &event.topics,
+                    data: Some(&event.data)
+                })
+            )
+            .unwrap(),
             Some(1)
         );
         assert_eq!(
             receipt_log_index(&logs, &emitter, &event.topics[0], None).unwrap(),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn erc20_selects_the_second_activation_and_deposit_in_a_batch() {
+        use crate::nb2::{abi::address_word, util::u256_64};
+
+        let factory = [1; 20];
+        let token_a = address_word(&[2; 20]);
+        let token_b = address_word(&[3; 20]);
+        let vault_a = [4; 20];
+        let vault_b = [5; 20];
+        let activation = topic::erc20_activated();
+        let deposit = topic::erc20_deposited();
+        let log = |address: &[u8], topics: &[[u8; 32]], data: &[u8]| ReceiptLogJson {
+            address: hex0x(address),
+            topics: topics.iter().map(|topic| hex0x(topic)).collect(),
+            data: hex0x(data),
+            log_index: None,
+        };
+        let activation_a = [
+            activation,
+            token_a,
+            address_word(&vault_a),
+            address_word(&[6; 20]),
+        ];
+        let activation_b = [
+            activation,
+            token_b,
+            address_word(&vault_b),
+            address_word(&[7; 20]),
+        ];
+        let a_data = [8; 96];
+        let b_data = [9; 96];
+        let activations = [
+            log(&factory, &activation_a, &a_data),
+            log(&factory, &activation_b, &b_data),
+        ];
+        assert_eq!(
+            receipt_log_index(
+                &activations,
+                &factory,
+                &activation,
+                Some(ReceiptLogMatch {
+                    topics: &activation_b,
+                    data: Some(&b_data)
+                })
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            receipt_log_index(
+                &activations,
+                &factory,
+                &activation,
+                Some(ReceiptLogMatch {
+                    topics: &activation_b,
+                    data: Some(&a_data)
+                })
+            )
+            .unwrap(),
+            None
+        );
+
+        let deposit_a = [deposit, u256_64(1), token_b];
+        let deposit_b = [deposit, u256_64(2), token_b];
+        let deposits = [
+            log(&vault_b, &deposit_a, &[]),
+            log(&vault_b, &deposit_b, &[]),
+        ];
+        assert_eq!(
+            receipt_log_index(
+                &deposits,
+                &vault_b,
+                &deposit,
+                Some(ReceiptLogMatch {
+                    topics: &deposit_b,
+                    data: None
+                })
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            receipt_log_index(
+                &deposits,
+                &vault_b,
+                &deposit,
+                Some(ReceiptLogMatch {
+                    topics: &[deposit, u256_64(2), token_a],
+                    data: None
+                })
+            )
+            .unwrap(),
+            None
         );
     }
 }

@@ -5,7 +5,8 @@ import { addressWord } from '../../src/nb2/abi.js';
 import { decodeConfig, domainOf, encodeConfig, erc20Identities, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { erc20Create2 } from '../../src/nb2/erc20.js';
-import { recoveredSettlementEta } from '../../src/nb2/recovery.js';
+import { RecoveryAuthority, RecoverySession, recoveredSettlementEta } from '../../src/nb2/recovery.js';
+import { preflightRecovery } from '../../src/nb2/recovery-cost.js';
 import { decodeToken } from '../../src/nb2/token.js';
 import { TrustInput } from '../../src/nb2/trust.js';
 import { verdictAbi, verifyHeld, verifyReturn } from '../../src/nb2/verify.js';
@@ -43,5 +44,28 @@ test('Go ERC20 vectors isolate tokens, genesis and generation before accepting a
     const verdict = await verifyReturn(gamma, bytes(asset.Evidence), trust, PRODUCTION_PARAMS);
     assert.deepEqual(verdictAbi(verdict), bytes(asset.Verdict));
     assert.deepEqual(await recoveredSettlementEta(cfg, domain, trust, bytes(asset.Recovery), bytes(asset.ReturnProof)), verdict.eta);
+  }
+});
+
+test('ERC20 recovery refuses either generation or graph pins that contradict Γ', async () => {
+  const asset = fixture.Assets[0];
+  const gamma = bytes(asset.Gamma);
+  const cfg = decodeConfig(gamma, PRODUCTION_PARAMS);
+  const { generation, pins } = cfg.erc20!;
+  const trust = await TrustInput.fromBundle(readFileSync(new URL('nb2-continuation-v1.1/transcripts/root/utb.cbor', files)), cfg.rootGenesis);
+  const authority = new RecoveryAuthority(trust, async () => {});
+  const deployment = { salt: generation, pins, recovery: bytes(asset.Recovery), runtimeHash: new Uint8Array(32).fill(1),
+    vaultRuntimeHash: new Uint8Array(32).fill(2) };
+  const good = await RecoverySession.create(gamma, bytes(asset.Evidence), authority, PRODUCTION_PARAMS, deployment);
+  assert.equal(good.id.length, 32);
+  const limits = { signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: cfg.chainId,
+    maxNonce: 255n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, balance: 10n ** 20n, feeBudget: 10n ** 20n };
+  const backlog = { signedStart: 0n, observed: 0n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n,
+    receiptP99Ms: 1000n, advancePeakSeals: 1n, finalInclusionMs: 25n, finalPeakSeals: 1n, qualifiedForMs: 200_000n };
+  for (const mismatch of [{ ...deployment, salt: HE(generation) }, { ...deployment, pins: HE(pins) }]) {
+    await assert.rejects(RecoverySession.create(gamma, bytes(asset.Evidence), authority, PRODUCTION_PARAMS, mismatch), { rule: 'ConfigShape' });
+    await assert.rejects(preflightRecovery(gamma, bytes(asset.Held), trust, PRODUCTION_PARAMS, mismatch, {
+      pins: mismatch.pins, runtimeHash: mismatch.runtimeHash, vaultRuntimeHash: mismatch.vaultRuntimeHash, ranges: [],
+    }, limits, backlog), /unqualified recovery deployment/);
   }
 });

@@ -47,8 +47,8 @@ class Flaky implements Aggregator {
 }
 
 /** A simulated deployment, its published files, and a wallet directory on it with one minted 10-unit token `coin`. */
-async function world(opts: { badCodeHash?: boolean } = {}) {
-  const s = await setup();
+async function world(opts: { badCodeHash?: boolean; profile?: Uint8Array } = {}) {
+  const s = await setup(opts.profile);
   const pub = tmp();
   const pins = {
     gamma: hex(s.pins.gamma), build: 'test', vaultRuntimeCodeHash: opts.badCodeHash ? `0x${'11'.repeat(32)}` : hex(s.pins.vaultRuntimeCodeHash),
@@ -64,6 +64,37 @@ async function world(opts: { badCodeHash?: boolean } = {}) {
   const openAt = (d = dir, overrides: OpenOptions = {}): Promise<Wallet> => new Wallet(d, secret, config).open({ check: false, lock: false, rpc: s.chain, aggregator: agg, gas: WORLD_GAS, ...overrides });
   return { ...s, config, agg, dir, secret, openAt };
 }
+
+test('issuance backup migrates the native high-water mark and restores unequal domain counters', async () => {
+  const native = await world();
+  const other = await world({ profile: new Uint8Array(32).fill(4) });
+  const first = await native.openAt();
+  native.chain.fund(first.signer.address, 10n ** 24n);
+  await planDeposit(first, 'low', 2n);
+  await planDeposit(first, 'unused', 2n);
+  await planDeposit(first, 'high', 6n);
+  await sendDeposit(first, 'high');
+  const backupPath = (w: Wallet) => join(native.dir, `backup-${toHex(w.bridge.domain)}.json`);
+  const legacy = join(native.dir, 'backup.json');
+  writeFileSync(legacy, readFileSync(backupPath(first)));
+  rmSync(backupPath(first));
+
+  const second = await other.openAt(native.dir);
+  other.chain.fund(second.signer.address, 10n ** 24n);
+  await planDeposit(second, 'other', 7n);
+  await sendDeposit(second, 'other');
+  assert.equal(existsSync(legacy), false);
+  assert.equal(JSON.parse(readFileSync(backupPath(first), 'utf8')).next, '3');
+  assert.equal(JSON.parse(readFileSync(backupPath(second), 'utf8')).next, '1');
+
+  rmSync(join(native.dir, 'journal.json'));
+  const restoredFirst = await native.openAt();
+  const restoredSecond = await other.openAt(native.dir);
+  assert.deepEqual(await restoredFirst.recoverDeposits(), [2n]);
+  assert.deepEqual(await restoredSecond.recoverDeposits(), [0n]);
+  assert.equal((await restoredFirst.bridge.journal.intents())?.next, '3');
+  assert.equal((await restoredSecond.bridge.journal.intents())?.next, '1');
+});
 
 async function withCoin() {
   const x = await world();

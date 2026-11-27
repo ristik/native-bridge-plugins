@@ -1,6 +1,6 @@
 /** Cold admission is based on the complete signed EIP-1559 envelope and a pinned execution bound. */
 import { eq } from '../bytes.js';
-import { decodeConfig, domainOf, MAX_SEGMENT, type Params } from './config.js';
+import { decodeConfig, domainOf, MAX_SEGMENT, type Config, type Params } from './config.js';
 import { fail } from './errors.js';
 import { rlpBytes, rlpList, rlpUintEnc } from './rlp.js';
 import { burnIndex, verifySealReceipt } from './rules.js';
@@ -10,9 +10,10 @@ import type { RecoveryDeployment } from './recovery.js';
 import type { TrustInput } from './trust.js';
 import { verifyHeld } from './verify.js';
 
-export const validRecoveryDeployment = (d: RecoveryDeployment): boolean =>
+export const validRecoveryDeployment = (d: RecoveryDeployment, cfg?: Config): boolean =>
   d.salt.length === 32 && d.recovery.length === 20 && d.runtimeHash.length === 32 && d.pins.length === 32
-  && (d.vaultRuntimeHash === undefined || d.vaultRuntimeHash.length === 32);
+  && (d.vaultRuntimeHash === undefined || d.vaultRuntimeHash.length === 32)
+  && (!cfg?.erc20 || (eq(d.salt, cfg.erc20.generation) && eq(d.pins, cfg.erc20.pins)));
 
 export interface RecoveryShape {
   entry: 'run' | 'advanceGaps' | 'redeemRecovered';
@@ -265,7 +266,7 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   checkBacklogMeasurements(backlog);
   const config = Uint8Array.from(gamma);
   const cfg = decodeConfig(config, params);
-  if (!validRecoveryDeployment(deployment) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
+  if (!validRecoveryDeployment(deployment, cfg) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
     || !eq(deployment.vaultRuntimeHash, calibration.vaultRuntimeHash) || cfg.chainId !== limits.chainId) {
     fail('CapacityPreflight', 'unqualified recovery deployment');
   }

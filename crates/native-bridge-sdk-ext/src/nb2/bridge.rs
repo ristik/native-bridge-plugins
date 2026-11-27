@@ -46,6 +46,10 @@ use super::gas::{
     create_address, redeem_tx_framing, DeploymentCode, GasModel, MeasuredGasModel, RedeemShape,
 };
 use super::journal::*;
+use super::recovery::RecoveryDeployment;
+use super::recovery_cost::{
+    preflight_recovery, AdmissionContext, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
+};
 use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
 use super::rules::{
     burn_index, capacity_exceeded, capacity_preflight, check_state_read, topic_index,
@@ -61,7 +65,7 @@ use super::tokenops::{
     token_of_child, token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
 };
 use super::trust::{bind_trust, TrustInput};
-use super::util::{arr, be_int, cat};
+use super::util::{arr, be_int, cat, u256, u256_64};
 use super::verify::{
     decode_evidence, encode_return_data, evidence_of, verify_held, verify_part, verify_split,
     ReturnData, Verdict,
@@ -103,6 +107,16 @@ fn erc20_create2(factory: &[u8; 20], salt: &[u8; 32], initcode: &[u8; 32]) -> [u
 
 type Callback<A, R> = Box<dyn Fn(A) -> R + Send + Sync>;
 
+/// Authenticated continuation calibration, qualified backlog bounds and payer policy.
+pub struct Erc20ReturnRecovery {
+    pub deployment: RecoveryDeployment,
+    pub calibration: Box<dyn RecoveryCalibration + Send + Sync>,
+    /// The bridge reads the signed start and the current segment for each quote.
+    pub backlog: RecoveryBacklog,
+    /// Upper limits for the payer. The bridge further caps them by the deployment and live balance.
+    pub limits: RecoveryLimits,
+}
+
 /// The bridge's inputs.
 const IMPORTED_TIP_PROFILE_HASH: &str =
     "0x63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e";
@@ -126,6 +140,7 @@ pub struct BridgeOptions {
     /// Default true: a deposit is not sent before its intent's high-water mark is backed up.
     pub require_backup: Option<bool>,
     pub gas: Option<Box<dyn GasModel>>,
+    pub erc20_return_recovery: Option<Erc20ReturnRecovery>,
     /// Blocks the head must advance, after a send's nonce is seen used without its success receipt, before the send counts as dead.
     pub dead_after_blocks: Option<u64>,
     /// A seal receipt older than this many blocks gives a warning (default 7,200).
@@ -165,6 +180,7 @@ impl BridgeOptions {
             backup: None,
             require_backup: None,
             gas: None,
+            erc20_return_recovery: None,
             dead_after_blocks: None,
             max_seal_age_blocks: None,
             refresh_trust: None,
@@ -353,6 +369,7 @@ pub struct NativeBridgeV2 {
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Whether the gas model applies to this deployment's verifier (checked once, from its runtime code).
     gas_fits: Mutex<Option<bool>>,
+    erc20_return_recovery: Option<Erc20ReturnRecovery>,
     unsafe_test_trust: bool,
 }
 
@@ -408,6 +425,7 @@ impl NativeBridgeV2 {
             now: o.now,
             locks: Mutex::new(HashMap::new()),
             gas_fits: Mutex::new(None),
+            erc20_return_recovery: o.erc20_return_recovery,
             unsafe_test_trust: o.unsafe_test_trust,
             pins: o.pins,
             cfg,
@@ -488,27 +506,34 @@ impl NativeBridgeV2 {
                 "the ERC20 chain or factory graph differs from the release",
             );
         }
-        let topic = topic::erc20_activated();
-        let proof = self
-            .evm
-            .bound_receipt_proof(&pins.activation_tx, &pins.factory, &topic)?;
+        let topics = [
+            topic::erc20_activated(),
+            token,
+            address_word(&vault),
+            address_word(&recovery),
+        ];
+        let data = cat(&[
+            &self.domain,
+            &self.pins.vault_runtime_code_hash,
+            &he(&[&rc]),
+        ]);
+        let proof = self.evm.matching_mint_receipt_proof(
+            &pins.activation_tx,
+            &pins.factory,
+            &topics,
+            Some(&data),
+            true,
+        )?;
         let log = self.retrying_trust(|t| {
             super::deposit::verify_receipt_log_at(&self.cfg, t, &proof.proof, &pins.factory)
         })?;
         if log.header.number_u64() != self.pins.deployment_block
-            || log.topics
-                != [
-                    topic.to_vec(),
-                    token.to_vec(),
-                    address_word(&vault).to_vec(),
-                    address_word(&recovery).to_vec(),
-                ]
-            || log.data
-                != cat(&[
-                    &self.domain,
-                    &self.pins.vault_runtime_code_hash,
-                    &he(&[&rc]),
-                ])
+            || !log
+                .topics
+                .iter()
+                .map(Vec::as_slice)
+                .eq(topics.iter().map(|t| t.as_slice()))
+            || log.data != data
         {
             return refuse(
                 WalletReason::BadDeployment,
@@ -959,11 +984,12 @@ impl NativeBridgeV2 {
     fn require_erc20_qualification(&self) -> Result<()> {
         if self.cfg.erc20.is_some()
             && !self.unsafe_test_trust
-            && !self
+            && (!self
                 .pins
                 .erc20
                 .as_ref()
                 .is_some_and(|e| e.funding_qualified)
+                || self.pins.return_reserve_segments < 64)
         {
             return fail_d(
                 Rule::CapacityPreflight,
@@ -1219,16 +1245,18 @@ impl NativeBridgeV2 {
         amount: &BigUint,
         first_owner: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let rp = if self.cfg.erc20.is_some() {
-            self.evm
-                .bound_receipt_proof(tx, &self.cfg.vault, &self.deposit_topic())?
-        } else {
-            self.evm.mint_receipt_proof(
-                tx,
-                &self.cfg.vault,
-                hex(&self.cfg.semantic_profile_hash) == IMPORTED_TIP_PROFILE_HASH,
-            )?
-        };
+        let mut topics = vec![self.deposit_topic(), u256_64(n)];
+        if let Some(e) = &self.cfg.erc20 {
+            topics.push(address_word(&e.token));
+        }
+        let rp = self.evm.matching_mint_receipt_proof(
+            tx,
+            &self.cfg.vault,
+            &topics,
+            None,
+            self.cfg.erc20.is_some()
+                || hex(&self.cfg.semantic_profile_hash) == IMPORTED_TIP_PROFILE_HASH,
+        )?;
         let j = ReceiptBacking {
             d: self.domain,
             n,
@@ -1762,6 +1790,7 @@ impl NativeBridgeV2 {
             }
             let mut warnings = Vec::new();
             if self.cfg.erc20.is_some() {
+                self.preview_erc20_recipient(&recipient, &held.amount)?;
                 warnings.push("The burn fixes this recipient. Permanent blocking or an outbound tax can strand the claim.".to_string());
             }
             if !self.evm.code(&recipient)?.is_empty() {
@@ -1816,6 +1845,7 @@ impl NativeBridgeV2 {
                 paid: None,
                 extra: Default::default(),
             };
+            self.quote_erc20_continuation(&record, token, a, c_obs, payer)?;
             self.journal.put_return(&record)?;
             Ok(ReturnPlan {
                 return_id,
@@ -1987,6 +2017,110 @@ impl NativeBridgeV2 {
         }
     }
 
+    fn quote_erc20_continuation(
+        &self,
+        record: &ReturnRecord,
+        source: &[u8],
+        a: u64,
+        observed: u64,
+        payer: &[u8],
+    ) -> Result<()> {
+        let Some(erc20) = &self.cfg.erc20 else {
+            return Ok(());
+        };
+        let (Some(quote), Some(pins)) = (&self.erc20_return_recovery, &self.pins.erc20) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "a bounded ERC20 continuation quote is required",
+            );
+        };
+        let recovery = erc20_create2(
+            &pins.factory,
+            &he(&[&address_word(&erc20.token)]),
+            &pins.recovery_initcode_hash,
+        );
+        if quote.deployment.recovery != recovery
+            || quote.deployment.vault_runtime_hash != Some(self.pins.vault_runtime_code_hash)
+            || he(&[&self.evm.code(&recovery)?]) != quote.deployment.runtime_hash
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation calibration differs from the deployed graph",
+            );
+        }
+        let mut limits = quote.limits.clone();
+        let (base_fee, priority) = self.evm.fees()?;
+        if priority > limits.max_priority_fee_per_gas
+            || BigUint::from(2u8) * base_fee + priority > limits.max_fee_per_gas
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "current fees exceed the continuation bid limits",
+            );
+        }
+        limits.signed_bytes = limits
+            .signed_bytes
+            .min(self.pins.max_encoded_tx_bytes as usize);
+        limits.gas = limits.gas.min(self.pins.user_gas_limit);
+        limits.balance = limits.balance.min(self.evm.balance(payer)?);
+        let backlog = RecoveryBacklog {
+            signed_start: a,
+            observed,
+            ..quote.backlog.clone()
+        };
+        let seal = record.seal_receipt.as_deref().map(unhex).transpose()?;
+        let admission = self.retrying_trust(|trust| {
+            preflight_recovery(
+                &AdmissionContext {
+                    gamma: &self.pins.gamma,
+                    trust,
+                    params: &build_params(self.pins.build),
+                    deployment: &quote.deployment,
+                    calibration: &*quote.calibration,
+                    limits: &limits,
+                },
+                source,
+                &backlog,
+                seal.as_deref(),
+            )
+        })?;
+        let calls = admission.run.len() as u64 + admission.advance_calls + 1;
+        let nonce = self.evm.nonce(payer, "pending")?;
+        if nonce
+            .checked_add(calls - 1)
+            .map_or(true, |last| last > limits.max_nonce)
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation schedule exceeds the declared nonce horizon",
+            );
+        }
+        Ok(())
+    }
+
+    fn preview_erc20_recipient(&self, recipient: &[u8; 20], amount: &BigUint) -> Result<()> {
+        if self.cfg.erc20.is_none() {
+            return Ok(());
+        }
+        let data = cat(&[
+            &sel("previewPayout(address,uint256)"),
+            &address_word(recipient),
+            &u256(amount),
+        ]);
+        if !self.evm.call_reverts_with(
+            &self.cfg.vault,
+            &data,
+            350_000,
+            &sel("PayoutPreviewPassed()"),
+        ) {
+            return refuse(
+                WalletReason::RecipientRefused,
+                "the ERC20 payout simulation did not confirm an exact transfer",
+            );
+        }
+        Ok(())
+    }
+
     /// Certify the terminal burn of a planned return: R signs the recipient, the amount and the index. The exact request is
     /// journaled before certification, the certified burn before this returns; a second call resumes the same burn and never
     /// makes another.
@@ -2023,7 +2157,10 @@ impl NativeBridgeV2 {
                 None => recipient.to_vec(),
                 Some(p) => unhex(p)?,
             };
-            self.preflight(&unhex(&rec.source)?, &amount, &recipient, a, &payer)?;
+            let source = unhex(&rec.source)?;
+            let (observed, _) = self.preflight(&source, &amount, &recipient, a, &payer)?;
+            self.quote_erc20_continuation(&rec, &source, a, observed, &payer)?;
+            self.preview_erc20_recipient(&recipient, &amount)?;
             let r = encode_return_data(&ReturnData {
                 d: self.domain,
                 asset: self.cfg.asset,
@@ -2032,7 +2169,7 @@ impl NativeBridgeV2 {
                 min_index: a,
             });
             let req = transfer_request(
-                &unhex(&rec.source)?,
+                &source,
                 owner,
                 &TransferTx {
                     recipient: burn_predicate(&hu(&[&r])),
@@ -2775,3 +2912,7 @@ pub fn other_bytes(evidence: usize) -> usize {
     let calldata = redeem_calldata_length(evidence, 32) + 31;
     calldata - evidence + redeem_tx_framing(calldata)
 }
+
+#[cfg(test)]
+#[path = "bridge_erc20_tests.rs"]
+mod erc20_tests;

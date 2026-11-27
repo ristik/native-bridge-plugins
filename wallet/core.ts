@@ -7,7 +7,7 @@
  *   config.json          where the deployment's files and endpoints are (written by `init`, once the installation check passed)
  *   secret.hex           the wallet secret (32 bytes, unencrypted: a test wallet), unless the config names an environment variable
  *   journal.json         the plug-in's journal (docs/nb2-journal.md); one JSON file
- *   backup.json          the intent high-water mark handed to the backup callback (a real wallet stores it with its seed backup)
+ *   backup-<D>.json      the seed backup's issuance high-water mark for redemption domain D
  *   tokens.json          the wallet's names for its tokens; the token bytes in tokens/<name>.cbor
  *   tokens/<name>.pending.json   a transfer between its request and its saved result (the one step the plug-in does not journal)
  *   trust-history.cbor   the trust-base history, the shipped bundle extended by refreshes
@@ -34,9 +34,9 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   HttpJsonRpc, LocalKeySigner, NativeBridgeV2, PRODUCTION_TRUST_FRESHNESS_MS, TESTNET_TRUST_FRESHNESS_MS, Nb2Error, RpcError, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
-  freshMask, localOwner, transferRequest, verifyHeld,
+  DEFAULT_KEY_SCHEME, freshMask, JOURNAL_FORMAT, JOURNAL_VERSION, localOwner, transferRequest, verifyHeld,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
-  type ReturnRecord,
+  type IntentsRecord, type ReturnRecord,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
@@ -163,6 +163,29 @@ export function removeDurable(file: string): void {
   unlinkSync(file);
   fsyncDir(dirname(file));
   io.durable(file, null);
+}
+
+function intentsBackupFile(dir: string, domain: string): string {
+  if (!/^0x[0-9a-f]{64}$/.test(domain)) throw new Error('invalid issuance backup domain');
+  return join(dir, `backup-${domain.slice(2)}.json`);
+}
+
+function readIntentsBackup(file: string, domain?: string): IntentsRecord | undefined {
+  if (!existsSync(file)) return undefined;
+  const record = JSON.parse(readFileSync(file, 'utf8')) as IntentsRecord;
+  if (record?.format !== JOURNAL_FORMAT || record.version !== JOURNAL_VERSION || record.kind !== 'intents'
+    || typeof record.domain !== 'string' || (domain !== undefined && record.domain !== domain)
+    || typeof record.keyScheme !== 'string' || typeof record.next !== 'string' || !/^(0|[1-9][0-9]*)$/.test(record.next)) {
+    throw new Error('invalid issuance backup');
+  }
+  return record;
+}
+
+function saveIntentsBackup(dir: string, record: IntentsRecord): void {
+  const file = intentsBackupFile(dir, record.domain);
+  const previous = readIntentsBackup(file, record.domain);
+  if (previous && previous.keyScheme !== record.keyScheme) throw new Error('issuance backup key derivation changed');
+  if (!previous || BigInt(previous.next) < BigInt(record.next)) writeDurable(file, JSON.stringify(record));
 }
 
 /**
@@ -463,14 +486,29 @@ export class Wallet {
       journal: new FileJournalStore(join(this.dir, 'journal.json')),
       bridgeKey: deriveBridgeKey(sha256(concat(tag('nb2-reference-wallet/seed/'), this.secret))),
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
-      backup: async (intents) => writeDurable(join(this.dir, 'backup.json'), JSON.stringify(intents)),
+      backup: async (intents) => saveIntentsBackup(this.dir, intents),
       refreshTrust: () => this.refreshAuthority(),
       unsafeTestTrust: !!opts.rpc,
       trustFreshnessMs: opts.trustFreshnessMs ?? (opts.rpc ? undefined :
         this.release.status === 'testnet-provisional' ? TESTNET_TRUST_FRESHNESS_MS : PRODUCTION_TRUST_FRESHNESS_MS),
       receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
     }, opts.check ?? true);
+    const legacyFile = join(this.dir, 'backup.json');
+    const legacy = readIntentsBackup(legacyFile);
+    if (legacy) {
+      saveIntentsBackup(this.dir, legacy);
+      removeDurable(legacyFile);
+    }
     return this;
+  }
+
+  /** Restore issuance intents by scanning to the current redemption domain's backed-up counter. */
+  public async recoverDeposits(): Promise<bigint[]> {
+    const domain = hx(this.bridge.domain);
+    const backup = readIntentsBackup(intentsBackupFile(this.dir, domain), domain);
+    if (!backup) throw new Error('no issuance backup for this redemption domain');
+    if (backup.keyScheme !== DEFAULT_KEY_SCHEME) throw new Error('unsupported issuance backup key derivation');
+    return this.bridge.recoverDeposits(BigInt(backup.next));
   }
 
   private get index(): Record<string, TokenEntry> {

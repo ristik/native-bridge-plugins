@@ -59,6 +59,7 @@ pub struct RecoveryCalibrationRange {
 }
 
 /// Effective minima over authenticated deployment, node/relay, chain and payer. Empty access lists, zero value.
+#[derive(Clone)]
 pub struct RecoveryLimits {
     pub signed_bytes: usize,
     pub calldata_bytes: usize,
@@ -228,6 +229,7 @@ fn gap_shape(entry: RecoveryEntry, gaps: usize, width: usize) -> RecoveryShape {
     }
 }
 
+#[derive(Clone)]
 pub struct RecoveryBacklog {
     pub signed_start: u64,
     pub observed: u64,
@@ -270,7 +272,8 @@ pub fn preflight_recovery(
     starting_seal: Option<&[u8]>,
 ) -> Result<RecoveryAdmission> {
     let cfg = decode_config(ctx.gamma, ctx.params)?;
-    if ctx.deployment.pins != ctx.calibration.pins()
+    if !ctx.deployment.matches_config(&cfg)
+        || ctx.deployment.pins != ctx.calibration.pins()
         || ctx.deployment.runtime_hash != ctx.calibration.runtime_hash()
         || ctx.deployment.vault_runtime_hash.is_none()
         || ctx.deployment.vault_runtime_hash != ctx.calibration.vault_runtime_hash()

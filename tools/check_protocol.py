@@ -54,8 +54,10 @@ def check_erc20_profile():
     for impl in ('packages/native-bridge-plugin/src/nb2/bridge.ts', 'crates/native-bridge-sdk-ext/src/nb2/bridge.rs'):
         assert digest in (ROOT / impl).read_text(), f'ERC20 semantic profile digest mismatch: {impl}'
     vectors = 'protocol/vectors/erc20-nb2/'
-    expected = load(vectors + 'generator.json')['sha256']
-    assert hashlib.sha256((ROOT / (vectors + 'vectors.json')).read_bytes()).hexdigest() == expected, 'ERC20 vector digest mismatch'
+    generator = load(vectors + 'generator.json')
+    assert hashlib.sha256((ROOT / (vectors + 'vectors.json')).read_bytes()).hexdigest() == generator['sha256'], 'ERC20 vector digest mismatch'
+    deployed = generator['contracts']['sdkFixture']
+    assert hashlib.sha256((ROOT / (vectors + deployed['file'])).read_bytes()).hexdigest() == deployed['sha256'], 'ERC20 deployed fixture digest mismatch'
 
 
 def main():

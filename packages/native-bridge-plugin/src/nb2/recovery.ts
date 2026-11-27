@@ -263,9 +263,9 @@ export class RecoverySession {
     const deployment = { salt: Uint8Array.from(input.salt), recovery: Uint8Array.from(input.recovery), runtimeHash: Uint8Array.from(input.runtimeHash), pins: Uint8Array.from(input.pins),
       vaultRuntimeHash: input.vaultRuntimeHash && Uint8Array.from(input.vaultRuntimeHash) };
     const { salt, recovery, runtimeHash, pins } = deployment;
-    if (!validRecoveryDeployment(deployment)) fail('ConfigShape');
     const config = Uint8Array.from(gamma);
     const cfg = decodeConfig(config, params);
+    if (!validRecoveryDeployment(deployment, cfg)) fail('ConfigShape');
     const domain = domainOf(config);
     const snapshot = Uint8Array.from(evidence);
     const token = decodeToken(snapshot);

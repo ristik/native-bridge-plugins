@@ -31,7 +31,7 @@ import {
 } from './journal.js';
 import { recoveredSettlementEta } from './recovery.js';
 import { burnIndex, capacityExceeded, capacityPreflight, maxProofs, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
-import { AmbiguousBroadcast, CERTIFICATION_DEPTH, EvmReader, ProofUnavailable, RpcError, type JsonRpc, type ReceiptJson } from './rpc.js';
+import { AmbiguousBroadcast, CERTIFICATION_DEPTH, EvmReader, ProofUnavailable, RpcError, revertDataOf, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
 import { buildHistory, checkSegmentLog, gapProofLen, genesisHead, type Segment } from './segment.js';
 import { MAX_MINT_PROOF, encodeToken, decodeToken, burnPredicate, signaturePredicate, tokenIdOf, valueData, lineageOf, parseTransfer, parseCertification, stateId, encodePredicate, encodeProof, encodeCertification } from './token.js';
@@ -48,6 +48,13 @@ const assetSelector = (signature: string) => HE(ascii(signature)).slice(0, 4);
 export async function verifyErc20Activation(
   evm: EvmReader, cfg: Config, gamma: Uint8Array, pins: Erc20ActivationPins, trust: TrustInput,
   vaultRuntime: Uint8Array, deploymentBlock: bigint,
+): Promise<void> {
+  return checkErc20Activation(evm, cfg, gamma, pins, vaultRuntime, deploymentBlock, (verify) => verify(trust));
+}
+
+async function checkErc20Activation(
+  evm: EvmReader, cfg: Config, gamma: Uint8Array, pins: Erc20ActivationPins, vaultRuntime: Uint8Array, deploymentBlock: bigint,
+  verifyWithTrust: (verify: (trust: TrustInput) => Promise<void>) => Promise<void>,
 ): Promise<void> {
   const erc20 = cfg.erc20;
   if (!erc20 || pins.factory.length !== 20 || [pins.factoryRuntimeHash, pins.vaultInitcodeHash,
@@ -84,11 +91,13 @@ export async function verifyErc20Activation(
     data: concat(domainOf(gamma), vaultRuntime, HE(recoveryCode)),
   };
   const proof = await evm.receiptProof(pins.activationTx, pins.factory, TOPIC.ERC20Activated, false, expected, [], undefined, true);
-  const log = await verifyReceiptLog(cfg, trust, proof.proof, pins.factory);
-  if (log.header.number !== deploymentBlock || log.topics.length !== expected.topics.length
-    || log.topics.some((t, i) => !eq(t, expected.topics[i])) || !eq(log.data, expected.data)) {
-    return refuse('BadDeployment', 'the certified activation differs from the pinned deployment');
-  }
+  await verifyWithTrust(async (trust) => {
+    const log = await verifyReceiptLog(cfg, trust, proof.proof, pins.factory);
+    if (log.header.number !== deploymentBlock || log.topics.length !== expected.topics.length
+      || log.topics.some((t, i) => !eq(t, expected.topics[i])) || !eq(log.data, expected.data)) {
+      return refuse('BadDeployment', 'the certified activation differs from the pinned deployment');
+    }
+  });
 }
 
 /** Optional display metadata. The read budget and accepted reply sizes are bounded. */
@@ -107,15 +116,17 @@ export async function readErc20Metadata(evm: EvmReader, token: Uint8Array): Prom
   return { symbol, decimals };
 }
 
-/** Read-only transfer refusal probe at the current state. Settlement still checks exact deltas. */
+/** Run the vault's bounded payout checks in an eth_call that always rolls back. */
 export async function previewErc20Recipient(evm: EvmReader, cfg: Config, recipient: Uint8Array, amount: bigint): Promise<void> {
   if (!cfg.erc20) return;
-  const data = concat(assetSelector('transfer(address,uint256)'), addressWord(recipient), u256(amount));
-  const result = await evm.call(cfg.erc20.token, data, cfg.vault, 180_000n)
-    .catch(() => refuse('RecipientRefused', 'the ERC20 payout simulation reverted'));
-  if (result.length !== 0 && !eq(result, u256(1))) {
-    return refuse('RecipientRefused', 'the token refused the recipient simulation');
+  const data = concat(assetSelector('previewPayout(address,uint256)'), addressWord(recipient), u256(amount));
+  try {
+    await evm.call(cfg.vault, data, undefined, 350_000n);
+  } catch (error) {
+    const marker = error instanceof RpcError && error.code !== 0 ? revertDataOf(error) : null;
+    if (marker && eq(marker, assetSelector('PayoutPreviewPassed()'))) return;
   }
+  return refuse('RecipientRefused', 'the ERC20 payout simulation did not confirm an exact transfer');
 }
 /** The deployment manifest pins outside D (section 4.3; the manifest schema is NB2-09's). */
 export interface DeploymentPins {
@@ -348,8 +359,8 @@ export class NativeBridgeV2 {
       if (!eq(HE(await b.evm.code(b.cfg.vault)), opts.pins.vaultRuntimeCodeHash)) refuse('BadDeployment', 'the vault runtime code hash is not the pinned one');
       if (b.cfg.erc20) {
         if (!opts.pins.erc20) return refuse('BadDeployment', 'the ERC20 activation pins are missing');
-        await verifyErc20Activation(b.evm, b.cfg, opts.pins.gamma, opts.pins.erc20, b.opts.trust,
-          opts.pins.vaultRuntimeCodeHash, opts.pins.deploymentBlock);
+        await checkErc20Activation(b.evm, b.cfg, opts.pins.gamma, opts.pins.erc20,
+          opts.pins.vaultRuntimeCodeHash, opts.pins.deploymentBlock, (verify) => b.retryingTrust(verify));
       }
     }
     return b;
@@ -610,7 +621,11 @@ export class NativeBridgeV2 {
 
   /** The receipt proof and J of deposit number `n` of intent `i`, verified offline. */
   private async proveDeposit(i: bigint, tx: Uint8Array, n: bigint, amount: bigint, firstOwner: Uint8Array): Promise<{ receiptProof: Uint8Array; reason: Uint8Array }> {
-    const rp = await this.evm.mintReceiptProof(tx, this.cfg.vault, (this.cfg.erc20 !== undefined || toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH), depositTopic(this.cfg.erc20?.token));
+    const token = this.cfg.erc20?.token;
+    const topic = depositTopic(token);
+    const topics = token ? [topic, u256(n), addressWord(token)] : [topic, u256(n)];
+    const rp = await this.evm.mintReceiptProof(tx, this.cfg.vault,
+      token !== undefined || toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH, topic, topics);
     const j = { d: this.domain, n, r: this.secretOf(i), proof: rp.proof };
     const ev = await this.retryingTrust((trust) => verifyDepositEvidence(this.cfg, this.domain, trust, j));
     if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');
@@ -1190,11 +1205,11 @@ export class NativeBridgeV2 {
     this.requireErc20Qualification();
     delete record.recovery;
     const a = undec(record.a);
+    let ordinary: Awaited<ReturnType<NativeBridgeV2['preflight']>>;
     try {
       const source = unhex(record.source);
-      const ordinary = await this.preflight(source, amount, unhex(record.recipient), a, unhex(record.payer ?? record.recipient), admission);
+      ordinary = await this.preflight(source, amount, unhex(record.recipient), a, unhex(record.payer ?? record.recipient), admission);
       await admission?.checkOrdinary?.(structuredClone(record), ordinary.gas);
-      return ordinary;
     } catch (e) {
       if (!admission?.recover || !((e instanceof Nb2Error && e.rule === 'CapacityPreflight') ||
         (e instanceof WalletError && e.reason === 'InsufficientFunds'))) throw e;
@@ -1202,6 +1217,11 @@ export class NativeBridgeV2 {
       const observed = undec(record.recovery.observed);
       return { cObs: observed, pNow: observed > a ? observed - a : 0n, need: 0n, pMax: 0n, gas: 0n };
     }
+    if (this.cfg.erc20) {
+      if (!admission?.recover) return fail('CapacityPreflight', 'a bounded ERC20 continuation quote is required');
+      await admission.recover(structuredClone(record));
+    }
+    return ordinary;
   }
 
   private async verifyReturnAnchor(rec: ReturnRecord): Promise<void> {
