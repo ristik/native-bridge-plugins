@@ -1,6 +1,6 @@
 # Wallet guide transcript: public testnet `tn-public-20261128`
 
-> The values below are from generation `tn-public-20261128` and change on regeneration.
+> Historical record for generation `tn-public-20261128`. Use the current release manifest for live deployment values.
 
 Run on 2026-11-26 (UTC) by following the guide ([`nb2-wallet-guide.md`](nb2-wallet-guide.md), "Try it: the reference wallet") literally:
 
@@ -11,7 +11,7 @@ Run on 2026-11-26 (UTC) by following the guide ([`nb2-wallet-guide.md`](nb2-wall
 - Public URLs only: gateway `https://pos.staging.unicity.network/rpc`; the aggregator came from the default (`<origin>/aggregator`).
 - The EVM key is a scratch key funded with 5 UCT by the operator funder account, because the public faucet needs a human CAPTCHA. It was passed
   with `--key-env NB2_KEY` so that this fresh wallet reuses the funded address; `payer.json` is the guide's policy file.
-- No step needed a deviation. (An earlier run at the commit the manifest names needed `--aggregator`; the guide notes this.)
+- No step needed a deviation. An earlier run at the commit that generation's manifest pinned needed `--aggregator` because its default was `<rpc>/aggregator`.
 
 Long hex values are shortened with `..` as in the guide; transaction hashes are complete.
 

@@ -47,9 +47,10 @@ every run.
 
 ### What you need
 
-The public testnet is `tn-public-20261128` at `https://pos.staging.unicity.network`. A testnet regeneration replaces the chain ID, the
-contract addresses and the manifest, and the chain ID is random each time. **Never copy them from this guide.** Read them from the release
-the deployment publishes; the wallet's installation check refuses a mismatch.
+The public testnet runs at `https://pos.staging.unicity.network`. The live generation at the time of this update was `tn-public-20261127b`.
+For each run, use `package.generation` in the published release manifest to identify the generation. A regeneration changes the chain ID,
+contract addresses and manifest. Read the chain ID and vault address from that manifest and check its chain ID and genesis hash against
+`https://pos.staging.unicity.network/api/network`. The wallet's installation check refuses a mismatch.
 
 - **The deployment's public files**, under `https://pos.staging.unicity.network/release/` (a bft-core testnet package publishes them from
   `GENERATION/bridge/nb2/public/`; `SHA256SUMS` there lists every file):
@@ -75,9 +76,6 @@ the deployment publishes; the wallet's installation check refuses a mismatch.
   git checkout <bridge.sources["native-bridge-plugins"] of nb2-release.json>
   npm ci
   ```
-
-  A checkout older than the origin-derived aggregator default (the manifest of `tn-public-20261128` names such a commit) needs
-  `--aggregator https://pos.staging.unicity.network/aggregator` on `init`; the default there is `<rpc>/aggregator`, which does not exist.
 
 - **Some UCT on the EVM chain** for the deposit itself and for gas. The deployment's faucet page is `https://pos.staging.unicity.network/faucet/`
   and needs a human CAPTCHA. Run `init` first: it prints the address to fund.
@@ -237,15 +235,15 @@ settle the same redemption ID.
 
 ### Walkthrough on the public testnet
 
-This is the guide's flow run against `tn-public-20261128` from a clean checkout of this change, with a fresh wallet and public
-URLs only (2026-11-26). The full transcript, with the transaction hashes, is
-[`nb2-public-testnet-transcript.md`](nb2-public-testnet-transcript.md). The deployment is a production-build vault, so one thing differs from
-the lane transcript below:
+The historical walkthrough ran on generation `tn-public-20261128` on 2026-11-26, from a clean checkout with a fresh wallet and public
+URLs. Its transaction hashes and output are recorded in [`nb2-public-testnet-transcript.md`](nb2-public-testnet-transcript.md).
+When following these steps, download the current release first. The public deployment uses a production-build vault, so one thing differs
+from the lane transcript below:
 
 - **`plan-return`, `burn` and `redeem` need a payer policy** (`--return-policy FILE`): the production build refuses to plan a return without
-  explicit payer limits (`CapacityPreflight: explicit payer limits are required`). A policy for the public testnet, read off the release
-  (`pins.userGasLimit` 24,000,000, `limits.maxEncodedTxBytes` 524,288, `limits.calldataBytes` 393,216) and the gateway's `eth_gasPrice`
-  (10^6 wei):
+  explicit payer limits (`CapacityPreflight: explicit payer limits are required`). Use `pins.userGasLimit`, `limits.maxEncodedTxBytes.value`
+  and `limits.calldataBytes.value` from your release when choosing ceilings. Check the gateway's `eth_gasPrice` when setting fee limits in
+  wei. The example below uses the limits and gas price from the recorded walkthrough.
 
   ```json
   {
