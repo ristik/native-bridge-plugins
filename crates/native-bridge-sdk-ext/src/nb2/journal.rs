@@ -220,6 +220,14 @@ pub struct DepositRecord {
     pub key_scheme: String,
     pub intent: Dec,
     pub amount: Dec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erc20_token: Option<Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<Dec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_credit: Option<Dec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_sends: Vec<SendRecord>,
     /// The first owner's compressed key and its 42-byte predicate.
     pub owner_key: Hex,
     pub first_owner: Hex,

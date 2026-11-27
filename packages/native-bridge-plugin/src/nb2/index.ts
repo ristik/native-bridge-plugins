@@ -28,3 +28,5 @@ export { parentLink, splitOutputCommitment, decodeSplitJustification, decodeSumP
 export * from './recovery.js';
 
 export * from './recovery-cost.js';
+
+export * from './erc20.js';

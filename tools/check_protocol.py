@@ -40,8 +40,27 @@ def check_v2_profile():
     assert 'NATIVE_BRIDGE_PROTO_VERSION=10' in (ROOT / 'protocol/interop.md').read_text()
 
 
+def check_erc20_profile():
+    path = 'protocol/profile-erc20.json'
+    profile = load(path)
+    assert profile['nativeBridgeProtocolVersion'] == 11
+    assert profile['config'] == {'version': 3, 'arity': 22, 'maxBytes': 480, 'segments': 64, 'buckets': 16}
+    for name, expected in profile['normativeArtifactSha256'].items():
+        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected, f'ERC20 normative artifact digest mismatch: {name}'
+    abi = load('protocol/abi-erc20.json')
+    assert abi['nativeBridgeProtocolVersion'] == 11
+    assert abi['vault']['depositEvent']['indexed'] == ['nonce', 'token']
+    digest = hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+    for impl in ('packages/native-bridge-plugin/src/nb2/bridge.ts', 'crates/native-bridge-sdk-ext/src/nb2/bridge.rs'):
+        assert digest in (ROOT / impl).read_text(), f'ERC20 semantic profile digest mismatch: {impl}'
+    vectors = 'protocol/vectors/erc20-nb2/'
+    expected = load(vectors + 'generator.json')['sha256']
+    assert hashlib.sha256((ROOT / (vectors + 'vectors.json')).read_bytes()).hexdigest() == expected, 'ERC20 vector digest mismatch'
+
+
 def main():
     check_v2_profile()
+    check_erc20_profile()
     package = load('packages/native-bridge-plugin/package.json')
     assert package['private'] and package['license'] == 'MIT OR Apache-2.0'
     deps = package['dependencies']

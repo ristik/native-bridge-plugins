@@ -25,9 +25,18 @@ export const TAG_ARCHIVE_STEP = HE(ascii('UNICITY_NB2_ARCHIVE_STEP'));
 
 export const TOPIC = {
   Deposited: HE(ascii('Deposited(uint64,bytes32,uint256,bytes32,bytes)')),
+  ERC20Deposited: HE(ascii('ERC20Deposited(uint64,address,bytes32,uint256,bytes32,bytes)')),
+  ERC20Activated: HE(ascii('ERC20Activated(address,address,address,bytes32,bytes32,bytes32)')),
   Paid: HE(ascii('Paid(bytes32,address,uint256)')),
   SegmentSealed: HE(ascii('SegmentSealed(uint64,bytes32,bytes32,bytes)')),
 } as const;
+
+export const depositTopic = (token?: Uint8Array) => token ? TOPIC.ERC20Deposited : TOPIC.Deposited;
+
+export function depositTopics(topics: Uint8Array[], token?: Uint8Array): boolean {
+  return topics.length === (token ? 3 : 2) && eq(topics[0], depositTopic(token))
+    && (!token || eq(topics[2], concat(new Uint8Array(12), token)));
+}
 
 /** r = HMAC-SHA256(key = k_w, msg = C(b("UNICITY_NB2_DEPOSIT_INTENT"), b(D), i)). */
 export const depositIntentSecret = (kw: Uint8Array, d: Uint8Array, i: bigint): Uint8Array =>
@@ -156,7 +165,7 @@ const zeroes = (n: number): Uint8Array => new Uint8Array(n);
 export async function verifyDepositEvidence(c: Config, domain: Uint8Array, t: TrustInput, j: ReceiptBacking): Promise<{ v: bigint; firstOwner: Uint8Array; blockNumber: bigint }> {
   if (!eq(j.d, domain)) fail('MintDomain');
   const log = await verifyReceiptLog(c, t, j.proof);
-  if (log.topics.length !== 2 || !eq(log.topics[0], TOPIC.Deposited) || !eq(log.topics[1], u256(j.n))) fail('LogTopics');
+  if (!depositTopics(log.topics, c.erc20?.token) || !eq(log.topics[1], u256(j.n))) fail('LogTopics');
   const data = log.data;
   if (data.length !== 224) fail('LogData');
   const v = data.subarray(32, 64).reduce((a, x) => (a << 8n) | BigInt(x), 0n);

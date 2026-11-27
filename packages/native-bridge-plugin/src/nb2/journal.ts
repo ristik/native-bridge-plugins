@@ -80,6 +80,11 @@ export interface DepositRecord extends Base {
   keyScheme: string;
   intent: Dec;
   amount: Dec;
+  /** ERC20 intent fields survive reconciliation of the certified net credit. */
+  erc20Token?: Hex;
+  requested?: Dec;
+  minCredit?: Dec;
+  approvalSends?: SendRecord[];
   /** The first owner's compressed key and its 42-byte predicate. */
   ownerKey: Hex;
   firstOwner: Hex;

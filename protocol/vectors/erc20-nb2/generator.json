@@ -1,0 +1,11 @@
+{
+  "repo": "https://github.com/ristik/bft-core.git",
+  "commit": "106e8c14a21de4a9f5634c82e429a4435d6c130e",
+  "command": "go test ./nb2ref -run ^TestERC20FlatReturnVectors$ -count=1",
+  "outputEnv": "NB2_ERC20_VECTORS",
+  "sha256": "fba5afaf34d647ac1fcfbc30cc728c1c300a31f18f6a097be4b533da1a27bd20",
+  "contracts": {
+    "repo": "https://github.com/ristik/unicity-pos-contracts.git",
+    "commit": "b8ad5163dee626e7e66b95378ea2957d7b4cb9ca"
+  }
+}

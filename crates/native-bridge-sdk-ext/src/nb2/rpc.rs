@@ -681,6 +681,15 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         self.receipt_proof_mode(tx_hash, vault, &topic::deposited(), None, bound)
     }
 
+    pub(crate) fn bound_receipt_proof(
+        &self,
+        tx: &[u8],
+        emitter: &[u8],
+        topic: &[u8],
+    ) -> Result<ReceiptProof> {
+        self.receipt_proof_mode(tx, emitter, topic, None, true)
+    }
+
     /// Rebuild a recovery proof with the child companion's committed technical record.
     pub fn recovery_receipt_proof(
         &self,

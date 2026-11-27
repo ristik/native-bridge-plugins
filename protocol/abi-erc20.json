@@ -1,0 +1,38 @@
+{
+  "nativeBridgeProtocolVersion": 11,
+  "factory": {
+    "functions": [
+      "activate(address,bytes,bytes) returns (address vault,address recovery,bytes32 domain)",
+      "predict(address) returns (address vault,address recovery)",
+      "config(address) returns (bytes)",
+      "VAULT_INITCODE_HASH() returns (bytes32)",
+      "RECOVERY_INITCODE_HASH() returns (bytes32)",
+      "GENERATION() returns (bytes32)",
+      "PINS() returns (bytes32)"
+    ],
+    "activationEvent": {
+      "signature": "ERC20Activated(address,address,address,bytes32,bytes32,bytes32)",
+      "indexed": ["token", "vault", "recovery"],
+      "data": ["domain", "vaultRuntimeHash", "recoveryRuntimeHash"]
+    }
+  },
+  "vault": {
+    "functions": [
+      "depositERC20(uint256 requested,uint256 minCredit,bytes firstOwner,bytes32 rho)",
+      "redeem(bytes,bytes32,uint64,bytes)",
+      "redeemRecovered(bytes)",
+      "domain() returns (bytes32)",
+      "config() returns (bytes)",
+      "state() returns (uint64,uint64,uint16,uint256,bytes32,bytes32)",
+      "TOKEN() returns (address)",
+      "ASSET() returns (bytes32)"
+    ],
+    "depositEvent": {
+      "signature": "ERC20Deposited(uint64,address,bytes32,uint256,bytes32,bytes)",
+      "indexed": ["nonce", "token"],
+      "data": ["domain", "credit", "rho", "firstOwner"]
+    },
+    "tokenErrors": ["BadCredit()", "ExcessDebit()", "InsufficientBacking()", "TokenCallFailed()"]
+  },
+  "settlementAndRecoveryAbi": "protocol 10 NB2 v1.1"
+}

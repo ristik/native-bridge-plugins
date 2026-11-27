@@ -471,8 +471,8 @@ export class EvmReader {
   }
 
   /** The paired profile selects the parent's UC from the canonical child's committed origin. */
-  public mintReceiptProof(txHash: Uint8Array, vault: Uint8Array, bound: boolean): Promise<ReceiptProof> {
-    return this.receiptProof(txHash, vault, TOPIC.Deposited, false, undefined, [], undefined, bound);
+  public mintReceiptProof(txHash: Uint8Array, vault: Uint8Array, bound: boolean, topic = TOPIC.Deposited): Promise<ReceiptProof> {
+    return this.receiptProof(txHash, vault, topic, false, undefined, [], undefined, bound);
   }
 
   /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
@@ -573,8 +573,8 @@ export class EvmReader {
     return this.logs(vault, [hexOf(TOPIC.Paid), hexOf(eta)], from, top);
   }
 
-  public async call(to: Uint8Array, data: Uint8Array, from?: Uint8Array): Promise<Uint8Array> {
-    return bytesOf(await this.rpc.call('eth_call', [{ to: hexOf(to), data: hexOf(data), ...(from ? { from: hexOf(from) } : {}) }, 'latest']), 'eth_call');
+  public async call(to: Uint8Array, data: Uint8Array, from?: Uint8Array, gas?: bigint): Promise<Uint8Array> {
+    return bytesOf(await this.rpc.call('eth_call', [{ to: hexOf(to), data: hexOf(data), ...(from ? { from: hexOf(from) } : {}), ...(gas === undefined ? {} : { gas: qty(gas) }) }, 'latest']), 'eth_call');
   }
 
   /** Check imported authority and simulate the exact fee-bearing return at the same finalized block. */

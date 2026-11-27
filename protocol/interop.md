@@ -413,3 +413,74 @@ The transcript manifest digest is `41856353c08fa85b87ce59e470ac152213ac7de3031fb
 `protocol/vectors/nb2/` retains protocol 9 vectors for common custody, receipt and primitive regression checks.
 The old gas calibration is retained for historical comparison. The default measured gas model requires its
 calibrated artifacts, so protocol 10 must use a qualified model supplied for its deployment before wallet burns.
+
+## ERC20 profile 11 [bft-core #1038]
+
+The ERC20 profile uses the NB2 v1.1 lineage and continuation framing and the
+imported-tip authority rule. Its semantic profile is `profile-erc20.json`.
+The profile uses one CREATE2 vault and recovery verifier per token and factory
+generation. The ordinary verifier and lineage helper are shared within the
+generation. The receipt helper can be shared with the native UCT release.
+
+```text
+x = u64be(chainId) || tokenAddress20 || authenticatedExecutionGenesis32
+asset = H(ASCII("UNICITY/NB2/ERC20/ASSET/1/") || x)
+ty    = H(ASCII("UNICITY/NB2/ERC20/TYPE/1/") || x)
+aid   = H(ASCII("UNICITY/NB2/ERC20/COIN/1/") || x)
+Γ = C(b("UNICITY_NB2_CFG"),3,network,b(rootGenesis32),b(executionGenesis32),chainId,
+      evmPartition,b(evmShard),aggregatorPartition,b(vault20),b(asset32),b(ty32),b(aid32),
+      b(semanticProfileHash32),b(verifier20),b(verifierCodeHash32),64,16,b(Qmax),
+      b(tokenAddress20),b(factoryGeneration32),b(graphPins32))
+D = H(Γ)
+vaultSalt = u256be(uint160(tokenAddress))
+recoverySalt = K256(vaultSalt)
+recoveryGeneration = K256(K256(ASCII("UNICITY/NB2/CONT/1.1/GEN")) || factoryGeneration32 || D)
+```
+
+Γ is a strict 22-item array of at most 480 bytes. The token address, factory
+generation and graph pins are nonzero. The root genesis is the authenticated
+root Trust Base genesis EntryID. Metadata has display authority only. Before
+adding a part to a balance, authenticate its full lineage and root receipt
+against the selected domain. Store balances, journals and pending returns by D.
+
+The authenticated release pins the factory address and runtime hash, both
+fixed initcode hashes, and the generation's ordinary verifier and dependency
+graph. Compute both addresses with EIP-1014 using the pinned factory and salts.
+The factory accepts the exact templates by hash and supplies their constructor
+arguments through transient context. A successful duplicate returns the
+already deployed pair. Only the first activation emits the indexed
+`ERC20Activated(address token,address vault,address recovery,bytes32 domain,
+bytes32 vaultRuntimeHash,bytes32 recoveryRuntimeHash)` event with the first
+three fields indexed. Authenticate the certified activation receipt, the
+execution genesis, the exact Γ returned by the factory and vault, the pinned
+ordinary hash and the activated runtime hashes. The activation locator can
+come from any caller.
+
+The nonpayable entry point is
+`depositERC20(uint256 requested,uint256 minCredit,bytes firstOwner,bytes32 rho)`.
+The vault accepts `0 < minCredit <= credit <= requested`. Credit is the measured
+vault increase. The sender's measured debit is capped at requested. Depositors
+authorize the exact allowance to the selected vault. The vault checks existing
+backing and increments Q by the measured credit. A direct transfer creates no
+credit. The `ERC20Deposited(uint64,address,bytes32,uint256,bytes32,bytes)` log
+uses topics `[signature, uint256(nonce), leftpad(tokenAddress20)]` and the
+same canonical 224 data bytes as Deposited, with the measured credit in the
+amount word. The certified receipt must carry that exact emitter, token, D,
+nonce, valid secret opening and owner. Root mint, splits and returns use the
+same encodings, with the asset identities from Γ and the certified credit at
+the root. Back up issuance intent data before sending funds.
+
+Both settlement routes use the same V, eta, liability and recent buffers.
+The signed recipient is nonzero and differs from the vault. Each balance
+probe has a 30,000 gas cap and each transfer has a 150,000 gas cap. The vault
+must lose exactly the burned amount and the recipient must gain exactly that
+amount. A failed transfer or delta check reverts payment, accounting, replay,
+seal and logs together. A failed attempt can be retried by any payer using the
+same signed burn and destination. Before deposit disclose outbound taxes,
+rebases, confiscation and upgrades. Before burn disclose that permanent
+blocking or a permanent outbound tax can strand the claim. The checks assume
+truthful balances. Retain the signed evidence before submission.
+
+ERC20 qualification binds measurements to this deployment and verifies signed
+transaction fit, ERC20-specific packet and settlement gas, the full 64-segment
+fee reserve and the sustained catch-up inequality with offline restore.

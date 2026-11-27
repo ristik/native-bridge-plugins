@@ -1,0 +1,23 @@
+{
+  "artifactVersion": 1,
+  "nativeBridgeProtocolVersion": 11,
+  "name": "erc20-nb2",
+  "status": "development-unqualified-for-real-value",
+  "lineageAndRecoveryWireVersion": "0x0101",
+  "baseImportedTipSemanticProfileSha256": "63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e",
+  "config": {
+    "version": 3,
+    "arity": 22,
+    "maxBytes": 480,
+    "segments": 64,
+    "buckets": 16
+  },
+  "gasCaps": {
+    "balanceProbe": 30000,
+    "tokenTransfer": 150000
+  },
+  "normativeArtifactSha256": {
+    "protocol/interop.md": "60b3abaef0679548bef1368fe30463e921aa9c0e86dc5be294f208caa4ea2a66",
+    "protocol/abi-erc20.json": "e8b608bb2844833d7f023643b8a70324d17ca5315ceaf7c2bf9c31789d7cb2ca"
+  }
+}

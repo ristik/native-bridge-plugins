@@ -26,7 +26,7 @@ import { resolve } from 'node:path';
 
 import { keccak_256 } from '@noble/hashes/sha3.js';
 
-import { Nb2Error, WalletError } from '../packages/native-bridge-plugin/src/nb2/index.js';
+import { ERC20_DEPOSIT_RISKS, ERC20_RETURN_RISKS, Nb2Error, readErc20Metadata, WalletError } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import {
   RegistryLagExpired, Wallet, burn, connectionOf, hx, mint, parseAmount, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, split, status, transfer, uct, unhex,
   type WalletConfig,
@@ -34,7 +34,25 @@ import {
 import { archiveRequired, paymentVanished, publishReturnBackup, reconcileReturn, readPayerPolicy, restoreReturn, returnHeadroom, routeRequired, type PayerPolicy } from './recovery.js';
 import type { ReturnRecord } from '../packages/native-bridge-plugin/src/nb2/journal.js';
 
-const formatAmount = (wei: bigint | string): string => `${uct(wei)} UCT`;
+const formatUct = (wei: bigint | string): string => `${uct(wei)} UCT`;
+async function assetDisplay(w: Wallet): Promise<(amount: bigint | string) => string> {
+  const e = w.bridge.cfg.erc20;
+  if (!e) return formatUct;
+  const { symbol, decimals } = await readErc20Metadata(w.bridge.evm, e.token);
+  const token = `${hx(e.token)} on chain ${w.bridge.cfg.chainId} (genesis ${hx(w.bridge.cfg.executionGenesis)})`;
+  return (amount) => {
+    const n = BigInt(amount);
+    if (decimals === undefined || !symbol) return `${n} base units of ${token}`;
+    if (decimals === 0) return `${n} ${symbol} (${token})`;
+    const scale = 10n ** BigInt(decimals);
+    const frac = String(n % scale).padStart(decimals, '0').replace(/0+$/, '');
+    return `${n / scale}${frac ? '.' + frac : ''} ${symbol} (${n} base units, ${token})`;
+  };
+}
+function baseUnits(s: string): bigint {
+  if (!/^\d+$/.test(s) || BigInt(s) === 0n) throw new Error('use a positive integer in ERC20 base units');
+  return BigInt(s);
+}
 const say = (s: string): void => console.log(s);
 const retrying = (what: string) => (reason: string): void => say(`  ${what}: ${reason}, retrying`);
 
@@ -79,13 +97,16 @@ async function init(dir: string, args: string[]): Promise<void> {
   const w = await Wallet.create(dir, cfg, () => Uint8Array.from(randomBytes(32)));
   say(`wallet ${resolve(dir)} for the ${w.pins.build} vault ${hx(w.bridge.cfg.vault)} on chain ${w.bridge.cfg.chainId}`);
   say(`installation check passed: chain ID, config() = the pinned Γ, the vault's runtime code hash`);
-  say(`fund this EVM address with UCT for deposits and gas: ${hx(w.signer.address)}`);
+  const e = w.bridge.cfg.erc20;
+  say(e ? `fund ${hx(w.signer.address)} with ${hx(e.token)} for deposits and UCT for gas`
+    : `fund this EVM address with UCT for deposits and gas: ${hx(w.signer.address)}`);
 }
 
 /** The commands that read only: every other one runs the installation check first. */
 const READ_ONLY = new Set(['address', 'tokens', 'status']);
 
 async function continueReturn(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary: boolean, cold = false): Promise<void> {
+  const formatAmount = await assetDisplay(w);
   for (;;) {
     const result = await resumePayout(w, rec, policy, ordinary, cold);
     if (result.state === 'paid') {
@@ -126,6 +147,7 @@ async function main(): Promise<void> {
   const [cmd, ...rest] = args;
   if (cmd === 'init') return init(dir, rest);
   const recipientOpt = option(rest, '--recipient');
+  const minCreditOpt = option(rest, '--min-credit');
   const toKeyOpt = option(rest, '--to-key');
   const policyPath = option(rest, '--return-policy');
   const policy = policyPath ? readPayerPolicy(policyPath) : undefined;
@@ -144,9 +166,13 @@ async function main(): Promise<void> {
   // a command that moves value checks the deployment again first: a network reset can leave the same chain ID and vault address with
   // another vault behind them, and the saved manifest is then not that deployment's
   const w = await Wallet.load(dir).open({ check: !READ_ONLY.has(cmd) });
+  const erc20 = w.bridge.cfg.erc20;
+  if (minCreditOpt !== undefined && (!erc20 || cmd !== 'deposit')) throw new Error('--min-credit requires an ERC20 deposit');
+  const parseAssetAmount = erc20 ? baseUnits : parseAmount;
+  const formatAmount = await assetDisplay(w);
   switch (cmd) {
     case 'address': {
-      say(`EVM address ${hx(w.signer.address)}: ${formatAmount(await w.bridge.evm.balance(w.signer.address))}`);
+      say(`EVM address ${hx(w.signer.address)}: ${formatUct(await w.bridge.evm.balance(w.signer.address))}`);
       say(`Unicity owner key ${hx(w.ownerPub(0))}`);
       return;
     }
@@ -155,16 +181,25 @@ async function main(): Promise<void> {
       const [name, amount] = rest;
       if (!w.has(name)) {
         need(rest, 2, 'deposit NAME AMOUNT');
-        const plan = await planDeposit(w, name, parseAmount(amount));
-        say(`planned deposit intent ${plan.intent} of ${formatAmount(plan.amount)} as ${name}; the intent high-water mark is backed up`);
+        if (erc20) {
+          say(ERC20_DEPOSIT_RISKS);
+          if (minCreditOpt === undefined) throw new Error('ERC20 deposit requires --min-credit in base units');
+        }
+        const minimum = minCreditOpt === undefined ? undefined : baseUnits(minCreditOpt);
+        const plan = await planDeposit(w, name, parseAssetAmount(amount), minimum);
+        say(`planned deposit intent ${plan.intent} as ${name}, requested ${formatAmount(plan.amount)}${minimum === undefined ? '' : `, minimum credit ${formatAmount(minimum)}`}`);
       } else {
         // a deposit already planned under NAME is only reconciled (submitDeposit never sends it twice), and only for its own amount
         const e = w.entry(name);
         if (e.intent === undefined) throw new Error(`the wallet already has a token named ${name}`);
-        if (amount !== undefined && parseAmount(amount) !== BigInt(e.amount)) throw new Error(`${name} is a planned deposit of ${formatAmount(e.amount)}, not ${amount}: run deposit ${name} ${uct(e.amount)}`);
+        const requested = BigInt(e.requested ?? e.amount);
+        if (amount !== undefined && parseAssetAmount(amount) !== requested) throw new Error(`${name} requested ${formatAmount(requested)}`);
+        if (minCreditOpt !== undefined && e.minCredit !== String(baseUnits(minCreditOpt))) throw new Error('minimum credit differs from the saved intent');
+        if (erc20) say(ERC20_DEPOSIT_RISKS);
       }
       const r = await sendDeposit(w, name);
       say(`deposit ${r.depositNumber} in block ${r.blockNumber} (tx ${hx(r.txHash)})`);
+      if (erc20) say(`observed lock credit ${formatAmount(w.entry(name).amount)}. Mint verifies the certified receipt.`);
       say(`next: mint ${name}`);
       return;
     }
@@ -186,7 +221,7 @@ async function main(): Promise<void> {
       const own = (w.entry(rest[0]).owner + 1) % 4;
       const token = await transfer(w, rest[0], rest[1], own, toKeyOpt ? unhex(toKeyOpt) : undefined, recoverProof);
       say(await returnHeadroom(w, token));
-      if (toKeyOpt) say(`transferred ${rest[0]} to ${toKeyOpt}: hand ${resolve(w.dir, 'tokens', `${rest[1]}.cbor`)} to its owner`);
+      if (toKeyOpt) say(`transferred ${rest[0]} to ${toKeyOpt}: hand ${resolve(w.dir, 'tokens', w.entry(rest[1]).file)} to its owner`);
       else say(`transferred ${rest[0]} as ${rest[1]} to the wallet's owner key ${own}`);
       return;
     }
@@ -195,7 +230,7 @@ async function main(): Promise<void> {
       const parts = rest.slice(1).map((s) => {
         const [label, amount] = s.split('=');
         if (!label || !amount) throw new Error(`a part is NEW=AMOUNT: ${s}`);
-        return { label, amount: parseAmount(amount) };
+        return { label, amount: parseAssetAmount(amount) };
       });
       await split(w, rest[0], w.entry(rest[0]).owner, parts);
       say(`split ${rest[0]} into ${parts.map((p) => `${p.label} (${formatAmount(p.amount)})`).join(' + ')}`);
@@ -218,6 +253,7 @@ async function main(): Promise<void> {
     }
     case 'burn': {
       need(rest, 1, 'burn NAME [--recipient ADDR]');
+      if (erc20) say(ERC20_RETURN_RISKS);
       const b = await burn(w, rest[0], recipient, retrying('the burn'), policy, backup && resolve(backup));
       if (b.plan === null) say(`${rest[0]} was already burned: resumed`);
       else say(`the preflight passes again at index a = ${b.plan.a}`);

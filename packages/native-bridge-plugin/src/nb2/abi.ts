@@ -5,13 +5,16 @@
 import { concat, eq, toHex } from '../bytes.js';
 import { ascii, beInt, u256 } from './cbor.js';
 import { HE } from './crypto.js';
-import { TOPIC } from './deposit.js';
-import { ALL_RULES, isRetryableVerifierRefusal, type Rule } from './errors.js';
+import { depositTopics, TOPIC } from './deposit.js';
+import { ALL_RULES, ERC20_RULES, isRetryableVerifierRefusal, type Rule } from './errors.js';
 
 const sel = (sig: string): Uint8Array => HE(ascii(sig)).subarray(0, 4);
 
 export const SELECTOR = {
   deposit: sel('deposit(bytes,bytes32)'),
+  depositERC20: sel('depositERC20(uint256,uint256,bytes,bytes32)'),
+  approve: sel('approve(address,uint256)'),
+  allowance: sel('allowance(address,address)'),
   redeem: sel('redeem(bytes,bytes32,uint64,bytes)'),
   domain: sel('domain()'),
   config: sel('config()'),
@@ -35,7 +38,7 @@ export const ERROR_SIGNATURES: Partial<Record<Rule, string>> = {
 export const signatureOf = (r: Rule): string => ERROR_SIGNATURES[r] ?? `${r}()`;
 export const selectorOf = (r: Rule): Uint8Array => sel(signatureOf(r));
 
-const BY_SELECTOR = new Map<string, Rule>(ALL_RULES.map((r) => [toHex(selectorOf(r)), r]));
+const BY_SELECTOR = new Map<string, Rule>([...ALL_RULES, ...ERC20_RULES].map((r) => [toHex(selectorOf(r)), r]));
 
 const pad32 = (b: Uint8Array): Uint8Array => concat(b, new Uint8Array((32 - (b.length % 32)) % 32));
 
@@ -66,6 +69,14 @@ export function revertData(r: Rule, ...vals: (bigint | Uint8Array)[]): Uint8Arra
 
 export const depositCalldata = (firstOwner: Uint8Array, rho: Uint8Array): Uint8Array =>
   concat(SELECTOR.deposit, abiEncode([{ bytes: firstOwner }, { word: rho }]));
+
+export const addressWord = (address: Uint8Array): Uint8Array => concat(new Uint8Array(12), address);
+
+export const depositErc20Calldata = (requested: bigint, minCredit: bigint, owner: Uint8Array, rho: Uint8Array): Uint8Array =>
+  concat(SELECTOR.depositERC20, abiEncode([{ word: u256(requested) }, { word: u256(minCredit) }, { bytes: owner }, { word: rho }]));
+
+export const approveCalldata = (vault: Uint8Array, requested: bigint): Uint8Array =>
+  concat(SELECTOR.approve, addressWord(vault), u256(requested));
 
 export const redeemCalldata = (evidence: Uint8Array, claimedEta: Uint8Array, claimedStart: bigint, history: Uint8Array): Uint8Array =>
   concat(SELECTOR.redeem, abiEncode([{ bytes: evidence }, { word: claimedEta }, { word: u256(claimedStart) }, { bytes: history }]));
@@ -139,7 +150,7 @@ export function classifyRedeemError(e: DecodedError | null): RedeemAction {
     case 'StaleEndpoint': return 'rebuild-history';
     case 'FutureIndex': return 'wait';
     case 'BadGapProof': case 'ChainMismatch': case 'BadHistoryLength': return 'repair-proof';
-    case 'PayoutFailed': case 'Reentrancy': return 'retry-later';
+    case 'PayoutFailed': case 'InsufficientBacking': case 'TokenCallFailed': case 'Reentrancy': return 'retry-later';
     case 'VerifierRefused': return isRetryableVerifierRefusal(e.inner?.rule) ? 'retry-later' : 'stop';
     default: return 'stop';
   }
@@ -148,8 +159,11 @@ export function classifyRedeemError(e: DecodedError | null): RedeemAction {
 /** A log as an RPC returns it. */
 export interface RawLog { address: Uint8Array; topics: Uint8Array[]; data: Uint8Array; blockNumber: bigint; blockHash: Uint8Array; transactionHash: Uint8Array; logIndex: bigint; removed?: boolean }
 
-export function decodeDeposited(l: RawLog): { n: bigint; domain: Uint8Array; amount: bigint; rho: Uint8Array; firstOwner: Uint8Array } | null {
-  if (l.topics.length !== 2 || !eq(l.topics[0], TOPIC.Deposited) || l.data.length !== 224) return null;
+export function decodeDeposited(l: RawLog, token?: Uint8Array): { n: bigint; domain: Uint8Array; amount: bigint; rho: Uint8Array; firstOwner: Uint8Array } | null {
+  if (!depositTopics(l.topics, token) || l.data.length !== 224) return null;
+  if (token && (l.topics[1].length !== 32 || beInt(l.topics[1]) === 0n || beInt(l.topics[1]) >= 1n << 56n
+    || beInt(l.data.subarray(32, 64)) === 0n || beInt(l.data.subarray(96, 128)) !== 128n
+    || beInt(l.data.subarray(128, 160)) !== 42n || l.data.subarray(202).some((b) => b !== 0))) return null;
   return { n: beInt(l.topics[1]), domain: l.data.slice(0, 32), amount: beInt(l.data.subarray(32, 64)), rho: l.data.slice(64, 96), firstOwner: l.data.slice(160, 202) };
 }
 

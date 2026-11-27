@@ -8,35 +8,39 @@ use alloc::vec::Vec;
 use core::fmt;
 
 macro_rules! rules {
-    ($($sec:literal => [$($name:ident),* $(,)?]),* $(,)?) => {
+    (erc20 = [$($erc20:ident),*]; $($sec:literal => [$($name:ident),* $(,)?]),* $(,)?) => {
         /// A section 14 rule.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[allow(missing_docs)]
-        pub enum Rule { $($($name),*),* }
+        pub enum Rule { $($($name,)*)* $($erc20,)* }
 
         impl Rule {
             /// Every rule, in section 14 order.
             pub const ALL: &'static [Rule] = &[$($(Rule::$name),*),*];
 
+            /// ERC20 profile rule extensions.
+            pub const ERC20: &'static [Rule] = &[$(Rule::$erc20),*];
+
             /// The rule's name (`AlreadyPaid`).
             pub fn name(self) -> &'static str {
-                match self { $($(Rule::$name => stringify!($name)),*),* }
+                match self { $($(Rule::$name => stringify!($name),)*)* $(Rule::$erc20 => stringify!($erc20),)* }
             }
 
             /// Its section (`14.5`).
             pub fn section(self) -> &'static str {
-                match self { $($(Rule::$name => $sec),*),* }
+                match self { $($(Rule::$name => $sec,)*)* $(Rule::$erc20 => "ERC20",)* }
             }
 
             /// The rule of a name.
             pub fn from_name(s: &str) -> Option<Rule> {
-                match s { $($(stringify!($name) => Some(Rule::$name),)*)* _ => None }
+                match s { $($(stringify!($name) => Some(Rule::$name),)*)* $(stringify!($erc20) => Some(Rule::$erc20),)* _ => None }
             }
         }
     };
 }
 
 rules! {
+    erc20 = [BadCredit, ExcessDebit, InsufficientBacking, TokenCallFailed];
     "14.1" => [Truncated, Trailing, NonCanonical, Shape, Tag, Version, Length, IntRange, InputTooLarge, ConfigShape, EvidenceShape],
     "14.2" => [MintDomain, DepositUC, DepositHeader, ReceiptPath, ReceiptType, ReceiptStatus, LogIndex, LogEmitter, LogTopics,
         LogData, SecretOpening, MintSalt, MintType, MintOwner, MintData, MintReason],
