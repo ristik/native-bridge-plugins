@@ -48,7 +48,8 @@ use super::gas::{
 use super::journal::*;
 use super::recovery::RecoveryDeployment;
 use super::recovery_cost::{
-    preflight_recovery, AdmissionContext, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
+    preflight_recovery_with_signing_bounds, quote_erc20_call, AdmissionContext, Erc20OrdinaryBound,
+    Erc20SigningBounds, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
 };
 use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
 use super::rules::{
@@ -115,6 +116,9 @@ pub struct Erc20ReturnRecovery {
     pub backlog: RecoveryBacklog,
     /// Upper limits for the payer. The bridge further caps them by the deployment and live balance.
     pub limits: RecoveryLimits,
+    pub signing_bounds: Erc20SigningBounds,
+    /// Maximum mined ordinary attempts before fallback and maximum time per attempt in milliseconds.
+    pub ordinary_attempts: Option<(u64, u64)>,
 }
 
 /// The bridge's inputs.
@@ -1820,7 +1824,7 @@ impl NativeBridgeV2 {
                     }
                 }
             }
-            let record = ReturnRecord {
+            let mut record = ReturnRecord {
                 base: self.journal.base("return"),
                 return_id: hex(&return_id),
                 source: hex(token),
@@ -1841,7 +1845,7 @@ impl NativeBridgeV2 {
                 paid: None,
                 extra: Default::default(),
             };
-            let (c_obs, ordinary) = self.admit_return(&record, token, &held.amount, &recipient, a, payer)?;
+            let (c_obs, ordinary) = self.admit_return(&mut record, token, &held.amount, &recipient, a, payer)?;
             if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
                 if existing.status != "planned" {
                     return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
@@ -2010,7 +2014,7 @@ impl NativeBridgeV2 {
 
     fn admit_return(
         &self,
-        record: &ReturnRecord,
+        record: &mut ReturnRecord,
         source: &[u8],
         amount: &BigUint,
         recipient: &[u8; 20],
@@ -2031,7 +2035,7 @@ impl NativeBridgeV2 {
             }
             Err(error) => return Err(error),
         };
-        self.quote_erc20_continuation(record, source, a, observed, payer)?;
+        self.quote_erc20_continuation(record, source, a, observed, payer, ordinary)?;
         Ok((observed, ordinary))
     }
 
@@ -2047,11 +2051,12 @@ impl NativeBridgeV2 {
 
     fn quote_erc20_continuation(
         &self,
-        record: &ReturnRecord,
+        record: &mut ReturnRecord,
         source: &[u8],
         a: u64,
         observed: u64,
         payer: &[u8],
+        ordinary: Option<PreflightResult>,
     ) -> Result<()> {
         let Some(erc20) = &self.cfg.erc20 else {
             return Ok(());
@@ -2091,6 +2096,31 @@ impl NativeBridgeV2 {
             .min(self.pins.max_encoded_tx_bytes as usize);
         limits.gas = limits.gas.min(self.pins.user_gas_limit);
         limits.balance = limits.balance.min(self.evm.balance(payer)?);
+        let ordinary = ordinary
+            .map(|pf| {
+                let return_data = encode_return_data(&ReturnData {
+                    d: self.domain,
+                    asset: self.cfg.asset,
+                    recipient: unhex_n(&record.recipient)?,
+                    amount: undec(&record.amount)?,
+                    min_index: a,
+                });
+                let evidence = evidence_of(source).len() + burn_pair_bound(return_data.len());
+                let history = if pf.need == 0 {
+                    0
+                } else {
+                    32 + pf.need as usize * super::segment::gap_proof_len(self.cfg.k)
+                };
+                let (attempts_before_fallback, inclusion_ms) =
+                    quote.ordinary_attempts.unwrap_or_default();
+                Ok::<_, Error>(Erc20OrdinaryBound {
+                    gas: pf.gas,
+                    calldata_bytes: super::abi::redeem_calldata_length(evidence, history),
+                    attempts_before_fallback,
+                    inclusion_ms,
+                })
+            })
+            .transpose()?;
         let backlog = RecoveryBacklog {
             signed_start: a,
             observed,
@@ -2098,7 +2128,7 @@ impl NativeBridgeV2 {
         };
         let seal = record.seal_receipt.as_deref().map(unhex).transpose()?;
         let admission = self.retrying_trust(|trust| {
-            preflight_recovery(
+            preflight_recovery_with_signing_bounds(
                 &AdmissionContext {
                     gamma: &self.pins.gamma,
                     trust,
@@ -2110,12 +2140,15 @@ impl NativeBridgeV2 {
                 source,
                 &backlog,
                 seal.as_deref(),
+                Some(&quote.signing_bounds),
+                ordinary.as_ref(),
             )
         })?;
         let calls = admission.run.len() as u64 + admission.advance_calls + 1;
         let nonce = self.evm.nonce(payer, "pending")?;
         if nonce
             .checked_add(calls - 1)
+            .and_then(|last| last.checked_add(admission.prior_attempts))
             .map_or(true, |last| last > limits.max_nonce)
         {
             return fail_d(
@@ -2123,6 +2156,24 @@ impl NativeBridgeV2 {
                 "continuation schedule exceeds the declared nonce horizon",
             );
         }
+        let mut schedule = serde_json::json!({
+            "generation": hex(&super::recovery::recovery_generation(&quote.deployment.salt, &self.domain)),
+            "calls": (u128::from(calls) + u128::from(admission.prior_attempts)).to_string(),
+            "totalFee": dec(&admission.total_fee),
+            "runCuts": admission.run.iter().map(|call| call.shape.operations).collect::<Vec<_>>(),
+            "advanceGaps": admission.advance.shape.gaps,
+            "observed": dec(observed),
+            "receiptP99Ms": dec(backlog.receipt_p99_ms),
+            "finalInclusionMs": dec(backlog.final_inclusion_ms),
+            "qualifiedForMs": dec(backlog.qualified_for_ms),
+        });
+        if let Some(ordinary) = ordinary {
+            schedule["ordinary"] = serde_json::json!({
+                "gas": dec(ordinary.gas), "calldataBytes": ordinary.calldata_bytes,
+                "maxFeePerGas": dec(&limits.max_fee_per_gas), "attemptsBeforeFallback": dec(ordinary.attempts_before_fallback),
+            });
+        }
+        record.extra.insert("recovery".into(), schedule);
         Ok(())
     }
 
@@ -2186,7 +2237,7 @@ impl NativeBridgeV2 {
                 Some(p) => unhex(p)?,
             };
             let source = unhex(&rec.source)?;
-            self.admit_return(&rec, &source, &amount, &recipient, a, &payer)?;
+            self.admit_return(&mut rec, &source, &amount, &recipient, a, &payer)?;
             self.preview_erc20_recipient(&recipient, &amount)?;
             let r = encode_return_data(&ReturnData {
                 d: self.domain,
@@ -2464,14 +2515,16 @@ impl NativeBridgeV2 {
             } else {
                 None
             };
-            let tx = self.signed_with_replacement(
-                signer,
+            let request = self.transaction_request(
+                &signer.address(),
                 &self.cfg.vault,
                 &rtx.calldata,
                 BigUint::default(),
                 gas,
                 replacement.as_ref(),
             )?;
+            self.check_erc20_ordinary_attempt(&fresh, &signer.address(), &request)?;
+            let tx = sign_tx(signer, &request)?;
             self.check_ordinary_import(&fresh, Some(&tx.raw))?;
             if let Some((old, _)) = &expired {
                 if self.evm.nonce(&old.from, "latest")? != old.request.nonce {
@@ -2714,49 +2767,120 @@ impl NativeBridgeV2 {
         value: BigUint,
         gas: u64,
     ) -> Result<SignedTx> {
-        self.signed_with_replacement(signer, to, data, value, gas, None)
+        sign_tx(
+            signer,
+            &self.transaction_request(&signer.address(), to, data, value, gas, None)?,
+        )
     }
 
-    fn signed_with_replacement(
+    fn check_erc20_ordinary_attempt(
         &self,
-        signer: &dyn EvmSigner,
+        record: &ReturnRecord,
+        payer: &[u8; 20],
+        request: &TxRequest,
+    ) -> Result<()> {
+        if self.cfg.erc20.is_none() {
+            return Ok(());
+        }
+        let Some(ordinary) = record
+            .extra
+            .get("recovery")
+            .and_then(|plan| plan.get("ordinary"))
+        else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary route lacks a signing reserve",
+            );
+        };
+        let Some(policy) = &self.erc20_return_recovery else {
+            return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
+        };
+        let field = |name| {
+            ordinary
+                .get(name)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+        };
+        let prior = record
+            .sends
+            .iter()
+            .map(|sent| sent.nonce.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut limits = policy.limits.clone();
+        limits.gas = limits
+            .gas
+            .min(undec64(field("gas"))?)
+            .min(self.pins.user_gas_limit);
+        limits.calldata_bytes = limits
+            .calldata_bytes
+            .min(ordinary["calldataBytes"].as_u64().unwrap_or(0) as usize);
+        limits.signed_bytes = limits
+            .signed_bytes
+            .min(self.pins.max_encoded_tx_bytes as usize);
+        limits.max_fee_per_gas = limits.max_fee_per_gas.min(undec(field("maxFeePerGas"))?);
+        limits.max_priority_fee_per_gas = limits
+            .max_priority_fee_per_gas
+            .min(limits.max_fee_per_gas.clone());
+        let Some((_, fee)) = quote_erc20_call(request.data.len(), request.gas, &limits) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary call is outside the ERC20 admission limits",
+            );
+        };
+        if (!prior.contains(dec(request.nonce).as_str())
+            && prior.len() as u64 >= undec64(field("attemptsBeforeFallback"))?)
+            || request.nonce > limits.max_nonce
+            || request.max_fee_per_gas > limits.max_fee_per_gas
+            || request.max_priority_fee_per_gas > limits.max_priority_fee_per_gas
+            || fee > limits.fee_budget
+            || fee > limits.balance
+            || fee > self.evm.balance(payer)?
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary attempt exceeds its signing reserve",
+            );
+        }
+        Ok(())
+    }
+
+    fn transaction_request(
+        &self,
+        payer: &[u8; 20],
         to: &[u8; 20],
         data: &[u8],
         value: BigUint,
         gas: u64,
         replace: Option<&(TxRequest, bool)>,
-    ) -> Result<SignedTx> {
+    ) -> Result<TxRequest> {
         let (base_fee, mut priority) = self.evm.fees()?;
         let mut max_fee = BigUint::from(2u8) * base_fee + &priority;
         let nonce = if let Some((prior, pooled)) = replace {
-            if self.evm.nonce(&signer.address(), "latest")? != prior.nonce {
+            if self.evm.nonce(payer, "latest")? != prior.nonce {
                 return refuse(
                     WalletReason::NotPending,
                     "payout nonce changed during replacement",
                 );
             }
-            if *pooled || self.evm.nonce(&signer.address(), "pending")? > prior.nonce {
+            if *pooled || self.evm.nonce(payer, "pending")? > prior.nonce {
                 let bump = |bid: &BigUint| bid + bid / 10u8 + 1u8;
                 max_fee = max_fee.max(bump(&prior.max_fee_per_gas));
                 priority = priority.max(bump(&prior.max_priority_fee_per_gas));
             }
             prior.nonce
         } else {
-            self.evm.nonce(&signer.address(), "pending")?
+            self.evm.nonce(payer, "pending")?
         };
-        sign_tx(
-            signer,
-            &TxRequest {
-                chain_id: self.cfg.chain_id,
-                nonce,
-                max_priority_fee_per_gas: priority,
-                max_fee_per_gas: max_fee,
-                gas,
-                to: *to,
-                value,
-                data: data.to_vec(),
-            },
-        )
+        Ok(TxRequest {
+            chain_id: self.cfg.chain_id,
+            nonce,
+            max_priority_fee_per_gas: priority,
+            max_fee_per_gas: max_fee,
+            gas,
+            to: *to,
+            value,
+            data: data.to_vec(),
+        })
     }
 
     fn send_record(&self, tx: &SignedTx) -> SendRecord {

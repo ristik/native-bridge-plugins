@@ -910,7 +910,8 @@ export async function redeem(w: Wallet, label: string, polls = 60, pollMs = 3_00
 export async function resumePayout(w: Wallet, rec: ReturnRecord, policy: PayerPolicy, ordinary = false, cold = false): Promise<RecoveryResult | ReconcileResult> {
   rec = (await w.bridge.journal.ret(rec.returnId)) ?? rec;
   if (cold) rec = await qualifyExistingRecovery(w, rec, policy);
-  return (rec.recovery || hasPeerComplete(w, rec)) && !ordinary ? recoverStep(w, rec, policy) : redeemOrdinary(w, rec, policy);
+  const preferRecovery = cold || hasPeerComplete(w, rec) || (rec.recovery && !rec.recovery.ordinary);
+  return preferRecovery && !ordinary ? recoverStep(w, rec, policy) : redeemOrdinary(w, rec, policy);
 }
 
 /** Receive and verify the complete held lineage before adding it to spendable storage. */

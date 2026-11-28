@@ -6,7 +6,7 @@ import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, VANISHED_CLAIM_HORIZON, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, gapProofLen, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, redeemCalldataLength, recoveryCatchUpCalls, recoveryGeneration,
-  recoveryRpcSource, replacementBid, signTx, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
+  quoteErc20Call, recoveryRpcSource, replacementBid, signTx, type Erc20SigningBounds, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
   type RedeemShape, type ReturnAdmission, type ReturnRecord, type ReconcileResult, type TrustInput, type SendRecord, type RedeemOptions, type ReturnEvidence,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
@@ -34,6 +34,9 @@ export interface PayerPolicy {
   maxPriorityFeePerGas: bigint;
   maxTransactionFee?: bigint;
   feeBudget: bigint;
+  /** Qualified duration of the fee ceiling starting at the signing check. */
+  feeWindowMs?: bigint;
+  ordinaryAttemptsBeforeFallback?: bigint;
   archives: string[];
 }
 
@@ -46,7 +49,9 @@ export function readPayerPolicy(path: string): PayerPolicy {
   return { gas: uint(p.gas), signedBytes: p.signedBytes, calldataBytes: p.calldataBytes, maxNonce: uint(p.maxNonce),
     maxFeePerGas: uint(p.maxFeePerGas), maxPriorityFeePerGas: uint(p.maxPriorityFeePerGas),
     maxTransactionFee: p.maxTransactionFee === undefined ? undefined : uint(p.maxTransactionFee),
-    feeBudget: uint(p.feeBudget), archives: p.archives ?? [] };
+    feeBudget: uint(p.feeBudget), feeWindowMs: p.feeWindowMs === undefined ? undefined : uint(p.feeWindowMs),
+    ordinaryAttemptsBeforeFallback: p.ordinaryAttemptsBeforeFallback === undefined ? undefined : uint(p.ordinaryAttemptsBeforeFallback),
+    archives: p.archives ?? [] };
 }
 
 interface ReleaseRecovery {
@@ -54,6 +59,7 @@ interface ReleaseRecovery {
   generation: Uint8Array;
   calibration: RecoveryCalibration;
   backlog: Omit<RecoveryBacklog, 'signedStart' | 'observed'>;
+  signingWindows?: Omit<Erc20SigningBounds, 'feeWindowMs' | 'ordinary'> & { ordinaryInclusionMs?: bigint };
 }
 
 function recoveryRelease(w: Wallet): ReleaseRecovery {
@@ -61,6 +67,7 @@ function recoveryRelease(w: Wallet): ReleaseRecovery {
     salt: string; address: string; runtimeHash: string; pins: string;
     ranges: (Omit<RecoveryCalibration['ranges'][number], 'execution'> & { execution: string })[];
     backlog: Record<keyof Omit<RecoveryBacklog, 'signedStart' | 'observed'>, string>;
+    signingWindows?: { progressWindowMs: string; advanceWindowMs: string; ordinaryInclusionMs?: string };
   } | undefined;
   if (r === undefined || !Array.isArray(r.ranges)) throw new Nb2Error('CapacityPreflight', 'qualified recovery release is required');
   const deployment = { salt: bytes(r.salt, 32), recovery: bytes(r.address, 20), runtimeHash: bytes(r.runtimeHash, 32),
@@ -69,7 +76,10 @@ function recoveryRelease(w: Wallet): ReleaseRecovery {
   const calibration = { pins, runtimeHash, vaultRuntimeHash,
     ranges: r.ranges.map(({ minReceiptBytes, max, execution }) => ({ minReceiptBytes, max, execution: uint(execution) })) };
   const b = r.backlog;
+  const windows = r.signingWindows;
   return { deployment, calibration, generation: recoveryGeneration(deployment.salt, w.bridge.domain),
+    signingWindows: windows && { progressWindowMs: uint(windows.progressWindowMs), advanceWindowMs: uint(windows.advanceWindowMs),
+      ordinaryInclusionMs: windows.ordinaryInclusionMs === undefined ? undefined : uint(windows.ordinaryInclusionMs) },
     backlog: { duringProgress: uint(b.duringProgress), peakSeals: uint(b.peakSeals), elapsedMs: uint(b.elapsedMs), receiptP99Ms: uint(b.receiptP99Ms),
       advancePeakSeals: uint(b.advancePeakSeals), finalInclusionMs: uint(b.finalInclusionMs), finalPeakSeals: uint(b.finalPeakSeals),
       qualifiedForMs: uint(b.qualifiedForMs) } };
@@ -158,6 +168,9 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior, req.nonce), req.nonce);
       const fee = req.gas * req.maxFeePerGas;
+      if (w.bridge.cfg.erc20 && !quoteErc20Call(req.data.length, req.gas, limits)) {
+        throw new Nb2Error('CapacityPreflight', 'ordinary payment is outside the ERC20 admission limits');
+      }
       if (req.gas > limits.gas || req.nonce > limits.maxNonce || req.maxFeePerGas > limits.maxFeePerGas ||
         req.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || req.data.length > limits.calldataBytes ||
         req.data.length + 256 > limits.signedBytes || fee > limits.balance || fee > limits.feeBudget ||
@@ -192,7 +205,9 @@ function ordinaryGas(w: Wallet): ((shape: RedeemShape) => bigint | null) | undef
 }
 
 function ordinaryEnvelope(w: Wallet, policy: PayerPolicy): ReturnAdmission['ordinaryEnvelope'] {
-  return { encodedBytes: BigInt(Math.min(policy.signedBytes, policy.calldataBytes)), gas: policy.gas, gasFor: ordinaryGas(w) };
+  const erc20 = !!w.bridge.cfg.erc20;
+  return { encodedBytes: BigInt(Math.min(policy.signedBytes, policy.calldataBytes, erc20 ? 393_216 : Infinity)),
+    gas: erc20 && policy.gas > 24_000_000n ? 24_000_000n : policy.gas, gasFor: ordinaryGas(w) };
 }
 
 export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string, replacing?: bigint): ReturnAdmission {
@@ -200,6 +215,8 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
     ordinaryEnvelope: policy && ordinaryEnvelope(w, policy),
     checkOrdinary: w.release.recovery === undefined && policy === undefined ? undefined : async (rec, gas) => {
       if (!policy) throw new WalletError('PolicyRequired', 'explicit payer limits are required');
+      // The ERC20 signing check prices both routes together at the qualified ceiling.
+      if (w.bridge.cfg.erc20) return;
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, bytes(rec.payer ?? rec.recipient, 20));
       const fee = gas * limits.currentBid;
@@ -208,7 +225,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
         throw new Nb2Error('CapacityPreflight', 'ordinary return exceeds the payer or reserve limits');
       }
     },
-    recover: w.release.recovery === undefined ? undefined : async (rec) => {
+    recover: w.release.recovery === undefined ? undefined : async (rec, ordinary) => {
       if (!policy) throw new WalletError('PolicyRequired', 'explicit payer limits are required');
       const release = recoveryRelease(w);
       await checkGraph(w, release);
@@ -216,15 +233,22 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
       const limits = await limitsOf(w, policy, payer, reservedFees(w, rec, payer, undefined, replacing), replacing);
       const a = uint(rec.a);
       const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
+      const bounds = release.signingWindows && policy.feeWindowMs !== undefined ? {
+        ...release.signingWindows, feeWindowMs: policy.feeWindowMs,
+        ordinary: ordinary && { ...ordinary, attemptsBeforeFallback: policy.ordinaryAttemptsBeforeFallback ?? 0n,
+          inclusionMs: release.signingWindows.ordinaryInclusionMs ?? 0n },
+      } : undefined;
       const plan = await preflightRecovery(w.pins.gamma, bytes(rec.source), w.trust, buildParams(w.pins.build),
-        release.deployment, release.calibration, limits, { ...release.backlog, signedStart: a, observed: segment < a ? a : segment },
-        rec.sealReceipt ? bytes(rec.sealReceipt) : undefined);
-      const calls = BigInt(plan.run.length) + plan.advance.calls + 1n;
+        release.deployment, release.calibration, limits, { ...release.backlog, signedStart: a, observed: segment },
+        rec.sealReceipt ? bytes(rec.sealReceipt) : undefined, bounds);
+      const calls = BigInt(plan.run.length) + plan.advance.calls + 1n + plan.priorAttempts;
       if ((replacing ?? await w.bridge.evm.nonce(payer)) + calls - 1n > limits.maxNonce) {
         throw new Nb2Error('CapacityPreflight', 'recovery schedule exceeds the declared nonce horizon');
       }
       return { generation: hx(release.generation), calls: String(calls), totalFee: String(plan.totalFee),
         runCuts: plan.run.map((quote) => quote.shape.operations), advanceGaps: plan.advance.quote.shape.gaps,
+        ordinary: ordinary && { gas: String(ordinary.gas), calldataBytes: ordinary.calldataBytes,
+          maxFeePerGas: String(limits.maxFeePerGas), attemptsBeforeFallback: String(plan.priorAttempts) },
         observed: String(segment < a ? a : segment), receiptP99Ms: String(release.backlog.receiptP99Ms),
         finalInclusionMs: String(release.backlog.finalInclusionMs), qualifiedForMs: String(release.backlog.qualifiedForMs) };
     },
@@ -459,7 +483,7 @@ async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec:
     throw new Nb2Error('CapacityPreflight', 'portable gap batch or settlement suffix is outside the release limits');
   }
   const confirmedCuts = journal?.cuts.filter((item) => item.cut.kind === 'run').length ?? 0;
-  if (!cursor?.gap) checkRemainingRecoveryRuns(held, runCuts, confirmedCuts, release.calibration, limits);
+  if (!cursor?.gap) checkRemainingRecoveryRuns(held, runCuts, confirmedCuts, release.calibration, limits, !!cfg.erc20);
   const covered = cursor?.gap?.cursor?.next ?? uint(rec.a);
   const { segment } = await evm.vaultState(cfg.vault);
   recoveryCatchUpCalls(advanceGaps, {
@@ -832,7 +856,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       const count = rec.recovery!.runCuts[journal.cuts.length];
       const packet = await s.run(cursor.from, count, w.trust, cursor.prior);
       cut = { kind: 'run', count };
-      quote = quoteRecovery(packet.shape, release.calibration, limits);
+      quote = quoteRecovery(packet.shape, release.calibration, limits, !!w.bridge.cfg.erc20);
       ({ calldata, requiredSignerEpoch } = packet);
     } else {
       const start = cursor.gap.cursor?.next ?? uint(rec.a);

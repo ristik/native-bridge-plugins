@@ -30,6 +30,7 @@ import {
   Journal, dec, hex, undec, unhex, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
 import { recoveredSettlementEta } from './recovery.js';
+import { quoteErc20Call, type Erc20SigningBounds } from './recovery-cost.js';
 import { burnIndex, capacityExceeded, capacityPreflight, maxProofs, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
 import { AmbiguousBroadcast, CERTIFICATION_DEPTH, EvmReader, ProofUnavailable, RpcError, revertDataOf, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
@@ -221,7 +222,7 @@ export interface ReturnPlan {
 export interface ReturnAdmission {
   ordinaryEnvelope?: { encodedBytes: bigint; gas: bigint; gasFor?: (shape: RedeemShape) => bigint | null };
   checkOrdinary?(record: ReturnRecord, gas: bigint): Promise<void>;
-  recover?(record: ReturnRecord): Promise<NonNullable<ReturnRecord['recovery']>>;
+  recover?(record: ReturnRecord, ordinary?: Pick<NonNullable<Erc20SigningBounds['ordinary']>, 'gas' | 'calldataBytes'>): Promise<NonNullable<ReturnRecord['recovery']>>;
   beforeCertification?(record: ReturnRecord): Promise<void>;
 }
 
@@ -1173,7 +1174,7 @@ export class NativeBridgeV2 {
    * The section 12.5 preflight for burning `token` at index `a` to `recipient`, with a fresh endpoint estimate (c_obs = max(c, a); the
    * state read is an availability assumption, not evidence) and the payer's funds for the worst-case gas limit.
    */
-  private async preflight(token: Uint8Array, amount: bigint, recipient: Uint8Array, a: bigint, payer: Uint8Array, admission?: ReturnAdmission): Promise<{ cObs: bigint; pNow: bigint; need: bigint; pMax: bigint; gas: bigint }> {
+  private async preflight(token: Uint8Array, amount: bigint, recipient: Uint8Array, a: bigint, payer: Uint8Array, admission?: ReturnAdmission) {
     const envelope = admission?.ordinaryEnvelope;
     if (!envelope?.gasFor && !(await this.gasApplies())) {
       fail('CapacityPreflight', `the gas model ${this.gas.name} is not calibrated for this deployment (its verifier, helper and vault code, its native gas schedule): supply a GasModel for it`);
@@ -1192,13 +1193,14 @@ export class NativeBridgeV2 {
     const lMax = envelope && envelope.encodedBytes < pins.maxEncodedTxBytes ? envelope.encodedBytes : pins.maxEncodedTxBytes;
     const userGasLimit = envelope && envelope.gas < pins.userGasLimit ? envelope.gas : pins.userGasLimit;
     const pf = capacityPreflight({ lMax, lT, lO, K: this.cfg.K, a, cObs, reserve: pins.returnReserveSegments, gasAt, userGasLimit });
-    if (admission?.checkOrdinary) return { cObs, ...pf };
+    const calldataBytes = redeemCalldataLength(Number(lT), pf.need === 0n ? 0 : 32 + Number(pf.need) * gapProofLen(this.cfg.K));
+    if (admission?.checkOrdinary) return { cObs, ...pf, calldataBytes };
     // the payer must fund the worst-case gas limit at the current fee level (twice the base fee plus the priority fee)
     const fees = await this.evm.fees();
     const cost = pf.gas * (2n * fees.baseFee + fees.priority);
     const bal = await this.evm.balance(payer);
     if (bal < cost) refuse('InsufficientFunds', `the payer holds ${bal} wei, the worst-case gas limit ${pf.gas} needs ${cost}`);
-    return { cObs, ...pf };
+    return { cObs, ...pf, calldataBytes };
   }
 
   private async admitReturn(record: ReturnRecord, amount: bigint, admission?: ReturnAdmission) {
@@ -1219,7 +1221,10 @@ export class NativeBridgeV2 {
     }
     if (this.cfg.erc20) {
       if (!admission?.recover) return fail('CapacityPreflight', 'a bounded ERC20 continuation quote is required');
-      await admission.recover(structuredClone(record));
+      const { gas, calldataBytes } = ordinary;
+      const qualified = await admission.recover(structuredClone(record), { gas, calldataBytes });
+      if (!qualified.ordinary) fail('CapacityPreflight', 'a bounded ordinary attempt policy is required');
+      record.recovery = qualified;
     }
     return ordinary;
   }
@@ -1354,7 +1359,7 @@ export class NativeBridgeV2 {
     if (rec.status === 'planned') {
       // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
       if (owner === undefined) return refuse('BadInput', 'only the holder can sign a new burn');
-      if (admission) await this.verifyReturnAnchor(rec);
+      if (admission || this.cfg.erc20) await this.verifyReturnAnchor(rec);
       const recipient = unhex(rec.recipient);
       this.checkReturnRecipient(recipient);
       if (expectedRecipient && !eq(recipient, expectedRecipient)) refuse('BadInput', 'planned return does not match the authorized recipient');
@@ -1519,7 +1524,20 @@ export class NativeBridgeV2 {
       }
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
-        options.admit && ((request) => options.admit!(request, fresh.sends)), expired && {
+        async (request) => {
+          if (this.cfg.erc20) {
+            const ordinary = fresh.recovery?.ordinary;
+            const prior = new Set(fresh.sends.map((send) => undec(send.nonce)));
+            if (!ordinary || (!prior.has(request.nonce) && BigInt(prior.size) >= undec(ordinary.attemptsBeforeFallback)) ||
+              !quoteErc20Call(request.data.length, request.gas, {
+                ...request, maxNonce: request.nonce, gas: undec(ordinary.gas), calldataBytes: ordinary.calldataBytes,
+                maxFeePerGas: undec(ordinary.maxFeePerGas), signedBytes: Number(this.opts.pins.maxEncodedTxBytes), balance: 0n, feeBudget: 0n,
+              }) || request.maxFeePerGas > undec(ordinary.maxFeePerGas) || !options.admit) {
+              fail('CapacityPreflight', 'ordinary attempt exceeds its signing reserve');
+            }
+          }
+          await options.admit?.(request, fresh.sends);
+        }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
             .map((send) => decodeSignedTx(unhex(send.raw)).request),
         });

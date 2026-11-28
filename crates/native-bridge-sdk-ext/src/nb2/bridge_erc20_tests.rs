@@ -148,6 +148,12 @@ fn continuation(cfg: &Config, recovery: [u8; 20], fee_budget: u64) -> Erc20Retur
             vault_runtime_hash: calibration.vault_runtime_hash(),
         },
         calibration,
+        signing_bounds: Erc20SigningBounds {
+            fee_window_ms: 400_000,
+            progress_window_ms: 100_000,
+            advance_window_ms: 2_000,
+        },
+        ordinary_attempts: Some((1, 1_000)),
         backlog: RecoveryBacklog {
             signed_start: 0,
             observed: 0,
@@ -419,3 +425,4 @@ fn recovery_session_and_quote_reject_one_mismatched_config_field() {
         );
     }
 }
+use crate::nb2::recovery_cost::preflight_recovery;

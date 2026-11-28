@@ -168,6 +168,7 @@ export interface ReturnRecord extends Base {
   recovery?: {
     generation: Hex; calls: Dec; totalFee: Dec; runCuts: number[]; advanceGaps: number;
     observed: Dec; receiptP99Ms: Dec; finalInclusionMs: Dec; qualifiedForMs: Dec;
+    ordinary?: { gas: Dec; calldataBytes: number; maxFeePerGas: Dec; attemptsBeforeFallback: Dec };
   };
   /** The certified burned part: the redeem evidence's token. */
   burned?: Hex;

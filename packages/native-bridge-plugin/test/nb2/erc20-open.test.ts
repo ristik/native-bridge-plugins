@@ -164,7 +164,7 @@ test('the second deposit in one certified receipt mints, and each new burn requi
       assert.ok(cost > 0n && cost <= feeBudget && cost <= await bridge.evm.balance(x.payer.address));
       ordinaryChecks++;
     },
-    recover: async () => {
+    recover: async (_, ordinary) => {
       continuationChecks++;
       const plan = await preflightRecovery(x.options().pins.gamma, held, x.tip.trust, PRODUCTION_PARAMS, graph, { ...graph, ranges }, {
         signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: x.cfg.chainId,
@@ -172,13 +172,15 @@ test('the second deposit in one certified receipt mints, and each new burn requi
       }, {
         signedStart: 0n, observed: 0n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n,
         receiptP99Ms: 1000n, advancePeakSeals: 1n, finalInclusionMs: 25n, finalPeakSeals: 1n, qualifiedForMs: 200_000n,
-      });
+      }, undefined, { feeWindowMs: 400_000n, progressWindowMs: 100_000n, advanceWindowMs: 2000n,
+        ordinary: ordinary && { ...ordinary, attemptsBeforeFallback: 1n, inclusionMs: 1000n } });
       return { generation: hex(graph.salt), calls: String(BigInt(plan.run.length) + plan.advance.calls + 1n),
         totalFee: String(plan.totalFee), runCuts: plan.run.map((cut) => cut.shape.operations), advanceGaps: plan.advance.quote.shape.gaps,
+        ordinary: ordinary && { gas: String(ordinary.gas), calldataBytes: ordinary.calldataBytes, maxFeePerGas: '10', attemptsBeforeFallback: '1' },
         observed: '0', receiptP99Ms: '1000', finalInclusionMs: '25', qualifiedForMs: '200000' };
     },
   };
-  await assert.rejects(bridge.planReturn(held, recipient, x.payer.address, { admission }), /insufficient recovery fee budget/);
+  await assert.rejects(bridge.planReturn(held, recipient, x.payer.address, { admission }), /insufficient authorized fee budget/);
   assert.equal(ordinaryChecks, 1);
   assert.equal(continuationChecks, 1);
   feeBudget = 10n ** 20n;

@@ -6,7 +6,7 @@ import { decodeConfig, domainOf, MAX_SEGMENT, type Config, type Params } from '.
 import { HE, HU } from './crypto.js';
 import { decodeDepositProof, decodeReceiptBacking, encodeDepositProof, verifyReceiptLog } from './deposit.js';
 import { fail, Nb2Error, refuse, WalletError } from './errors.js';
-import { quoteRecovery, validRecoveryDeployment, type RecoveryCalibration, type RecoveryLimits, type RecoveryQuote, type RecoveryShape } from './recovery-cost.js';
+import { ERC20_RESUME_OPERATIONS, quoteRecovery, quoteRunCut, scheduleRecoveryRuns, validRecoveryDeployment, type RecoveryCalibration, type RecoveryLimits, type RecoveryQuote, type RecoveryShape } from './recovery-cost.js';
 import { verifySealReceipt } from './rules.js';
 import { foldHistory, gapProofLen, GapTree } from './segment.js';
 import { decodeSplitManifest, parentLink } from './split.js';
@@ -332,17 +332,28 @@ export class RecoverySession {
 
   private checkCalibration(calibration: RecoveryCalibration, limits: RecoveryLimits): void {
     if (!eq(this.deployment.pins, calibration.pins) || !eq(this.deployment.runtimeHash, calibration.runtimeHash)
+      || (this.cfg.erc20 && (!this.deployment.vaultRuntimeHash || !calibration.vaultRuntimeHash
+        || !eq(this.deployment.vaultRuntimeHash, calibration.vaultRuntimeHash)))
       || this.cfg.chainId !== limits.chainId) fail('CapacityPreflight', 'unqualified recovery deployment');
+  }
+
+  /** Plan every cut of a certified burn using worst-case openings and predecessor receipt size. */
+  planRuns(calibration: RecoveryCalibration, limits: RecoveryLimits): RecoveryQuote[] {
+    this.checkCalibration(calibration, limits);
+    const spans = this.ops.map(({ start, end, claims }) => ({ start, end, claims: claims.length }));
+    return scheduleRecoveryRuns(spans.length, (from, end) =>
+      quoteRunCut(spans, from, end, spans[spans.length - 1].end, calibration, limits, !!this.cfg.erc20));
   }
 
   /** Fit the largest prefix within the authenticated packet and transaction limits. */
   async runBounded(from: number, trust: TrustInput, calibration: RecoveryCalibration, limits: RecoveryLimits,
     prior?: { seq: bigint; receipt: Uint8Array }): Promise<{ packet: RunPacket; quote: RecoveryQuote }> {
     this.checkCalibration(calibration, limits);
-    for (let count = Math.min(16, this.ops.length - from); count > 0; count--) {
+    const max = this.cfg.erc20 && prior ? ERC20_RESUME_OPERATIONS : 16;
+    for (let count = Math.min(max, this.ops.length - from); count > 0; count--) {
       try {
         const packet = await this.run(from, count, trust, prior);
-        const quote = quoteRecovery(packet.shape, calibration, limits);
+        const quote = quoteRecovery(packet.shape, calibration, limits, !!this.cfg.erc20);
         if (quote !== null) return { packet, quote };
       } catch (e) {
         if (!(e instanceof Nb2Error && e.rule === 'InputTooLarge' && (e.detail === 'run pages' || e.detail === 'cold calldata'))) throw e;

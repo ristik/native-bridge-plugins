@@ -20,6 +20,8 @@ const RECEIPT_BYTES: usize = 65_536;
 const SPARSE: usize = 8_224;
 const SEAL_RESERVE: u64 = 500_000;
 const GAS_LIMIT: u64 = 24_000_000;
+/// ERC20 release admission cap. The continuation wire still accepts 16 Resume operations.
+pub const ERC20_RESUME_OPERATIONS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryEntry {
@@ -85,7 +87,15 @@ pub fn quote_recovery(
     calibration: &dyn RecoveryCalibration,
     limits: &RecoveryLimits,
 ) -> Option<RecoveryQuote> {
-    quote_range(shape, shape.receipt_bytes, calibration, limits)
+    quote_range(shape, shape.receipt_bytes, calibration, limits, false)
+}
+
+pub fn quote_erc20_recovery(
+    shape: RecoveryShape,
+    calibration: &dyn RecoveryCalibration,
+    limits: &RecoveryLimits,
+) -> Option<RecoveryQuote> {
+    quote_range(shape, shape.receipt_bytes, calibration, limits, true)
 }
 
 fn quote_range(
@@ -93,9 +103,19 @@ fn quote_range(
     min_receipt_bytes: usize,
     calibration: &dyn RecoveryCalibration,
     limits: &RecoveryLimits,
+    erc20: bool,
 ) -> Option<RecoveryQuote> {
     let n = shape.calldata_bytes;
-    if !(68..=CALLDATA_BYTES.min(limits.calldata_bytes)).contains(&n) {
+    if !(68..=CALLDATA_BYTES.min(limits.calldata_bytes)).contains(&n)
+        || shape.operations > 16
+        || shape.pages > 32
+        || shape.gaps > 1024
+        || shape.receipt_bytes > RECEIPT_BYTES
+        || (erc20
+            && shape.entry == RecoveryEntry::Run
+            && shape.receipt_bytes != 0
+            && shape.operations > ERC20_RESUME_OPERATIONS)
+    {
         return None;
     }
     let execution = calibration
@@ -122,7 +142,20 @@ fn quote_range(
     };
     let gas =
         (21_000 + 16 * n as u64 + reserve).checked_add(execution.checked_mul(6)?.div_ceil(5))?;
-    if gas > GAS_LIMIT.min(limits.gas)
+    let (signed_bytes, fee) = quote_erc20_call(n, gas, limits)?;
+    Some(RecoveryQuote {
+        shape,
+        gas,
+        signed_bytes,
+        fee,
+    })
+}
+
+/// Bound a zero-value Type 2 call with an empty access list and full-width signature.
+pub fn quote_erc20_call(n: usize, gas: u64, limits: &RecoveryLimits) -> Option<(usize, BigUint)> {
+    if !(68..=CALLDATA_BYTES.min(limits.calldata_bytes)).contains(&n)
+        || gas == 0
+        || gas > GAS_LIMIT.min(limits.gas)
         || limits.chain_id == 0
         || limits.max_fee_per_gas.bits() == 0
         || limits.max_fee_per_gas.bits() > 256
@@ -156,12 +189,7 @@ fn quote_range(
     {
         return None;
     }
-    Some(RecoveryQuote {
-        shape,
-        gas,
-        signed_bytes,
-        fee,
-    })
+    Some((signed_bytes, fee))
 }
 
 #[derive(Clone, Copy)]
@@ -254,7 +282,83 @@ pub struct RecoveryAdmission {
     pub settlement_max_gaps: usize,
     pub settle: RecoveryQuote,
     pub total_fee: BigUint,
+    pub prior_attempts: u64,
 }
+
+/// Qualified upper time bounds, in milliseconds, through inclusion and usable proof.
+pub struct Erc20SigningBounds {
+    pub fee_window_ms: u64,
+    /// Includes burn and Run certification, covered restores and any delay before fallback.
+    pub progress_window_ms: u64,
+    /// Worst time to a usable advance proof, over which advance_peak_seals is bounded.
+    pub advance_window_ms: u64,
+}
+
+pub struct Erc20OrdinaryBound {
+    pub gas: u64,
+    pub calldata_bytes: usize,
+    pub attempts_before_fallback: u64,
+    pub inclusion_ms: u64,
+}
+
+pub fn erc20_signing_reserve(
+    recovery_fee: BigUint,
+    calls: u64,
+    backlog: &RecoveryBacklog,
+    limits: &RecoveryLimits,
+    bounds: &Erc20SigningBounds,
+    ordinary: Option<&Erc20OrdinaryBound>,
+) -> Result<(BigUint, u64)> {
+    if bounds.fee_window_ms == 0
+        || bounds.progress_window_ms == 0
+        || bounds.advance_window_ms < backlog.receipt_p99_ms
+        || bounds.advance_window_ms == 0
+    {
+        return fail_d(
+            Rule::CapacityPreflight,
+            "unqualified ERC20 fee or inclusion windows",
+        );
+    }
+    let continuation_ms = u128::from(calls) * u128::from(bounds.advance_window_ms)
+        + u128::from(backlog.final_inclusion_ms);
+    if continuation_ms > u128::from(backlog.qualified_for_ms)
+        || u128::from(bounds.progress_window_ms) + continuation_ms
+            > u128::from(bounds.fee_window_ms)
+    {
+        return fail_d(Rule::CapacityPreflight, "unqualified ERC20 signing horizon");
+    }
+    let (total_fee, prior_attempts) = if let Some(ordinary) = ordinary {
+        let attempts = ordinary.attempts_before_fallback;
+        if attempts == 0
+            || ordinary.inclusion_ms == 0
+            || u128::from(attempts) * u128::from(ordinary.inclusion_ms)
+                > u128::from(bounds.progress_window_ms)
+        {
+            return fail_d(Rule::CapacityPreflight, "unqualified ordinary retry window");
+        }
+        let Some((_, fee)) = quote_erc20_call(ordinary.calldata_bytes, ordinary.gas, limits) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary call is outside the ERC20 admission limits",
+            );
+        };
+        let retries = &fee * attempts;
+        (recovery_fee.max(fee) + retries, attempts)
+    } else {
+        (recovery_fee, 0)
+    };
+    if total_fee > limits.fee_budget {
+        return fail_d(
+            Rule::CapacityPreflight,
+            "insufficient authorized fee budget",
+        );
+    }
+    if total_fee > limits.balance {
+        return fail_d(Rule::CapacityPreflight, "insufficient free payer balance");
+    }
+    Ok((total_fee, prior_attempts))
+}
+
 pub struct AdmissionContext<'a> {
     pub gamma: &'a [u8],
     pub trust: &'a TrustInput,
@@ -271,7 +375,19 @@ pub fn preflight_recovery(
     backlog: &RecoveryBacklog,
     starting_seal: Option<&[u8]>,
 ) -> Result<RecoveryAdmission> {
+    preflight_recovery_with_signing_bounds(ctx, held, backlog, starting_seal, None, None)
+}
+
+pub fn preflight_recovery_with_signing_bounds(
+    ctx: &AdmissionContext<'_>,
+    held: &[u8],
+    backlog: &RecoveryBacklog,
+    starting_seal: Option<&[u8]>,
+    bounds: Option<&Erc20SigningBounds>,
+    ordinary: Option<&Erc20OrdinaryBound>,
+) -> Result<RecoveryAdmission> {
     let cfg = decode_config(ctx.gamma, ctx.params)?;
+    let erc20 = cfg.erc20.is_some();
     if !ctx.deployment.matches_config(&cfg)
         || ctx.deployment.pins != ctx.calibration.pins()
         || ctx.deployment.runtime_hash != ctx.calibration.runtime_hash()
@@ -336,7 +452,13 @@ pub fn preflight_recovery(
             if from == 0 { 0 } else { RECEIPT_BYTES },
             opening,
         )?;
-        quote_range(shape, usize::from(from != 0), ctx.calibration, ctx.limits)
+        quote_range(
+            shape,
+            usize::from(from != 0),
+            ctx.calibration,
+            ctx.limits,
+            erc20,
+        )
     };
     if (0..spans.len()).any(|i| quoted(i, i + 1).is_none()) {
         return fail_d(Rule::CapacityPreflight, "indivisible run operation");
@@ -353,13 +475,13 @@ pub fn preflight_recovery(
     }
     let Some(last) = backlog
         .observed
+        .max(backlog.signed_start)
         .checked_add(backlog.during_progress)
         .and_then(|x| x.checked_add(64))
     else {
         return fail_d(Rule::CapacityPreflight, "unqualified backlog");
     };
-    if backlog.observed < backlog.signed_start
-        || last > MAX_SEGMENT
+    if last > MAX_SEGMENT
         || backlog.elapsed_ms == 0
         || backlog.receipt_p99_ms == 0
         || backlog.final_inclusion_ms == 0
@@ -382,6 +504,7 @@ pub fn preflight_recovery(
             1,
             ctx.calibration,
             ctx.limits,
+            erc20,
         )
     };
     if gap(1).is_none() {
@@ -423,6 +546,7 @@ pub fn preflight_recovery(
             1,
             ctx.calibration,
             ctx.limits,
+            erc20,
         ) else {
             return fail_d(Rule::CapacityPreflight, "unqualified settlement suffix");
         };
@@ -435,6 +559,24 @@ pub fn preflight_recovery(
     for quote in &run {
         total_fee += &quote.fee;
     }
+    let (total_fee, prior_attempts) = if erc20 {
+        let Some(bounds) = bounds else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "unqualified ERC20 fee or inclusion windows",
+            );
+        };
+        erc20_signing_reserve(
+            total_fee,
+            advance_calls,
+            backlog,
+            ctx.limits,
+            bounds,
+            ordinary,
+        )?
+    } else {
+        (total_fee, 0)
+    };
     if total_fee > ctx.limits.fee_budget || total_fee > ctx.limits.balance {
         return fail_d(Rule::CapacityPreflight, "insufficient recovery fee budget");
     }
@@ -445,5 +587,6 @@ pub fn preflight_recovery(
         settlement_max_gaps: q - 1,
         settle,
         total_fee,
+        prior_attempts,
     })
 }
