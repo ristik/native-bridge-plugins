@@ -182,7 +182,7 @@ export interface RecoveryBacklog {
   peakSeals: bigint;
   elapsedMs: bigint;
   receiptP99Ms: bigint;
-  /** Qualified maximum arrivals, including bursts, in any receiptP99Ms window. */
+  /** Qualified maximum arrivals, including bursts, before the next usable advance proof. */
   advancePeakSeals: bigint;
   /** Qualified time from sealing the final endpoint, including proof retrieval, through settlement inclusion. */
   finalInclusionMs: bigint;

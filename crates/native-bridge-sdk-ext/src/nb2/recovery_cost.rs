@@ -266,7 +266,7 @@ pub struct RecoveryBacklog {
     pub peak_seals: u64,
     pub elapsed_ms: u64,
     pub receipt_p99_ms: u64,
-    /// Qualified maximum arrivals, including bursts, in any receipt_p99_ms window.
+    /// Qualified maximum arrivals, including bursts, before the next usable advance proof.
     pub advance_peak_seals: u64,
     /// Qualified time from sealing the final endpoint, including proof retrieval, through settlement inclusion.
     pub final_inclusion_ms: u64,
@@ -309,6 +309,12 @@ pub fn erc20_signing_reserve(
     bounds: &Erc20SigningBounds,
     ordinary: Option<&Erc20OrdinaryBound>,
 ) -> Result<(BigUint, u64)> {
+    if limits.max_fee_per_gas.bits() == 0
+        || limits.max_fee_per_gas.bits() > 256
+        || limits.max_priority_fee_per_gas > limits.max_fee_per_gas
+    {
+        return fail_d(Rule::CapacityPreflight, "invalid ERC20 fee limits");
+    }
     if bounds.fee_window_ms == 0
         || bounds.progress_window_ms == 0
         || bounds.advance_window_ms < backlog.receipt_p99_ms

@@ -34,6 +34,8 @@ test('ERC20 builds a whole schedule with capped Resume cuts and refuses an indiv
   assert.equal(quoteRecovery(max.shape, calibration, { ...exact, calldataBytes: max.shape.calldataBytes - 1 }, true), null);
   assert.equal(quoteRecovery(max.shape, calibration, { ...exact, gas: max.gas - 1n }, true), null);
   assert.equal(quoteRecovery(max.shape, calibration, { ...exact, maxTransactionFee: max.fee - 1n }, true), null);
+  const over24M = { ...calibration, ranges: calibration.ranges.map((range) => ({ ...range, execution: 20_000_000n })) };
+  assert.equal(quoteRecovery(max.shape, over24M, { ...limits, gas: 40_000_000n }, true), null);
 });
 
 test('ERC20 uses net progress and reserves the larger route plus bounded attempts at the fee ceiling', () => {
