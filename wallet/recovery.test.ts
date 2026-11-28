@@ -8,12 +8,14 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  CERTIFICATION_DEPTH, EvmReader, GapTree, Journal, NativeBridgeV2, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx, domainOf,
-  evidenceOf, firstOwnerOf, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
+  CERTIFICATION_DEPTH, EvmReader, GapTree, Journal, NativeBridgeV2, Nb2Error, SELECTOR, TOPIC, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx, domainOf,
+  evidenceOf, firstOwnerOf, nextHead, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryCalibration, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { ascii, u256 } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
+import { LIMITS } from '../packages/native-bridge-plugin/src/nb2/deposit.js';
+import { segmentSealedData } from '../packages/native-bridge-plugin/src/nb2/segment.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
@@ -107,6 +109,128 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   await mint(w, 'coin');
   return { w, open, root, cfg, chain, deployment, aggregator, dir, rpc, rpcOn, views, manifest };
 }
+
+test('a deposit with an oversized certified receipt cannot mint offline', async (t) => {
+  const { w, chain, cfg, aggregator } = await setup(t);
+  const plan = await planDeposit(w, 'wide-deposit', 1n);
+  const padding = { address: new Uint8Array(20).fill(0x61), topics: [], data: new Uint8Array(LIMITS.receiptLeafNodeBytes) };
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, cfg.vault) || !eq(data, plan.calldata)) return undefined;
+    vault.deposit(plan.amount, plan.firstOwner, plan.rho);
+    return [padding];
+  };
+  const { txHash, depositNumber } = await sendDeposit(w, 'wide-deposit');
+  const receipt = await w.bridge.evm.mintReceiptProof(txHash, cfg.vault, false, TOPIC.Deposited, [TOPIC.Deposited, u256(depositNumber)]);
+  assert.ok(receipt.proof.nodes.at(-1)!.length > LIMITS.receiptLeafNodeBytes);
+  assert.ok(receipt.encoded.length < LIMITS.justificationBytes);
+  const calls = aggregator.calls;
+  await assert.rejects(mint(w, 'wide-deposit'), { rule: 'InputTooLarge', message: /deposit receipt exceeds the offline proof limits/ });
+  const pending = (await w.bridge.journal.deposit(plan.intent))!;
+  assert.equal(pending.status, 'deposited');
+  assert.equal(pending.reason, undefined);
+  assert.equal(aggregator.calls, calls);
+});
+
+test('continuation authenticates the whole archived suffix before its first advance and settles past an oversized seal', async (t) => {
+  const { w, open, chain, cfg, deployment } = await setup(t);
+  const release = w.release.recovery as { ranges: { max: { entry: string; gaps: number } }[] };
+  release.ranges = release.ranges.filter(({ max }) => max.entry === 'run' || max.gaps <= 2);
+  const { eta } = await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const evidence = evidenceOf(unhex(rec.burned!));
+  const session = await RecoverySession.create(chain.gamma, evidence, new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const verdict = await verifyReturn(chain.gamma, evidence, w.trust, TEST_PARAMS);
+  const complete = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to, data) => {
+    if (!eq(to, deployment.recovery)) return;
+    assert.deepEqual(data, complete.calldata);
+    return [{ address: to, topics: complete.event.topics, data: complete.event.data }];
+  };
+  const checkpoint = await recoverStep(w, rec, caps);
+  assert.equal(checkpoint.state, 'checkpoint');
+  assert.ok('txHash' in checkpoint);
+  const completion = await recoveryRpcSource(w.bridge.evm, checkpoint.txHash)(deployment.recovery, complete.event);
+
+  const producer = await open('shared-seal-producer');
+  chain.fund(producer.signer.address, 10n ** 18n);
+  const owner = firstOwnerOf(w.owner(0).publicKey);
+  const marker = new Uint8Array(20).fill(0x62);
+  chain.coldCall = async (vault, to) => {
+    if (!eq(to, marker)) return;
+    const index = vault.c;
+    for (let i = 0n; i < cfg.K; i++) {
+      const id = HE(u256(index * cfg.K + i + 1n));
+      vault.deposit(1n, owner, id);
+      vault.redeem(id, index, new Uint8Array(), { ret: verdictAbi({
+        ...verdict, eta: id, minSegment: index, recipient: producer.signer.address, amount: 1n,
+      }) });
+    }
+    return index === 0n ? [{ address: marker, topics: [], data: new Uint8Array(LIMITS.receiptLeafNodeBytes) }] : [];
+  };
+  for (let i = 0; i < 3; i++) {
+    const tx = await signTx(producer.signer, { chainId: cfg.chainId, nonce: BigInt(i), maxFeePerGas: 15n,
+      maxPriorityFeePerGas: 1n, gas: 1_000_000n, to: marker, value: 0n, data: new Uint8Array() });
+    await producer.bridge.evm.sendRaw(tx.raw);
+  }
+  assert.equal(chain.vault.c, 3n);
+  const before = unhex(rec.startHead);
+  const seals = await w.bridge.evm.segmentLogs(cfg.vault, BigInt(rec.fromBlock), 0n, 3n);
+  const oversized = await w.bridge.evm.receiptProof(seals[0].transactionHash, cfg.vault, TOPIC.SegmentSealed, true, seals[0]);
+  assert.ok(oversized.proof.nodes.at(-1)!.length > LIMITS.receiptLeafNodeBytes);
+  assert.ok(oversized.encoded.length < LIMITS.justificationBytes);
+  await assert.rejects(session.certifiedGaps(w.trust, 0n, before, [oversized.encoded]),
+    (e: unknown) => e instanceof Nb2Error && e.rule === 'SealReceipt' && e.innermost === 'InputTooLarge');
+
+  const segments = chain.vault.events.flatMap((e) => e.name === 'SegmentSealed'
+    ? [{ index: e.segment, before: e.before, after: e.after, z: e.ids, root: GapTree.build(e.ids)!.root }] : []);
+  const fetchLogs = w.bridge.evm.segmentLogs.bind(w.bridge.evm);
+  const counterfeitIds = [1n, 2n, 3n, 4n].map(u256);
+  const tail = segments[2];
+  const wrongData = segmentSealedData(tail.before, nextHead(chain.domain, tail.index, tail.before, GapTree.build(counterfeitIds)!.root), counterfeitIds);
+  const sign = t.mock.method(w.signer, 'signTransaction', async () => { throw new Error('signer reached'); });
+  const send = t.mock.method(w.bridge.evm, 'sendRaw', async () => { throw new Error('sender reached'); });
+  const payerBefore = chain.balanceOf(w.signer.address);
+  for (const [change, error] of [
+    [(rows: typeof seals) => rows.map((l) => eq(l.topics[1], u256(2)) ? { ...l, data: wrongData } : l), /do not fold to the certified vault head/],
+    [(rows: typeof seals) => rows.map((l) => eq(l.topics[1], u256(2)) ? { ...l, data: l.data.slice(0, -32) } : l), /SegmentLog: length/],
+    [(rows: typeof seals) => rows.filter((l) => !eq(l.topics[1], u256(2))), /archived segment range is incomplete/],
+  ] as const) {
+    w.bridge.evm.segmentLogs = async (...args) => change(await fetchLogs(...args));
+    await assert.rejects(recoverStep(w, rec, caps), error);
+    assert.equal(sign.mock.callCount(), 0);
+    assert.equal(send.mock.callCount(), 0);
+    assert.equal(chain.balanceOf(w.signer.address), payerBefore);
+  }
+  sign.mock.restore();
+  send.mock.restore();
+  w.bridge.evm.segmentLogs = fetchLogs;
+
+  const paths = segments.map((e) => GapTree.build(e.z)!.prove(eta)!);
+  const advance = await session.gaps('advanceGaps', w.trust, completion, { seq: 1n }, paths.slice(0, 2), before);
+  assert.ok(advance.event && advance.head);
+  const gapEvent = advance.event;
+  chain.coldCall = async (_vault, to, data) => {
+    if (!eq(to, deployment.recovery)) return;
+    assert.deepEqual(data, advance.calldata);
+    return [{ address: to, topics: gapEvent.topics, data: gapEvent.data }];
+  };
+  const advanced = await recoverStep(w, rec, caps);
+  assert.equal(advanced.state, 'checkpoint');
+  assert.ok('txHash' in advanced);
+  const gapReceipt = await recoveryRpcSource(w.bridge.evm, advanced.txHash)(deployment.recovery, gapEvent);
+  const settle = await session.gaps('redeemRecovered', w.trust, gapReceipt,
+    { seq: 2n, cursor: { next: 2n, head: advance.head } }, paths.slice(2));
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, cfg.vault) || hx(data.subarray(0, 4)) !== selector('redeemRecovered(bytes)')) return;
+    assert.deepEqual(data, settle.calldata);
+    const history = buildHistory(segments, eta, 0n, vault.c, before);
+    vault.redeem(eta, 0n, history.history, { ret: verdictAbi(verdict) });
+    return [];
+  };
+  assert.equal((await recoverStep(w, rec, caps)).state, 'paid');
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid' && eq(e.eta, eta)).length, 1);
+  assert.equal(chain.vault.q, 0n);
+});
 
 test('refused preflight never certifies a spend, and receive verifies the full path and owner', async (t) => {
   const { w, open, aggregator, views } = await setup(t);

@@ -638,6 +638,8 @@ segments of history at 72,852 / 126,393 / 661,926 gas, and the sealing return (t
 
 ## Limits
 
+**Known limitation.** A deposit whose receipt exceeds the proof limits cannot be recovered offline in this release. For a shared segment seal with an oversized receipt, the continuation wallet can reconstruct the history from archived segment IDs and authenticate it against a certified vault head. A receipt-bound fix is planned for the next generation. [bft-core #1355](https://github.com/ristik/bft-core/issues/1355)
+
 **The test vault.** The package deploys two vaults: the test build (K = 4, B = 2), whose manifest the lanes and the walkthrough use, and
 the production build (K = 64, B = 16) beside it. A segment seals every K payments, so at K = 4 the lane can rotate segments in a few
 returns. Wallets read K from Γ; nothing in a wallet depends on which build it is.

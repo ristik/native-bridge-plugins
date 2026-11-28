@@ -17,7 +17,7 @@ use super::recovery_cost::{
     RecoveryQuote, RecoveryShape, ERC20_RESUME_OPERATIONS,
 };
 use super::rules::verify_seal_receipt;
-use super::segment::{fold_history, gap_proof_len, GapTree};
+use super::segment::{check_segment_log, fold_history, gap_proof_len, GapTree};
 use super::split::{decode_split_manifest, parent_link};
 use super::token::{decode_token, mint_source_hash, result_state, state_id, token_id_of, Token};
 use super::trust::{bind_trust, decode_uc, shard_bytes, TrustInput};
@@ -906,6 +906,66 @@ pub struct GapPacket {
 }
 
 impl RecoverySession {
+    /// Authenticate the full archived suffix against the terminal seal receipt, then return
+    /// up to `limit` exclusion proofs for the next packet. Each log supplies its index and ABI data.
+    pub fn archived_gaps(
+        &self,
+        trust: &TrustInput,
+        start: u64,
+        mut head: Hash,
+        logs: &[(u64, &[u8])],
+        terminal_seal: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let end = start
+            .checked_add(logs.len() as u64)
+            .filter(|end| *end <= MAX_SEGMENT);
+        let Some(end) =
+            end.filter(|_| start >= self.verdict.min_segment && !logs.is_empty() && limit <= 1024)
+        else {
+            return fail_d(Rule::Shape, "archived gap range");
+        };
+        let mut paths = Vec::new();
+        let mut paid = false;
+        for (i, &(index, data)) in logs.iter().enumerate() {
+            if index != start + i as u64 {
+                return fail_d(Rule::SegmentLog, "nonconsecutive archived seals");
+            }
+            let segment = check_segment_log(&self.verdict.domain, self.cfg.k, index, &head, data)?;
+            if segment.z.contains(&self.verdict.eta) {
+                paid = true;
+            } else if i < limit {
+                paths.push(
+                    GapTree::build(&segment.z)
+                        .unwrap()
+                        .prove(&self.verdict.eta)
+                        .unwrap(),
+                );
+            }
+            head = segment.after;
+        }
+        self.authority.accept(trust, &self.cfg)?;
+        let seal = verify_seal_receipt(
+            &self.cfg,
+            &self.verdict.domain,
+            &self.authority.checkpoint()?,
+            terminal_seal,
+        )?;
+        if seal.segment.index != end - 1 || seal.segment.after != head {
+            return fail_d(
+                Rule::SegmentLog,
+                "archived seals do not fold to the certified vault head",
+            );
+        }
+        if paid {
+            return refuse(
+                WalletReason::AlreadyPaid,
+                "return appears in a certified sealed segment",
+            );
+        }
+        Ok(paths)
+    }
+
     /// Materialize consecutive exclusion proofs from certified vault seal receipts.
     pub fn certified_gaps(
         &self,

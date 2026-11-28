@@ -8,7 +8,7 @@ import { decodeDepositProof, decodeReceiptBacking, encodeDepositProof, verifyRec
 import { fail, Nb2Error, refuse, WalletError } from './errors.js';
 import { ERC20_RESUME_OPERATIONS, quoteRecovery, quoteRunCut, scheduleRecoveryRuns, validRecoveryDeployment, type RecoveryCalibration, type RecoveryLimits, type RecoveryQuote, type RecoveryShape } from './recovery-cost.js';
 import { verifySealReceipt } from './rules.js';
-import { foldHistory, gapProofLen, GapTree } from './segment.js';
+import { checkSegmentLog, foldHistory, gapProofLen, GapTree } from './segment.js';
 import { decodeSplitManifest, parentLink } from './split.js';
 import { decodeToken, lineageOf, mintSourceHash, resultState, stateId, tokenIdOf } from './token.js';
 import { bindTrust, decodeUc, type TrustInput } from './trust.js';
@@ -448,6 +448,33 @@ export class RecoverySession {
     if (fault !== undefined) throw fault;
     if (unavailable !== undefined) throw unavailable;
     return refuse('EvidenceMissing', 'no recovery receipt source');
+  }
+
+  /**
+   * Authenticate the entire archived suffix against its terminal seal receipt. Only materialize
+   * the next packet's witnesses, and refuse membership anywhere in the authenticated suffix.
+   */
+  async archivedGaps(trust: TrustInput, start: bigint, head: Uint8Array,
+    logs: readonly { index: bigint; data: Uint8Array }[], terminalSeal: Uint8Array, limit: number): Promise<Uint8Array[]> {
+    const end = start + BigInt(logs.length);
+    if (start < this.verdict.minSegment || end > MAX_SEGMENT || head.length !== 32 || logs.length === 0 ||
+      !Number.isInteger(limit) || limit < 0 || limit > 1024) fail('Shape', 'archived gap range');
+    const paths: Uint8Array[] = [];
+    let before: Uint8Array = Uint8Array.from(head);
+    let paid: bigint | undefined;
+    for (const [i, log] of logs.entries()) {
+      if (log.index !== start + BigInt(i)) fail('SegmentLog', 'nonconsecutive archived seals');
+      const segment = checkSegmentLog(this.verdict.domain, this.cfg.K, log.index, before, log.data);
+      if (segment.z.some((id) => eq(id, this.verdict.eta))) paid = log.index;
+      else if (i < limit) paths.push(GapTree.build(segment.z)!.prove(this.verdict.eta)!);
+      before = segment.after;
+    }
+    const receipt = Uint8Array.from(terminalSeal);
+    await this.authority.accept(trust, this.cfg);
+    const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, await this.authority.checkpoint, receipt);
+    if (segment.index !== end - 1n || !eq(segment.after, before)) fail('SegmentLog', 'archived seals do not fold to the certified vault head');
+    if (paid !== undefined) refuse('AlreadyPaid', `return appears in certified sealed segment ${paid}`);
+    return paths;
   }
 
   /** Materialize consecutive exclusion proofs from certified vault seal receipts. */

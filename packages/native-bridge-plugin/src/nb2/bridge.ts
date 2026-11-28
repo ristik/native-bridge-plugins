@@ -657,12 +657,21 @@ export class NativeBridgeV2 {
     const token = this.cfg.erc20?.token;
     const topic = depositTopic(token);
     const topics = token ? [topic, u256(n), addressWord(token)] : [topic, u256(n)];
-    const rp = await this.evm.mintReceiptProof(tx, this.cfg.vault,
-      token !== undefined || toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH, topic, topics);
-    const j = { d: this.domain, n, r: this.secretOf(i), proof: rp.proof };
-    const ev = await this.retryingTrust((trust) => verifyDepositEvidence(this.cfg, this.domain, trust, j));
-    if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');
-    return { receiptProof: rp.encoded, reason: encodeReceiptBacking(j) };
+    try {
+      const rp = await this.evm.mintReceiptProof(tx, this.cfg.vault,
+        token !== undefined || toHex(this.cfg.semanticProfileHash) === IMPORTED_TIP_PROFILE_HASH, topic, topics);
+      const reason = encodeReceiptBacking({ d: this.domain, n, r: this.secretOf(i), proof: rp.proof });
+      // A constructed proof must fit the offline mint verifier before it enters the journal.
+      const j = decodeReceiptBacking(reason);
+      const ev = await this.retryingTrust((trust) => verifyDepositEvidence(this.cfg, this.domain, trust, j));
+      if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');
+      return { receiptProof: rp.encoded, reason };
+    } catch (e) {
+      if (e instanceof Nb2Error && e.innermost === 'InputTooLarge') {
+        fail('InputTooLarge', 'this deposit receipt exceeds the offline proof limits for this release');
+      }
+      throw e;
+    }
   }
 
   /** The ordinary mint with reason J, certified by the aggregator and verified offline. */

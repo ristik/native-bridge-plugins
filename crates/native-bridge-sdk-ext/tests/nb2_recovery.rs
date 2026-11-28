@@ -10,8 +10,10 @@ use native_bridge_sdk_ext::nb2::{
         GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoveryEvent,
         RecoverySession,
     },
+    segment::{next_head, segment_sealed_data, GapTree},
     trust::TrustInput,
     util::{arr, from_hex},
+    verify::verify_return,
     Rule, WalletReason,
 };
 use serde_json::Value;
@@ -99,6 +101,34 @@ fn op_count(calldata: &[u8]) -> usize {
         pos += 8 + (n - index * 4096).min(4096) + 32 * depth;
     }
     raw[pos] as usize
+}
+
+#[test]
+fn archived_gaps_check_the_suffix_beyond_the_first_packet() {
+    let path = "transcripts/root";
+    let (session, trust, gamma, _) = load(BASE, path);
+    let params = production_params();
+    let cfg = decode_config(&gamma, &params).unwrap();
+    let evidence = read(BASE, &format!("{path}/evidence.bin"));
+    let verdict = verify_return(&gamma, &evidence, &trust, &params).unwrap();
+    let start = verdict.min_segment;
+    let ids: Vec<[u8; 32]> = (0..cfg.k).map(|i| [i as u8; 32]).collect();
+    let root = GapTree::build(&ids).unwrap().root();
+    let head = [3; 32];
+    let middle = next_head(&verdict.domain, start, &head, &root);
+    let end = next_head(&verdict.domain, start + 1, &middle, &root);
+    let first = segment_sealed_data(&head, &middle, &ids);
+    let last = segment_sealed_data(&middle, &end, &ids);
+    let bad = [(start, first.as_slice()), (start + 2, last.as_slice())];
+    let err = session
+        .archived_gaps(&trust, start, head, &bad, &[], 1)
+        .unwrap_err();
+    assert_eq!(err.rule().unwrap().rule, Rule::SegmentLog);
+    let consecutive = [(start, first.as_slice()), (start + 1, last.as_slice())];
+    let err = session
+        .archived_gaps(&trust, start, head, &consecutive, &[], 1)
+        .unwrap_err();
+    assert_eq!(err.rule().unwrap().rule, Rule::SealReceipt);
 }
 
 #[test]
