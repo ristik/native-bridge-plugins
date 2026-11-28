@@ -20,6 +20,7 @@ REQUIRED_ERC20_EVIDENCE = {
     'protocol/calibration/erc20-1349-live.json',
 }
 QUALIFIED_ERC20_EVIDENCE = 'protocol/calibration/erc20-qualified-release.json'
+QUALIFIED_ERC20_MANIFEST = 'protocol/calibration/erc20-qualified-wallet-manifest.json'
 
 
 def load(path):
@@ -105,10 +106,15 @@ def check_erc20_release(digest, profile):
         canonical = json.dumps(bounds, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()
         assert record['qualifiedBoundsSha256'] == hashlib.sha256(canonical).hexdigest(), 'qualification evidence bounds mismatch'
         hex_field(record['walletManifestSha256'], 64, 'walletManifestSha256')
+        assert evidence.get(QUALIFIED_ERC20_MANIFEST) == record['walletManifestSha256'], 'missing or mismatched qualified ERC20 wallet manifest pin'
+        manifest = load(QUALIFIED_ERC20_MANIFEST)
+        assert manifest['pins']['erc20']['fundingQualified'] is True, 'qualified ERC20 wallet manifest must enable funding'
+        assert manifest['pins']['vaultRuntimeCodeHash'] == release['deployment']['vaultRuntimeHash'], 'qualified ERC20 wallet manifest vault runtime mismatch'
         support = record['supportingEvidence']
         fields(support, set(bounds), 'qualification supporting evidence')
         for name in support.values():
-            assert isinstance(name, str) and name in evidence and name != QUALIFIED_ERC20_EVIDENCE, 'missing qualification supporting evidence pin'
+            assert (isinstance(name, str) and name in evidence
+                    and name not in {QUALIFIED_ERC20_EVIDENCE, QUALIFIED_ERC20_MANIFEST}), 'missing qualification supporting evidence pin'
 
 
 def fields(value, expected, label):

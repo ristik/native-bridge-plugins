@@ -67,14 +67,18 @@ class Erc20ReleaseTests(unittest.TestCase):
             },
         }
 
-    def pin_qualification(self, **overrides):
+    def pin_qualification(self, *, manifest_funding=True, **overrides):
         bounds = self.release['qualifiedBounds']
         payload = json.dumps(bounds, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()
+        manifest = {'pins': {'vaultRuntimeCodeHash': self.release['deployment']['vaultRuntimeHash'],
+                             'erc20': {'fundingQualified': manifest_funding}}}
+        manifest_path = checker.QUALIFIED_ERC20_MANIFEST
+        self.release['evidence'][manifest_path] = self.write_bytes(manifest_path, json.dumps(manifest).encode())
         record = {
             'deployment': self.release['deployment'],
             'semanticProfileSha256': self.digest,
             'qualifiedBoundsSha256': hashlib.sha256(payload).hexdigest(),
-            'walletManifestSha256': 'ef' * 32,
+            'walletManifestSha256': self.release['evidence'][manifest_path],
             'supportingEvidence': dict.fromkeys(bounds, sorted(checker.REQUIRED_ERC20_EVIDENCE)[0]),
             **overrides,
         }
@@ -118,6 +122,22 @@ class Erc20ReleaseTests(unittest.TestCase):
         self.check()
         self.pin_qualification()
         self.check()
+
+    def test_promotion_requires_the_exact_wallet_manifest(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        self.pin_qualification(manifest_funding=False)
+        with self.assertRaisesRegex(AssertionError, 'must enable funding'):
+            self.check()
+        self.pin_qualification()
+        manifest = checker.QUALIFIED_ERC20_MANIFEST
+        del self.release['evidence'][manifest]
+        with self.assertRaisesRegex(AssertionError, 'qualified ERC20 wallet manifest pin'):
+            self.check()
+        self.pin_qualification()
+        self.write_bytes(manifest, (self.root / manifest).read_bytes() + b'\n')
+        with self.assertRaisesRegex(AssertionError, 'evidence digest mismatch'):
+            self.check()
 
     def test_true_flag_requires_deployment_specific_evidence(self):
         self.complete()
