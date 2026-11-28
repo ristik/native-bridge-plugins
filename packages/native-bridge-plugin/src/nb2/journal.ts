@@ -514,15 +514,17 @@ export class Journal {
       fail('CapacityPreflight', 'payer fee history needs an authenticated chain association');
     }
     requireExecutionPayer(record, payer);
-    const path = this.payerSendPath(chainId, payer, record);
-    const ordinary = record.sends.map(({ raw }) => decodeSignedTx(unhex(raw))).filter(({ from, request }) =>
+    const history = await this.ret(record.returnId) ?? record;
+    requireExecutionPayer(history, payer);
+    const path = this.payerSendPath(chainId, payer, history);
+    const ordinary = history.sends.map(({ raw }) => decodeSignedTx(unhex(raw))).filter(({ from, request }) =>
       request.chainId === chainId && eqBytes(from, payer));
-    if (record.executionPayer === undefined && ordinary.length > 0 && !await this.payerHistoryComplete(path)) {
-      await this.indexPayerSends(record, []);
+    if (history.executionPayer === undefined && ordinary.length > 0 && !await this.payerHistoryComplete(path)) {
+      await this.indexPayerSends(history, []);
     }
     const prefix = `nb2/payer-fees/v1/${path}/`;
     const keys = await this.store.list(prefix);
-    if ((record.executionPayer !== undefined || ordinary.length > 0 || keys.length > 0 ||
+    if ((history.executionPayer !== undefined || ordinary.length > 0 || keys.length > 0 ||
         await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) && !await this.payerHistoryComplete(path)) {
       fail('CapacityPreflight', 'return needs its local signed fees indexed');
     }
@@ -550,8 +552,6 @@ export class Journal {
   public async preparePayerBroadcast(record: ReturnRecord, chainId: bigint, raw: Uint8Array): Promise<void> {
     const { from, request } = decodeSignedTx(raw);
     if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
-    const current = await this.ret(record.returnId);
-    if (current) requireExecutionPayer(current, from);
     await this.payerFeeMaxima(record, chainId, from);
     if (!await this.payerHistoryComplete(this.payerSendPath(chainId, from, record))) {
       fail('CapacityPreflight', 'return needs its local signed fees indexed');

@@ -1082,8 +1082,14 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     }
     if (!current.executionPayer) {
       const durable = (await w.bridge.journal.retForUpdate(rec.returnId))!;
-      durable.executionPayer = hx(w.signer.address);
-      await w.bridge.journal.putReturn(durable);
+      const bound = executionPayerOf(durable);
+      if (bound && !eq(bound, w.signer.address)) {
+        throw new WalletError('NotPending', `return is bound to execution payer ${hx(bound)}`);
+      }
+      if (!durable.executionPayer) {
+        durable.executionPayer = hx(w.signer.address);
+        await w.bridge.journal.putReturn(durable);
+      }
     }
     if (expired) (journal.replacedSettlements ??= []).push(journal.pending!.raw);
     (journal.signerEpochs ??= {})[hx(tx.hash)] = String(requiredSignerEpoch);

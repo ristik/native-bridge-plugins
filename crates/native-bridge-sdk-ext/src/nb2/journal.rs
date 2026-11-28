@@ -879,6 +879,9 @@ impl Journal {
             );
         }
         record.require_execution_payer(payer)?;
+        let stored = self.ret(&record.return_id)?;
+        let record = stored.as_ref().unwrap_or(record);
+        record.require_execution_payer(payer)?;
         let path = payer_send_path(chain_id, payer, record);
         let executor = record.extra.contains_key("executionPayer");
         let ordinary = record
@@ -961,9 +964,6 @@ impl Journal {
                 WalletReason::BadInput,
                 "signed payer packet belongs to another chain",
             );
-        }
-        if let Some(current) = self.ret(&record.return_id)? {
-            current.require_execution_payer(&tx.from)?;
         }
         self.payer_fee_maxima(record, chain_id, &tx.from)?;
         if !self.payer_history_complete(&payer_send_path(chain_id, &tx.from, record))? {

@@ -1683,7 +1683,12 @@ fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacemen
     legacy
         .index_payer_sends(&unregistered, &[&foreign, &different])
         .unwrap();
+    let mut before_binding = unregistered.clone();
+    before_binding.extra.remove("executionPayer");
     for error in [
+        legacy
+            .prepare_payer_signing(&before_binding, chain, &payer)
+            .unwrap_err(),
         legacy
             .payer_fee_maxima(&unregistered, chain, &payer)
             .unwrap_err(),
@@ -2047,7 +2052,14 @@ fn a_second_ordinary_payer_cannot_sign_or_rebroadcast_an_already_bound_return() 
                 .push(bridge.send_record(&sign_tx(&first, &next).unwrap()));
         }
         bridge.journal.put_return(&record).unwrap();
+        let mut before_binding = record.clone();
+        before_binding.extra.remove("executionPayer");
+        before_binding.sends.clear();
         for error in [
+            bridge
+                .journal
+                .prepare_payer_signing(&before_binding, chain, &other.address())
+                .unwrap_err(),
             bridge.submit_redeem(&return_id, &signer).unwrap_err(),
             bridge.sign_redeem_tx(&record, &signer, &next).unwrap_err(),
             bridge
