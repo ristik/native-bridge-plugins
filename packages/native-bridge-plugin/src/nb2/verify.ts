@@ -4,7 +4,7 @@ import { concat, eq, toHex } from '../bytes.js';
 import {
   amount, array, ascii, bytesN, cAmount, cArr, cBytes, cTag, cUint, isUint, scanOne, tagContent, u256, version, type Item,
 } from './cbor.js';
-import { ASSET_UCT, DOMAIN, MAX_SEGMENT, TAG, V2_VERSION, decodeConfig, deriveType, deriveCoin, domainOf, type Config, type Params } from './config.js';
+import { DOMAIN, MAX_SEGMENT, TAG, V2_VERSION, configIdentities, decodeConfig, domainOf, encodeConfig, type Config, type Params } from './config.js';
 import { HU, minterKey, parseKey, verifyUnlock } from './crypto.js';
 import { verifyRootMint } from './deposit.js';
 import { Nb2Error, fail, wrap } from './errors.js';
@@ -79,8 +79,9 @@ export async function verifySplit(c: Config, d: Uint8Array, t: TrustInput, part:
 
 async function walk(c: Config, d: Uint8Array, t: TrustInput, part: Token, mode: 'held' | 'split' | 'return'): Promise<{ level: Level; terminal: LineageLevel }> {
   bindTrust(t, c);
-  if (!eq(c.asset, ASSET_UCT) || !eq(c.ty, deriveType(c.network, c.rootGenesis, c.executionGenesis, c.chainId))
-    || !eq(c.aid, deriveCoin(c.network, c.rootGenesis, c.executionGenesis, c.chainId))) fail('ConfigShape');
+  const { asset, ty, aid } = configIdentities(c);
+  if (!eq(c.asset, asset) || !eq(c.ty, ty) || !eq(c.aid, aid)) fail('ConfigShape');
+  if (c.erc20 && !eq(d, domainOf(encodeConfig(c)))) fail('MintDomain');
   const chain = lineageOf(part);
   const checks: LineageChecks = { seen: new Set(), claim: claimConsistency() };
   let parent: Split | null = null;
@@ -245,7 +246,7 @@ function checkReturn(c: Config, d: Uint8Array, part: LineageLevel, lv: Level): R
   const r = decodeReturnData(last.data);
   if (r.minIndex > MAX_SEGMENT) fail('ReturnIndex');
   if (!eq(r.d, d)) fail('ReturnDomain');
-  if (!eq(r.asset, ASSET_UCT)) fail('ReturnAsset');
+  if (!eq(r.asset, c.asset)) fail('ReturnAsset');
   if (r.amount !== lv.amount) fail('ReturnAmount');
   if (r.recipient.every((x) => x === 0) || eq(r.recipient, c.vault)) fail('ReturnRecipient');
   if (!eq(last.recipient.params, HU(last.data!))) fail('BurnReason');

@@ -124,7 +124,7 @@ export class FakeAggregator implements Aggregator {
   public readonly certified = new Map<string, Uint8Array>();
   public time = 1_700_000_000n;
   public calls = 0;
-  public constructor(private readonly root: Root, private readonly movingProofs = false) {}
+  public constructor(private readonly root: Root, private readonly movingProofs = false, private readonly epoch = 1n) {}
 
   public async certify(request: Uint8Array): Promise<Uint8Array> {
     this.calls++;
@@ -140,7 +140,7 @@ export class FakeAggregator implements Aggregator {
     const smt = new SparseMerkleTree(new DataHasherFactory(HashAlgorithm.SHA256, NodeDataHasher));
     await smt.addLeaf(sid, HU(cArr(cBytes(cd.transactionHash.data), cUint(t))));
     const r = await smt.calculateRoot();
-    const uc = await makeUc(this.root, AGG_PARTITION, r.hash.data, sha(concat(ascii('aggregator block'), r.hash.data)), t + 1n);
+    const uc = await makeUc(this.root, AGG_PARTITION, r.hash.data, sha(concat(ascii('aggregator block'), r.hash.data)), t + 1n, this.epoch);
     const proof = cTag(39033, cArr(cUint(1), request, cUint(t), cBytes(InclusionCertificate.create(r, sid).encode()), uc));
     this.certified.set(toHex(sid), proof);
     return proof;

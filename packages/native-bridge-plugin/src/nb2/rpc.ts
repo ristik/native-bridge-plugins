@@ -471,19 +471,22 @@ export class EvmReader {
   }
 
   /** The paired profile selects the parent's UC from the canonical child's committed origin. */
-  public mintReceiptProof(txHash: Uint8Array, vault: Uint8Array, bound: boolean): Promise<ReceiptProof> {
-    return this.receiptProof(txHash, vault, TOPIC.Deposited, false, undefined, [], undefined, bound);
+  public mintReceiptProof(txHash: Uint8Array, vault: Uint8Array, bound: boolean, topic = TOPIC.Deposited,
+    topics?: readonly Uint8Array[]): Promise<ReceiptProof> {
+    return this.receiptProof(txHash, vault, topic, false, topics && { topics }, [], undefined, bound);
   }
 
-  /** The DepositProof container for the first log of `txHash` emitted by `emitter` with `topic0`. */
-  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false, expected?: Pick<RecoveryEvent, 'topics' | 'data'>, archives: readonly EvmReader[] = [], authenticate?: (raw: Uint8Array, uc: Uint8Array) => Promise<void>, bindMintWitness = false): Promise<ReceiptProof> {
+  /** The DepositProof container for a receipt log matching the emitter, topic and any supplied fields. */
+  public async receiptProof(txHash: Uint8Array, emitter: Uint8Array, topic0: Uint8Array, bindTechnicalRecord = false,
+    expected?: { topics: readonly Uint8Array[]; data?: Uint8Array }, archives: readonly EvmReader[] = [],
+    authenticate?: (raw: Uint8Array, uc: Uint8Array) => Promise<void>, bindMintWitness = false): Promise<ReceiptProof> {
     const r = await this.receipt(txHash);
     if (r === null) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} has no receipt on this node (pending, unknown or pruned)`);
     if (qtyOf(r!.status, 'status') !== 1n) refuse('Reverted', `transaction 0x${toHex(txHash)} failed: its logs never count`);
     const idx = r!.logs.findIndex((l) => eq(bytesOf(l.address, 'address'), emitter) && l.topics.length > 0
       && eq(bytesOf(l.topics[0], 'topic'), topic0) && (expected === undefined || (
         l.topics.length === expected.topics.length && l.topics.every((topic, i) => eq(bytesOf(topic, 'topic'), expected.topics[i]))
-        && eq(bytesOf(l.data, 'log data'), expected.data))));
+        && (expected.data === undefined || eq(bytesOf(l.data, 'log data'), expected.data)))));
     if (idx < 0) refuse('EvidenceMissing', `transaction 0x${toHex(txHash)} emitted no such log from 0x${toHex(emitter)}`);
     const blockHash = fixedOf(r!.blockHash, 32, 'blockHash');
     const sources = archives.length ? [...new Set([this, ...archives])] : undefined;
@@ -573,8 +576,8 @@ export class EvmReader {
     return this.logs(vault, [hexOf(TOPIC.Paid), hexOf(eta)], from, top);
   }
 
-  public async call(to: Uint8Array, data: Uint8Array, from?: Uint8Array): Promise<Uint8Array> {
-    return bytesOf(await this.rpc.call('eth_call', [{ to: hexOf(to), data: hexOf(data), ...(from ? { from: hexOf(from) } : {}) }, 'latest']), 'eth_call');
+  public async call(to: Uint8Array, data: Uint8Array, from?: Uint8Array, gas?: bigint): Promise<Uint8Array> {
+    return bytesOf(await this.rpc.call('eth_call', [{ to: hexOf(to), data: hexOf(data), ...(from ? { from: hexOf(from) } : {}), ...(gas === undefined ? {} : { gas: qty(gas) }) }, 'latest']), 'eth_call');
   }
 
   /** Check imported authority and simulate the exact fee-bearing return at the same finalized block. */

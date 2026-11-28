@@ -4,7 +4,7 @@ use num_bigint::BigUint;
 
 use super::cbor::*;
 use super::config::{
-    asset_uct, decode_config, derive_coin, derive_type, domain, domain_of, tag, Config, Params,
+    config_identities, decode_config, domain, domain_of, encode_config, tag, Config, Params,
     MAX_SEGMENT, V2_VERSION,
 };
 use super::crypto::{hu, minter_key, minter_scalar, minter_scalar_valid, parse_key, verify_unlock};
@@ -163,11 +163,12 @@ pub fn verify_split(
 
 fn walk(c: &Config, d: &[u8; 32], t: &TrustInput, part: &Token, held: bool) -> Result<Level> {
     bind_trust(t, c)?;
-    if c.asset != asset_uct()
-        || c.ty != derive_type(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id)
-        || c.aid != derive_coin(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id)
-    {
+    let (asset, ty, aid) = config_identities(c);
+    if (c.asset, c.ty, c.aid) != (asset, ty, aid) {
         return fail(Rule::ConfigShape);
+    }
+    if c.erc20.is_some() && *d != domain_of(&encode_config(c)) {
+        return fail(Rule::MintDomain);
     }
     let mut checks = LineageChecks::default();
     let mut parent = None;
@@ -498,7 +499,7 @@ fn check_return(c: &Config, d: &[u8; 32], part: &LineageLevel, lv: &Level) -> Re
     if r.d != *d {
         return fail(Rule::ReturnDomain);
     }
-    if r.asset != asset_uct() {
+    if r.asset != c.asset {
         return fail(Rule::ReturnAsset);
     }
     if r.amount != lv.amount {

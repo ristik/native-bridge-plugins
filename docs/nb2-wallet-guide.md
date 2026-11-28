@@ -496,8 +496,10 @@ What can be rebuilt: segment logs, gap trees, gap proofs, held witnesses, fee es
 and checked from the pinned genesis entry). A wallet that deletes them and keeps the journal and its tokens still redeems; the lane's `cold`
 stage does exactly that.
 
-The reference wallet keeps all of this in its directory: `journal.json`, `backup.json` (the high-water mark; a real wallet stores it with
-the seed backup, off the device), `tokens.json` with `tokens/*.cbor` and any `tokens/*.pending.json`, and `trust-history.cbor`.
+The reference wallet keeps `journal.json`, `tokens.json` with `tokens/*.cbor` and any `tokens/*.pending.json`, and
+`trust-history.cbor` in its directory. Each `backup-<D>.json` holds the issuance high-water mark for one redemption domain.
+Keep those files with the seed backup off the device. On open, the wallet migrates a legacy `backup.json` using the domain
+stored in the backup itself. After journal loss, `Wallet.recoverDeposits()` scans to the current domain's backed-up counter.
 
 **How the reference store meets the contract.** Every file is written durably:
 

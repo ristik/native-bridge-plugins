@@ -1,5 +1,5 @@
 /** Γ, D and the asset identity (section 4; bft-core `nb2ref/config.go`). */
-import { eq, toHex } from '../bytes.js';
+import { concat, eq, toHex } from '../bytes.js';
 import {
   MAX_U64, amount, array, ascii, bstr, bytesN, cAmount, cArr, cBytes, cUint, literal, scanOne, uintIn, version,
 } from './cbor.js';
@@ -62,15 +62,17 @@ export interface Config {
   K: bigint;
   B: bigint;
   Qmax: bigint;
+  erc20?: { token: Uint8Array; generation: Uint8Array; pins: Uint8Array };
 }
 
 export const CONFIG_ARITY = 19;
 
 export function encodeConfig(c: Config): Uint8Array {
   return cArr(
-    cBytes(ascii(DOMAIN.config)), cUint(CONFIG_VERSION), cUint(c.network), cBytes(c.rootGenesis), cBytes(c.executionGenesis), cUint(c.chainId),
+    cBytes(ascii(DOMAIN.config)), cUint(c.erc20 ? 3n : CONFIG_VERSION), cUint(c.network), cBytes(c.rootGenesis), cBytes(c.executionGenesis), cUint(c.chainId),
     cUint(c.evmPartition), cBytes(c.evmShard), cUint(c.aggregatorPartition), cBytes(c.vault), cBytes(c.asset), cBytes(c.ty), cBytes(c.aid),
     cBytes(c.semanticProfileHash), cBytes(c.verifier), cBytes(c.verifierCodeHash), cUint(c.K), cUint(c.B), cAmount(c.Qmax),
+    ...(c.erc20 ? [cBytes(c.erc20.token), cBytes(c.erc20.generation), cBytes(c.erc20.pins)] : []),
   );
 }
 
@@ -107,9 +109,11 @@ export function canonicalShardId(b: Uint8Array): boolean {
 /** Strictly decode Γ under the admitted set `p` (every section 4.1 check that needs no deployment environment). */
 export function decodeConfig(b: Uint8Array, p: Params): Config {
   if (b.length > MAX_CONFIG_BYTES) throw new ConfigError(CONFIG_ARITY, new Nb2Error('InputTooLarge'));
-  const k = at(CONFIG_ARITY, () => array(scanOne(b), CONFIG_ARITY));
+  const arity = b[0] === 0x96 ? 22 : CONFIG_ARITY;
+  if (arity === 22 && b.length > 480) throw new ConfigError(arity, new Nb2Error('InputTooLarge'));
+  const k = at(arity, () => array(scanOne(b), arity));
   at(0, () => literal(k[0], DOMAIN.config));
-  at(1, () => version(k[1], CONFIG_VERSION));
+  at(1, () => version(k[1], arity === 22 ? 3n : CONFIG_VERSION));
   const network = Number(at(2, () => uintIn(k[2], 1n, 65535n)));
   const rootGenesis = at(3, () => bytesN(k[3], 32));
   const executionGenesis = at(4, () => bytesN(k[4], 32));
@@ -133,10 +137,42 @@ export function decodeConfig(b: Uint8Array, p: Params): Config {
   if (!admits(p, K, B)) throw new ConfigError(17, new Nb2Error('IntRange'));
   const Qmax = at(18, () => amount(k[18]));
   if (Qmax > QMAX_LIMIT) throw new ConfigError(18, new Nb2Error('IntRange'));
+  const erc20 = arity === 22 ? {
+    token: at(19, () => bytesN(k[19], 20)).slice(),
+    generation: at(20, () => bytesN(k[20], 32)).slice(),
+    pins: at(21, () => bytesN(k[21], 32)).slice(),
+  } : undefined;
+  if (erc20) {
+    if (K !== 64n) throw new ConfigError(16, new Nb2Error('IntRange'));
+    if (B !== 16n) throw new ConfigError(17, new Nb2Error('IntRange'));
+    for (const [i, value] of [erc20.token, erc20.generation, erc20.pins].entries()) {
+      if (value.every((x) => x === 0)) throw new ConfigError(19 + i, new Nb2Error('IntRange'));
+    }
+  }
   return {
+    ...(erc20 ? { erc20 } : {}),
     network, rootGenesis: rootGenesis.slice(), executionGenesis: executionGenesis.slice(), chainId, evmPartition: Number(ep), evmShard: evmShard.slice(),
     aggregatorPartition: Number(ap), vault: vault.slice(), asset: asset.slice(), ty: ty.slice(), aid: aid.slice(),
     semanticProfileHash: semanticProfileHash.slice(), verifier: verifier.slice(), verifierCodeHash: verifierCodeHash.slice(), K, B, Qmax,
+  };
+}
+
+/** ERC20 asset IDs use the authenticated genesis, with no metadata or bridge generation. */
+export function erc20Identities(chainId: bigint, token: Uint8Array, genesis: Uint8Array) {
+  if (chainId <= 0n || chainId > MAX_U64 || token.length !== 20 || token.every((x) => x === 0)
+    || genesis.length !== 32) fail('ConfigShape');
+  const id = new Uint8Array(8);
+  new DataView(id.buffer).setBigUint64(0, chainId);
+  const x = concat(id, token, genesis);
+  const hash = (label: string) => HU(concat(ascii(`UNICITY/NB2/ERC20/${label}/1/`), x));
+  return { asset: hash('ASSET'), ty: hash('TYPE'), aid: hash('COIN') };
+}
+
+export function configIdentities(c: Config) {
+  return c.erc20 ? erc20Identities(c.chainId, c.erc20.token, c.executionGenesis) : {
+    asset: ASSET_UCT,
+    ty: deriveType(c.network, c.rootGenesis, c.executionGenesis, c.chainId),
+    aid: deriveCoin(c.network, c.rootGenesis, c.executionGenesis, c.chainId),
   };
 }
 
@@ -168,9 +204,10 @@ export function construct(gamma: Uint8Array, env: Environment, p: Params): Confi
   } catch (e) {
     throw new BadConfigError(e instanceof ConfigError ? e.field : CONFIG_ARITY);
   }
-  if (!eq(c.asset, ASSET_UCT)) throw new BadConfigError(10);
-  if (!eq(c.ty, deriveType(c.network, c.rootGenesis, c.executionGenesis, c.chainId))) throw new BadConfigError(11);
-  if (!eq(c.aid, deriveCoin(c.network, c.rootGenesis, c.executionGenesis, c.chainId))) throw new BadConfigError(12);
+  const { asset, ty, aid } = configIdentities(c);
+  if (!eq(c.asset, asset)) throw new BadConfigError(10);
+  if (!eq(c.ty, ty)) throw new BadConfigError(11);
+  if (!eq(c.aid, aid)) throw new BadConfigError(12);
   if (!eq(c.vault, env.address)) throw new BadConfigError(9);
   if (c.chainId !== env.chainId) throw new BadConfigError(5);
   if (!eq(c.verifierCodeHash, env.verifierCodeHash)) throw new BadConfigError(15);

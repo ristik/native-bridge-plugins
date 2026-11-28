@@ -46,6 +46,12 @@ pub mod topic {
         he(&[b"Deposited(uint64,bytes32,uint256,bytes32,bytes)"])
     }
 
+    pub fn erc20_deposited() -> [u8; 32] {
+        he(&[b"ERC20Deposited(uint64,address,bytes32,uint256,bytes32,bytes)"])
+    }
+    pub fn erc20_activated() -> [u8; 32] {
+        he(&[b"ERC20Activated(address,address,address,bytes32,bytes32,bytes32)"])
+    }
     pub fn paid() -> [u8; 32] {
         he(&[b"Paid(bytes32,address,uint256)"])
     }
@@ -262,6 +268,26 @@ fn decode_receipt(v: &[u8]) -> Result<RlpItem<'_>> {
     Ok(logs)
 }
 
+pub fn deposit_topic(token: Option<&[u8; 20]>) -> [u8; 32] {
+    match token {
+        Some(_) => topic::erc20_deposited(),
+        None => topic::deposited(),
+    }
+}
+
+pub fn deposit_topics(topics: &[Vec<u8>], token: Option<&[u8; 20]>) -> bool {
+    match (token, topics) {
+        (None, [topic, _]) => *topic == deposit_topic(None),
+        (Some(token), [topic, _, address]) => {
+            *topic == deposit_topic(Some(token))
+                && address.len() == 32
+                && address[..12] == [0; 12]
+                && address[12..] == token[..]
+        }
+        _ => false,
+    }
+}
+
 /// Section 6.2 steps 2 to 5 up to the emitter: the EVM UC (`DepositUC`), the header bound to its input record
 /// (`DepositHeader`), the receipt path keyed by RLP(txIndex) (`ReceiptPath`), type and status, `logs[logIndex]` (`LogIndex`)
 /// and its address (`LogEmitter`). The caller checks its event's topics and data.
@@ -354,7 +380,8 @@ pub fn verify_deposit_evidence(
         return fail(Rule::MintDomain);
     }
     let log = verify_receipt_log(c, t, &j.proof)?;
-    if log.topics.len() != 2 || log.topics[0] != topic::deposited() || log.topics[1] != u256_64(j.n)
+    if !deposit_topics(&log.topics, c.erc20.as_ref().map(|e| &e.token))
+        || log.topics[1] != u256_64(j.n)
     {
         return fail(Rule::LogTopics);
     }

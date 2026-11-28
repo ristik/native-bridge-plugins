@@ -146,14 +146,43 @@ pub struct Config {
     pub k: u64,
     pub b: u64,
     pub qmax: BigUint,
+    pub erc20: Option<Erc20Config>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Erc20Config {
+    pub token: [u8; 20],
+    pub generation: [u8; 32],
+    pub pins: [u8; 32],
+}
+
+pub fn erc20_identities(
+    chain_id: u64,
+    token: &[u8; 20],
+    genesis: &[u8; 32],
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let chain = chain_id.to_be_bytes();
+    let hash = |label: &[u8]| hu(&[b"UNICITY/NB2/ERC20/", label, b"/1/", &chain, token, genesis]);
+    (hash(b"ASSET"), hash(b"TYPE"), hash(b"COIN"))
+}
+
+pub fn config_identities(c: &Config) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    match &c.erc20 {
+        Some(erc20) => erc20_identities(c.chain_id, &erc20.token, &c.execution_genesis),
+        None => (
+            asset_uct(),
+            derive_type(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id),
+            derive_coin(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id),
+        ),
+    }
 }
 
 pub const CONFIG_ARITY: usize = 19;
 
 pub fn encode_config(c: &Config) -> Vec<u8> {
-    c_arr_v(&[
+    let mut fields = alloc::vec![
         c_bytes(domain::CONFIG.as_bytes()),
-        c_uint(CONFIG_VERSION),
+        c_uint(if c.erc20.is_some() { 3 } else { CONFIG_VERSION }),
         c_uint(c.network as u64),
         c_bytes(&c.root_genesis),
         c_bytes(&c.execution_genesis),
@@ -171,7 +200,11 @@ pub fn encode_config(c: &Config) -> Vec<u8> {
         c_uint(c.k),
         c_uint(c.b),
         c_amount(&c.qmax),
-    ])
+    ];
+    if let Some(e) = &c.erc20 {
+        fields.extend([c_bytes(&e.token), c_bytes(&e.generation), c_bytes(&e.pins)]);
+    }
+    c_arr_v(&fields)
 }
 
 /// D = H_U(Γ).
@@ -214,13 +247,18 @@ fn a32(b: &[u8]) -> [u8; 32] {
 
 /// Strictly decode Γ under the admitted set `p` (every section 4.1 check that needs no deployment environment).
 pub fn decode_config(b: &[u8], p: &Params) -> Result<Config> {
-    if b.len() > MAX_CONFIG_BYTES {
-        return Err(config_error(CONFIG_ARITY, Rule::InputTooLarge));
+    let (arity, limit, ver) = if b.first() == Some(&0x96) {
+        (22, 480, 3)
+    } else {
+        (CONFIG_ARITY, MAX_CONFIG_BYTES, CONFIG_VERSION)
+    };
+    if b.len() > limit {
+        return Err(config_error(arity, Rule::InputTooLarge));
     }
-    let root = at(CONFIG_ARITY, scan_one(b))?;
-    let k = at(CONFIG_ARITY, array(&root, CONFIG_ARITY))?;
+    let root = at(arity, scan_one(b))?;
+    let k = at(arity, array(&root, arity))?;
     at(0, literal(&k[0], domain::CONFIG))?;
-    at(1, version(&k[1], CONFIG_VERSION))?;
+    at(1, version(&k[1], ver))?;
     let network = at(2, uint_in(&k[2], 1, 65535))? as u16;
     let root_genesis = a32(at(3, bytes_n(&k[3], 32))?);
     let execution_genesis = a32(at(4, bytes_n(&k[4], 32))?);
@@ -254,6 +292,29 @@ pub fn decode_config(b: &[u8], p: &Params) -> Result<Config> {
     if qmax > qmax_limit() {
         return Err(config_error(18, Rule::IntRange));
     }
+    let erc20 = if arity == 22 {
+        if kk != 64 {
+            return Err(config_error(16, Rule::IntRange));
+        }
+        if bb != 16 {
+            return Err(config_error(17, Rule::IntRange));
+        }
+        let token = at(19, bytes_n(&k[19], 20))?;
+        let generation = at(20, bytes_n(&k[20], 32))?;
+        let pins = at(21, bytes_n(&k[21], 32))?;
+        for (i, field) in [token, generation, pins].into_iter().enumerate() {
+            if field.iter().all(|&b| b == 0) {
+                return Err(config_error(19 + i, Rule::IntRange));
+            }
+        }
+        Some(Erc20Config {
+            token: super::util::arr(token),
+            generation: a32(generation),
+            pins: a32(pins),
+        })
+    } else {
+        None
+    };
     Ok(Config {
         network,
         root_genesis,
@@ -272,6 +333,7 @@ pub fn decode_config(b: &[u8], p: &Params) -> Result<Config> {
         k: kk,
         b: bb,
         qmax,
+        erc20,
     })
 }
 
@@ -340,13 +402,14 @@ pub fn construct(gamma: &[u8], env: &Environment, p: &Params) -> Result<Config> 
         Err(Error::Rule(e)) => return Err(bad_config(e.config_field.unwrap_or(CONFIG_ARITY))),
         Err(e) => return Err(e),
     };
-    if c.asset != asset_uct() {
+    let (asset, ty, aid) = config_identities(&c);
+    if c.asset != asset {
         return Err(bad_config(10));
     }
-    if c.ty != derive_type(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id) {
+    if c.ty != ty {
         return Err(bad_config(11));
     }
-    if c.aid != derive_coin(c.network, &c.root_genesis, &c.execution_genesis, c.chain_id) {
+    if c.aid != aid {
         return Err(bad_config(12));
     }
     if c.vault != env.address {

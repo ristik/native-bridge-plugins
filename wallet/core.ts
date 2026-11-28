@@ -7,7 +7,7 @@
  *   config.json          where the deployment's files and endpoints are (written by `init`, once the installation check passed)
  *   secret.hex           the wallet secret (32 bytes, unencrypted: a test wallet), unless the config names an environment variable
  *   journal.json         the plug-in's journal (docs/nb2-journal.md); one JSON file
- *   backup.json          the intent high-water mark handed to the backup callback (a real wallet stores it with its seed backup)
+ *   backup-<D>.json      the seed backup's issuance high-water mark for redemption domain D
  *   tokens.json          the wallet's names for its tokens; the token bytes in tokens/<name>.cbor
  *   tokens/<name>.pending.json   a transfer between its request and its saved result (the one step the plug-in does not journal)
  *   trust-history.cbor   the trust-base history, the shipped bundle extended by refreshes
@@ -34,9 +34,9 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   HttpJsonRpc, LocalKeySigner, NativeBridgeV2, PRODUCTION_TRUST_FRESHNESS_MS, TESTNET_TRUST_FRESHNESS_MS, Nb2Error, RpcError, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
-  freshMask, localOwner, transferRequest, verifyHeld,
+  DEFAULT_KEY_SCHEME, freshMask, JOURNAL_FORMAT, JOURNAL_VERSION, localOwner, transferRequest, verifyHeld,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
-  type ReturnRecord,
+  type IntentsRecord, type ReturnRecord,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HU, parseKey } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
@@ -76,10 +76,16 @@ export function uct(wei: bigint | string): string {
 /** The wallet pins of a release manifest (nb2-release.json `pins`, spec section 4.3). */
 export function pinsOf(release: { pins: Record<string, unknown> }): DeploymentPins {
   const p = release.pins as Record<string, string | boolean | number>;
+  const erc20 = release.pins.erc20 as { factory: string; factoryRuntimeHash: string; vaultInitcodeHash: string; recoveryInitcodeHash: string; activationTx: string; fundingQualified?: boolean } | undefined;
   return {
     gamma: unhex(p.gamma as string), build: p.build as 'test' | 'production', vaultRuntimeCodeHash: unhex(p.vaultRuntimeCodeHash as string),
     maxEncodedTxBytes: BigInt(p.maxEncodedTxBytes as number), userGasLimit: BigInt(p.userGasLimit as string), gasReserve: BigInt(p.gasReserve as string),
     returnReserveSegments: BigInt(p.returnReserveSegments as number), deploymentBlock: BigInt(p.deploymentBlock as number), stateReadOnly: p.stateReadOnly as boolean,
+    ...(erc20 ? { erc20: {
+      factory: unhex(erc20.factory), factoryRuntimeHash: unhex(erc20.factoryRuntimeHash),
+      vaultInitcodeHash: unhex(erc20.vaultInitcodeHash), recoveryInitcodeHash: unhex(erc20.recoveryInitcodeHash),
+      activationTx: unhex(erc20.activationTx), fundingQualified: erc20.fundingQualified === true,
+    } } : {}),
     ...(typeof p.nativeGasSchedule === 'string' ? { nativeGasSchedule: p.nativeGasSchedule } : {}),
   };
 }
@@ -159,6 +165,29 @@ export function removeDurable(file: string): void {
   io.durable(file, null);
 }
 
+function intentsBackupFile(dir: string, domain: string): string {
+  if (!/^0x[0-9a-f]{64}$/.test(domain)) throw new Error('invalid issuance backup domain');
+  return join(dir, `backup-${domain.slice(2)}.json`);
+}
+
+function readIntentsBackup(file: string, domain?: string): IntentsRecord | undefined {
+  if (!existsSync(file)) return undefined;
+  const record = JSON.parse(readFileSync(file, 'utf8')) as IntentsRecord;
+  if (record?.format !== JOURNAL_FORMAT || record.version !== JOURNAL_VERSION || record.kind !== 'intents'
+    || typeof record.domain !== 'string' || (domain !== undefined && record.domain !== domain)
+    || typeof record.keyScheme !== 'string' || typeof record.next !== 'string' || !/^(0|[1-9][0-9]*)$/.test(record.next)) {
+    throw new Error('invalid issuance backup');
+  }
+  return record;
+}
+
+function saveIntentsBackup(dir: string, record: IntentsRecord): void {
+  const file = intentsBackupFile(dir, record.domain);
+  const previous = readIntentsBackup(file, record.domain);
+  if (previous && previous.keyScheme !== record.keyScheme) throw new Error('issuance backup key derivation changed');
+  if (!previous || BigInt(previous.next) < BigInt(record.next)) writeDurable(file, JSON.stringify(record));
+}
+
 /**
  * The exclusive lock of a wallet directory: the file `lock` holds the owner's process ID and host. A lock left by a process that no longer
  * runs on this host is taken over; one held elsewhere (another live process, or another host or container, whose liveness this process
@@ -228,7 +257,7 @@ export class FileJournalStore implements JournalStore {
 }
 
 /** A token the wallet holds, by the name the user gave it. `spent` says why it is no longer held (split, transferred, burned, sent). */
-export interface TokenEntry { file: string; owner: number; amount: string; intent?: string; returnId?: string; authorizedRecipient?: string; note?: string; spent?: string; splitInto?: string[] }
+export interface TokenEntry { file: string; domain?: string; requested?: string; minCredit?: string; owner: number; amount: string; intent?: string; returnId?: string; authorizedRecipient?: string; note?: string; spent?: string; splitInto?: string[] }
 
 /** A transfer between its request and its saved result: tokens/<to>.pending.json. */
 interface PendingTransfer { from: string; to: string; owner: number; toKey?: string; tx: string; cd: string; proof?: string }
@@ -457,22 +486,43 @@ export class Wallet {
       journal: new FileJournalStore(join(this.dir, 'journal.json')),
       bridgeKey: deriveBridgeKey(sha256(concat(tag('nb2-reference-wallet/seed/'), this.secret))),
       // the intent high-water mark goes with the seed backup before any deposit is sent (section 12.1): here a file beside the journal
-      backup: async (intents) => writeDurable(join(this.dir, 'backup.json'), JSON.stringify(intents)),
+      backup: async (intents) => saveIntentsBackup(this.dir, intents),
       refreshTrust: () => this.refreshAuthority(),
       unsafeTestTrust: !!opts.rpc,
       trustFreshnessMs: opts.trustFreshnessMs ?? (opts.rpc ? undefined :
         this.release.status === 'testnet-provisional' ? TESTNET_TRUST_FRESHNESS_MS : PRODUCTION_TRUST_FRESHNESS_MS),
       receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
     }, opts.check ?? true);
+    const legacyFile = join(this.dir, 'backup.json');
+    const legacy = readIntentsBackup(legacyFile);
+    if (legacy) {
+      saveIntentsBackup(this.dir, legacy);
+      removeDurable(legacyFile);
+    }
     return this;
   }
 
+  /** Restore issuance intents by scanning to the current redemption domain's backed-up counter. */
+  public async recoverDeposits(): Promise<bigint[]> {
+    const domain = hx(this.bridge.domain);
+    const backup = readIntentsBackup(intentsBackupFile(this.dir, domain), domain);
+    if (!backup) throw new Error('no issuance backup for this redemption domain');
+    if (backup.keyScheme !== DEFAULT_KEY_SCHEME) throw new Error('unsupported issuance backup key derivation');
+    return this.bridge.recoverDeposits(BigInt(backup.next));
+  }
+
   private get index(): Record<string, TokenEntry> {
-    const f = join(this.dir, 'tokens.json');
+    const f = this.indexFile();
     return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : {};
   }
   private set index(idx: Record<string, TokenEntry>) {
-    writeDurable(join(this.dir, 'tokens.json'), JSON.stringify(idx, null, 2));
+    writeDurable(this.indexFile(), JSON.stringify(idx, null, 2));
+  }
+  private indexFile(): string {
+    return join(this.dir, this.bridge?.cfg.erc20 ? `tokens-${toHex(this.bridge.domain)}.json` : 'tokens.json');
+  }
+  private tokenFile(label: string): string {
+    return this.bridge?.cfg.erc20 ? `${toHex(this.bridge.domain)}-${label}` : label;
   }
   public labels(): string[] {
     return Object.keys(this.index).sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
@@ -483,6 +533,7 @@ export class Wallet {
   public entry(label: string): TokenEntry {
     const e = this.index[label];
     if (!e) throw new Error(`the wallet holds no token named ${label}`);
+    if (this.bridge?.cfg.erc20 && e.domain !== hx(this.bridge.domain)) throw new Error('token storage belongs to another redemption domain');
     return e;
   }
   public token(label: string): Uint8Array {
@@ -508,9 +559,10 @@ export class Wallet {
   }
   public keep(label: string, token: Uint8Array, owner: number, extra: Partial<TokenEntry> = {}): void {
     if (!NAME.test(label)) throw new Error(`a token name is 1 to 64 letters, digits, '.', '_' or '-': ${JSON.stringify(label)}`);
-    writeDurable(join(this.dir, 'tokens', `${label}.cbor`), token);
+    const file = `${this.tokenFile(label)}.cbor`;
+    writeDurable(join(this.dir, 'tokens', file), token);
     const idx = this.index;
-    idx[label] = { ...(idx[label] ?? {}), file: `${label}.cbor`, owner, amount: '0', ...extra };
+    idx[label] = { ...(idx[label] ?? {}), file, owner, amount: '0', ...extra, ...(this.bridge?.cfg.erc20 ? { domain: hx(this.bridge.domain) } : {}) };
     this.index = idx;
   }
   public update(label: string, extra: Partial<TokenEntry>): void {
@@ -519,7 +571,7 @@ export class Wallet {
     this.index = idx;
   }
   public pendingFile(to: string): string {
-    return join(this.dir, 'tokens', `${to}.pending.json`);
+    return join(this.dir, 'tokens', `${this.tokenFile(to)}.pending.json`);
   }
   /** Every transfer between its request and its saved result. */
   public pendingTransfers(): PendingTransfer[] {
@@ -612,10 +664,10 @@ export async function retry<T>(f: () => Promise<T>, note: (reason: string) => vo
 }
 
 /** Deposit: plan an intent (the secret is derived, the high-water mark backed up) and journal it under LABEL. Nothing is sent. */
-export async function planDeposit(w: Wallet, label: string, amount: bigint): Promise<DepositPlan> {
+export async function planDeposit(w: Wallet, label: string, amount: bigint, minCredit?: bigint): Promise<DepositPlan> {
   w.checkNewName(label); // before an intent is used up
-  const plan = await w.bridge.planDeposit(amount, w.ownerPub(0));
-  w.keep(label, new Uint8Array(), 0, { intent: plan.intent.toString(), amount: amount.toString(), note: 'deposit planned' });
+  const plan = await w.bridge.planDeposit(amount, w.ownerPub(0), minCredit);
+  w.keep(label, new Uint8Array(), 0, { intent: plan.intent.toString(), amount: amount.toString(), note: 'deposit planned', ...(minCredit === undefined ? {} : { requested: String(amount), minCredit: String(minCredit) }) });
   return plan;
 }
 
@@ -627,7 +679,8 @@ export async function sendDeposit(w: Wallet, label: string): Promise<{ txHash: U
   const e = w.entry(label);
   if (e.intent === undefined) throw new Error(`${label} is not a deposit`);
   const r = await w.bridge.submitDeposit(BigInt(e.intent), w.signer);
-  w.update(label, { note: 'deposited' });
+  const rec = await w.bridge.journal.deposit(BigInt(e.intent));
+  w.update(label, { note: 'deposited', ...(rec ? { amount: rec.amount } : {}) });
   return r;
 }
 
@@ -887,13 +940,14 @@ export async function status(w: Wallet): Promise<string[]> {
     if (e.returnId !== undefined) byReturn.set(e.returnId.toLowerCase(), l);
   }
   const st = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
-  const lines: string[] = [`vault ${hx(w.bridge.cfg.vault)}: segment ${st.segment}, ${st.deposits} deposits, ${uct(st.outstanding)} UCT outstanding`];
+  const asset = w.bridge.cfg.erc20 ? `${st.outstanding} base units of ${hx(w.bridge.cfg.erc20.token)} on chain ${w.bridge.cfg.chainId}` : `${uct(st.outstanding)} UCT`;
+  const lines: string[] = [`vault ${hx(w.bridge.cfg.vault)}: segment ${st.segment}, ${st.deposits} deposits, ${asset} outstanding`];
   const words = await w.bridge.status();
   const deposits = await w.bridge.journal.deposits();
   const returns = await w.bridge.journal.returns();
   deposits.forEach((d, i) => {
     const l = byIntent.get(d.intent);
-    const next = !l ? '' : d.status === 'planned' || d.status === 'submitted' ? `deposit ${l} ${uct(d.amount)}` : d.status === 'deposited' || d.status === 'proven' ? `mint ${l}` : '';
+    const next = !l ? '' : d.status === 'planned' || d.status === 'submitted' ? `deposit ${l}` : d.status === 'deposited' || d.status === 'proven' ? `mint ${l}` : '';
     lines.push(`${l ?? '?'}: ${words[i]}${d.depositNumber ? ` (deposit ${d.depositNumber}, block ${d.blockNumber})` : ''}${next ? `; next: ${next}` : ''}`);
   });
   for (const p of w.pendingTransfers()) lines.push(`${p.to}: transfer of ${p.from} requested, not saved yet; next: transfer ${p.from} ${p.to}`);

@@ -29,11 +29,12 @@ use num_bigint::BigUint;
 use serde_json::json;
 
 use super::abi::{
-    classify_redeem_error, decode_deposited, decode_paid, decode_revert, deposit_calldata,
-    redeem_calldata, redeem_calldata_length, DecodedError, ErrArg, RedeemAction,
+    address_word, classify_redeem_error, decode_asset_deposit, decode_paid, decode_revert,
+    deposit_calldata, deposit_erc20_calldata, redeem_calldata, redeem_calldata_length, sel,
+    DecodedError, ErrArg, RedeemAction,
 };
 use super::cbor::{c_arr, c_bytes};
-use super::config::{asset_uct, build_params, decode_config, domain_of, Build, Config};
+use super::config::{build_params, config_identities, decode_config, domain_of, Build, Config};
 use super::crypto::{he, hmac_sha256, hu, parse_key};
 use super::deposit::{
     decode_receipt_backing, deposit_intent_secret, deposit_salt, encode_receipt_backing,
@@ -45,6 +46,10 @@ use super::gas::{
     create_address, redeem_tx_framing, DeploymentCode, GasModel, MeasuredGasModel, RedeemShape,
 };
 use super::journal::*;
+use super::recovery::RecoveryDeployment;
+use super::recovery_cost::{
+    preflight_recovery, AdmissionContext, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
+};
 use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
 use super::rules::{
     burn_index, capacity_exceeded, capacity_preflight, check_state_read, topic_index,
@@ -60,7 +65,7 @@ use super::tokenops::{
     token_of_child, token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
 };
 use super::trust::{bind_trust, TrustInput};
-use super::util::{arr, be_int, cat};
+use super::util::{arr, be_int, cat, u256, u256_64};
 use super::verify::{
     decode_evidence, encode_return_data, evidence_of, verify_held, verify_part, verify_split,
     ReturnData, Verdict,
@@ -82,13 +87,41 @@ pub struct DeploymentPins {
     pub max_jump: Option<u64>,
     /// The chain's native gas schedules (CERT_BATCH_V2, the RSMT membership, SHA-256), as the default gas model names them.
     pub native_gas_schedule: Option<String>,
+    pub erc20: Option<Erc20ActivationPins>,
+}
+
+/// Factory, CREATE2 templates and the certified activation locator.
+#[derive(Debug, Clone)]
+pub struct Erc20ActivationPins {
+    pub factory: [u8; 20],
+    pub factory_runtime_hash: [u8; 32],
+    pub vault_initcode_hash: [u8; 32],
+    pub recovery_initcode_hash: [u8; 32],
+    pub activation_tx: [u8; 32],
+    pub funding_qualified: bool,
+}
+
+fn erc20_create2(factory: &[u8; 20], salt: &[u8; 32], initcode: &[u8; 32]) -> [u8; 20] {
+    arr(&he(&[&[0xff], factory, salt, initcode])[12..])
 }
 
 type Callback<A, R> = Box<dyn Fn(A) -> R + Send + Sync>;
 
+/// Authenticated continuation calibration, qualified backlog bounds and payer policy.
+pub struct Erc20ReturnRecovery {
+    pub deployment: RecoveryDeployment,
+    pub calibration: Box<dyn RecoveryCalibration + Send + Sync>,
+    /// The bridge reads the signed start and the current segment for each quote.
+    pub backlog: RecoveryBacklog,
+    /// Upper limits for the payer. The bridge further caps them by the deployment and live balance.
+    pub limits: RecoveryLimits,
+}
+
 /// The bridge's inputs.
 const IMPORTED_TIP_PROFILE_HASH: &str =
     "0x63158aeb61ee273e6c319c19f1663ec3910d6b5403b7affc90dec31813514e7e";
+const ERC20_PROFILE_HASH: &str =
+    "0xf05dd5c3563165d73c1cf91a5af79ec7afcaa77edc90061c6e7666bf53a8b0b6";
 pub const TESTNET_TRUST_FRESHNESS_MS: u64 = 15 * 60 * 1000;
 pub const PRODUCTION_TRUST_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -107,6 +140,7 @@ pub struct BridgeOptions {
     /// Default true: a deposit is not sent before its intent's high-water mark is backed up.
     pub require_backup: Option<bool>,
     pub gas: Option<Box<dyn GasModel>>,
+    pub erc20_return_recovery: Option<Erc20ReturnRecovery>,
     /// Blocks the head must advance, after a send's nonce is seen used without its success receipt, before the send counts as dead.
     pub dead_after_blocks: Option<u64>,
     /// A seal receipt older than this many blocks gives a warning (default 7,200).
@@ -146,6 +180,7 @@ impl BridgeOptions {
             backup: None,
             require_backup: None,
             gas: None,
+            erc20_return_recovery: None,
             dead_after_blocks: None,
             max_seal_age_blocks: None,
             refresh_trust: None,
@@ -226,10 +261,13 @@ pub struct ReturnPlan {
     /// The endpoint estimate and the history already owed from a.
     pub c_obs: u64,
     pub p_now: u64,
-    /// The proofs that fit beside the evidence (bytes) and the remaining margin: pMax - (pNow + returnReserveSegments).
+    /// Ordinary proof capacity and margin. Both are zero on a continuation-only plan.
     pub p_max: u64,
     pub margin_segments: i128,
+    /// The ordinary gas quote, or zero when continuation is the only admitted route.
     pub gas_limit: u64,
+    /// The bounded continuation is the available route at the observed state.
+    pub continuation_only: bool,
     pub warnings: Vec<String>,
     pub record: ReturnRecord,
 }
@@ -334,6 +372,8 @@ pub struct NativeBridgeV2 {
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Whether the gas model applies to this deployment's verifier (checked once, from its runtime code).
     gas_fits: Mutex<Option<bool>>,
+    erc20_return_recovery: Option<Erc20ReturnRecovery>,
+    unsafe_test_trust: bool,
 }
 
 impl NativeBridgeV2 {
@@ -341,7 +381,12 @@ impl NativeBridgeV2 {
         let cfg = decode_config(&o.pins.gamma, &build_params(o.pins.build))?;
         let domain = domain_of(&o.pins.gamma);
         bind_trust(&o.trust, &cfg)?;
-        if !o.unsafe_test_trust && hex(&cfg.semantic_profile_hash) != IMPORTED_TIP_PROFILE_HASH {
+        let profile = if cfg.erc20.is_some() {
+            ERC20_PROFILE_HASH
+        } else {
+            IMPORTED_TIP_PROFILE_HASH
+        };
+        if !o.unsafe_test_trust && hex(&cfg.semantic_profile_hash) != profile {
             return refuse(
                 WalletReason::BadDeployment,
                 "the wallet requires the paired imported-tip NB2 semantic profile",
@@ -383,6 +428,8 @@ impl NativeBridgeV2 {
             now: o.now,
             locks: Mutex::new(HashMap::new()),
             gas_fits: Mutex::new(None),
+            erc20_return_recovery: o.erc20_return_recovery,
+            unsafe_test_trust: o.unsafe_test_trust,
             pins: o.pins,
             cfg,
             domain,
@@ -397,7 +444,7 @@ impl NativeBridgeV2 {
 
     pub fn open_checked(o: BridgeOptions, check: bool) -> Result<Self> {
         let b = Self::construct(o)?;
-        if check {
+        if check || b.cfg.erc20.is_some() {
             if b.evm.chain_id()? != b.cfg.chain_id {
                 return refuse(WalletReason::BadDeployment, "the RPC serves another chain");
             }
@@ -414,7 +461,89 @@ impl NativeBridgeV2 {
                 );
             }
         }
+        if b.cfg.erc20.is_some() {
+            b.verify_erc20_activation()?;
+        }
         Ok(b)
+    }
+
+    fn verify_erc20_activation(&self) -> Result<()> {
+        let (Some(e), Some(pins)) = (&self.cfg.erc20, &self.pins.erc20) else {
+            return refuse(
+                WalletReason::BadDeployment,
+                "the ERC20 activation pins are missing",
+            );
+        };
+        let (asset, ty, aid) = config_identities(&self.cfg);
+        let token = address_word(&e.token);
+        let vault = erc20_create2(&pins.factory, &token, &pins.vault_initcode_hash);
+        let recovery = erc20_create2(&pins.factory, &he(&[&token]), &pins.recovery_initcode_hash);
+        let Some((_, genesis)) = self.evm.header_by_number(0)? else {
+            return refuse(
+                WalletReason::BadDeployment,
+                "the execution genesis is unavailable",
+            );
+        };
+        let rc = self.evm.code(&recovery)?;
+        let call = |sig| self.evm.call(&pins.factory, &sel(sig), None);
+        let gamma = self.evm.call(
+            &pins.factory,
+            &cat(&[&sel("config(address)"), &token]),
+            None,
+        )?;
+        if (asset, ty, aid) != (self.cfg.asset, self.cfg.ty, self.cfg.aid)
+            || vault != self.cfg.vault
+            || genesis != self.cfg.execution_genesis
+            || rc.is_empty()
+            || he(&[&self.evm.code(&pins.factory)?]) != pins.factory_runtime_hash
+            || he(&[&self.evm.code(&self.cfg.verifier)?]) != self.cfg.verifier_code_hash
+            || super::abi::decode_bytes_return(&gamma).as_deref()
+                != Some(self.pins.gamma.as_slice())
+            || call("VAULT_INITCODE_HASH()")? != pins.vault_initcode_hash
+            || call("RECOVERY_INITCODE_HASH()")? != pins.recovery_initcode_hash
+            || call("GENERATION()")? != e.generation
+            || call("PINS()")? != e.pins
+        {
+            return refuse(
+                WalletReason::BadDeployment,
+                "the ERC20 chain or factory graph differs from the release",
+            );
+        }
+        let topics = [
+            topic::erc20_activated(),
+            token,
+            address_word(&vault),
+            address_word(&recovery),
+        ];
+        let data = cat(&[
+            &self.domain,
+            &self.pins.vault_runtime_code_hash,
+            &he(&[&rc]),
+        ]);
+        let proof = self.evm.matching_mint_receipt_proof(
+            &pins.activation_tx,
+            &pins.factory,
+            &topics,
+            Some(&data),
+            true,
+        )?;
+        let log = self.retrying_trust(|t| {
+            super::deposit::verify_receipt_log_at(&self.cfg, t, &proof.proof, &pins.factory)
+        })?;
+        if log.header.number_u64() != self.pins.deployment_block
+            || !log
+                .topics
+                .iter()
+                .map(Vec::as_slice)
+                .eq(topics.iter().map(|t| t.as_slice()))
+            || log.data != data
+        {
+            return refuse(
+                WalletReason::BadDeployment,
+                "the certified ERC20 activation differs from the deployment",
+            );
+        }
+        Ok(())
     }
 
     pub fn pins(&self) -> &DeploymentPins {
@@ -601,8 +730,39 @@ impl NativeBridgeV2 {
     /// rho, and journal the plan with the new high-water mark, which is handed to the backup. Serialized: two plans never share
     /// an intent.
     pub fn plan_deposit(&self, amount: &BigUint, owner_key: &[u8]) -> Result<DepositPlan> {
-        if amount.bits() == 0 {
-            return refuse(WalletReason::BadInput, "a deposit amount is positive");
+        self.plan_asset_deposit(amount, owner_key, None)
+    }
+
+    pub fn plan_erc20_deposit(
+        &self,
+        amount: &BigUint,
+        min_credit: &BigUint,
+        owner_key: &[u8],
+    ) -> Result<DepositPlan> {
+        self.plan_asset_deposit(amount, owner_key, Some(min_credit))
+    }
+
+    fn plan_asset_deposit(
+        &self,
+        amount: &BigUint,
+        owner_key: &[u8],
+        min_credit: Option<&BigUint>,
+    ) -> Result<DepositPlan> {
+        if amount.bits() == 0 || amount.bits() > 256 {
+            return refuse(
+                WalletReason::BadInput,
+                "a deposit amount is a positive uint256",
+            );
+        }
+        if match (&self.cfg.erc20, min_credit) {
+            (Some(_), Some(min)) => min.bits() == 0 || min > amount,
+            (None, None) => false,
+            _ => true,
+        } {
+            return refuse(
+                WalletReason::BadInput,
+                "ERC20 deposits require 0 < minCredit <= requested",
+            );
         }
         parse_key(owner_key)?;
         self.locked("intents", || {
@@ -635,6 +795,10 @@ impl NativeBridgeV2 {
                 key_scheme: self.key_scheme.clone(),
                 intent: dec(i),
                 amount: dec(amount),
+                erc20_token: self.cfg.erc20.as_ref().map(|e| hex(&e.token)),
+                requested: min_credit.map(|_| dec(amount)),
+                min_credit: min_credit.map(dec),
+                approval_sends: Vec::new(),
                 owner_key: hex(owner_key),
                 first_owner: hex(&first_owner),
                 rho: hex(&rho),
@@ -662,7 +826,7 @@ impl NativeBridgeV2 {
                 intent: i,
                 amount: amount.clone(),
                 rho,
-                calldata: deposit_calldata(&first_owner, &rho),
+                calldata: self.deposit_data(&rec)?,
                 first_owner,
                 record: rec,
             })
@@ -694,11 +858,11 @@ impl NativeBridgeV2 {
         let top = self.evm.block_number()?;
         for l in self.evm.logs(
             &self.cfg.vault,
-            &json!([hex(&topic::deposited())]),
+            &json!([hex(&self.deposit_topic())]),
             from,
             top,
         )? {
-            if let Some(d) = decode_deposited(&l.topics, &l.data) {
+            if let Some(d) = decode_asset_deposit(&l.topics, &l.data, self.erc20_token()) {
                 if l.address == self.cfg.vault && d.domain == self.domain && d.rho == rho {
                     out.push(SeenLog {
                         tx: l.transaction_hash.clone(),
@@ -733,12 +897,13 @@ impl NativeBridgeV2 {
             PlanRef::Plan(p) => p.intent,
             PlanRef::Intent(i) => *i,
         };
-        self.locked(&format!("deposit/{i}"), || {
+        let submit = || {
+            self.locked(&format!("deposit/{i}"), || {
             let Some(mut rec) = self.journal.deposit_for_update(i)? else {
                 return refuse(WalletReason::JournalNotPersisted, format!("intent {i} is not in the journal: plan it first"));
             };
             if let PlanRef::Plan(p) = &plan {
-                if rec.rho != hex(&p.rho) || rec.amount != dec(&p.amount) {
+                if rec.rho != hex(&p.rho) || rec.requested.as_ref().unwrap_or(&rec.amount) != &dec(&p.amount) {
                     return refuse(WalletReason::JournalNotPersisted, "the journal entry is not this plan");
                 }
             }
@@ -777,8 +942,14 @@ impl NativeBridgeV2 {
                     return self.adopt_deposits(&mut rec, &seen);
                 }
             }
-            let value = undec(&rec.amount)?;
-            let data = deposit_calldata(&unhex(&rec.first_owner)?, &unhex(&rec.rho)?);
+            let data = self.deposit_data(&rec)?;
+            let value = if let Some(erc20) = &self.cfg.erc20 {
+                self.require_erc20_qualification()?;
+                self.approve_deposit(&mut rec, signer, &erc20.token)?;
+                BigUint::default()
+            } else {
+                undec(&rec.amount)?
+            };
             let gas_limit = if self.gas_applies()? {
                 self.gas.deposit_gas_limit()
             } else {
@@ -802,14 +973,173 @@ impl NativeBridgeV2 {
             }
             self.record_deposit(&mut rec, &r)
         })
+        };
+        if self.cfg.erc20.is_some() {
+            self.locked(
+                &format!("erc20-approval/{}", hex(&signer.address())),
+                submit,
+            )
+        } else {
+            submit()
+        }
+    }
+
+    fn require_erc20_qualification(&self) -> Result<()> {
+        if self.cfg.erc20.is_some()
+            && !self.unsafe_test_trust
+            && (!self
+                .pins
+                .erc20
+                .as_ref()
+                .is_some_and(|e| e.funding_qualified)
+                || self.pins.return_reserve_segments < 64)
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "the ERC20 deployment is awaiting real-value qualification",
+            );
+        }
+        Ok(())
+    }
+
+    fn erc20_token(&self) -> Option<&[u8; 20]> {
+        self.cfg.erc20.as_ref().map(|e| &e.token)
+    }
+
+    fn deposit_topic(&self) -> [u8; 32] {
+        super::deposit::deposit_topic(self.erc20_token())
+    }
+
+    fn credit_bounds(&self, rec: &DepositRecord) -> Result<(BigUint, BigUint)> {
+        let (Some(requested), Some(min), Some(token)) =
+            (&rec.requested, &rec.min_credit, self.erc20_token())
+        else {
+            return refuse(
+                WalletReason::JournalNotPersisted,
+                "the ERC20 intent is missing its token or credit bounds",
+            );
+        };
+        let (requested, min) = (undec(requested)?, undec(min)?);
+        if rec.erc20_token.as_deref() != Some(hex(token).as_str())
+            || requested.bits() > 256
+            || min.bits() == 0
+            || min > requested
+        {
+            return refuse(
+                WalletReason::JournalNotPersisted,
+                "the ERC20 intent has invalid credit bounds",
+            );
+        }
+        Ok((requested, min))
+    }
+
+    fn deposit_data(&self, rec: &DepositRecord) -> Result<Vec<u8>> {
+        let owner = unhex(&rec.first_owner)?;
+        let rho = unhex(&rec.rho)?;
+        if self.cfg.erc20.is_some() {
+            let (requested, min) = self.credit_bounds(rec)?;
+            Ok(deposit_erc20_calldata(&requested, &min, &owner, &rho))
+        } else {
+            Ok(deposit_calldata(&owner, &rho))
+        }
+    }
+
+    fn approve_deposit(
+        &self,
+        rec: &mut DepositRecord,
+        signer: &dyn EvmSigner,
+        token: &[u8; 20],
+    ) -> Result<()> {
+        let (requested, _) = self.credit_bounds(rec)?;
+        let address = signer.address();
+        let spender = address_word(&self.cfg.vault);
+        let allowance = || -> Result<BigUint> {
+            let raw = self.evm.call(
+                token,
+                &cat(&[
+                    &sel("allowance(address,address)"),
+                    &address_word(&address),
+                    &spender,
+                ]),
+                None,
+            )?;
+            if raw.len() != 32 {
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "invalid ERC20 allowance response",
+                );
+            }
+            Ok(be_int(&raw))
+        };
+        if !rec.approval_sends.is_empty() {
+            let mut sends = rec.approval_sends.clone();
+            let landed = self.landed_send(&mut sends, None)?;
+            if matches!(landed, Landed::Pending | Landed::Replace(..)) {
+                rec.approval_sends = sends;
+                self.journal.put_deposit(rec)?;
+                return refuse(
+                    WalletReason::Unconfirmed,
+                    "an earlier token approval is pending",
+                );
+            }
+            rec.approval_sends.clear();
+            self.journal.put_deposit(rec)?;
+        }
+        let current = allowance()?;
+        if current == requested {
+            return Ok(());
+        }
+        let zero = BigUint::default();
+        let targets = [&zero, &requested];
+        for target in &targets[usize::from(current == zero)..] {
+            let data = cat(&[
+                &sel("approve(address,uint256)"),
+                &spender,
+                &super::util::u256(target),
+            ]);
+            let gas = match self.evm.estimate_gas(&address, token, &data, &zero)? {
+                Estimate::Gas(value) => value.checked_add(value.div_ceil(5)).unwrap_or_default(),
+                Estimate::Revert { message, .. } => {
+                    return refuse(
+                        WalletReason::Reverted,
+                        format!("token approval simulation refused: {message}"),
+                    )
+                }
+            };
+            if gas == 0 || gas > self.pins.user_gas_limit {
+                return fail_d(
+                    Rule::CapacityExceeded,
+                    "approval gas exceeds the user limit",
+                );
+            }
+            let tx = self.signed(signer, token, &data, zero.clone(), gas)?;
+            rec.approval_sends = vec![self.send_record(&tx)];
+            self.journal.put_deposit(rec)?;
+            let Some(receipt) = self.broadcast_and_wait(&tx)? else {
+                return refuse(
+                    WalletReason::Unconfirmed,
+                    "token approval has no receipt yet",
+                );
+            };
+            if !status_is_ok(&receipt) || &allowance()? != *target {
+                return refuse(
+                    WalletReason::Reverted,
+                    "token approval did not set the exact allowance",
+                );
+            }
+            rec.approval_sends.clear();
+            self.journal.put_deposit(rec)?;
+        }
+        Ok(())
     }
 
     fn record_deposit(&self, rec: &mut DepositRecord, r: &ReceiptJson) -> Result<Deposited> {
-        let want_topic = hex(&topic::deposited());
+        let want_topic = hex(&self.deposit_topic());
         let l = r.logs.iter().find(|x| {
             unhex(&x.address.to_lowercase()).is_ok_and(|a| a == self.cfg.vault)
-                && x.topics.len() == 2
-                && x.topics[0].to_lowercase() == want_topic
+                && x.topics
+                    .first()
+                    .is_some_and(|topic| topic.to_lowercase() == want_topic)
         });
         let Some(l) = l else {
             return refuse(
@@ -822,7 +1152,7 @@ impl NativeBridgeV2 {
             .iter()
             .map(|x| unhex(&x.to_lowercase()))
             .collect::<Result<Vec<_>>>()?;
-        let d = decode_deposited(&topics, &unhex(&l.data.to_lowercase())?);
+        let d = decode_asset_deposit(&topics, &unhex(&l.data.to_lowercase())?, self.erc20_token());
         let Some(d) = d.filter(|d| unhex(&rec.rho).is_ok_and(|rho| d.rho == rho)) else {
             return refuse(
                 WalletReason::ProviderFault,
@@ -835,6 +1165,16 @@ impl NativeBridgeV2 {
                 WalletReason::ProviderFault,
                 "the Deposited log carries another deployment's domain D",
             );
+        }
+        if self.cfg.erc20.is_some() {
+            let (requested, min) = self.credit_bounds(rec)?;
+            if d.amount < min || d.amount > requested || hex(&d.first_owner) != rec.first_owner {
+                return refuse(
+                    WalletReason::ProviderFault,
+                    "the ERC20 lock differs from the journaled credit bounds",
+                );
+            }
+            rec.amount = dec(&d.amount);
         }
         let block = super::rpc::qty64(&json!(r.block_number), "blockNumber")?;
         rec.deposit_tx = Some(r.transaction_hash.to_lowercase());
@@ -867,7 +1207,22 @@ impl NativeBridgeV2 {
     fn adopt_deposits(&self, rec: &mut DepositRecord, seen: &[SeenLog]) -> Result<Deposited> {
         merge_seen(rec, seen.iter().map(seen_entry).collect())?;
         if rec.status == "planned" || rec.status == "submitted" {
-            let first = &seen[0];
+            let first = if self.cfg.erc20.is_some() && rec.requested.is_some() {
+                let (requested, min) = self.credit_bounds(rec)?;
+                let Some(lock) = seen.iter().find(|s| {
+                    s.amount >= min
+                        && s.amount <= requested
+                        && hex(&s.first_owner) == rec.first_owner
+                }) else {
+                    return refuse(
+                        WalletReason::ProviderFault,
+                        "no ERC20 lock matches the journaled credit bounds and owner",
+                    );
+                };
+                lock
+            } else {
+                &seen[0]
+            };
             rec.deposit_tx = Some(hex(&first.tx));
             rec.block_number = Some(dec(first.block_number));
             rec.deposit_number = Some(dec(first.n));
@@ -893,10 +1248,17 @@ impl NativeBridgeV2 {
         amount: &BigUint,
         first_owner: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let rp = self.evm.mint_receipt_proof(
+        let mut topics = vec![self.deposit_topic(), u256_64(n)];
+        if let Some(e) = &self.cfg.erc20 {
+            topics.push(address_word(&e.token));
+        }
+        let rp = self.evm.matching_mint_receipt_proof(
             tx,
             &self.cfg.vault,
-            hex(&self.cfg.semantic_profile_hash) == IMPORTED_TIP_PROFILE_HASH,
+            &topics,
+            None,
+            self.cfg.erc20.is_some()
+                || hex(&self.cfg.semantic_profile_hash) == IMPORTED_TIP_PROFILE_HASH,
         )?;
         let j = ReceiptBacking {
             d: self.domain,
@@ -1083,11 +1445,11 @@ impl NativeBridgeV2 {
         let top = self.evm.block_number()?;
         for l in self.evm.logs(
             &self.cfg.vault,
-            &json!([hex(&topic::deposited())]),
+            &json!([hex(&self.deposit_topic())]),
             self.pins.deployment_block,
             top,
         )? {
-            let Some(d) = decode_deposited(&l.topics, &l.data) else {
+            let Some(d) = decode_asset_deposit(&l.topics, &l.data, self.erc20_token()) else {
                 continue;
             };
             if l.address != self.cfg.vault || d.domain != self.domain {
@@ -1114,6 +1476,10 @@ impl NativeBridgeV2 {
                         key_scheme: self.key_scheme.clone(),
                         intent: dec(i),
                         amount: dec(&seen[0].amount),
+                        erc20_token: self.erc20_token().map(|token| hex(token)),
+                        requested: None,
+                        min_credit: None,
+                        approval_sends: Vec::new(),
                         owner_key: hex(&seen[0].first_owner[9..]),
                         first_owner: hex(&seen[0].first_owner),
                         rho: hex(&rho_of(&self.domain, &self.secret_of(i))),
@@ -1155,7 +1521,9 @@ impl NativeBridgeV2 {
 
     /// Verify incoming lineage and bind its receipt to the paired RPC's canonical child.
     pub fn verify_received_token(&self, token: &[u8]) -> Result<HeldToken> {
-        if hex(&self.cfg.semantic_profile_hash) != IMPORTED_TIP_PROFILE_HASH {
+        if self.cfg.erc20.is_none()
+            && hex(&self.cfg.semantic_profile_hash) != IMPORTED_TIP_PROFILE_HASH
+        {
             return self.verify_token(token);
         }
         let part = decode_token(token)?;
@@ -1401,10 +1769,9 @@ impl NativeBridgeV2 {
     }
 
     /// Plan the return of a whole held part to `recipient` on the EVM: verify its full provenance, pick the index from a verified
-    /// seal receipt, and run the capacity preflight (section 12.5): the complete prospective return with the history already
-    /// owed from `a` plus `returnReserveSegments` must fit the encoded-transaction limit and `userGasLimit`, and `payer` must fund
-    /// that gas limit. Journals the plan; nothing irreversible happens here. `state_read` is the stateReadOnly substitute
-    /// (Some(verified index)).
+    /// seal receipt, and price the history owed from `a` plus the reserve under the transaction and payer limits.
+    /// ERC20 requires a bounded continuation quote and can use it when ordinary capacity or funding is insufficient.
+    /// Journals the plan. `state_read` is the stateReadOnly substitute (Some(verified index)).
     pub fn plan_return(
         &self,
         token: &[u8],
@@ -1424,6 +1791,10 @@ impl NativeBridgeV2 {
                 return refuse(WalletReason::RecipientRefused, "the zero address and the vault are refused");
             }
             let mut warnings = Vec::new();
+            if self.cfg.erc20.is_some() {
+                self.preview_erc20_recipient(&recipient, &held.amount)?;
+                warnings.push("The burn fixes this recipient. Permanent blocking or an outbound tax can strand the claim.".to_string());
+            }
             if !self.evm.code(&recipient)?.is_empty() {
                 warnings.push("the recipient is a contract: a payout it refuses strands the burn (simulation is not a guarantee)".to_string());
             }
@@ -1449,12 +1820,6 @@ impl NativeBridgeV2 {
                     }
                 }
             }
-            let (c_obs, pf) = self.preflight(token, &held.amount, &recipient, a, payer)?;
-            if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
-                if existing.status != "planned" {
-                    return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
-                }
-            }
             let record = ReturnRecord {
                 base: self.journal.base("return"),
                 return_id: hex(&return_id),
@@ -1476,6 +1841,12 @@ impl NativeBridgeV2 {
                 paid: None,
                 extra: Default::default(),
             };
+            let (c_obs, ordinary) = self.admit_return(&record, token, &held.amount, &recipient, a, payer)?;
+            if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
+                if existing.status != "planned" {
+                    return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
+                }
+            }
             self.journal.put_return(&record)?;
             Ok(ReturnPlan {
                 return_id,
@@ -1483,10 +1854,11 @@ impl NativeBridgeV2 {
                 recipient,
                 a,
                 c_obs,
-                p_now: pf.p_now,
-                p_max: pf.p_max,
-                margin_segments: pf.p_max as i128 - pf.need as i128,
-                gas_limit: pf.gas,
+                p_now: c_obs - a,
+                p_max: ordinary.map_or(0, |pf| pf.p_max),
+                margin_segments: ordinary.map_or(0, |pf| pf.p_max as i128 - pf.need as i128),
+                gas_limit: ordinary.map_or(0, |pf| pf.gas),
+                continuation_only: ordinary.is_none(),
                 warnings,
                 record,
             })
@@ -1532,7 +1904,28 @@ impl NativeBridgeV2 {
                 "the vault runtime code hash is not the pinned one",
             );
         }
-        let helper_code = self.evm.code(&create_address(&self.cfg.verifier, 1))?;
+        let helper_code = if self.cfg.erc20.is_some() {
+            let address = self.evm.call(&self.cfg.verifier, &sel("LINEAGE()"), None)?;
+            if address.len() != 32 || address[..12] != [0; 12] {
+                return refuse(
+                    WalletReason::BadDeployment,
+                    "the ERC20 ordinary verifier returned an invalid lineage address",
+                );
+            }
+            let code = self.evm.code(&address[12..])?;
+            let expected = self
+                .evm
+                .call(&self.cfg.verifier, &sel("LINEAGE_HASH()"), None)?;
+            if code.is_empty() || he(&[&code]).as_slice() != expected {
+                return refuse(
+                    WalletReason::BadDeployment,
+                    "the ERC20 lineage helper runtime differs from the verifier binding",
+                );
+            }
+            code
+        } else {
+            self.evm.code(&create_address(&self.cfg.verifier, 1))?
+        };
         let qmax = self.cfg.qmax.to_bytes_be();
         let fits = self
             .gas
@@ -1570,7 +1963,7 @@ impl NativeBridgeV2 {
         let c_obs = st.segment.max(a);
         let r = encode_return_data(&ReturnData {
             d: self.domain,
-            asset: asset_uct(),
+            asset: self.cfg.asset,
             recipient: *recipient,
             amount: amount.clone(),
             min_index: a,
@@ -1615,6 +2008,33 @@ impl NativeBridgeV2 {
         Ok((c_obs, pf))
     }
 
+    fn admit_return(
+        &self,
+        record: &ReturnRecord,
+        source: &[u8],
+        amount: &BigUint,
+        recipient: &[u8; 20],
+        a: u64,
+        payer: &[u8],
+    ) -> Result<(u64, Option<PreflightResult>)> {
+        self.require_erc20_qualification()?;
+        let (observed, ordinary) = match self.preflight(source, amount, recipient, a, payer) {
+            Ok((observed, preflight)) => (observed, Some(preflight)),
+            Err(error)
+                if self.cfg.erc20.is_some()
+                    && (error
+                        .rule()
+                        .is_some_and(|e| e.rule == Rule::CapacityPreflight)
+                        || error.reason() == Some(WalletReason::InsufficientFunds)) =>
+            {
+                (self.evm.vault_state(&self.cfg.vault)?.segment.max(a), None)
+            }
+            Err(error) => return Err(error),
+        };
+        self.quote_erc20_continuation(record, source, a, observed, payer)?;
+        Ok((observed, ordinary))
+    }
+
     fn return_record(&self, id: &[u8; 32]) -> Result<ReturnRecord> {
         match self.journal.ret_for_update(&hex(id))? {
             Some(r) => Ok(r),
@@ -1623,6 +2043,110 @@ impl NativeBridgeV2 {
                 format!("no journal entry for return {}", hex(id)),
             ),
         }
+    }
+
+    fn quote_erc20_continuation(
+        &self,
+        record: &ReturnRecord,
+        source: &[u8],
+        a: u64,
+        observed: u64,
+        payer: &[u8],
+    ) -> Result<()> {
+        let Some(erc20) = &self.cfg.erc20 else {
+            return Ok(());
+        };
+        let (Some(quote), Some(pins)) = (&self.erc20_return_recovery, &self.pins.erc20) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "a bounded ERC20 continuation quote is required",
+            );
+        };
+        let recovery = erc20_create2(
+            &pins.factory,
+            &he(&[&address_word(&erc20.token)]),
+            &pins.recovery_initcode_hash,
+        );
+        if quote.deployment.recovery != recovery
+            || quote.deployment.vault_runtime_hash != Some(self.pins.vault_runtime_code_hash)
+            || he(&[&self.evm.code(&recovery)?]) != quote.deployment.runtime_hash
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation calibration differs from the deployed graph",
+            );
+        }
+        let mut limits = quote.limits.clone();
+        let (base_fee, priority) = self.evm.fees()?;
+        if priority > limits.max_priority_fee_per_gas
+            || BigUint::from(2u8) * base_fee + priority > limits.max_fee_per_gas
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "current fees exceed the continuation bid limits",
+            );
+        }
+        limits.signed_bytes = limits
+            .signed_bytes
+            .min(self.pins.max_encoded_tx_bytes as usize);
+        limits.gas = limits.gas.min(self.pins.user_gas_limit);
+        limits.balance = limits.balance.min(self.evm.balance(payer)?);
+        let backlog = RecoveryBacklog {
+            signed_start: a,
+            observed,
+            ..quote.backlog.clone()
+        };
+        let seal = record.seal_receipt.as_deref().map(unhex).transpose()?;
+        let admission = self.retrying_trust(|trust| {
+            preflight_recovery(
+                &AdmissionContext {
+                    gamma: &self.pins.gamma,
+                    trust,
+                    params: &build_params(self.pins.build),
+                    deployment: &quote.deployment,
+                    calibration: &*quote.calibration,
+                    limits: &limits,
+                },
+                source,
+                &backlog,
+                seal.as_deref(),
+            )
+        })?;
+        let calls = admission.run.len() as u64 + admission.advance_calls + 1;
+        let nonce = self.evm.nonce(payer, "pending")?;
+        if nonce
+            .checked_add(calls - 1)
+            .map_or(true, |last| last > limits.max_nonce)
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation schedule exceeds the declared nonce horizon",
+            );
+        }
+        Ok(())
+    }
+
+    fn preview_erc20_recipient(&self, recipient: &[u8; 20], amount: &BigUint) -> Result<()> {
+        if self.cfg.erc20.is_none() {
+            return Ok(());
+        }
+        let data = cat(&[
+            &sel("previewPayout(address,uint256)"),
+            &address_word(recipient),
+            &u256(amount),
+        ]);
+        if !self.evm.call_reverts_with(
+            &self.cfg.vault,
+            &data,
+            350_000,
+            &sel("PayoutPreviewPassed()"),
+        ) {
+            return refuse(
+                WalletReason::RecipientRefused,
+                "the ERC20 payout simulation did not confirm an exact transfer",
+            );
+        }
+        Ok(())
     }
 
     /// Certify the terminal burn of a planned return: R signs the recipient, the amount and the index. The exact request is
@@ -1640,21 +2164,39 @@ impl NativeBridgeV2 {
         let amount = undec(&rec.amount)?;
         let a = undec64(&rec.a)?;
         if rec.status == "planned" {
+            if self.cfg.erc20.is_some() {
+                if recipient == [0; 20] || recipient == self.cfg.vault {
+                    return refuse(
+                        WalletReason::RecipientRefused,
+                        "the zero address and the vault are refused",
+                    );
+                }
+                let source = unhex(&rec.source)?;
+                let held = self.verify_token(&source)?;
+                if hu(&[&source]) != *return_id || held.amount != amount {
+                    return refuse(
+                        WalletReason::BadInput,
+                        "planned return differs from the verified source and amount",
+                    );
+                }
+            }
             // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
             let payer = match &rec.payer {
                 None => recipient.to_vec(),
                 Some(p) => unhex(p)?,
             };
-            self.preflight(&unhex(&rec.source)?, &amount, &recipient, a, &payer)?;
+            let source = unhex(&rec.source)?;
+            self.admit_return(&rec, &source, &amount, &recipient, a, &payer)?;
+            self.preview_erc20_recipient(&recipient, &amount)?;
             let r = encode_return_data(&ReturnData {
                 d: self.domain,
-                asset: asset_uct(),
+                asset: self.cfg.asset,
                 recipient,
                 amount: amount.clone(),
                 min_index: a,
             });
             let req = transfer_request(
-                &unhex(&rec.source)?,
+                &source,
                 owner,
                 &TransferTx {
                     recipient: burn_predicate(&hu(&[&r])),
@@ -2397,3 +2939,7 @@ pub fn other_bytes(evidence: usize) -> usize {
     let calldata = redeem_calldata_length(evidence, 32) + 31;
     calldata - evidence + redeem_tx_framing(calldata)
 }
+
+#[cfg(test)]
+#[path = "bridge_erc20_tests.rs"]
+mod erc20_tests;

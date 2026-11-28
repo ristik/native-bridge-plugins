@@ -205,6 +205,7 @@ pub fn make_uc(
 pub fn make_config(root: &Root, k: u64, b: u64) -> Config {
     let execution_genesis = sha(b"execution genesis");
     Config {
+        erc20: None,
         network: NETWORK,
         root_genesis: root.pin,
         execution_genesis,
@@ -997,6 +998,7 @@ pub struct World {
 
 pub fn pins_of(chain: &FakeChain) -> DeploymentPins {
     DeploymentPins {
+        erc20: None,
         gamma: chain.gamma.clone(),
         build: Build::Test,
         vault_runtime_code_hash: he(&[&chain.vault_code]),

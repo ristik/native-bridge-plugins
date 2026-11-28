@@ -7,11 +7,11 @@ use alloc::vec::Vec;
 use num_bigint::BigUint;
 
 use super::crypto::he;
-use super::deposit::topic;
+use super::deposit::{deposit_topics, topic};
 use super::errors::{is_retryable_verifier_refusal, Rule};
 use super::util::{arr, be_int, cat, to_u64, u256, u256_64};
 
-fn sel(sig: &str) -> [u8; 4] {
+pub(crate) fn sel(sig: &str) -> [u8; 4] {
     arr(&he(&[sig.as_bytes()])[..4])
 }
 
@@ -19,6 +19,9 @@ fn sel(sig: &str) -> [u8; 4] {
 pub mod selector {
     pub fn deposit() -> [u8; 4] {
         super::sel("deposit(bytes,bytes32)")
+    }
+    pub fn deposit_erc20() -> [u8; 4] {
+        super::sel("depositERC20(uint256,uint256,bytes,bytes32)")
     }
     pub fn redeem() -> [u8; 4] {
         super::sel("redeem(bytes,bytes32,uint64,bytes)")
@@ -136,6 +139,27 @@ pub fn deposit_calldata(first_owner: &[u8], rho: &[u8]) -> Vec<u8> {
     ])
 }
 
+pub fn address_word(address: &[u8; 20]) -> [u8; 32] {
+    let mut word = [0; 32];
+    word[12..].copy_from_slice(address);
+    word
+}
+
+pub fn deposit_erc20_calldata(
+    requested: &BigUint,
+    min_credit: &BigUint,
+    owner: &[u8],
+    rho: &[u8],
+) -> Vec<u8> {
+    let body = abi_encode(&[
+        AbiArg::Word(u256(requested)),
+        AbiArg::Word(u256(min_credit)),
+        AbiArg::Bytes(owner.to_vec()),
+        AbiArg::Word(arr(rho)),
+    ]);
+    cat(&[&selector::deposit_erc20(), &body])
+}
+
 pub fn redeem_calldata(
     evidence: &[u8],
     claimed_eta: &[u8],
@@ -210,7 +234,10 @@ pub fn decode_revert(data: &[u8]) -> Option<DecodedError> {
     if data.len() < 4 {
         return None;
     }
-    let rule = *Rule::ALL.iter().find(|r| selector_of(**r) == data[..4])?;
+    let rule = *Rule::ALL
+        .iter()
+        .chain(Rule::ERC20)
+        .find(|r| selector_of(**r) == data[..4])?;
     let types = arg_types(rule);
     let body = &data[4..];
     let parse = || -> Option<(Vec<ErrArg>, Option<Box<DecodedError>>)> {
@@ -291,7 +318,10 @@ pub fn classify_redeem_error(e: Option<&DecodedError>) -> RedeemAction {
         Rule::BadGapProof | Rule::ChainMismatch | Rule::BadHistoryLength => {
             RedeemAction::RepairProof
         }
-        Rule::PayoutFailed | Rule::Reentrancy => RedeemAction::RetryLater,
+        Rule::PayoutFailed
+        | Rule::InsufficientBacking
+        | Rule::TokenCallFailed
+        | Rule::Reentrancy => RedeemAction::RetryLater,
         Rule::VerifierRefused => {
             if e.inner
                 .as_ref()
@@ -330,11 +360,31 @@ pub struct DepositedLog {
 }
 
 pub fn decode_deposited(topics: &[Vec<u8>], data: &[u8]) -> Option<DepositedLog> {
-    if topics.len() != 2 || topics[0] != topic::deposited() || data.len() != 224 {
+    decode_asset_deposit(topics, data, None)
+}
+
+pub fn decode_asset_deposit(
+    topics: &[Vec<u8>],
+    data: &[u8],
+    token: Option<&[u8; 20]>,
+) -> Option<DepositedLog> {
+    if !deposit_topics(topics, token) || data.len() != 224 {
+        return None;
+    }
+    let n = to_u64(&be_int(&topics[1]))?;
+    if token.is_some()
+        && (topics[1].len() != 32
+            || n == 0
+            || n > super::config::MAX_DEPOSIT
+            || data[96..128] != u256_64(128)
+            || data[128..160] != u256_64(42)
+            || data[202..].iter().any(|&b| b != 0)
+            || data[32..64] == [0; 32])
+    {
         return None;
     }
     Some(DepositedLog {
-        n: to_u64(&be_int(&topics[1]))?,
+        n,
         domain: data[..32].to_vec(),
         amount: be_int(&data[32..64]),
         rho: data[64..96].to_vec(),

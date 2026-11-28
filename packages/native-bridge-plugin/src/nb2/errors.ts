@@ -20,7 +20,8 @@ export const RULES = {
   '14.6': ['SealReceipt', 'SegmentLog', 'CapacityPreflight', 'CapacityExceeded', 'ImplausibleIndex', 'EvidencePruned'],
 } as const;
 
-export type Rule = (typeof RULES)[keyof typeof RULES][number];
+export const ERC20_RULES = ['BadCredit', 'ExcessDebit', 'InsufficientBacking', 'TokenCallFailed'] as const;
+export type Rule = (typeof RULES)[keyof typeof RULES][number] | typeof ERC20_RULES[number];
 
 /** Every rule, in section 14 order. */
 export const ALL_RULES: readonly Rule[] = Object.values(RULES).flat() as Rule[];

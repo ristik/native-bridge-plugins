@@ -53,7 +53,8 @@ export async function recoveredSettlementEta(cfg: Config, domain: Uint8Array, tr
   const proof = decodeDepositProof(calldata.subarray(proofStart, proofStart + length));
   const log = await verifyReceiptLog(cfg, trust, proof, emitter);
   if (log.topics.length !== 2 || !eq(log.topics[0], topics[kind]) ||
-    log.data.length !== (kind === 'complete' ? 224 : 288) || !eq(log.data.subarray(32, 64), domain)) return;
+    log.data.length !== (kind === 'complete' ? 224 : 288) || !eq(log.data.subarray(32, 64), domain)
+    || !eq(log.data.subarray(128, 160), cfg.asset)) return;
   return log.data.slice(64, 96);
 }
 
@@ -262,9 +263,9 @@ export class RecoverySession {
     const deployment = { salt: Uint8Array.from(input.salt), recovery: Uint8Array.from(input.recovery), runtimeHash: Uint8Array.from(input.runtimeHash), pins: Uint8Array.from(input.pins),
       vaultRuntimeHash: input.vaultRuntimeHash && Uint8Array.from(input.vaultRuntimeHash) };
     const { salt, recovery, runtimeHash, pins } = deployment;
-    if (!validRecoveryDeployment(deployment)) fail('ConfigShape');
     const config = Uint8Array.from(gamma);
     const cfg = decodeConfig(config, params);
+    if (!validRecoveryDeployment(deployment, cfg)) fail('ConfigShape');
     const domain = domainOf(config);
     const snapshot = Uint8Array.from(evidence);
     const token = decodeToken(snapshot);

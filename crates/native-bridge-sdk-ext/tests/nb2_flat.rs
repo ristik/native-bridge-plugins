@@ -593,3 +593,60 @@ fn wallet_intervals_match_shared_b1_imported_tip_cases() {
         }
     }
 }
+
+#[test]
+fn erc20_go_vectors_isolate_tokens_and_domains() {
+    use native_bridge_sdk_ext::nb2::config::{config_identities, encode_config};
+    use serde_json::Value;
+
+    let doc: Value =
+        serde_json::from_slice(&std::fs::read(format!("{DIR}../erc20-nb2/vectors.json")).unwrap())
+            .unwrap();
+    let params = production_params();
+    let assets = doc["Assets"].as_array().unwrap();
+    let raw = |asset: &Value, key: &str| {
+        from_hex(asset[key].as_str().unwrap().trim_start_matches("0x")).unwrap()
+    };
+    for (i, asset) in assets.iter().enumerate() {
+        let gamma = raw(asset, "Gamma");
+        let mut cfg = decode_config(&gamma, &params).unwrap();
+        let domain = domain_of(&gamma);
+        assert_eq!(domain.as_slice(), raw(asset, "Domain"));
+        assert_eq!(encode_config(&cfg), gamma);
+        let (tag, ty, coin) = config_identities(&cfg);
+        assert_eq!(tag.as_slice(), raw(asset, "Asset"));
+        assert_eq!(ty.as_slice(), raw(asset, "Type"));
+        assert_eq!(coin.as_slice(), raw(asset, "Coin"));
+        let trust =
+            TrustInput::from_bundle(&read("transcripts/root/utb.cbor"), &cfg.root_genesis).unwrap();
+        let held = decode_token(&raw(asset, "Held")).unwrap();
+        assert_eq!(
+            verify_held(&cfg, &domain, &trust, &held).unwrap().amount,
+            40u8.into()
+        );
+        for foreign in assets
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| i != *j)
+            .map(|(_, v)| v)
+        {
+            assert!(verify_held(
+                &cfg,
+                &domain,
+                &trust,
+                &decode_token(&raw(foreign, "Held")).unwrap()
+            )
+            .is_err());
+        }
+        let verdict = verify_return(&gamma, &raw(asset, "Evidence"), &trust, &params).unwrap();
+        assert_eq!(verdict_abi(&verdict), raw(asset, "Verdict"));
+        cfg.erc20.as_mut().unwrap().generation = [7; 32];
+        assert_eq!(
+            verify_held(&cfg, &domain_of(&encode_config(&cfg)), &trust, &held)
+                .unwrap_err()
+                .rule()
+                .map(|error| error.rule),
+            Some(Rule::MintDomain)
+        );
+    }
+}
