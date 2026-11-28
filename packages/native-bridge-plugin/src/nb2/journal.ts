@@ -472,6 +472,9 @@ export class Journal {
     const executor = record.executionPayer === undefined ? undefined : this.payerSendPath(chainId, unhex(record.executionPayer), record);
     const ordinary = record.sends.map(({ raw }) => decodeSignedTx(unhex(raw))).filter(({ from, request }) =>
       request.chainId === chainId && eqBytes(from, payer));
+    if (executor === undefined && ordinary.length > 0 && !await this.payerHistoryComplete(path)) {
+      await this.indexPayerSends(record, []);
+    }
     const prefix = `nb2/payer-fees/v1/${path}/`;
     const keys = await this.store.list(prefix);
     if ((executor !== undefined && !await this.payerHistoryComplete(executor)) ||

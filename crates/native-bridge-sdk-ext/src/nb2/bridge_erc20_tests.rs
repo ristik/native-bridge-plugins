@@ -1710,6 +1710,36 @@ fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacemen
     assert_eq!(fees.prior, BigUint::default());
     unregistered.status = "paid".into();
     legacy.put_return(&unregistered).unwrap();
+    let mut old_ordinary = unregistered.clone();
+    old_ordinary.return_id = hex(&[0x75; 32]);
+    old_ordinary.extra.remove("executionPayer");
+    old_ordinary.sends.push(
+        bridge.send_record(
+            &sign_tx(
+                &signer,
+                &TxRequest {
+                    gas: 2,
+                    chain_id: chain,
+                    nonce: 0,
+                    to: rpc.recovery,
+                    max_fee_per_gas: 10u8.into(),
+                    ..tx.clone()
+                },
+            )
+            .unwrap(),
+        ),
+    );
+    legacy.put_return(&old_ordinary).unwrap();
+    legacy
+        .prepare_payer_broadcast(&old_ordinary, chain, &local)
+        .unwrap();
+    assert_eq!(
+        legacy
+            .payer_fees(&old_ordinary, chain, &payer, 0)
+            .unwrap()
+            .at_nonce,
+        20u8.into()
+    );
     let hash = he(&[&super::super::header::encode_header(
         &super::super::rpc::header_of_json(&finalized_header()).unwrap(),
     )]);

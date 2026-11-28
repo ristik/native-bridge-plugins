@@ -9,7 +9,7 @@ import { ascii, u256 } from '../../src/nb2/cbor.js';
 import { decodeConfig, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { decodeReceiptBacking, depositedData, TOPIC } from '../../src/nb2/deposit.js';
-import { LocalKeySigner, signTx } from '../../src/nb2/evm.js';
+import { LocalKeySigner, decodeSignedTx, signTx } from '../../src/nb2/evm.js';
 import { Journal, MemoryJournalStore, continuationReserve, payerNonceLimit } from '../../src/nb2/journal.js';
 import { WalletError } from '../../src/nb2/errors.js';
 import { quoteErc20Call, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, quoteScheduledRecoveryRuns,
@@ -570,6 +570,11 @@ test('ordinary takeover migrates local Run fees and preserves the higher replace
   await legacy.preparePayerBroadcast(unregistered, chainId, lower);
   assert.deepEqual(await legacy.payerFees(unregistered, chainId, payer, 0n), { prior: 0n, atNonce: 20n });
   await legacy.putReturn({ ...unregistered, status: 'paid' });
+  const oldOrdinary = { ...unregistered, returnId: hex(key('ordinary-only legacy return')), executionPayer: undefined,
+    sends: [{ raw: hex(local), hash: hex(decodeSignedTx(local).hash), nonce: '0', gas: '2', at: '0' }] };
+  await legacy.putReturn(oldOrdinary);
+  await legacy.preparePayerBroadcast(oldOrdinary, chainId, local);
+  assert.deepEqual(await legacy.payerFees(oldOrdinary, chainId, payer, 0n), { prior: 0n, atNonce: 20n });
   const plan = first.recovery!;
   const policy = { ...erc20Recovery.limits, chainId, maxFeePerGas: 20n };
   const attempts = BigInt(plan.ordinary!.attemptsBeforeFallback);

@@ -833,9 +833,8 @@ impl Journal {
             );
         }
         let path = payer_send_path(chain_id, payer, record);
-        let prefix = format!("nb2/payer-fees/v1/{path}/");
-        let keys = self.store.list(&prefix)?;
-        if let Some(executor) = record.extra.get("executionPayer").and_then(Value::as_str) {
+        let executor = record.extra.get("executionPayer").and_then(Value::as_str);
+        if let Some(executor) = executor {
             if !self.payer_history_complete(&payer_send_path(
                 chain_id,
                 &unhex_n::<20>(executor)?,
@@ -852,14 +851,20 @@ impl Journal {
             .iter()
             .map(|send| decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other))
             .collect::<Result<Vec<_>>>()?;
-        if (!keys.is_empty()
+        let has_ordinary = ordinary
+            .iter()
+            .any(|tx| tx.request.chain_id == chain_id && tx.from.as_slice() == payer);
+        if executor.is_none() && has_ordinary && !self.payer_history_complete(&path)? {
+            self.index_payer_sends(record, &[])?;
+        }
+        let prefix = format!("nb2/payer-fees/v1/{path}/");
+        let keys = self.store.list(&prefix)?;
+        if (has_ordinary
+            || !keys.is_empty()
             || self
                 .store
                 .get(&format!("nb2/payer-sends/v1/{path}"))?
-                .is_some()
-            || ordinary
-                .iter()
-                .any(|tx| tx.request.chain_id == chain_id && tx.from.as_slice() == payer))
+                .is_some())
             && !self.payer_history_complete(&path)?
         {
             return fail_d(
