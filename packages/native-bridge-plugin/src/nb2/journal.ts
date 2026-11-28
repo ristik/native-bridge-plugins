@@ -484,8 +484,10 @@ export class Journal {
       return;
     }
     if (record.status === 'submitted') unsupportedErc20Return();
-    if (record.erc20PayerState === 1) return;
-    // Funded returns already admitted under the payer-slot protocol may predate the record flag.
+    const holderBurn = record.status !== 'planned' && record.status !== 'paid' &&
+      record.payer !== undefined && record.burnRequest !== undefined;
+    if (record.erc20PayerState === 1 && !holderBurn) return;
+    // An unpaid local burn keeps its slot before the first signed EVM packet.
     const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
     const owner = `nb2/v1/${record.domain.slice(2)}/return/${record.returnId.slice(2)}`;
     if (slot?.split('#')[0] !== owner) unsupportedErc20Return();

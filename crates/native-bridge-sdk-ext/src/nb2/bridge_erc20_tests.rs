@@ -1086,6 +1086,12 @@ fn erc20_startup_signing_and_rebroadcast_refuse_pre_release_records_without_inde
     };
     assert_refused(journal.open_erc20_payer_journal(chain).unwrap_err());
     assert_refused(bridge.burn(&id, &NeverSign).unwrap_err());
+    let mut unreserved = record.clone();
+    unreserved.extra.insert("erc20PayerState".into(), json!(1));
+    unreserved.status = "burn-requested".into();
+    unreserved.burn_request = Some(hex(&[0x37; 32]));
+    journal.put_return(&unreserved).unwrap();
+    assert_refused(journal.open_erc20_payer_journal(chain).unwrap_err());
     let request = TxRequest {
         chain_id: chain,
         nonce: 7,

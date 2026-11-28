@@ -148,6 +148,7 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   // Use UCT receipt fixtures with the current ERC20 payer journal.
   w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
   rec.erc20PayerState = 1;
+  delete rec.payer;
   rec.recovery!.envelope = { gas: String(caps.gas), signedBytes: caps.signedBytes, calldataBytes: caps.calldataBytes,
     maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
   await w.bridge.journal.putReturn(rec);
@@ -167,7 +168,7 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   assert.equal(checkpoint.completed, '1');
   assert.ok(BigInt(checkpoint.continuationGas) * caps.maxFeePerGas < BigInt(rec.recovery!.totalFee));
   const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const,
-    payer: hx(w.signer.address), executionPayer: undefined };
+    executionPayer: undefined };
   const store = w.bridge.journal;
   await store.putReturn(other);
   chain.fund(w.signer.address, BigInt(other.recovery!.totalFee) - chain.balanceOf(w.signer.address));
@@ -202,6 +203,8 @@ test('a Run with only its first fee authorized leaves the payer free for another
     maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
   first.erc20PayerState = 1;
   second.erc20PayerState = 1;
+  delete first.payer;
+  delete second.payer;
   await w.bridge.journal.putReturn(first);
   await w.bridge.journal.putReturn(second);
   const session = await RecoverySession.create(chain.gamma, unhex(first.burned!),
@@ -239,6 +242,7 @@ test('a contested ordinary handoff reserves the old fee and the entire fallback 
     maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: (await w.bridge.buildRedeem(unhex(rec.returnId))).calldata });
   const oldFee = old.request.gas * old.request.maxFeePerGas;
   rec.erc20PayerState = 1;
+  delete rec.payer;
   plan.ordinary = { gas: '40000', calldataBytes: 393216, maxFeePerGas: String(caps.maxFeePerGas), attemptsBeforeFallback: '1' };
   const coldCalls = BigInt(plan.calls);
   plan.calls = String(coldCalls + 1n);
@@ -352,6 +356,7 @@ test('a peer payout keeps the wallet packet reserved after it drops out of the m
   const journal = w.bridge.journal;
   const erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
   rec.erc20PayerState = 1;
+  delete rec.payer;
   await journal.putReturn(rec);
   await journal.registerPayerChain(cfg.chainId);
   w.bridge.cfg.erc20 = erc20;
@@ -411,6 +416,7 @@ test('a peer payout cannot release the payer while the recovery signer is outsta
   // Use receipt fixtures for proof verification and the ERC20 guard for local execution.
   const erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
   rec.erc20PayerState = 1;
+  delete rec.payer;
   await w.bridge.journal.putReturn(rec);
   await w.bridge.journal.registerPayerChain(cfg.chainId);
   w.bridge.cfg.erc20 = erc20;
@@ -1400,7 +1406,7 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   const journalStore = reopened.bridge.journal;
   reopened.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
   const pledged = { ...localPlan, returnId: hx(key('pledged payer balance')), status: 'burned' as const,
-    payer: hx(reopened.signer.address), executionPayer: undefined, sends: [], recovery: { ...cold.recovery!, totalFee: String(cost) } };
+    payer: hx(reopened.signer.address), burnRequest: undefined, executionPayer: undefined, sends: [], recovery: { ...cold.recovery!, totalFee: String(cost) } };
   await journalStore.putReturn(pledged);
   await checkLocalErc20Returns(reopened);
 

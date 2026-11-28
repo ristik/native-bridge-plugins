@@ -865,10 +865,14 @@ impl Journal {
         if record.status == "submitted" {
             return unsupported_erc20_return();
         }
-        if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1) {
+        let holder_burn = record.status != "planned"
+            && record.status != "paid"
+            && record.payer.is_some()
+            && record.burn_request.is_some();
+        if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1) && !holder_burn {
             return Ok(());
         }
-        // Funded returns already admitted under the payer-slot protocol may predate the record flag.
+        // An unpaid local burn keeps its slot before the first signed EVM packet.
         let payer = unhex_n::<20>(record.payer.as_deref().unwrap_or(&record.recipient))?;
         let slot = self
             .store

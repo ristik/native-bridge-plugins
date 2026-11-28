@@ -378,6 +378,10 @@ test('ERC20 startup, signing and rebroadcast refuse pre-release records without 
   await assert.rejects(reopen(), refused);
   await assert.rejects(bridge.burn(bytes(old.returnId), { ...owner, signUnlock: async () => assert.fail('holder signer reached') }, admission), refused);
 
+  // A current-format local holder burn also requires the durable payer slot.
+  await bridge.journal.putReturn({ ...record, status: 'burn-requested', burnRequest: hex(key('unreserved holder burn')) });
+  await assert.rejects(reopen(), refused);
+
   const tx = await signTx(x.payer, { chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
     maxPriorityFeePerGas: 1n, to: x.cfg.vault, value: 0n, data: new Uint8Array() });
   const pending = { ...old, status: 'submitted' as const, executionPayer: hex(payer), sends: [bridge['sendRecord'](tx)] };
