@@ -13,7 +13,7 @@ import {
   type ReturnAdmission, type ReturnRecord, type ReconcileResult, type TrustInput, type SendRecord, type RedeemOptions, type ReturnEvidence,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
-import { beInt } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
+import { ascii, beInt } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
 import type { CertifiedVaultHead } from '../packages/native-bridge-plugin/src/nb2/recovery.js';
 import { fsyncDir, hx, readRetrying, unhex, writeDurable, type Wallet } from './core.js';
 
@@ -772,6 +772,23 @@ function definitiveArchiveError(e: unknown): boolean {
   return e instanceof WalletError && (e.reason === 'AlreadyPaid' || e.reason === 'TrustInput');
 }
 
+/** Retain the newest certified execution anchor for this deployment, even if its proof is unavailable. */
+function retainCheckpointAnchor(w: Wallet, block: { header: { number: bigint }; hash: Uint8Array }): void {
+  const path = join(w.dir, `checkpoint-anchor-${hx(w.bridge.domain).slice(2)}.json`);
+  const { number } = block.header;
+  if (existsSync(path)) {
+    const previous = JSON.parse(readFileSync(path, 'utf8'));
+    const height = uint(previous.height);
+    const hash = bytes(previous.hash, 32);
+    if (number < height) throw new WalletError('EvidenceMissing', `certified execution head is behind the retained checkpoint anchor at block ${height}`);
+    if (number === height) {
+      if (!eq(block.hash, hash)) throw new WalletError('ProviderFault', 'conflicting certified execution heads at the retained checkpoint anchor');
+      return;
+    }
+  }
+  writeDurable(path, JSON.stringify({ height: String(number), hash: hx(block.hash) }));
+}
+
 /** Select the newest authenticated block independently of which reader supplies its storage proof. */
 async function checkpointHistory(w: Wallet, rec: ReturnRecord, session: RecoverySession, archive: readonly EvmReader[],
   start: bigint, head: Uint8Array, limit: number) {
@@ -793,6 +810,7 @@ async function checkpointHistory(w: Wallet, rec: ReturnRecord, session: Recovery
     if (!block || candidate.header.number > block.header.number) block = candidate;
   }
   if (!block) throw failed ?? new WalletError('EvidenceMissing', 'no certified execution head for checkpoint preflight');
+  retainCheckpointAnchor(w, block);
   let anchor: CertifiedVaultHead | undefined;
   for (const reader of archive) {
     try {
@@ -927,6 +945,10 @@ export function routeRequired(result: RouteBlocked): never {
   throw new WalletError('NotPending', `route blocked by ${result.route} transaction ${hx(result.txHash)}. Resume that route with its payer and reconcile the exact send before switching routes`);
 }
 
+const recoverySelector = (method: string) => HE(ascii(`${method}(bytes)`)).subarray(0, 4);
+const checkpointSelectors = [recoverySelector('run'), recoverySelector('advanceGaps')];
+const settlementSelector = recoverySelector('redeemRecovered');
+
 /** A certified event authenticates the cursor. Check nonce consumption independently. */
 async function lowerRecoverySend(w: Wallet, rec: ReturnRecord, journal?: RecoveryJournal) {
   const raw = [...(journal?.superseded ?? []), ...(journal?.attempts ?? [])];
@@ -994,7 +1016,15 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
       const epoch = journal?.signerEpochs?.[hx(lower.hash)];
       if (!journal || epoch === undefined) throw new WalletError('NotPending', 'retry needs the authenticated cut for the prior signed packet');
       const release = recoveryRelease(w);
-      if (eq(lower.request.to, release.deployment.recovery)) {
+      await checkGraph(w, release);
+      const { chainId, data, to, value } = lower.request;
+      const selector = data.subarray(0, 4);
+      const checkpoint = eq(to, release.deployment.recovery) && checkpointSelectors.some((entry) => eq(entry, selector));
+      const settlement = eq(to, w.bridge.cfg.vault) && eq(selector, settlementSelector);
+      if (chainId !== w.bridge.cfg.chainId || value !== 0n || (!checkpoint && !settlement)) {
+        throw new WalletError('BadDeployment', 'saved recovery packet does not call the installed recovery graph');
+      }
+      if (checkpoint) {
         const active = activeRecovery(rec, journal);
         const session = await openSession(w, release, active);
         // A portable Complete can supersede the packet's local predecessor. The signed
@@ -1104,35 +1134,33 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       if (batch < 1n || batch > 1024n) throw new Error('invalid admitted gap batch');
       const head = cursor.gap.cursor?.head ?? bytes(rec.startHead, 32);
       const startHead = (gaps: Uint8Array[]) => !cursor.gap?.cursor && gaps.length > 0 ? head : undefined;
+      const settle = async (gaps: Uint8Array[]) => {
+        const packet = await s.gaps('redeemRecovered', w.trust, cursor.prior!.receipt, cursor.gap!, gaps, startHead(gaps));
+        return { packet, gaps, price: quoteRecovery(packet.shape, release.calibration, limits) };
+      };
       let settlement;
-      let settlementGaps: Uint8Array[] = [];
-      let terminalError: unknown;
       try {
         const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
         if (segment - start <= batch) {
           const { endpoint, gaps } = await gapHistory(w, rec, s, archive, start, head, segment, Number(batch));
-          if (endpoint - start < batch) {
-            settlement = await s.gaps('redeemRecovered', w.trust, cursor.prior!.receipt, cursor.gap, gaps, startHead(gaps));
-            settlementGaps = gaps;
-          }
+          if (endpoint - start < batch) settlement = await settle(gaps);
         }
       } catch (e) {
         if (definitiveArchiveError(e)) throw e;
-        terminalError = e;
       }
-      const price = settlement && quoteRecovery(settlement.shape, release.calibration, limits);
-      if (settlement && price) {
-        cut = { kind: 'settle', gaps: settlementGaps.map(hx) };
-        ({ calldata, requiredSignerEpoch } = settlement);
-        quote = price;
-        to = w.bridge.cfg.vault;
-      } else {
-        const { gaps } = await checkpointHistory(w, rec, s, archive, start, head, Number(batch));
-        if (BigInt(gaps.length) !== batch) throw terminalError ?? new Nb2Error('CapacityPreflight', 'qualified settlement suffix exceeds payer limits');
+      const authenticated = settlement?.price ? undefined : await checkpointHistory(w, rec, s, archive, start, head, Number(batch));
+      if (authenticated && authenticated.endpoint - start >= batch) {
+        const { gaps } = authenticated;
         const packet = await s.gaps('advanceGaps', w.trust, cursor.prior!.receipt, cursor.gap, gaps, startHead(gaps));
         cut = { kind: 'advance', gaps: gaps.map(hx) };
         ({ calldata, requiredSignerEpoch } = packet);
         quote = quoteRecovery(packet.shape, release.calibration, limits);
+      } else {
+        const { packet, gaps, price } = authenticated ? await settle(authenticated.gaps) : settlement!;
+        cut = { kind: 'settle', gaps: gaps.map(hx) };
+        ({ calldata, requiredSignerEpoch } = packet);
+        quote = price;
+        to = w.bridge.cfg.vault;
       }
     }
     const pendingNonce = await w.bridge.evm.nonce(w.signer.address);
