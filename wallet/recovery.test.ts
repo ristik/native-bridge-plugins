@@ -309,7 +309,7 @@ for (const empty of [false, true]) test(
     }
   }
   const before = unhex(rec.startHead);
-  const segments = chain.vault.events.filter((e) => e.name === 'SegmentSealed' && e.segment >= start).map((e) =>
+  const segments = chain.vault.events.filter((e) => e.name === 'SegmentSealed').filter((e) => e.segment >= start).map((e) =>
     ({ index: e.segment, z: e.ids, before: e.before, after: e.after, root: GapTree.build(e.ids)!.root }));
   const eta = session.redemptionId;
   const gaps = segments.map((e) => GapTree.build(e.z)!.prove(eta)!);
