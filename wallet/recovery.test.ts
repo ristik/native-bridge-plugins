@@ -147,21 +147,32 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   };
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   const path = join(w.dir, `recovery-${rec.returnId.slice(2)}.json`);
-  const { cuts } = JSON.parse(readFileSync(path, 'utf8'));
+  const { cuts, attempts } = JSON.parse(readFileSync(path, 'utf8'));
   packet = await session.run(1, 1, w.trust, { seq: 1n, receipt: unhex(cuts[0].location.proof) });
 
   // This fixture authenticates ordinary NB2 receipts and enables the ERC20 wallet's payer guard for execution.
   w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
   rec.recovery!.envelope = { gas: String(caps.gas), signedBytes: caps.signedBytes, calldataBytes: caps.calldataBytes,
     maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
+  rec.executionPayer = (await w.bridge.journal.ret(rec.returnId))!.executionPayer;
+  assert.equal(rec.executionPayer, hx(w.signer.address));
   await w.bridge.journal.putReturn(rec);
+  const signed = decodeSignedTx(unhex(attempts[0])).request;
+  const feeIndex = `nb2/payer-fee-index/v1/${rec.domain.slice(2)}/${rec.returnId.slice(2)}`;
+  assert.equal(await w.bridge.journal.store.get(feeIndex), null);
+  assert.deepEqual(await w.bridge.journal.store.list('nb2/payer-sends/v1/'), []);
+  await assert.rejects(w.bridge.journal.payerFees(rec, cfg.chainId, w.signer.address, signed.nonce + 1n), /local signed fees indexed/);
   await indexLocalRecoverySends(w);
+  assert.equal(await w.bridge.journal.store.get(feeIndex), '1');
+  assert.deepEqual(await w.bridge.journal.payerFees(rec, cfg.chainId, w.signer.address, signed.nonce + 1n),
+    { prior: signed.gas * signed.maxFeePerGas, atNonce: 0n });
   const progress = await w.bridge.journal.store.list(`nb2/payer-progress/v2/${cfg.chainId}/`);
   assert.equal(progress.length, 1);
   const checkpoint = JSON.parse((await w.bridge.journal.store.get(progress[0]))!);
   assert.equal(checkpoint.completed, '1');
   assert.ok(BigInt(checkpoint.continuationGas) * caps.maxFeePerGas < BigInt(rec.recovery!.totalFee));
-  const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const, payer: hx(w.signer.address) };
+  const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const,
+    payer: hx(w.signer.address), executionPayer: undefined };
   const store = w.bridge.journal;
   await store.putReturn(other);
   chain.fund(w.signer.address, BigInt(other.recovery!.totalFee) - chain.balanceOf(w.signer.address));
@@ -410,6 +421,21 @@ test('a reopened wallet refuses an altered planned recipient and keeps the origi
     await burn(reopened, 'coin', undefined, undefined, caps);
     assert.equal((await reopened.returnRecord('coin')).recipient, hx(address));
   }
+});
+
+test('ordinary wallet admission budgets the higher signed fee at the replacement nonce once', async (t) => {
+  const { w, cfg } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const nonce = await w.bridge.evm.nonce(w.signer.address);
+  const request = { chainId: cfg.chainId, nonce, gas: 100_000n, maxFeePerGas: 15n, maxPriorityFeePerGas: 1n,
+    to: cfg.vault, value: 0n, data: new Uint8Array(68) };
+  const older = await signTx(w.signer, { ...request, maxFeePerGas: 30n });
+  const prior = [{ raw: hx(older.raw), hash: hx(older.hash), nonce: String(nonce), gas: String(request.gas), at: '0' }];
+  const oldFee = older.request.gas * older.request.maxFeePerGas;
+  const policy = { ...caps, maxFeePerGas: 20n, feeBudget: oldFee };
+  await assert.rejects(ordinaryPayout(w, rec, { ...policy, feeBudget: oldFee - 1n }).admit!(request, prior), /remaining payer limits/);
+  await ordinaryPayout(w, rec, policy).admit!(request, prior);
 });
 
 test('ordinary signing re-prices the reserve against the newest bid inside the payer cap', async (t) => {

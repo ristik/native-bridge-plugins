@@ -531,6 +531,11 @@ fn payer_send_path(chain_id: u64, payer: &[u8], record: &ReturnRecord) -> String
     )
 }
 
+pub(crate) struct PayerFees {
+    pub prior: BigUint,
+    pub at_nonce: BigUint,
+}
+
 impl Journal {
     pub fn new(store: Arc<dyn JournalStore>, domain: [u8; 32]) -> Self {
         Journal {
@@ -741,8 +746,13 @@ impl Journal {
         for send in &record.sends {
             self.retain_payer_send(record, &unhex(&send.raw)?)?;
         }
+        let chain = self
+            .store
+            .get(&format!("nb2/domain-chain/v1/{}", &record.base.domain[2..]))?;
         let prefix = "nb2/payer-sends/v1/";
         let suffix = format!("/{id}");
+        let executor = record.extra.get("executionPayer").and_then(Value::as_str);
+        let mut executor_indexed = executor.is_none();
         for key in self.store.list(prefix)? {
             if !key.ends_with(&suffix) {
                 continue;
@@ -750,32 +760,43 @@ impl Journal {
             let Some(highest) = self.store.get(&key)? else {
                 return Ok(());
             };
-            let fee = format!(
-                "nb2/payer-fees/v1/{}/{}",
-                &key[prefix.len()..],
-                undec64(&highest)?
-            );
+            let path = &key[prefix.len()..];
+            let fee = format!("nb2/payer-fees/v1/{path}/{}", undec64(&highest)?);
             if self.store.get(&fee)?.is_none() {
                 return Ok(());
             }
+            let mut parts = path.split('/');
+            let signed_chain = parts.next();
+            let same_chain = chain.is_none() || chain.as_deref() == signed_chain;
+            executor_indexed |= same_chain
+                && parts.next().is_some_and(|address| {
+                    executor.and_then(|payer| payer.strip_prefix("0x")) == Some(address)
+                });
         }
-        self.store.put_if(&fee_index, None, "1")?;
+        if executor_indexed {
+            self.store.put_if(&fee_index, None, "1")?;
+        }
         Ok(())
     }
 
     /// Count the greatest locally authorized fee per nonce across both routes for this payer and return.
-    pub(crate) fn prior_payer_fees(
+    pub(crate) fn payer_fees(
         &self,
         record: &ReturnRecord,
         chain_id: u64,
         payer: &[u8],
-        replacing: u64,
-    ) -> Result<BigUint> {
+        nonce: u64,
+    ) -> Result<PayerFees> {
         let path = payer_send_path(chain_id, payer, record);
-        if self
-            .store
-            .get(&format!("nb2/payer-sends/v1/{path}"))?
+        if (record
+            .extra
+            .get("executionPayer")
+            .and_then(Value::as_str)
             .is_some()
+            || self
+                .store
+                .get(&format!("nb2/payer-sends/v1/{path}"))?
+                .is_some())
             && self
                 .store
                 .get(&format!(
@@ -793,11 +814,9 @@ impl Journal {
         }
         let mut fees = std::collections::BTreeMap::<u64, BigUint>::new();
         let mut record_fee = |nonce, fee| {
-            if nonce != replacing {
-                let saved = fees.entry(nonce).or_default();
-                if *saved < fee {
-                    *saved = fee;
-                }
+            let saved = fees.entry(nonce).or_default();
+            if *saved < fee {
+                *saved = fee;
             }
         };
         let prefix = format!("nb2/payer-fees/v1/{path}/");
@@ -819,7 +838,11 @@ impl Journal {
                 );
             }
         }
-        Ok(fees.values().sum())
+        let at_nonce = fees.remove(&nonce).unwrap_or_default();
+        Ok(PayerFees {
+            prior: fees.values().sum(),
+            at_nonce,
+        })
     }
 
     /// Publish a replayed checkpoint. Readers check the exact block's execution finality before crediting it.

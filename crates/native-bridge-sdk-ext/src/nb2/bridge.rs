@@ -3253,7 +3253,18 @@ impl NativeBridgeV2 {
                 "ordinary attempt exceeds its signing reserve",
             );
         }
-        let mut required = fee;
+        let fees = self
+            .journal
+            .payer_fees(record, request.chain_id, payer, request.nonce)?;
+        if fees.at_nonce != BigUint::default()
+            && request.nonce < self.evm.nonce(payer, "finalized")?
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary replacement nonce is already finalized",
+            );
+        }
+        let mut required = fee.max(fees.at_nonce);
         if other.contested_drain {
             self.verify_erc20_recovery_release(policy)?;
             let generation = hex(&super::recovery::recovery_generation(
@@ -3296,18 +3307,21 @@ impl NativeBridgeV2 {
             } else {
                 continuation_gas
             };
-            let suffix_fee =
-                (route + BigUint::from(attempts) * ordinary_gas) * &fallback_limits.max_fee_per_gas;
-            required = required.max(suffix_fee);
-            let spent =
-                self.journal
-                    .prior_payer_fees(record, request.chain_id, payer, request.nonce)?;
-            if &required + spent > limits.fee_budget {
-                return fail_d(
-                    Rule::CapacityPreflight,
-                    "remaining continuation schedule exceeds the authorized payer fee budget",
-                );
-            }
+            let ceiling = &fallback_limits.max_fee_per_gas;
+            let allowance = if attempts > 0 {
+                BigUint::from(ordinary_gas) * ceiling
+            } else {
+                BigUint::default()
+            };
+            let other_work =
+                (route + BigUint::from(attempts.saturating_sub(1)) * ordinary_gas) * ceiling;
+            required = other_work + required.max(allowance);
+        }
+        if &required + fees.prior > limits.fee_budget {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "remaining continuation schedule exceeds the authorized payer fee budget",
+            );
         }
         if required > limits.balance || required > self.erc20_free_balance(payer, other)? {
             return fail_d(

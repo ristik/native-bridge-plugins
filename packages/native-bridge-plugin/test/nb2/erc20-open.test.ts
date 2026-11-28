@@ -528,38 +528,50 @@ test('contested ordinary signing checks fallback signed bytes and per-packet fee
   });
 });
 
-test('ordinary takeover includes finalized local Run fees once per nonce', async () => {
+test('ordinary takeover migrates local Run fees and preserves the higher replacement fee', async () => {
   const { x, bridge, held } = await heldPair();
   const payer = x.payer.address;
   const { chainId, K } = x.cfg;
   const erc20Recovery = admissionFor(x);
   const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery } });
-  const first = { ...record, status: 'burned' as const };
-  const other = { ...first, returnId: hex(key('other legacy return waits during fee reconciliation')) };
+  const first = { ...record, status: 'burned' as const, executionPayer: hex(payer) };
+  const other = { ...record, status: 'burned' as const, returnId: hex(key('other legacy return waits during fee reconciliation')) };
   const journal = bridge.journal;
   await journal.putReturn(first);
   await journal.putReturn(other);
   const request = { chainId, nonce: 1n, gas: 100_000n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n,
     to: x.cfg.vault, value: 0n, data: new Uint8Array(68) };
-  const raw = (signer: typeof x.payer, gas: bigint, chain = chainId, nonce = 0n) =>
-    signTx(signer, { ...request, gas, chainId: chain, nonce, to: bytes(x.a.recovery) }).then((signed) => signed.raw);
+  const raw = (signer: typeof x.payer, gas: bigint, chain = chainId, nonce = 0n, maxFeePerGas = 10n) =>
+    signTx(signer, { ...request, gas, chainId: chain, nonce, maxFeePerGas, to: bytes(x.a.recovery) }).then((signed) => signed.raw);
   const id = `${first.domain.slice(2)}/${first.returnId.slice(2)}`;
-  await journal.store.putIf(`nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${id}`, null, '0');
-  await journal.indexPayerSends(first, []);
-  assert.equal(await journal.store.get(`nb2/payer-fee-index/v1/${id}`), null);
-  await journal.retainPayerSend(first, await raw(x.payer, 2n));
+  const watermark = `nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${id}`;
+  const feeIndex = `nb2/payer-fee-index/v1/${id}`;
   const plan = first.recovery!;
-  const policy = { ...erc20Recovery.limits, chainId };
+  const policy = { ...erc20Recovery.limits, chainId, maxFeePerGas: 20n };
   const attempts = BigInt(plan.ordinary!.attemptsBeforeFallback);
   const fallback = quoteScheduledRecoveryFee(held, K, {
     cuts: plan.runCuts, completedRuns: 1, batch: plan.advanceGaps,
     advances: BigInt(plan.calls) - BigInt(plan.runCuts.length) - attempts - 1n,
   }, erc20Recovery.calibration, policy);
-  const suffix = continuationReserve(fallback, BigInt(plan.ordinary!.gas) * policy.maxFeePerGas, attempts);
+  const ordinaryGas = BigInt(plan.ordinary!.gas);
+  const allowance = ordinaryGas * policy.maxFeePerGas;
+  const suffix = continuationReserve(fallback, allowance, attempts);
   await journal.indexRecoveryProgress(chainId, first, 1n, { blockNumber: 20n, blockHash: key('finalized local Run') });
   bridge.evm.isFinalizedBlock = async () => true;
   x.finalized(1n);
   const opts = { erc20Recovery, admit: async () => assert.fail('budget refusal must precede admission') };
+  assert.equal(await journal.store.get(watermark), null);
+  assert.equal(await journal.store.get(feeIndex), null);
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...opts, erc20Policy: { ...policy, feeBudget: suffix },
+  }), /local signed fees indexed/);
+  await journal.indexPayerSends(first, []);
+  assert.equal(await journal.store.get(feeIndex), null);
+  await journal.indexPayerSends(first, [await raw(x.payer, 200n, chainId + 1n)]);
+  assert.equal(await journal.store.get(feeIndex), null);
+  await journal.store.putIf(watermark, null, '0');
+  await journal.indexPayerSends(first, []);
+  assert.equal(await journal.store.get(feeIndex), null);
   await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
     ...opts, erc20Policy: { ...policy, feeBudget: suffix + 20n },
   }), /local signed fees indexed/);
@@ -567,11 +579,24 @@ test('ordinary takeover includes finalized local Run fees once per nonce', async
     raw(x.payer, 2n), raw(x.payer, 1n), raw(new LocalKeySigner(key('peer Run signer')), 200n),
     raw(x.payer, 200n, chainId + 1n), raw(x.payer, 200n, chainId, request.nonce),
   ]));
+  assert.equal(await journal.store.get(feeIndex), '1');
+  assert.deepEqual(await journal.payerFees(first, chainId, payer, request.nonce), { prior: 20n, atNonce: 2000n });
   await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
     ...opts, erc20Policy: { ...policy, feeBudget: suffix + 19n },
   }), /authorized payer fee budget/);
+  const higherBid = 30n;
+  const oldFee = ordinaryGas * higherBid;
+  await journal.retainPayerSend(first, await raw(x.payer, ordinaryGas, chainId, request.nonce, higherBid));
+  const required = suffix - allowance + oldFee;
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...opts, erc20Policy: { ...policy, feeBudget: suffix + 20n },
+  }), /authorized payer fee budget/);
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...opts, erc20Policy: { ...policy, feeBudget: required + 19n },
+  }), /authorized payer fee budget/);
   await bridge['reserveOrdinaryPayer'](first, payer, request, {
-    erc20Recovery, admit: async () => {}, erc20Policy: { ...policy, feeBudget: suffix + 20n },
+    erc20Recovery, admit: async (_req, _prior, fee) => assert.equal(fee, required),
+    erc20Policy: { ...policy, feeBudget: required + 20n },
   });
 });
 

@@ -1581,7 +1581,7 @@ fn contested_ordinary_signing_checks_fallback_signed_bytes_and_per_packet_fee() 
 }
 
 #[test]
-fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
+fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacement_fee() {
     use super::super::evm::LocalKeySigner;
     use super::super::recovery::RecoveryReceipt;
     let (mut bridge, rpc, held) = return_bridge(
@@ -1600,13 +1600,16 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
     first.status = "burned".into();
     let mut other = first.clone();
     other.return_id = hex(&[0x33; 32]);
+    first
+        .extra
+        .insert("executionPayer".into(), json!(hex(&payer)));
     bridge.journal.put_return(&first).unwrap();
     bridge.journal.put_return(&other).unwrap();
     let tx = TxRequest {
         chain_id: chain,
         nonce: 1,
         gas: 100_000,
-        max_fee_per_gas: 10u8.into(),
+        max_fee_per_gas: 7u8.into(),
         max_priority_fee_per_gas: 1u8.into(),
         to: bridge.cfg.vault,
         value: BigUint::default(),
@@ -1619,6 +1622,7 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
                 gas,
                 chain_id,
                 nonce,
+                max_fee_per_gas: 10u8.into(),
                 to: rpc.recovery,
                 ..tx.clone()
             },
@@ -1628,23 +1632,8 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
     };
     let run = raw(&signer, 2, chain, 0);
     let id = format!("{}/{}", &first.base.domain[2..], &first.return_id[2..]);
-    bridge
-        .journal
-        .store
-        .put_if(
-            &format!("nb2/payer-sends/v1/{chain}/{}/{id}", to_hex(&payer)),
-            None,
-            "0",
-        )
-        .unwrap();
-    bridge.journal.index_payer_sends(&first, &[]).unwrap();
-    assert!(bridge
-        .journal
-        .store
-        .get(&format!("nb2/payer-fee-index/v1/{id}"))
-        .unwrap()
-        .is_none());
-    bridge.journal.retain_payer_send(&first, &run).unwrap();
+    let watermark = format!("nb2/payer-sends/v1/{chain}/{}/{id}", to_hex(&payer));
+    let fee_index = format!("nb2/payer-fee-index/v1/{id}");
     let hash = he(&[&super::super::header::encode_header(
         &super::super::rpc::header_of_json(&finalized_header()).unwrap(),
     )]);
@@ -1672,6 +1661,10 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
     let advances = recovery_advance_calls(plan, cuts.len(), attempts).unwrap();
     let batch = plan["advanceGaps"].as_u64().unwrap() as usize;
     let saved = bridge.erc20_return_recovery.as_ref().unwrap();
+    let limits = RecoveryLimits {
+        max_fee_per_gas: 7u8.into(),
+        ..saved.limits.clone()
+    };
     let suffix = admitted_recovery_gas(
         &held,
         RecoverySuffix {
@@ -1682,27 +1675,38 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
         },
         bridge.cfg.k,
         &*saved.calibration,
-        &saved.limits,
+        &limits,
     )
     .unwrap();
     let gas: BigUint = suffix.run.into_iter().fold(
         BigUint::from(advances) * suffix.advance + suffix.settle,
         |sum, gas| sum + gas,
     );
+    let allowance = &ordinary_gas * &limits.max_fee_per_gas;
     let needed =
-        (gas.max(ordinary_gas.clone()) + ordinary_gas * attempts) * &saved.limits.max_fee_per_gas;
+        (gas.max(ordinary_gas.clone()) + &ordinary_gas * attempts) * &limits.max_fee_per_gas;
     rpc.finalized_nonce.store(1, Ordering::SeqCst);
-    bridge
-        .erc20_return_recovery
-        .as_mut()
-        .unwrap()
-        .limits
-        .fee_budget = &needed + 20u8;
+    bridge.erc20_return_recovery.as_mut().unwrap().limits = RecoveryLimits {
+        fee_budget: needed.clone(),
+        ..limits
+    };
+    assert!(bridge.journal.store.get(&watermark).unwrap().is_none());
+    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
     let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
     assert!(
         error.to_string().contains("local signed fees indexed"),
         "{error}"
     );
+    bridge.journal.index_payer_sends(&first, &[]).unwrap();
+    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
+    bridge
+        .journal
+        .index_payer_sends(&first, &[&raw(&signer, 200, chain + 1, 0)])
+        .unwrap();
+    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
+    bridge.journal.store.put_if(&watermark, None, "0").unwrap();
+    bridge.journal.index_payer_sends(&first, &[]).unwrap();
+    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
     let peer = LocalKeySigner::new(&[0x36; 32]);
     bridge
         .journal
@@ -1717,6 +1721,16 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
             ],
         )
         .unwrap();
+    assert_eq!(
+        bridge.journal.store.get(&fee_index).unwrap().as_deref(),
+        Some("1")
+    );
+    let fees = bridge
+        .journal
+        .payer_fees(&first, chain, &payer, tx.nonce)
+        .unwrap();
+    assert_eq!(fees.prior, 20u8.into());
+    assert_eq!(fees.at_nonce, 2000u16.into());
     bridge
         .erc20_return_recovery
         .as_mut()
@@ -1728,13 +1742,46 @@ fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
         error.to_string().contains("authorized payer fee budget"),
         "{error}"
     );
+    let old_gas = undec64(ordinary["gas"].as_str().unwrap()).unwrap();
+    let old = raw(&signer, old_gas, chain, tx.nonce);
+    bridge.journal.retain_payer_send(&first, &old).unwrap();
+    let old_fee = BigUint::from(old_gas) * 10u8;
+    let required = &needed - allowance + &old_fee;
     bridge
         .erc20_return_recovery
         .as_mut()
         .unwrap()
         .limits
         .fee_budget = needed + 20u8;
+    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
+    assert!(
+        error.to_string().contains("authorized payer fee budget"),
+        "{error}"
+    );
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = &required + 19u8;
+    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
+    assert!(
+        error.to_string().contains("authorized payer fee budget"),
+        "{error}"
+    );
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = required + 20u8;
     bridge.sign_redeem_tx(&first, &signer, &tx).unwrap();
+    let fees = bridge
+        .journal
+        .payer_fees(&first, chain, &payer, tx.nonce)
+        .unwrap();
+    assert_eq!(fees.prior, 20u8.into());
+    assert_eq!(fees.at_nonce, old_fee);
 }
 
 #[test]

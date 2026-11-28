@@ -435,25 +435,30 @@ export class Journal {
     const feeIndex = `nb2/payer-fee-index/v1/${id}`;
     if (await this.store.get(feeIndex) === '1') return;
     for (const send of record.sends) await this.retainPayerSend(record, unhex(send.raw));
+    const chain = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
     const prefix = 'nb2/payer-sends/v1/';
+    let executorIndexed = record.executionPayer === undefined;
     for (const key of await this.store.list(prefix)) {
       if (!key.endsWith('/' + id)) continue;
+      const path = key.slice(prefix.length);
       const highest = await this.store.get(key);
-      if (highest === null || await this.store.get(`nb2/payer-fees/v1/${key.slice(prefix.length)}/${undec(highest)}`) === null) return;
+      if (highest === null || await this.store.get(`nb2/payer-fees/v1/${path}/${undec(highest)}`) === null) return;
+      const [signedChain, payer] = path.split('/');
+      if ((chain === null || chain === signedChain) && '0x' + payer === record.executionPayer) executorIndexed = true;
     }
-    await this.store.putIf(feeIndex, null, '1');
+    if (executorIndexed) await this.store.putIf(feeIndex, null, '1');
   }
 
   /** Count the greatest locally authorized fee per nonce across both routes for this payer and return. */
-  public async priorPayerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, replacing: bigint): Promise<bigint> {
+  public async payerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, nonce: bigint): Promise<{ prior: bigint; atNonce: bigint }> {
     const path = this.payerSendPath(chainId, payer, record);
-    if (await this.store.get(`nb2/payer-sends/v1/${path}`) !== null &&
+    if ((record.executionPayer !== undefined || await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) &&
       await this.store.get(`nb2/payer-fee-index/v1/${record.domain.slice(2)}/${record.returnId.slice(2)}`) !== '1') {
       fail('CapacityPreflight', 'return needs its local signed fees indexed');
     }
     const fees = new Map<bigint, bigint>();
     const recordFee = (nonce: bigint, fee: bigint) => {
-      if (nonce !== replacing && fee > (fees.get(nonce) ?? 0n)) fees.set(nonce, fee);
+      if (fee > (fees.get(nonce) ?? 0n)) fees.set(nonce, fee);
     };
     const prefix = `nb2/payer-fees/v1/${path}/`;
     for (const key of await this.store.list(prefix)) {
@@ -465,9 +470,11 @@ export class Journal {
       const { from, request } = decodeSignedTx(unhex(send.raw));
       if (request.chainId === chainId && eqBytes(from, payer)) recordFee(request.nonce, request.gas * request.maxFeePerGas);
     }
-    let total = 0n;
-    for (const fee of fees.values()) total += fee;
-    return total;
+    const atNonce = fees.get(nonce) ?? 0n;
+    fees.delete(nonce);
+    let prior = 0n;
+    for (const fee of fees.values()) prior += fee;
+    return { prior, atNonce };
   }
 
   /** Publish a replayed checkpoint. Readers independently check execution finality before giving credit. */

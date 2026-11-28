@@ -117,7 +117,7 @@ async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
   }
 }
 
-interface FeeReservations { total: bigint; attempts: { nonce: bigint; fee: bigint }[] }
+interface FeeReservations { total: bigint; replacementFee: bigint; attempts: { nonce: bigint; fee: bigint }[] }
 
 async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations, replacementNonce?: bigint,
   otherReturns: PayerCommitments = { fees: 0n, calls: 0n }): Promise<RecoveryLimits & { currentBid: bigint }> {
@@ -152,19 +152,19 @@ async function otherErc20Reserves(w: Wallet, rec: ReturnRecord, payer: Uint8Arra
 /** Reserve the greatest fee at each payer nonce. At most one replacement can be mined. */
 function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends, replacing?: bigint): FeeReservations {
   const recovery = loadRecovery(w, rec);
-  const raw = [...ordinary.map((send) => send.raw), ...(recovery?.attempts ?? []), ...(recovery?.superseded ?? []), ...(recovery?.replacedSettlements ?? [])];
-  if (recovery?.pending) raw.push(recovery.pending.raw);
-  if (recovery?.settled?.submitted) raw.push(recovery.settled.submitted.raw);
+  const raw = [...ordinary.map((send) => send.raw), ...recoveryPackets(recovery)];
   const byNonce = new Map<bigint, bigint>();
   const legacy = uint(recovery?.fees ?? '0');
   for (const signed of raw) {
     const { request, from } = decodeSignedTx(bytes(signed));
-    if (!eq(from, payer) || request.chainId !== w.bridge.cfg.chainId || request.nonce === replacing) continue;
+    if (!eq(from, payer) || request.chainId !== w.bridge.cfg.chainId) continue;
     const fee = request.gas * request.maxFeePerGas;
     if (fee > (byNonce.get(request.nonce) ?? 0n)) byNonce.set(request.nonce, fee);
   }
+  const replacementFee = replacing === undefined ? 0n : byNonce.get(replacing) ?? 0n;
+  if (replacing !== undefined) byNonce.delete(replacing);
   const attempts = Array.from(byNonce, ([nonce, fee]) => ({ nonce, fee }));
-  return { total: attempts.reduce((sum, tx) => sum + tx.fee, legacy), attempts };
+  return { total: attempts.reduce((sum, tx) => sum + tx.fee, legacy), replacementFee, attempts };
 }
 
 function recoveryEmitter(w: Wallet): Uint8Array | undefined {
@@ -182,13 +182,15 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
     recovery,
     admit: async (req, prior, remainingFee) => {
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
-      const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior, req.nonce), req.nonce,
+      const reserved = reservedFees(w, rec, w.signer.address, prior, req.nonce);
+      const limits = await limitsOf(w, policy, w.signer.address, reserved, req.nonce,
         await otherErc20Reserves(w, rec, w.signer.address));
       const fee = req.gas * req.maxFeePerGas;
       if (w.bridge.cfg.erc20 && !quoteErc20Call(req.data.length, req.gas, limits)) {
         throw new Nb2Error('CapacityPreflight', 'ordinary payment is outside the ERC20 admission limits');
       }
-      const needed = remainingFee !== undefined && remainingFee > fee ? remainingFee : fee;
+      const atNonce = reserved.replacementFee > fee ? reserved.replacementFee : fee;
+      const needed = remainingFee !== undefined && remainingFee > atNonce ? remainingFee : atNonce;
       if (req.gas > limits.gas || req.nonce > limits.maxNonce || req.maxFeePerGas > limits.maxFeePerGas ||
         req.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || req.data.length > limits.calldataBytes ||
         (!w.bridge.cfg.erc20 && req.data.length + 256 > limits.signedBytes) || needed > limits.balance || needed > limits.feeBudget ||
@@ -573,14 +575,18 @@ function loadRecovery(w: Wallet, rec: ReturnRecord): RecoveryJournal | undefined
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
 }
 
+function recoveryPackets(saved?: RecoveryJournal): string[] {
+  const raw = [...(saved?.attempts ?? []), ...(saved?.superseded ?? []), ...(saved?.replacedSettlements ?? [])];
+  if (saved?.pending) raw.push(saved.pending.raw);
+  if (saved?.settled?.submitted) raw.push(saved.settled.submitted.raw);
+  return raw;
+}
+
 /** Import the pre-upgrade wallet's separately durable signed packets into the shared payer journal. */
 export async function indexLocalRecoverySends(w: Wallet): Promise<void> {
   for (const { record } of await w.bridge.journal.allReturns()) {
     const saved = loadRecovery(w, record);
-    const raw = [...(saved?.attempts ?? []), ...(saved?.superseded ?? []), ...(saved?.replacedSettlements ?? [])];
-    if (saved?.pending) raw.push(saved.pending.raw);
-    if (saved?.settled?.submitted) raw.push(saved.settled.submitted.raw);
-    await w.bridge.journal.indexPayerSends(record, raw.map((signed) => bytes(signed)));
+    await w.bridge.journal.indexPayerSends(record, recoveryPackets(saved).map((signed) => bytes(signed)));
     if (record.domain === hx(w.bridge.domain) && record.status !== 'paid' && record.recovery && saved && (saved.cuts.length || saved.complete)) {
       const release = recoveryRelease(w);
       await checkGraph(w, release);
@@ -994,7 +1000,8 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     }
     const pendingNonce = await w.bridge.evm.nonce(w.signer.address);
     const nonce = replacing ?? pendingNonce;
-    if (quote === null || nonce > limits.maxNonce || quote.fee > limits.feeBudget || quote.fee > limits.balance) {
+    const replacementExtra = quote !== null && reservations.replacementFee > quote.fee ? reservations.replacementFee - quote.fee : 0n;
+    if (quote === null || nonce > limits.maxNonce || quote.fee + replacementExtra > limits.feeBudget || quote.fee + replacementExtra > limits.balance) {
       throw new Nb2Error('CapacityPreflight', 'packet exceeds the remaining payer limits');
     }
     if (expired && pendingNonce > nonce &&
@@ -1018,7 +1025,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
           const continuation = suffix.fee > quote.fee ? suffix.fee : quote.fee;
           const ordinary = uint(current.recovery?.ordinary?.gas ?? '0') * live.maxFeePerGas;
           const retryCalls = other.contestedDrain ? ordinaryCalls : 0n;
-          const reserve = continuationReserve(continuation, ordinary, retryCalls);
+          const reserve = continuationReserve(continuation, ordinary, retryCalls) + replacementExtra;
           if (reserve > live.balance || reserve > live.feeBudget || nonce + suffix.calls + retryCalls - 1n > live.maxNonce ||
               nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
             throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');

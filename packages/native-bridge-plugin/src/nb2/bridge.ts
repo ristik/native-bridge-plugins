@@ -1765,9 +1765,13 @@ export class NativeBridgeV2 {
       nonce: request.nonce, maxNonce: options.erc20Policy?.maxNonce, remainingCalls: remainingRecoveryCalls(plan, completed, spentCalls),
       beforeSigning: async (other) => {
         const packet = request.gas * request.maxFeePerGas;
-        let needed = packet;
+        const fees = await this.journal.payerFees(record, request.chainId, payer, request.nonce);
+        if (fees.atNonce > 0n && request.nonce < await this.evm.nonce(payer, 'finalized')) {
+          fail('CapacityPreflight', 'ordinary replacement nonce is already finalized');
+        }
+        let needed = fees.atNonce > packet ? fees.atNonce : packet;
+        const authorization = options.erc20Policy;
         if (other.contestedDrain) {
-          const authorization = options.erc20Policy;
           if (!authorization || typeof authorization.maxFeePerGas !== 'bigint' || authorization.maxFeePerGas <= 0n ||
             authorization.maxFeePerGas < request.maxFeePerGas) {
             fail('CapacityPreflight', 'remaining continuation schedule needs an authorized payer fee ceiling');
@@ -1790,18 +1794,19 @@ export class NativeBridgeV2 {
             cuts: plan.runCuts, completedRuns: Number(completed < runs ? completed : runs),
             batch: plan.advanceGaps, advances: advances > 0n ? advances : 0n,
           }, release.calibration, limits);
-          const suffix = continuationReserve(fallback, undec(plan.ordinary!.gas) * limits.maxFeePerGas,
-            remainingOrdinaryAttempts(plan, spentCalls));
-          if (suffix > needed) needed = suffix;
-          const spent = await this.journal.priorPayerFees(record, request.chainId, payer, request.nonce);
-          if (needed + spent > authorization.feeBudget) {
-            fail('CapacityPreflight', 'remaining continuation schedule exceeds the authorized payer fee budget');
-          }
+          const attempts = remainingOrdinaryAttempts(plan, spentCalls);
+          const ordinary = undec(plan.ordinary!.gas) * limits.maxFeePerGas;
+          const allowance = attempts > 0n ? ordinary : 0n;
+          const remainder = continuationReserve(fallback, ordinary, attempts) - allowance;
+          needed = remainder + (needed > allowance ? needed : allowance);
+        }
+        if (typeof authorization?.feeBudget === 'bigint' && needed + fees.prior > authorization.feeBudget) {
+          fail('CapacityPreflight', 'remaining continuation schedule exceeds the authorized payer fee budget');
         }
         if (needed > await this.freeErc20PayerBalance(payer, other)) {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the free payer balance');
         }
-        await options.admit!(structuredClone(request), structuredClone(record.sends), other.contestedDrain ? needed : undefined);
+        await options.admit!(structuredClone(request), structuredClone(record.sends), needed);
       },
     });
   }
