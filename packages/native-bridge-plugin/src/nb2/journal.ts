@@ -426,50 +426,92 @@ export class Journal {
     }
   }
 
-  /** Mark a return only after indexing every separately journaled signed recovery packet and its fee. */
-  public async indexPayerSends(record: ReturnRecord, raw: readonly Uint8Array[]): Promise<void> {
-    for (const signed of raw) await this.retainPayerSend(record, signed);
-    const id = `${record.domain.slice(2)}/${record.returnId.slice(2)}`;
-    const key = `nb2/payer-index/v1/${id}`;
-    await this.store.putIf(key, null, '1');
-    const feeIndex = `nb2/payer-fee-index/v1/${id}`;
-    if (await this.store.get(feeIndex) === '1') return;
-    for (const send of record.sends) await this.retainPayerSend(record, unhex(send.raw));
-    const chain = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
-    const prefix = 'nb2/payer-sends/v1/';
-    let executorIndexed = record.executionPayer === undefined;
-    for (const key of await this.store.list(prefix)) {
-      if (!key.endsWith('/' + id)) continue;
-      const path = key.slice(prefix.length);
-      const highest = await this.store.get(key);
-      if (highest === null || await this.store.get(`nb2/payer-fees/v1/${path}/${undec(highest)}`) === null) return;
-      const [signedChain, payer] = path.split('/');
-      if ((chain === null || chain === signedChain) && '0x' + payer === record.executionPayer) executorIndexed = true;
-    }
-    if (executorIndexed) await this.store.putIf(feeIndex, null, '1');
+  /** Pin this deployment domain to the chain authenticated by the SDK. */
+  public async registerPayerChain(chainId: bigint): Promise<void> {
+    const key = `nb2/domain-chain/v1/${toHex(this.domain)}`;
+    await this.store.putIf(key, null, dec(chainId));
+    if (await this.store.get(key) !== dec(chainId)) refuse('BadInput', 'journal domain has another chain ID');
   }
 
-  /** Count the greatest locally authorized fee per nonce across both routes for this payer and return. */
-  public async payerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, nonce: bigint): Promise<{ prior: bigint; atNonce: bigint }> {
+  private async payerHistoryComplete(path: string): Promise<boolean> {
+    return await this.store.get(`nb2/payer-fee-index/v2/${path}`) === '1';
+  }
+
+  private async completePayerHistory(path: string): Promise<void> {
+    await this.store.putIf(`nb2/payer-fee-index/v2/${path}`, null, '1');
+    if (!await this.payerHistoryComplete(path)) refuse('JournalNotPersisted', 'payer fee index completion was not persisted');
+  }
+
+  /** Import the caller's complete local signed history. Unregistered domains cannot be marked complete. */
+  public async indexPayerSends(record: ReturnRecord, raw: readonly Uint8Array[]): Promise<void> {
+    const chain = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
+    const covered = new Map<string, bigint>();
+    for (const [index, signed] of [...raw, ...record.sends.map(({ raw }) => unhex(raw))].entries()) {
+      const { from, request } = decodeSignedTx(signed);
+      if (chain !== dec(request.chainId)) continue;
+      await this.retainPayerSend(record, signed);
+      // Ordinary records alone cannot prove the separate recovery history of a recorded executor.
+      const path = this.payerSendPath(request.chainId, from, record);
+      if (record.executionPayer !== undefined && index >= raw.length && !covered.has(path)) continue;
+      if (!covered.has(path) || request.nonce > covered.get(path)!) covered.set(path, request.nonce);
+    }
+    for (const [path, highest] of covered) {
+      if (await this.store.get(`nb2/payer-sends/v1/${path}`) === dec(highest)) {
+        await this.completePayerHistory(path);
+      }
+    }
+  }
+
+  /** Read the maximum signed fee at each nonce across both return routes. */
+  public async payerFeeMaxima(record: ReturnRecord, chainId: bigint, payer: Uint8Array): Promise<Map<bigint, bigint>> {
+    if (record.domain !== hex(this.domain)) refuse('BadInput', 'return belongs to another payer journal domain');
+    if (await this.store.get(`nb2/domain-chain/v1/${toHex(this.domain)}`) !== dec(chainId)) {
+      fail('CapacityPreflight', 'payer fee history needs an authenticated chain association');
+    }
     const path = this.payerSendPath(chainId, payer, record);
-    if ((record.executionPayer !== undefined || await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) &&
-      await this.store.get(`nb2/payer-fee-index/v1/${record.domain.slice(2)}/${record.returnId.slice(2)}`) !== '1') {
+    const executor = record.executionPayer === undefined ? undefined : this.payerSendPath(chainId, unhex(record.executionPayer), record);
+    const ordinary = record.sends.map(({ raw }) => decodeSignedTx(unhex(raw))).filter(({ from, request }) =>
+      request.chainId === chainId && eqBytes(from, payer));
+    const prefix = `nb2/payer-fees/v1/${path}/`;
+    const keys = await this.store.list(prefix);
+    if ((executor !== undefined && !await this.payerHistoryComplete(executor)) ||
+        ((ordinary.length > 0 || keys.length > 0 || await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) &&
+          !await this.payerHistoryComplete(path))) {
       fail('CapacityPreflight', 'return needs its local signed fees indexed');
     }
     const fees = new Map<bigint, bigint>();
     const recordFee = (nonce: bigint, fee: bigint) => {
       if (fee > (fees.get(nonce) ?? 0n)) fees.set(nonce, fee);
     };
-    const prefix = `nb2/payer-fees/v1/${path}/`;
-    for (const key of await this.store.list(prefix)) {
+    for (const key of keys) {
       const value = await this.store.get(key);
       if (value === null) refuse('JournalNotPersisted', 'signed fee disappeared during payer reconciliation');
       recordFee(undec(key.slice(prefix.length)), undec(value));
     }
-    for (const send of record.sends) {
-      const { from, request } = decodeSignedTx(unhex(send.raw));
-      if (request.chainId === chainId && eqBytes(from, payer)) recordFee(request.nonce, request.gas * request.maxFeePerGas);
+    for (const { request } of ordinary) recordFee(request.nonce, request.gas * request.maxFeePerGas);
+    return fees;
+  }
+
+  /** Check an existing scope or initialize an empty one before asking the payer to sign. */
+  public async preparePayerSigning(record: ReturnRecord, chainId: bigint, payer: Uint8Array): Promise<Map<bigint, bigint>> {
+    const fees = await this.payerFeeMaxima(record, chainId, payer);
+    await this.completePayerHistory(this.payerSendPath(chainId, payer, record));
+    return fees;
+  }
+
+  /** Revalidate an exact signed packet's scope and retain its maximum before handing it to an RPC. */
+  public async preparePayerBroadcast(record: ReturnRecord, chainId: bigint, raw: Uint8Array): Promise<void> {
+    const { from, request } = decodeSignedTx(raw);
+    if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
+    await this.payerFeeMaxima(record, chainId, from);
+    if (!await this.payerHistoryComplete(this.payerSendPath(chainId, from, record))) {
+      fail('CapacityPreflight', 'return needs its local signed fees indexed');
     }
+    await this.retainPayerSend(record, raw);
+  }
+
+  public async payerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, nonce: bigint): Promise<{ prior: bigint; atNonce: bigint }> {
+    const fees = await this.payerFeeMaxima(record, chainId, payer);
     const atNonce = fees.get(nonce) ?? 0n;
     fees.delete(nonce);
     let prior = 0n;
@@ -546,7 +588,7 @@ export class Journal {
       // Pre-upgrade returns without chain metadata remain protected until their domain is opened.
       if (registered !== null && undec(registered) !== chainId) continue;
       if (rec.status !== 'planned' && rec.executionPayer === address &&
-          await this.store.get(`nb2/payer-index/v1/${rec.domain.slice(2)}/${rec.returnId.slice(2)}`) !== '1') {
+          (registered === null || !await this.payerHistoryComplete(this.payerSendPath(chainId, payer, rec)))) {
         fail('CapacityPreflight', 'another return needs its local signed sends indexed');
       }
       if (!active(rec)) continue;
@@ -580,9 +622,7 @@ export class Journal {
   public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false, options: PayerCheck = {}): Promise<PayerCommitments> {
     if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
     if (options.fence && options.signingNonce !== undefined) refuse('BadInput', 'payer claim cannot sign both a burn and an EVM packet');
-    const domainKey = `nb2/domain-chain/v1/${toHex(this.domain)}`;
-    await this.store.putIf(domainKey, null, dec(chainId));
-    if (await this.store.get(domainKey) !== dec(chainId)) refuse('BadInput', 'journal domain has another chain ID');
+    await this.registerPayerChain(chainId);
     const key = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
     const target = this.key('return', id.slice(2));
     for (;;) {

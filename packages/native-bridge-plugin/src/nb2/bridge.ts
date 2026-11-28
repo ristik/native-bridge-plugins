@@ -393,6 +393,7 @@ export class NativeBridgeV2 {
         if (!opts.pins.erc20) return refuse('BadDeployment', 'the ERC20 activation pins are missing');
         await checkErc20Activation(b.evm, b.cfg, opts.pins.gamma, opts.pins.erc20,
           opts.pins.vaultRuntimeCodeHash, opts.pins.deploymentBlock, (verify) => b.retryingTrust(verify));
+        await b.journal.registerPayerChain(b.cfg.chainId);
       }
     }
     return b;
@@ -1519,7 +1520,6 @@ export class NativeBridgeV2 {
       try {
         if (this.cfg.erc20) {
           this.checkErc20Reserve(rec.recovery!, await this.checkErc20Funds(rec, this.erc20Limits(admissionSnapshot!.erc20Recovery!.limits)));
-          await this.journal.indexPayerSends(rec, []);
         }
         signed = await transferRequest(source, { publicKey: owner.publicKey, signUnlock: async (message) => {
           signing = true;
@@ -1715,13 +1715,13 @@ export class NativeBridgeV2 {
       if (expired && await this.evm.nonce(signer.address, 'latest') !== tx.request.nonce) {
         return { state: 'pending', txHash: unhex(fresh.sends.at(-1)!.hash) };
       }
-      if (this.cfg.erc20 && !fresh.executionPayer) await this.journal.indexPayerSends(fresh, []);
       fresh.executionPayer ??= hex(signer.address);
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.saneHead());
       await this.journal.putReturn(fresh);
       expired = undefined;
+      if (this.cfg.erc20) await this.journal.preparePayerBroadcast(fresh, this.cfg.chainId, tx.raw);
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
       const outcome = await this.reconcileRecord(fresh, archives, { readOnly: true, pending });
@@ -1807,6 +1807,7 @@ export class NativeBridgeV2 {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the free payer balance');
         }
         await options.admit!(structuredClone(request), structuredClone(record.sends), needed);
+        await this.journal.preparePayerSigning(record, request.chainId, payer);
       },
     });
   }
@@ -2136,7 +2137,7 @@ export class NativeBridgeV2 {
         return { state: 'pending', txHash };
       }
       if (resubmit) {
-        if (this.cfg.erc20) await this.journal.retainPayerSend(rec, raw);
+        if (this.cfg.erc20) await this.journal.preparePayerBroadcast(rec, this.cfg.chainId, raw);
         try { await this.evm.sendRaw(raw); }
         catch (error) {
           if (onExpired && error instanceof RpcError && /replacement transaction underpriced/i.test(error.message) &&

@@ -117,6 +117,8 @@ async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
   }
 }
 
+function maxFee(a: bigint, b: bigint): bigint { return a > b ? a : b; }
+
 interface FeeReservations { total: bigint; replacementFee: bigint; attempts: { nonce: bigint; fee: bigint }[] }
 
 async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations, replacementNonce?: bigint,
@@ -150,10 +152,10 @@ async function otherErc20Reserves(w: Wallet, rec: ReturnRecord, payer: Uint8Arra
 }
 
 /** Reserve the greatest fee at each payer nonce. At most one replacement can be mined. */
-function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends, replacing?: bigint): FeeReservations {
+async function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends, replacing?: bigint): Promise<FeeReservations> {
   const recovery = loadRecovery(w, rec);
   const raw = [...ordinary.map((send) => send.raw), ...recoveryPackets(recovery)];
-  const byNonce = new Map<bigint, bigint>();
+  const byNonce = w.bridge.cfg.erc20 ? await w.bridge.journal.payerFeeMaxima(rec, w.bridge.cfg.chainId, payer) : new Map<bigint, bigint>();
   const legacy = uint(recovery?.fees ?? '0');
   for (const signed of raw) {
     const { request, from } = decodeSignedTx(bytes(signed));
@@ -182,7 +184,7 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
     recovery,
     admit: async (req, prior, remainingFee) => {
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
-      const reserved = reservedFees(w, rec, w.signer.address, prior, req.nonce);
+      const reserved = await reservedFees(w, rec, w.signer.address, prior, req.nonce);
       const limits = await limitsOf(w, policy, w.signer.address, reserved, req.nonce,
         await otherErc20Reserves(w, rec, w.signer.address));
       const fee = req.gas * req.maxFeePerGas;
@@ -252,7 +254,7 @@ export function walletAdmission(w: Wallet, policy?: PayerPolicy, backup?: string
       const release = recoveryRelease(w);
       await checkGraph(w, release);
       const payer = bytes(rec.payer ?? rec.recipient, 20);
-      const limits = await limitsOf(w, policy, payer, reservedFees(w, rec, payer, undefined, replacing), replacing,
+      const limits = await limitsOf(w, policy, payer, await reservedFees(w, rec, payer, undefined, replacing), replacing,
         await otherErc20Reserves(w, rec, payer));
       const a = uint(rec.a);
       const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
@@ -292,7 +294,7 @@ async function qualifyLineage(w: Wallet, rec: ReturnRecord, policy: PayerPolicy,
   if (w.bridge.cfg.erc20) {
     const input = erc20RecoveryInput(w, policy);
     await checkGraph(w, recoveryRelease(w));
-    input.limits = { ...await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, undefined, replacing), replacing,
+    input.limits = { ...await limitsOf(w, policy, w.signer.address, await reservedFees(w, rec, w.signer.address, undefined, replacing), replacing,
       await otherErc20Reserves(w, rec, w.signer.address)), maxNonce: policy.maxNonce };
     return w.bridge.qualifyErc20Recovery({ ...rec, payer: hx(w.signer.address) }, input, replacing);
   }
@@ -307,7 +309,7 @@ async function qualifySettlement(w: Wallet, rec: ReturnRecord, policy: PayerPoli
   await checkGraph(w, release);
   const { segment } = await w.bridge.evm.vaultState(w.bridge.cfg.vault);
   const observed = segment < start ? start : segment;
-  const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, undefined, replacing), replacing,
+  const limits = await limitsOf(w, policy, w.signer.address, await reservedFees(w, rec, w.signer.address, undefined, replacing), replacing,
     await otherErc20Reserves(w, rec, w.signer.address));
   const nonce = replacing ?? await w.bridge.evm.nonce(w.signer.address);
   const backlog = { ...release.backlog, signedStart: start, observed, duringProgress: 0n };
@@ -584,10 +586,11 @@ function recoveryPackets(saved?: RecoveryJournal): string[] {
 
 /** Import the pre-upgrade wallet's separately durable signed packets into the shared payer journal. */
 export async function indexLocalRecoverySends(w: Wallet): Promise<void> {
+  await w.bridge.journal.registerPayerChain(w.bridge.cfg.chainId);
   for (const { record } of await w.bridge.journal.allReturns()) {
-    const saved = loadRecovery(w, record);
+    const saved = record.domain === hx(w.bridge.domain) ? loadRecovery(w, record) : undefined;
     await w.bridge.journal.indexPayerSends(record, recoveryPackets(saved).map((signed) => bytes(signed)));
-    if (record.domain === hx(w.bridge.domain) && record.status !== 'paid' && record.recovery && saved && (saved.cuts.length || saved.complete)) {
+    if (record.status !== 'paid' && record.recovery && saved && (saved.cuts.length || saved.complete)) {
       const release = recoveryRelease(w);
       await checkGraph(w, release);
       const active = activeRecovery(record, saved);
@@ -869,7 +872,7 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
       const epoch = journal?.signerEpochs?.[hx(lower.hash)];
       if (epoch === undefined) throw new WalletError('NotPending', 'retry needs the authenticated cut for the prior signed packet');
       await w.bridge.evm.checkReturnImport(w.bridge.cfg, uint(epoch), { ...lower.request, from: lower.from });
-      if (w.bridge.cfg.erc20) await w.bridge.journal.retainPayerSend(rec, lower.raw);
+      if (w.bridge.cfg.erc20) await w.bridge.journal.preparePayerBroadcast(rec, w.bridge.cfg.chainId, lower.raw);
       try { await w.bridge.evm.sendRaw(lower.raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
@@ -935,6 +938,9 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
 
   {
     const replacing = expired?.request.nonce ?? handoff?.nonce;
+    const current = (await w.bridge.journal.ret(rec.returnId))!;
+    const reservedNonce = replacing ?? (w.bridge.cfg.erc20 ? await w.bridge.evm.nonce(w.signer.address) : undefined);
+    const reservations = await reservedFees(w, current, w.signer.address, undefined, reservedNonce);
     let remainingCalls: bigint;
     if (journal.complete) {
       rec = { ...rec, recovery: await qualifySettlement(w, rec, policy, cursor.gap?.cursor?.next ?? uint(rec.a), replacing) };
@@ -942,7 +948,6 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     } else {
       ({ calls: remainingCalls } = await qualifyRestoredSchedule(w, release, rec, journal, cursor));
     }
-    const current = (await w.bridge.journal.ret(rec.returnId))!;
     let ordinaryUsed = 0n;
     if (w.bridge.cfg.erc20 && current.recovery?.ordinary && current.sends.length) {
       const finalized = await w.bridge.evm.nonce(w.signer.address, 'finalized');
@@ -951,7 +956,6 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       ordinaryUsed = BigInt(new Set(used.map(({ request }) => request.nonce)).size);
     }
     const ordinaryCalls = remainingOrdinaryAttempts(current.recovery, ordinaryUsed);
-    const reservations = reservedFees(w, current, w.signer.address, undefined, replacing);
     const limits = await limitsOf(w, policy, w.signer.address, reservations, replacing, await otherErc20Reserves(w, current, w.signer.address));
     let cut: Cut;
     let quote: RecoveryQuote | null;
@@ -999,14 +1003,15 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       }
     }
     const pendingNonce = await w.bridge.evm.nonce(w.signer.address);
-    const nonce = replacing ?? pendingNonce;
-    const replacementExtra = quote !== null && reservations.replacementFee > quote.fee ? reservations.replacementFee - quote.fee : 0n;
-    if (quote === null || nonce > limits.maxNonce || quote.fee + replacementExtra > limits.feeBudget || quote.fee + replacementExtra > limits.balance) {
+    const nonce = reservedNonce ?? pendingNonce;
+    if (quote === null || nonce > limits.maxNonce ||
+        maxFee(quote.fee, reservations.replacementFee) > limits.feeBudget ||
+        maxFee(quote.fee, reservations.replacementFee) > limits.balance) {
       throw new Nb2Error('CapacityPreflight', 'packet exceeds the remaining payer limits');
     }
-    if (expired && pendingNonce > nonce &&
-        (limits.maxFeePerGas < replacementBid(expired.request.maxFeePerGas) ||
-         limits.maxPriorityFeePerGas < replacementBid(expired.request.maxPriorityFeePerGas))) {
+    const outbidsExpired = expired === undefined || (limits.maxFeePerGas >= replacementBid(expired.request.maxFeePerGas) &&
+      limits.maxPriorityFeePerGas >= replacementBid(expired.request.maxPriorityFeePerGas));
+    if (pendingNonce > nonce && !outbidsExpired) {
       throw new Nb2Error('CapacityPreflight', 'a pooled settlement replacement exceeds the payer bid limit');
     }
     if (cut.kind === 'settle' || expired || handoff) {
@@ -1017,19 +1022,36 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       if (competing.state !== 'not-paid') return competing;
     }
     if (w.bridge.cfg.erc20) {
+      const admittedMaxNonce = uint(current.recovery?.envelope?.maxNonce ?? String(policy.maxNonce));
+      const maxNonce = policy.maxNonce < admittedMaxNonce ? policy.maxNonce : admittedMaxNonce;
+      const otherPacket = handoff !== undefined || expired !== undefined || reservations.replacementFee > 0n;
+      const recoveryRetry = otherPacket && (!handoff || ordinaryCalls === 0n) ? 1n : 0n;
       await w.bridge.checkErc20Payer(current, w.signer.address, true, undefined, {
-        nonce, remainingCalls: remainingCalls + ordinaryCalls, maxNonce: policy.maxNonce, beforeSigning: async (other) => {
-          const live = await limitsOf(w, policy, w.signer.address, reservations, replacing, other);
+        nonce, remainingCalls: remainingCalls + ordinaryCalls + recoveryRetry, maxNonce, beforeSigning: async (other) => {
+          const fees = await reservedFees(w, current, w.signer.address, undefined, nonce);
+          const live = await limitsOf(w, { ...policy, maxNonce }, w.signer.address, fees, replacing, other);
+          const fullSchedule = other.contestedDrain || otherPacket || fees.replacementFee > 0n;
           const suffix = journal.complete ? { calls: remainingCalls, fee: uint(rec.recovery!.totalFee) }
-            : other.contestedDrain ? await qualifyRestoredSchedule(w, release, rec, journal, cursor, live) : { calls: 1n, fee: quote.fee };
-          const continuation = suffix.fee > quote.fee ? suffix.fee : quote.fee;
+            : fullSchedule ? await qualifyRestoredSchedule(w, release, rec, journal, cursor, live) : { calls: 1n, fee: quote.fee };
+          const continuation = maxFee(suffix.fee, quote.fee);
           const ordinary = uint(current.recovery?.ordinary?.gas ?? '0') * live.maxFeePerGas;
-          const retryCalls = other.contestedDrain ? ordinaryCalls : 0n;
-          const reserve = continuationReserve(continuation, ordinary, retryCalls) + replacementExtra;
-          if (reserve > live.balance || reserve > live.feeBudget || nonce + suffix.calls + retryCalls - 1n > live.maxNonce ||
-              nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
+          const retryCalls = fullSchedule ? ordinaryCalls : 0n;
+          const unusedOrdinary = handoff && retryCalls > 0n ? retryCalls - 1n : retryCalls;
+          const recoveryWins = continuationReserve(continuation, ordinary, retryCalls);
+          // A competing packet can consume this nonce and leave the complete recovery suffix due.
+          const oldWins = fees.replacementFee > 0n
+            ? fees.replacementFee + continuationReserve(continuation, ordinary, unusedOrdinary) : 0n;
+          const reserve = maxFee(recoveryWins, oldWins);
+          const calls = suffix.calls + retryCalls + (fees.replacementFee > 0n && unusedOrdinary === retryCalls ? 1n : 0n);
+          const evm = w.bridge.evm;
+          const pending = await evm.nonce(w.signer.address);
+          const nonceChanged = expired ? pending > nonce && !outbidsExpired : pending !== nonce;
+          if (reserve > live.balance || reserve > live.feeBudget || nonce + calls - 1n > live.maxNonce || nonceChanged ||
+              (replacing !== undefined && await evm.nonce(w.signer.address, 'latest') !== nonce) ||
+              (fees.replacementFee > 0n && await evm.nonce(w.signer.address, 'finalized') > nonce)) {
             throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');
           }
+          await w.bridge.journal.preparePayerSigning(current, w.bridge.cfg.chainId, w.signer.address);
         },
       });
     }
@@ -1149,7 +1171,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
       (journal.signerEpochs ??= {})[hx(hash)] = String(packet.requiredSignerEpoch);
       saveRecovery(w, rec, journal);
     }
-    if (w.bridge.cfg.erc20) await w.bridge.journal.retainPayerSend(rec, raw);
+    if (w.bridge.cfg.erc20) await w.bridge.journal.preparePayerBroadcast(rec, w.bridge.cfg.chainId, raw);
     try { await w.bridge.evm.sendRaw(raw); }
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     mined = await outcome();

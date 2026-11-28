@@ -502,6 +502,7 @@ impl NativeBridgeV2 {
         }
         if b.cfg.erc20.is_some() {
             b.verify_erc20_activation()?;
+            b.journal.register_payer_chain(b.cfg.chain_id)?;
         }
         Ok(b)
     }
@@ -2389,7 +2390,6 @@ impl NativeBridgeV2 {
                     if total > self.erc20_free_balance(&payer, &other)? {
                         return fail_d(Rule::CapacityPreflight, "insufficient free payer balance");
                     }
-                    self.journal.index_payer_sends(&rec, &[])?;
                 }
                 transfer_request_with(
                     &source,
@@ -2702,6 +2702,12 @@ impl NativeBridgeV2 {
                     });
                 }
             }
+            if self.cfg.erc20.is_some() {
+                fresh
+                    .extra
+                    .entry("executionPayer")
+                    .or_insert_with(|| serde_json::Value::String(hex(&signer.address())));
+            }
             fresh.sends.push(self.send_record(&tx));
             fresh.status = "submitted".into();
             if fresh.first_send_block.is_none() {
@@ -2709,6 +2715,10 @@ impl NativeBridgeV2 {
             }
             self.journal.put_return(&fresh)?;
             expired = None;
+            if self.cfg.erc20.is_some() {
+                self.journal
+                    .prepare_payer_broadcast(&fresh, self.cfg.chain_id, &tx.raw)?;
+            }
             let Some(r) = self.broadcast_and_wait(&tx)? else {
                 return Ok(ReconcileResult::Pending {
                     tx_hash: tx.hash.to_vec(),
@@ -3177,7 +3187,10 @@ impl NativeBridgeV2 {
                         other,
                         completed,
                         spent_calls,
-                    )
+                    )?;
+                    self.journal
+                        .prepare_payer_signing(record, request.chain_id, &payer)?;
+                    Ok(())
                 }),
                 ..Default::default()
             },
@@ -3491,7 +3504,8 @@ impl NativeBridgeV2 {
                     return Err(error);
                 }
                 if self.cfg.erc20.is_some() {
-                    self.journal.retain_payer_send(rec, &raw)?;
+                    self.journal
+                        .prepare_payer_broadcast(rec, self.cfg.chain_id, &raw)?;
                 }
             }
             if let Err(error) = self.send_raw_tolerant(&raw) {

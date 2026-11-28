@@ -370,11 +370,14 @@ test('a legacy drain waits for active recovery packets to be indexed and finaliz
   const active = { ...record, ...a.base(), returnId: hex(key('legacy execution return')), status: 'burned' as const, executionPayer: hex(payer) };
   const claimant = { ...record, status: 'burned' as const };
   await a.putReturn(active);
+  const obsolete = `nb2/payer-index/v1/${active.domain.slice(2)}/${active.returnId.slice(2)}`;
+  await store.putIf(obsolete, null, '1');
   await bridge.journal.putReturn(claimant);
   const drain = { mode: 'drain' as const, signingNonce: 7n, finalizedNonce: () => bridge.evm.nonce(payer, 'finalized') };
   await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, drain), /local signed sends indexed/);
   const tx = await signTx(x.payer, { chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
     maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
+  await a.registerPayerChain(chainId);
   await a.indexPayerSends(active, [tx.raw]);
   x.finalized(7n);
   await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, drain), /signed nonce awaiting finalization/);
@@ -429,6 +432,7 @@ test('finalized Runs let both legacy returns drain at the exact 15/8 nonce and b
     await journal.putReturn(legacy);
     const raw = await signTx(x.payer, { chainId, nonce: BigInt(index), gas: 100_000n, maxFeePerGas: 10n,
       maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
+    await journal.registerPayerChain(chainId);
     await journal.indexPayerSends(legacy, [raw.raw]);
     await journal.indexRecoveryProgress(chainId, legacy, 1n, { blockNumber: BigInt(index + 20), blockHash: checkpoints[index] }, 80n);
   }
@@ -545,7 +549,27 @@ test('ordinary takeover migrates local Run fees and preserves the higher replace
     signTx(signer, { ...request, gas, chainId: chain, nonce, maxFeePerGas, to: bytes(x.a.recovery) }).then((signed) => signed.raw);
   const id = `${first.domain.slice(2)}/${first.returnId.slice(2)}`;
   const watermark = `nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${id}`;
-  const feeIndex = `nb2/payer-fee-index/v1/${id}`;
+  const feeIndex = `nb2/payer-fee-index/v2/${chainId}/${toHex(payer)}/${id}`;
+  const legacy = new Journal(journal.store, key('unregistered legacy fee domain'));
+  const unregistered = { ...first, ...legacy.base(), returnId: hex(key('unregistered execution return')) };
+  const foreign = await raw(x.payer, 200n, chainId + 1n);
+  const local = await raw(x.payer, 2n);
+  await legacy.putReturn(unregistered);
+  await legacy.indexPayerSends(unregistered, [foreign]);
+  assert.equal(await journal.store.get(`nb2/domain-chain/v1/${toHex(legacy.domain)}`), null);
+  assert.deepEqual(await journal.store.list(`nb2/payer-fee-index/v2/`), []);
+  await legacy.registerPayerChain(chainId);
+  // The old unscoped marker could have been written by the foreign packet.
+  await journal.store.putIf(`nb2/payer-fee-index/v1/${toHex(legacy.domain)}/${unregistered.returnId.slice(2)}`, null, '1');
+  await legacy.indexPayerSends(unregistered, [foreign, await raw(new LocalKeySigner(key('different local payer')), 200n)]);
+  await assert.rejects(legacy.payerFees(unregistered, chainId, payer, 0n), /local signed fees indexed/);
+  await assert.rejects(legacy.preparePayerBroadcast(unregistered, chainId, local), /local signed fees indexed/);
+  await assert.rejects(legacy.preparePayerBroadcast(unregistered, chainId, foreign), /belongs to another chain/);
+  await legacy.indexPayerSends(unregistered, [local]);
+  const lower = await raw(x.payer, 1n);
+  await legacy.preparePayerBroadcast(unregistered, chainId, lower);
+  assert.deepEqual(await legacy.payerFees(unregistered, chainId, payer, 0n), { prior: 0n, atNonce: 20n });
+  await legacy.putReturn({ ...unregistered, status: 'paid' });
   const plan = first.recovery!;
   const policy = { ...erc20Recovery.limits, chainId, maxFeePerGas: 20n };
   const attempts = BigInt(plan.ordinary!.attemptsBeforeFallback);

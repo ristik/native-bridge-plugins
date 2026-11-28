@@ -1072,6 +1072,13 @@ fn active_legacy_packets_must_be_indexed_and_finalized_before_another_return_dra
         .extra
         .insert("executionPayer".into(), json!(hex(&payer)));
     other.put_return(&active).unwrap();
+    let obsolete = format!(
+        "nb2/payer-index/v1/{}/{}",
+        &active.base.domain[2..],
+        &active.return_id[2..]
+    );
+    other.store.put_if(&obsolete, None, "1").unwrap();
+
     let drain = PayerCheck {
         drain: true,
         signing_nonce: Some(7),
@@ -1102,6 +1109,7 @@ fn active_legacy_packets_must_be_indexed_and_finalized_before_another_return_dra
         },
     )
     .unwrap();
+    other.register_payer_chain(chain_id).unwrap();
     other.index_payer_sends(&active, &[&packet.raw]).unwrap();
     rpc.finalized_nonce.store(7, Ordering::SeqCst);
     assert!(claim(&drain)
@@ -1229,6 +1237,7 @@ fn finalized_runs_free_exact_nonce_and_balance_windows_for_both_legacy_returns()
             },
         )
         .unwrap();
+        journal.register_payer_chain(chain_id).unwrap();
         journal.index_payer_sends(&record, &[&packet.raw]).unwrap();
         journal
             .index_recovery_progress(
@@ -1633,7 +1642,74 @@ fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacemen
     let run = raw(&signer, 2, chain, 0);
     let id = format!("{}/{}", &first.base.domain[2..], &first.return_id[2..]);
     let watermark = format!("nb2/payer-sends/v1/{chain}/{}/{id}", to_hex(&payer));
-    let fee_index = format!("nb2/payer-fee-index/v1/{id}");
+    let fee_index = format!("nb2/payer-fee-index/v2/{chain}/{}/{id}", to_hex(&payer));
+    let legacy_domain = [0x72; 32];
+    let legacy = Journal::new(bridge.journal.store.clone(), legacy_domain);
+    let mut unregistered = first.clone();
+    unregistered.base.domain = hex(&legacy_domain);
+    unregistered.return_id = hex(&[0x73; 32]);
+    legacy.put_return(&unregistered).unwrap();
+    let foreign = raw(&signer, 200, chain + 1, 0);
+    let local = raw(&signer, 2, chain, 0);
+    legacy
+        .index_payer_sends(&unregistered, &[&foreign])
+        .unwrap();
+    assert!(legacy
+        .store
+        .get(&format!("nb2/domain-chain/v1/{}", to_hex(&legacy_domain)))
+        .unwrap()
+        .is_none());
+    assert!(legacy
+        .store
+        .list("nb2/payer-fee-index/v2/")
+        .unwrap()
+        .is_empty());
+    legacy.register_payer_chain(chain).unwrap();
+    legacy
+        .store
+        .put_if(
+            &format!(
+                "nb2/payer-fee-index/v1/{}/{}",
+                to_hex(&legacy_domain),
+                &unregistered.return_id[2..]
+            ),
+            None,
+            "1",
+        )
+        .unwrap();
+    let different = raw(&LocalKeySigner::new(&[0x74; 32]), 200, chain, 0);
+    legacy
+        .index_payer_sends(&unregistered, &[&foreign, &different])
+        .unwrap();
+    for error in [
+        legacy
+            .payer_fee_maxima(&unregistered, chain, &payer)
+            .unwrap_err(),
+        legacy
+            .prepare_payer_broadcast(&unregistered, chain, &local)
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("local signed fees indexed"),
+            "{error}"
+        );
+    }
+    let error = legacy
+        .prepare_payer_broadcast(&unregistered, chain, &foreign)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("belongs to another chain"),
+        "{error}"
+    );
+    legacy.index_payer_sends(&unregistered, &[&local]).unwrap();
+    legacy
+        .prepare_payer_broadcast(&unregistered, chain, &raw(&signer, 1, chain, 0))
+        .unwrap();
+    let fees = legacy.payer_fees(&unregistered, chain, &payer, 0).unwrap();
+    assert_eq!(fees.at_nonce, 20u8.into());
+    assert_eq!(fees.prior, BigUint::default());
+    unregistered.status = "paid".into();
+    legacy.put_return(&unregistered).unwrap();
     let hash = he(&[&super::super::header::encode_header(
         &super::super::rpc::header_of_json(&finalized_header()).unwrap(),
     )]);

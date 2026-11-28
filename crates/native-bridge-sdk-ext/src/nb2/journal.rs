@@ -731,96 +731,150 @@ impl Journal {
         }
     }
 
-    /// Register all separately retained signed packets before an upgraded wallet can reuse a payer.
-    pub fn index_payer_sends(&self, record: &ReturnRecord, signed: &[&[u8]]) -> Result<()> {
-        for raw in signed {
-            self.retain_payer_send(record, raw)?;
-        }
-        let id = format!("{}/{}", &record.base.domain[2..], &record.return_id[2..]);
-        self.store
-            .put_if(&format!("nb2/payer-index/v1/{id}"), None, "1")?;
-        let fee_index = format!("nb2/payer-fee-index/v1/{id}");
-        if self.store.get(&fee_index)?.as_deref() == Some("1") {
-            return Ok(());
-        }
-        for send in &record.sends {
-            self.retain_payer_send(record, &unhex(&send.raw)?)?;
-        }
-        let chain = self
-            .store
-            .get(&format!("nb2/domain-chain/v1/{}", &record.base.domain[2..]))?;
-        let prefix = "nb2/payer-sends/v1/";
-        let suffix = format!("/{id}");
-        let executor = record.extra.get("executionPayer").and_then(Value::as_str);
-        let mut executor_indexed = executor.is_none();
-        for key in self.store.list(prefix)? {
-            if !key.ends_with(&suffix) {
-                continue;
-            }
-            let Some(highest) = self.store.get(&key)? else {
-                return Ok(());
-            };
-            let path = &key[prefix.len()..];
-            let fee = format!("nb2/payer-fees/v1/{path}/{}", undec64(&highest)?);
-            if self.store.get(&fee)?.is_none() {
-                return Ok(());
-            }
-            let mut parts = path.split('/');
-            let signed_chain = parts.next();
-            let same_chain = chain.is_none() || chain.as_deref() == signed_chain;
-            executor_indexed |= same_chain
-                && parts.next().is_some_and(|address| {
-                    executor.and_then(|payer| payer.strip_prefix("0x")) == Some(address)
-                });
-        }
-        if executor_indexed {
-            self.store.put_if(&fee_index, None, "1")?;
+    /// Pin this deployment domain to the chain authenticated by the SDK.
+    pub fn register_payer_chain(&self, chain_id: u64) -> Result<()> {
+        let key = format!("nb2/domain-chain/v1/{}", to_hex(&self.domain));
+        self.store.put_if(&key, None, &dec(chain_id))?;
+        if self.store.get(&key)?.as_deref() != Some(&dec(chain_id)) {
+            return refuse(
+                WalletReason::BadInput,
+                "journal domain has another chain ID",
+            );
         }
         Ok(())
     }
 
-    /// Count the greatest locally authorized fee per nonce across both routes for this payer and return.
-    pub(crate) fn payer_fees(
+    fn payer_history_complete(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .get(&format!("nb2/payer-fee-index/v2/{path}"))?
+            .as_deref()
+            == Some("1"))
+    }
+
+    fn complete_payer_history(&self, path: &str) -> Result<()> {
+        self.store
+            .put_if(&format!("nb2/payer-fee-index/v2/{path}"), None, "1")?;
+        if !self.payer_history_complete(path)? {
+            return refuse(
+                WalletReason::JournalNotPersisted,
+                "payer fee index completion was not persisted",
+            );
+        }
+        Ok(())
+    }
+
+    /// Import complete local signed history. Unregistered domains cannot be marked complete.
+    pub fn index_payer_sends(&self, record: &ReturnRecord, signed: &[&[u8]]) -> Result<()> {
+        let chain = self
+            .store
+            .get(&format!("nb2/domain-chain/v1/{}", &record.base.domain[2..]))?;
+        let ordinary = record
+            .sends
+            .iter()
+            .map(|send| unhex(&send.raw))
+            .collect::<Result<Vec<_>>>()?;
+        let executor = record.extra.get("executionPayer").and_then(Value::as_str);
+        let mut covered = BTreeMap::<String, u64>::new();
+        for (index, raw) in signed
+            .iter()
+            .copied()
+            .chain(ordinary.iter().map(Vec::as_slice))
+            .enumerate()
+        {
+            let tx = decode_signed_tx(raw).map_err(Error::Other)?;
+            if chain.as_deref() != Some(&dec(tx.request.chain_id)) {
+                continue;
+            }
+            self.retain_payer_send(record, raw)?;
+            let path = payer_send_path(tx.request.chain_id, &tx.from, record);
+            // Ordinary records alone cannot prove the separate recovery history of a recorded executor.
+            if executor.is_some() && index >= signed.len() && !covered.contains_key(&path) {
+                continue;
+            }
+            let highest = covered.entry(path).or_default();
+            *highest = (*highest).max(tx.request.nonce);
+        }
+        for (path, highest) in covered {
+            if self
+                .store
+                .get(&format!("nb2/payer-sends/v1/{path}"))?
+                .as_deref()
+                == Some(&dec(highest))
+            {
+                self.complete_payer_history(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the maximum signed fee at each nonce across both return routes.
+    pub fn payer_fee_maxima(
         &self,
         record: &ReturnRecord,
         chain_id: u64,
         payer: &[u8],
-        nonce: u64,
-    ) -> Result<PayerFees> {
+    ) -> Result<BTreeMap<u64, BigUint>> {
+        if record.base.domain != hex(&self.domain) {
+            return refuse(
+                WalletReason::BadInput,
+                "return belongs to another payer journal domain",
+            );
+        }
+        if self
+            .store
+            .get(&format!("nb2/domain-chain/v1/{}", to_hex(&self.domain)))?
+            .as_deref()
+            != Some(&dec(chain_id))
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "payer fee history needs an authenticated chain association",
+            );
+        }
         let path = payer_send_path(chain_id, payer, record);
-        if (record
-            .extra
-            .get("executionPayer")
-            .and_then(Value::as_str)
-            .is_some()
+        let prefix = format!("nb2/payer-fees/v1/{path}/");
+        let keys = self.store.list(&prefix)?;
+        if let Some(executor) = record.extra.get("executionPayer").and_then(Value::as_str) {
+            if !self.payer_history_complete(&payer_send_path(
+                chain_id,
+                &unhex_n::<20>(executor)?,
+                record,
+            ))? {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "return needs its local signed fees indexed",
+                );
+            }
+        }
+        let ordinary = record
+            .sends
+            .iter()
+            .map(|send| decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other))
+            .collect::<Result<Vec<_>>>()?;
+        if (!keys.is_empty()
             || self
                 .store
                 .get(&format!("nb2/payer-sends/v1/{path}"))?
-                .is_some())
-            && self
-                .store
-                .get(&format!(
-                    "nb2/payer-fee-index/v1/{}/{}",
-                    &record.base.domain[2..],
-                    &record.return_id[2..]
-                ))?
-                .as_deref()
-                != Some("1")
+                .is_some()
+            || ordinary
+                .iter()
+                .any(|tx| tx.request.chain_id == chain_id && tx.from.as_slice() == payer))
+            && !self.payer_history_complete(&path)?
         {
             return fail_d(
                 Rule::CapacityPreflight,
                 "return needs its local signed fees indexed",
             );
         }
-        let mut fees = std::collections::BTreeMap::<u64, BigUint>::new();
+        let mut fees = BTreeMap::<u64, BigUint>::new();
         let mut record_fee = |nonce, fee| {
             let saved = fees.entry(nonce).or_default();
             if *saved < fee {
                 *saved = fee;
             }
         };
-        let prefix = format!("nb2/payer-fees/v1/{path}/");
-        for key in self.store.list(&prefix)? {
+        for key in keys {
             let Some(value) = self.store.get(&key)? else {
                 return refuse(
                     WalletReason::JournalNotPersisted,
@@ -829,8 +883,7 @@ impl Journal {
             };
             record_fee(undec64(&key[prefix.len()..])?, undec(&value)?);
         }
-        for send in &record.sends {
-            let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
+        for tx in ordinary {
             if tx.request.chain_id == chain_id && tx.from.as_slice() == payer {
                 record_fee(
                     tx.request.nonce,
@@ -838,6 +891,54 @@ impl Journal {
                 );
             }
         }
+        Ok(fees)
+    }
+
+    /// Check an existing scope or initialize an empty one before asking the payer to sign.
+    pub fn prepare_payer_signing(
+        &self,
+        record: &ReturnRecord,
+        chain_id: u64,
+        payer: &[u8],
+    ) -> Result<BTreeMap<u64, BigUint>> {
+        let fees = self.payer_fee_maxima(record, chain_id, payer)?;
+        let path = payer_send_path(chain_id, payer, record);
+        self.complete_payer_history(&path)?;
+        Ok(fees)
+    }
+
+    /// Revalidate an exact signed packet's scope and retain its maximum before handing it to an RPC.
+    pub fn prepare_payer_broadcast(
+        &self,
+        record: &ReturnRecord,
+        chain_id: u64,
+        raw: &[u8],
+    ) -> Result<()> {
+        let tx = decode_signed_tx(raw).map_err(Error::Other)?;
+        if tx.request.chain_id != chain_id {
+            return refuse(
+                WalletReason::BadInput,
+                "signed payer packet belongs to another chain",
+            );
+        }
+        self.payer_fee_maxima(record, chain_id, &tx.from)?;
+        if !self.payer_history_complete(&payer_send_path(chain_id, &tx.from, record))? {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "return needs its local signed fees indexed",
+            );
+        }
+        self.retain_payer_send(record, raw)
+    }
+
+    pub(crate) fn payer_fees(
+        &self,
+        record: &ReturnRecord,
+        chain_id: u64,
+        payer: &[u8],
+        nonce: u64,
+    ) -> Result<PayerFees> {
+        let mut fees = self.payer_fee_maxima(record, chain_id, payer)?;
         let at_nonce = fees.remove(&nonce).unwrap_or_default();
         Ok(PayerFees {
             prior: fees.values().sum(),
@@ -998,23 +1099,19 @@ impl Journal {
                     ordinary.insert(tx.request.nonce);
                 }
             }
-            if self
+            let registered = self
                 .store
                 .get(&format!("nb2/domain-chain/v1/{domain}"))?
                 .as_deref()
                 .map(undec64)
-                .transpose()?
-                .is_some_and(|known| known != chain_id)
-            {
+                .transpose()?;
+            if registered.is_some_and(|known| known != chain_id) {
                 continue;
             }
             if rec.status != "planned"
                 && executing
-                && self
-                    .store
-                    .get(&format!("nb2/payer-index/v1/{domain}/{id}"))?
-                    .as_deref()
-                    != Some("1")
+                && (registered.is_none()
+                    || !self.payer_history_complete(&payer_send_path(chain_id, payer, &rec))?)
             {
                 return fail_d(
                     Rule::CapacityPreflight,
@@ -1099,14 +1196,7 @@ impl Journal {
             );
         }
         unhex_n::<32>(id)?;
-        let domain_key = format!("nb2/domain-chain/v1/{}", to_hex(&self.domain));
-        self.store.put_if(&domain_key, None, &dec(chain_id))?;
-        if self.store.get(&domain_key)?.as_deref() != Some(&dec(chain_id)) {
-            return refuse(
-                WalletReason::BadInput,
-                "journal domain has another chain ID",
-            );
-        }
+        self.register_payer_chain(chain_id)?;
         let key = format!("nb2/payer/v1/{chain_id}/{}", to_hex(payer));
         let target = self.key("return", Some(&id[2..]));
         loop {
