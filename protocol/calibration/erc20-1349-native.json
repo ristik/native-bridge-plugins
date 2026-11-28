@@ -1,0 +1,139 @@
+{
+  "scope": "Synthetic authority and seeded state on the pinned native execution and contract builds",
+  "start": {
+    "operations": 16,
+    "calldataBytes": 141732,
+    "signedBytes": 141849,
+    "submittedGas": 24000000,
+    "gasUsed": 16291423,
+    "minimumBid": 16292458,
+    "conservativeQuote": 19138884,
+    "signedSha256": "627774eaf8a7595b274c2173d350a3b503e6f7b094db57c9899843582dcbbec8",
+    "predecessorReceiptBytes": 0,
+    "pages": 32
+  },
+  "resumeSplit": [
+    {
+      "operations": 8,
+      "calldataBytes": 301444,
+      "signedBytes": 301561,
+      "submittedGas": 24000000,
+      "gasUsed": 16203843,
+      "minimumBid": 16226187,
+      "conservativeQuote": 18534831,
+      "signedSha256": "c96245a200c1bc133bb7172b9093b4bb85903e832cd5a6882698fba84a383c89",
+      "predecessorReceiptBytes": 53435
+    },
+    {
+      "operations": 8,
+      "calldataBytes": 149860,
+      "signedBytes": 149977,
+      "submittedGas": 24000000,
+      "gasUsed": 9221792,
+      "minimumBid": 9239656,
+      "conservativeQuote": 10629396,
+      "signedSha256": "a8e3dd8677a7b803304482ab2857247b0e74e99831ef83b664c527478c402033"
+    }
+  ],
+  "unsplitResumeControl": {
+    "operations": 16,
+    "calldataBytes": 393188,
+    "signedBytes": 393305,
+    "submittedGas": 24000000,
+    "gasUsed": 23340867,
+    "minimumBid": 23383686,
+    "conservativeQuote": 26842576,
+    "signedSha256": "572018f0c8545284d99023e71947447447e483b955a743b1b4dd1792d68f11f8",
+    "predecessorReceiptBytes": 53435
+  },
+  "gapsAndSettlement": [
+    {
+      "name": "AdvanceGaps",
+      "gaps": 3,
+      "predecessorBytes": 50745,
+      "calldataBytes": 51684,
+      "signedBytes": 51864,
+      "gasLimit": 24000000,
+      "gasUsed": 1226332,
+      "minimumBid": 1226332,
+      "intrinsicGas": 838344,
+      "conservativeQuote": 1313530
+    },
+    {
+      "name": "recovered settlement",
+      "gaps": 0,
+      "predecessorBytes": 50745,
+      "calldataBytes": 50884,
+      "signedBytes": 51064,
+      "gasLimit": 24000000,
+      "gasUsed": 1894997,
+      "minimumBid": 1894997,
+      "intrinsicGas": 825508,
+      "conservativeQuote": 2118531
+    },
+    {
+      "name": "ordinary settlement",
+      "gaps": 0,
+      "calldataBytes": 4836,
+      "signedBytes": 5016,
+      "gasLimit": 24000000,
+      "gasUsed": 1715747,
+      "minimumBid": 1715747,
+      "intrinsicGas": 86208,
+      "conservativeQuote": 2053823
+    },
+    {
+      "name": "recovered settlement",
+      "gaps": 1,
+      "predecessorBytes": 50745,
+      "calldataBytes": 51172,
+      "signedBytes": 51352,
+      "gasLimit": 24000000,
+      "gasUsed": 1900254,
+      "minimumBid": 1900254,
+      "intrinsicGas": 830140,
+      "conservativeQuote": 2123889
+    },
+    {
+      "name": "ordinary settlement",
+      "gaps": 1,
+      "calldataBytes": 5156,
+      "signedBytes": 5336,
+      "gasLimit": 24000000,
+      "gasUsed": 1721054,
+      "minimumBid": 1721054,
+      "intrinsicGas": 90980,
+      "conservativeQuote": 2059585
+    },
+    {
+      "name": "recovered settlement",
+      "gaps": 2,
+      "predecessorBytes": 50745,
+      "calldataBytes": 51428,
+      "signedBytes": 51608,
+      "gasLimit": 24000000,
+      "gasUsed": 1906210,
+      "minimumBid": 1906210,
+      "intrinsicGas": 834236,
+      "conservativeQuote": 2130217
+    },
+    {
+      "name": "ordinary settlement",
+      "gaps": 2,
+      "calldataBytes": 5412,
+      "signedBytes": 5592,
+      "gasLimit": 24000000,
+      "gasUsed": 1726995,
+      "minimumBid": 1726995,
+      "intrinsicGas": 95076,
+      "conservativeQuote": 2065895
+    }
+  ],
+  "sourceSha256": {
+    "native-start.json": "53b9988196ee46daf8373b99223032fc8fbd3a8b0e3d323fb5d51f926a5d0f2b",
+    "native-start.log": "6b37c2308291f48610445cfefbe0dd6b28151aa31a6b95fc08d92f0483e5f678",
+    "native-run-width.json": "cb445c25ddd19e2eefd5935cb434338f54cdc27bfb23ed0d00b3e572a0a4d2a2",
+    "native-run-width.log": "d4a7bce93cd9fe6f2ed74872177223a49466526ab7b6a1d6e68061cb6d70565c",
+    "native-gap.json": "c689cb53b5cd3bf5c868f3877bfc5684de9821d947f058177b841309f544890f"
+  }
+}

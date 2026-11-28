@@ -1,0 +1,26 @@
+{
+  "artifactVersion": 1,
+  "semanticProfileSha256": "f05dd5c3563165d73c1cf91a5af79ec7afcaa77edc90061c6e7666bf53a8b0b6",
+  "fundingQualified": false,
+  "admissionCaps": {
+    "submittedGas": 24000000,
+    "calldataBytes": 393216,
+    "signedBytes": 524288,
+    "predecessorReceiptBytes": 65536,
+    "startOperations": 16,
+    "resumeOperations": 8,
+    "pages": 32,
+    "maxGapsPerCall": 1024,
+    "balanceProbeGas": 30000,
+    "tokenTransferGas": 150000,
+    "reserveSegments": 64
+  },
+  "qualifiedBounds": {
+    "calls": null,
+    "arrivals": null,
+    "inclusionAndFunding": null
+  },
+  "evidence": {
+    "protocol/calibration/erc20-1349-native.json": "99716069d08da64166b4006ac657f8d6b4499df4826d5ceaab4d4ae981feb9f7"
+  }
+}
