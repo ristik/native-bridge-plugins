@@ -20,6 +20,10 @@ use super::token::*;
 pub trait OwnerSigner {
     fn public_key(&self) -> [u8; 33];
     fn sign_unlock(&self, message: &[u8; 32]) -> core::result::Result<[u8; 65], String>;
+    /// A signer may report SigningDeclined only if it guarantees no signature was produced.
+    fn sign_unlock_for_burn(&self, message: &[u8; 32]) -> Result<[u8; 65]> {
+        self.sign_unlock(message).map_err(Error::Other)
+    }
 }
 
 /// An owner key held in memory.
@@ -163,6 +167,17 @@ pub fn head_of(t: &LineageLevel) -> (Predicate, [u8; 32]) {
 
 /// A transfer of `token` and its certification request, signed by the current owner.
 pub fn transfer_request(token: &[u8], owner: &dyn OwnerSigner, tr: &TransferTx) -> Result<Request> {
+    transfer_request_with(token, owner, tr, |message| {
+        owner.sign_unlock(message).map_err(Error::Other)
+    })
+}
+
+pub(crate) fn transfer_request_with(
+    token: &[u8],
+    owner: &dyn OwnerSigner,
+    tr: &TransferTx,
+    sign: impl FnOnce(&[u8; 32]) -> Result<[u8; 65]>,
+) -> Result<Request> {
     let t = decode_token(token)?;
     let (head_owner, state) = head_of(&t);
     if head_owner.ty != PRED_SIGNATURE || head_owner.params != owner.public_key() {
@@ -170,9 +185,7 @@ pub fn transfer_request(token: &[u8], owner: &dyn OwnerSigner, tr: &TransferTx) 
     }
     let tx = encode_transfer(tr);
     let tx_hash = hu(&[&tx]);
-    let unlock = owner
-        .sign_unlock(&unlock_message(&state, &tx_hash))
-        .map_err(Error::Other)?;
+    let unlock = sign(&unlock_message(&state, &tx_hash))?;
     // the owner's signature is checked by the NB2 unlock rule (recovery ID 0 or 1 included) before anything is journaled or certified
     verify_unlock(&head_owner.params, &state, &tx_hash, &unlock)?;
     let cd = Certification {

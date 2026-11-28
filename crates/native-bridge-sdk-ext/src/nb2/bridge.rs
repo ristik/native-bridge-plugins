@@ -63,7 +63,8 @@ use super::token::{
 };
 use super::tokenops::{
     append_transfer, certify_checked, child_mint, fresh_mask, mint_request, split_plan,
-    token_of_child, token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
+    token_of_child, token_of_mint, transfer_request, transfer_request_with, Aggregator,
+    OwnerSigner, SplitOutput,
 };
 use super::trust::{bind_trust, TrustInput};
 use super::util::{arr, be_int, cat, u256, u256_64};
@@ -2082,13 +2083,15 @@ impl NativeBridgeV2 {
                 "continuation calibration differs from the deployed graph",
             );
         }
+        self.verify_recovery_dependencies(&recovery)?;
         self.check_erc20_bid(&quote.limits)?;
         let mut limits = quote.limits.clone();
         limits.signed_bytes = limits
             .signed_bytes
             .min(self.pins.max_encoded_tx_bytes as usize);
         limits.gas = limits.gas.min(self.pins.user_gas_limit);
-        limits.balance = limits.balance.min(self.erc20_free_balance(record, payer)?);
+        let other = self.check_erc20_payer(record, payer, false, None)?;
+        limits.balance = limits.balance.min(self.erc20_free_balance(payer, &other)?);
         let ordinary = ordinary
             .map(|pf| {
                 let return_data = encode_return_data(&ReturnData {
@@ -2142,7 +2145,7 @@ impl NativeBridgeV2 {
             + u128::from(admission.advance_calls)
             + 1
             + u128::from(admission.prior_attempts);
-        self.check_erc20_nonce(payer, calls, limits.max_nonce)?;
+        self.check_erc20_nonce(payer, calls, limits.max_nonce, &other)?;
         let mut schedule = serde_json::json!({
             "generation": hex(&super::recovery::recovery_generation(&quote.deployment.salt, &self.domain)),
             "calls": dec(calls),
@@ -2169,6 +2172,32 @@ impl NativeBridgeV2 {
         Ok(offered)
     }
 
+    fn verify_recovery_dependencies(&self, recovery: &[u8; 20]) -> Result<()> {
+        let address = |getter| {
+            let word = self.evm.call(recovery, &sel(getter), None)?;
+            if word.len() != 32 || word[..12].iter().any(|v| *v != 0) {
+                return fail_d(Rule::CapacityPreflight, "invalid recovery helper address");
+            }
+            Ok(arr::<20>(&word[12..]))
+        };
+        let registry = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for (helper, getter) in [
+            (address("RECEIPTS()")?, "RECEIPTS_HASH()"),
+            (address("LINEAGE()")?, "LINEAGE_HASH()"),
+            (registry, "REGISTRY_HASH()"),
+        ] {
+            let runtime = self.evm.code(&helper)?;
+            let expected = self.evm.call(recovery, &sel(getter), None)?;
+            if runtime.is_empty() || he(&[&runtime]).as_slice() != expected {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "recovery dependency runtime differs from its pinned hash",
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn check_erc20_bid(&self, limits: &RecoveryLimits) -> Result<()> {
         let (base_fee, priority) = self.evm.fees()?;
         if priority > limits.max_priority_fee_per_gas
@@ -2182,9 +2211,21 @@ impl NativeBridgeV2 {
         Ok(())
     }
 
-    fn check_erc20_nonce(&self, payer: &[u8], calls: u128, max_nonce: u64) -> Result<()> {
-        let nonce = self.evm.nonce(payer, "pending")?;
-        if u128::from(nonce) + calls - 1 > u128::from(max_nonce) {
+    fn check_erc20_nonce(
+        &self,
+        payer: &[u8],
+        calls: u128,
+        max_nonce: u64,
+        other: &PayerCommitments,
+    ) -> Result<()> {
+        let nonce = self
+            .evm
+            .nonce(payer, "pending")?
+            .max(other.finalized_nonce.unwrap_or(0));
+        if other
+            .nonce_limit(max_nonce)
+            .map_or(true, |cap| u128::from(nonce) + calls - 1 > u128::from(cap))
+        {
             return fail_d(
                 Rule::CapacityPreflight,
                 "continuation schedule exceeds the declared nonce horizon",
@@ -2266,34 +2307,66 @@ impl NativeBridgeV2 {
                 amount: amount.clone(),
                 min_index: a,
             });
-            if let Some(policy) = &self.erc20_return_recovery {
-                if self.cfg.erc20.is_some() {
-                    self.journal.check_return_payer(
-                        self.cfg.chain_id,
-                        &payer,
-                        &rec.return_id,
-                        true,
-                    )?;
+            let mask = fresh_mask();
+            let claim = if self.cfg.erc20.is_some() {
+                self.check_erc20_payer(&rec, &payer, true, Some(&hex(&fresh_mask())))?
+                    .fence
+            } else {
+                None
+            };
+            let mut signing = false;
+            let signed = (|| {
+                if let Some(policy) = self
+                    .erc20_return_recovery
+                    .as_ref()
+                    .filter(|_| self.cfg.erc20.is_some())
+                {
                     self.check_erc20_bid(&policy.limits)?;
+                    let other = self.check_erc20_payer(&rec, &payer, false, None)?;
                     let schedule = &rec.extra["recovery"];
                     let calls = undec64(schedule["calls"].as_str().unwrap_or(""))?;
-                    self.check_erc20_nonce(&payer, u128::from(calls), policy.limits.max_nonce)?;
+                    self.check_erc20_nonce(
+                        &payer,
+                        u128::from(calls),
+                        policy.limits.max_nonce,
+                        &other,
+                    )?;
                     let total = undec(schedule["totalFee"].as_str().unwrap_or(""))?;
-                    if total > self.erc20_free_balance(&rec, &payer)? {
+                    if total > self.erc20_free_balance(&payer, &other)? {
                         return fail_d(Rule::CapacityPreflight, "insufficient free payer balance");
                     }
+                    self.journal.index_payer_sends(&rec, &[])?;
                 }
-            }
-            let req = transfer_request(
-                &source,
-                owner,
-                &TransferTx {
-                    recipient: burn_predicate(&hu(&[&r])),
-                    mask: fresh_mask().to_vec(),
-                    data: Some(r),
-                    deadline: None,
-                },
-            )?;
+                transfer_request_with(
+                    &source,
+                    owner,
+                    &TransferTx {
+                        recipient: burn_predicate(&hu(&[&r])),
+                        mask: mask.to_vec(),
+                        data: Some(r),
+                        deadline: None,
+                    },
+                    |message| {
+                        signing = true;
+                        if self.cfg.erc20.is_some() {
+                            owner.sign_unlock_for_burn(message)
+                        } else {
+                            owner.sign_unlock(message).map_err(Error::Other)
+                        }
+                    },
+                )
+            })();
+            let req = match signed {
+                Ok(req) => req,
+                Err(error) => {
+                    if let Some(fence) = claim.filter(|_| {
+                        !signing || error.reason() == Some(WalletReason::SigningDeclined)
+                    }) {
+                        self.journal.cancel_unsigned_return(&rec.return_id, fence)?;
+                    }
+                    return Err(error);
+                }
+            };
             rec.burn_tx = Some(hex(&req.tx));
             rec.burn_request = Some(hex(&req.cd));
             rec.status = "burn-requested".into();
@@ -2563,12 +2636,7 @@ impl NativeBridgeV2 {
             )?;
             self.check_erc20_ordinary_attempt(&fresh, &signer.address(), &request)?;
             if self.cfg.erc20.is_some() {
-                self.journal.check_return_payer(
-                    self.cfg.chain_id,
-                    &signer.address(),
-                    &fresh.return_id,
-                    true,
-                )?;
+                self.check_erc20_payer(&fresh, &signer.address(), true, None)?;
                 self.check_erc20_ordinary_attempt(&fresh, &signer.address(), &request)?;
             }
             let tx = sign_tx(signer, &request)?;
@@ -2584,6 +2652,9 @@ impl NativeBridgeV2 {
             fresh.status = "submitted".into();
             if fresh.first_send_block.is_none() {
                 fresh.first_send_block = Some(dec(self.evm.block_number()?));
+            }
+            if self.cfg.erc20.is_some() {
+                self.journal.retain_payer_send(&fresh, &tx.raw)?;
             }
             self.journal.put_return(&fresh)?;
             expired = None;
@@ -2848,6 +2919,7 @@ impl NativeBridgeV2 {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
         };
+        let other = self.check_erc20_payer(record, payer, false, None)?;
         let prior = record
             .sends
             .iter()
@@ -2876,12 +2948,15 @@ impl NativeBridgeV2 {
         };
         if (!prior.contains(dec(request.nonce).as_str())
             && prior.len() as u64 >= undec64(field("attemptsBeforeFallback"))?)
-            || request.nonce > limits.max_nonce
+            || request.nonce < other.finalized_nonce.unwrap_or(0)
+            || other
+                .nonce_limit(limits.max_nonce)
+                .map_or(true, |cap| request.nonce > cap)
             || request.max_fee_per_gas > limits.max_fee_per_gas
             || request.max_priority_fee_per_gas > limits.max_priority_fee_per_gas
             || fee > limits.fee_budget
             || fee > limits.balance
-            || fee > self.erc20_free_balance(record, payer)?
+            || fee > self.erc20_free_balance(payer, &other)?
         {
             return fail_d(
                 Rule::CapacityPreflight,
@@ -2891,13 +2966,39 @@ impl NativeBridgeV2 {
         Ok(())
     }
 
-    fn erc20_free_balance(&self, record: &ReturnRecord, payer: &[u8]) -> Result<BigUint> {
-        self.journal
-            .check_return_payer(self.cfg.chain_id, payer, &record.return_id, false)?;
-        Ok(self
+    fn check_erc20_payer(
+        &self,
+        record: &ReturnRecord,
+        payer: &[u8],
+        reserve: bool,
+        fence: Option<&str>,
+    ) -> Result<PayerCommitments> {
+        self.journal.check_payer(
+            self.cfg.chain_id,
+            payer,
+            &record.return_id,
+            reserve,
+            &PayerCheck {
+                drain: record.status != "planned",
+                finalized_nonce: Some(&|| self.evm.nonce(payer, "finalized")),
+                fence,
+            },
+        )
+    }
+
+    fn erc20_free_balance(&self, payer: &[u8], other: &PayerCommitments) -> Result<BigUint> {
+        let mut balance = self
             .evm
             .balance(payer)?
-            .min(self.evm.balance_at(payer, "pending")?))
+            .min(self.evm.balance_at(payer, "pending")?);
+        if other.finalized_nonce.is_some() {
+            balance = balance.min(self.evm.balance_at(payer, "finalized")?);
+        }
+        Ok(if balance > other.fees {
+            balance - &other.fees
+        } else {
+            BigUint::default()
+        })
     }
 
     fn transaction_request(
@@ -3022,12 +3123,7 @@ impl NativeBridgeV2 {
                     return Err(error);
                 }
                 if self.cfg.erc20.is_some() {
-                    self.journal.check_return_payer(
-                        self.cfg.chain_id,
-                        &tx.from,
-                        &rec.return_id,
-                        true,
-                    )?;
+                    self.journal.retain_payer_send(rec, &raw)?;
                 }
             }
             if let Err(error) = self.send_raw_tolerant(&raw) {

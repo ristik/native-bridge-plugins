@@ -43,7 +43,7 @@ import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/tok
 import { transferProofLimit } from '../packages/native-bridge-plugin/src/nb2/tokenops.js';
 import { isCertificationTrustPending } from '../packages/native-bridge-plugin/src/nb2/trust.js';
 import { TrustInput } from '../packages/native-bridge-plugin/src/trust.js';
-import { hasPeerComplete, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
+import { hasPeerComplete, indexLocalRecoverySends, pollOrdinaryPayout, qualifyExistingRecovery, redeemOrdinary, recoverStep, retainTerminal, returnHeadroom, walletAdmission, type PayerPolicy, type RecoveryResult } from './recovery.js';
 import { refreshAll } from './trust.js';
 
 export const unhex = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s.trim().replace(/^0x/, ''), 'hex'));
@@ -493,6 +493,7 @@ export class Wallet {
         this.release.status === 'testnet-provisional' ? TESTNET_TRUST_FRESHNESS_MS : PRODUCTION_TRUST_FRESHNESS_MS),
       receiptTimeoutMs: 180_000, pollMs: 1_000, ...(opts.gas ? { gas: opts.gas } : {}),
     }, opts.check ?? true);
+    if (this.bridge.cfg.erc20) await indexLocalRecoverySends(this);
     const legacyFile = join(this.dir, 'backup.json');
     const legacy = readIntentsBackup(legacyFile);
     if (legacy) {

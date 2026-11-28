@@ -6,7 +6,7 @@ import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, VANISHED_CLAIM_HORIZON, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, decodeSignedTx, evidenceOf, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch, recoveryCatchUpCalls, recoveryGeneration,
-  quoteErc20Call, quoteOrdinaryExecution, recoveryRpcSource, replacementBid, signTx, type Erc20ReturnRecovery, type Erc20SigningBounds,
+  payerNonceLimit, quoteErc20Call, quoteOrdinaryExecution, recoveryRpcSource, replacementBid, signTx, verifyRecoveryDependencies, type PayerCommitments, type Erc20ReturnRecovery, type Erc20SigningBounds,
   type OrdinaryCalibrationRange, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
   type ReturnAdmission, type ReturnRecord, type ReconcileResult, type TrustInput, type SendRecord, type RedeemOptions, type ReturnEvidence,
@@ -109,51 +109,43 @@ async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
     !eq(runtime, runtimeHash) || !eq(generation, release.generation) || !eq(installedPins, pins)) {
     throw new WalletError('BadDeployment', 'installed recovery graph differs from the authenticated release');
   }
-  const registry = bytes('0xff00000000000000000000000000000000000002', 20);
-  const [receipts, lineage, receiptHash, lineageHash, registryHash] = await Promise.all([
-    evm.call(recovery, getter('RECEIPTS')), evm.call(recovery, getter('LINEAGE')),
-    evm.call(recovery, getter('RECEIPTS_HASH')), evm.call(recovery, getter('LINEAGE_HASH')), evm.call(recovery, getter('REGISTRY_HASH')),
-  ]);
-  const helpers = [contractAddress(receipts), contractAddress(lineage), registry];
-  const expected = [receiptHash, lineageHash, registryHash];
-  if (helpers.some((helper) => helper.length !== 20)) throw new WalletError('BadDeployment', 'invalid recovery helper address');
-  const codes = await Promise.all(helpers.map((helper) => evm.code(helper)));
-  if (codes.some((code, i) => code.length === 0 || !eq(HE(code), expected[i]))) {
-    throw new WalletError('BadDeployment', 'recovery helper runtime differs from the installed binding');
+  try { await verifyRecoveryDependencies(evm, recovery); }
+  catch (e) {
+    if (e instanceof Nb2Error && e.rule === 'CapacityPreflight') throw new WalletError('BadDeployment', e.detail, e);
+    throw e;
   }
 }
 
 interface FeeReservations { total: bigint; attempts: { nonce: bigint; fee: bigint }[] }
 
 async function limitsOf(w: Wallet, p: PayerPolicy, payer: Uint8Array, reserved?: FeeReservations, replacementNonce?: bigint,
-  otherReturns = 0n): Promise<RecoveryLimits & { currentBid: bigint }> {
+  otherReturns: PayerCommitments = { fees: 0n, calls: 0n }): Promise<RecoveryLimits & { currentBid: bigint }> {
   const evm = w.bridge.evm;
   const block = reserved?.attempts.length ? await evm.saneHead() : undefined;
-  const [balance, minedNonce, nonce, fees, pendingBalance] = await Promise.all([
+  const [balance, minedNonce, nonce, fees, pendingBalance, finalizedBalance] = await Promise.all([
     evm.balance(payer, block), block === undefined ? 0n : evm.nonce(payer, block), evm.nonce(payer), evm.fees(),
     w.bridge.cfg.erc20 ? evm.balance(payer, 'pending') : undefined,
+    otherReturns.finalizedNonce === undefined ? undefined : evm.balance(payer, 'finalized'),
   ]);
   const outstanding = reserved?.attempts.reduce((sum, tx) => tx.nonce >= minedNonce ? sum + tx.fee : sum, 0n) ?? 0n;
   const spent = reserved?.total ?? 0n;
   const currentBid = 2n * fees.baseFee + fees.priority;
-  if ((replacementNonce ?? nonce) > p.maxNonce || currentBid > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
+  const maxNonce = payerNonceLimit(p.maxNonce, otherReturns);
+  const currentNonce = replacementNonce ?? nonce;
+  if (currentNonce > maxNonce || (otherReturns.finalizedNonce !== undefined && currentNonce < otherReturns.finalizedNonce)
+    || currentBid > p.maxFeePerGas || fees.priority > p.maxPriorityFeePerGas || spent > p.feeBudget) {
     throw new Nb2Error('CapacityPreflight', 'current payer nonce, bids or remaining budget exceed the declared limits');
   }
   const free = balance - outstanding;
-  const spendable = (pendingBalance !== undefined && pendingBalance < free ? pendingBalance : free) - otherReturns;
-  return { ...p, gas: p.gas < w.pins.userGasLimit ? p.gas : w.pins.userGasLimit,
+  const visible = pendingBalance !== undefined && pendingBalance < free ? pendingBalance : free;
+  const spendable = (finalizedBalance !== undefined && finalizedBalance < visible ? finalizedBalance : visible) - otherReturns.fees;
+  return { ...p, maxNonce, gas: p.gas < w.pins.userGasLimit ? p.gas : w.pins.userGasLimit,
     signedBytes: Math.min(p.signedBytes, Number(w.pins.maxEncodedTxBytes)), chainId: w.bridge.cfg.chainId, worstCaseEnvelope: !w.bridge.cfg.erc20,
     balance: spendable > 0n ? spendable : 0n, currentBid, feeBudget: p.feeBudget - spent };
 }
 
-async function otherErc20Reserves(w: Wallet, rec: ReturnRecord, payer: Uint8Array): Promise<bigint> {
-  if (!w.bridge.cfg.erc20) return 0n;
-  await w.bridge.journal.checkReturnPayer(w.bridge.cfg.chainId, payer, rec.returnId);
-  const address = hx(payer);
-  return (await w.bridge.journal.returns()).reduce((reserved, other) =>
-    other.returnId !== rec.returnId && other.status !== 'planned' && other.status !== 'paid'
-      && (other.payer ?? other.recipient) === address && other.recovery
-      ? reserved + uint(other.recovery.totalFee) : reserved, 0n);
+async function otherErc20Reserves(w: Wallet, rec: ReturnRecord, payer: Uint8Array): Promise<PayerCommitments | undefined> {
+  if (w.bridge.cfg.erc20) return w.bridge.checkErc20Payer(rec, payer);
 }
 
 /** Reserve the greatest fee at each payer nonce. At most one replacement can be mined. */
@@ -294,8 +286,8 @@ async function qualifyLineage(w: Wallet, rec: ReturnRecord, policy: PayerPolicy,
   if (w.bridge.cfg.erc20) {
     const input = erc20RecoveryInput(w, policy);
     await checkGraph(w, recoveryRelease(w));
-    input.limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, undefined, replacing), replacing,
-      await otherErc20Reserves(w, rec, w.signer.address));
+    input.limits = { ...await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, undefined, replacing), replacing,
+      await otherErc20Reserves(w, rec, w.signer.address)), maxNonce: policy.maxNonce };
     return w.bridge.qualifyErc20Recovery({ ...rec, payer: hx(w.signer.address) }, input, replacing);
   }
   const qualify = walletAdmission(w, policy, undefined, replacing).recover;
@@ -550,6 +542,17 @@ const pathOf = (w: Wallet, rec: ReturnRecord): string => {
 function loadRecovery(w: Wallet, rec: ReturnRecord): RecoveryJournal | undefined {
   const path = pathOf(w, rec);
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
+}
+
+/** Import the pre-upgrade wallet's separately durable signed packets into the shared payer journal. */
+export async function indexLocalRecoverySends(w: Wallet): Promise<void> {
+  for (const { record } of await w.bridge.journal.allReturns()) {
+    const saved = loadRecovery(w, record);
+    const raw = [...(saved?.attempts ?? []), ...(saved?.superseded ?? []), ...(saved?.replacedSettlements ?? [])];
+    if (saved?.pending) raw.push(saved.pending.raw);
+    if (saved?.settled?.submitted) raw.push(saved.settled.submitted.raw);
+    await w.bridge.journal.indexPayerSends(record, raw.map((signed) => bytes(signed)));
+  }
 }
 export function hasPeerComplete(w: Wallet, rec: ReturnRecord): boolean {
   return loadRecovery(w, rec)?.complete !== undefined;
@@ -806,7 +809,7 @@ async function reconcileForPayout(w: Wallet, rec: ReturnRecord, route: 'ordinary
       const epoch = journal?.signerEpochs?.[hx(lower.hash)];
       if (epoch === undefined) throw new WalletError('NotPending', 'retry needs the authenticated cut for the prior signed packet');
       await w.bridge.evm.checkReturnImport(w.bridge.cfg, uint(epoch), { ...lower.request, from: lower.from });
-      if (w.bridge.cfg.erc20) await w.bridge.journal.checkReturnPayer(w.bridge.cfg.chainId, lower.from, rec.returnId, true);
+      if (w.bridge.cfg.erc20) await w.bridge.journal.retainPayerSend(rec, lower.raw);
       try { await w.bridge.evm.sendRaw(lower.raw); }
       catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     }
@@ -943,15 +946,16 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       if (competing.state !== 'not-paid') return competing;
     }
     if (w.bridge.cfg.erc20) {
-      await w.bridge.journal.checkReturnPayer(w.bridge.cfg.chainId, w.signer.address, rec.returnId, true);
+      await w.bridge.checkErc20Payer(current, w.signer.address, true);
       const live = await limitsOf(w, policy, w.signer.address, reservations, replacing, await otherErc20Reserves(w, current, w.signer.address));
       const reserve = journal.complete ? uint(rec.recovery!.totalFee) : quote.fee;
-      if (reserve > live.balance || reserve > live.feeBudget || nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
+      if (reserve > live.balance || reserve > live.feeBudget || nonce > live.maxNonce || nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
         throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');
       }
     }
     const tx = await signTx(w.signer, { chainId: limits.chainId, nonce, maxFeePerGas: limits.maxFeePerGas,
       maxPriorityFeePerGas: limits.maxPriorityFeePerGas, gas: quote.gas, to, value: 0n, data: calldata });
+    if (w.bridge.cfg.erc20) await w.bridge.journal.indexPayerSends(current, [tx.raw]);
     if (tx.raw.length > quote.signedBytes) throw new Nb2Error('CapacityPreflight', 'signed recovery packet exceeds its bound');
     await w.bridge.evm.checkReturnImport(w.bridge.cfg, requiredSignerEpoch, { ...tx.request, from: w.signer.address });
     if (handoff) {
@@ -1057,7 +1061,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
       (journal.signerEpochs ??= {})[hx(hash)] = String(packet.requiredSignerEpoch);
       saveRecovery(w, rec, journal);
     }
-    if (w.bridge.cfg.erc20) await w.bridge.journal.checkReturnPayer(w.bridge.cfg.chainId, from, rec.returnId, true);
+    if (w.bridge.cfg.erc20) await w.bridge.journal.retainPayerSend(rec, raw);
     try { await w.bridge.evm.sendRaw(raw); }
     catch (e) { if (!(e instanceof AmbiguousBroadcast)) throw e; }
     mined = await outcome();

@@ -21,7 +21,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::errors::{fail_d, refuse, Result, Rule, WalletReason};
+use super::errors::{fail_d, refuse, Error, Result, Rule, WalletReason};
+use super::evm::decode_signed_tx;
 use super::util::{from_hex, to_hex};
 
 pub const JOURNAL_FORMAT: &str = "unicity-nb2-journal";
@@ -374,6 +375,58 @@ pub struct Journal {
     seen: Mutex<HashMap<String, Option<String>>>,
 }
 
+#[derive(Default)]
+pub struct PayerCheck<'a> {
+    pub drain: bool,
+    pub finalized_nonce: Option<&'a dyn Fn() -> Result<u64>>,
+    pub fence: Option<&'a str>,
+}
+
+#[derive(Default)]
+pub struct PayerCommitments {
+    pub fees: BigUint,
+    pub calls: u128,
+    nonce_windows: Vec<(u64, Option<u64>)>,
+    pub finalized_nonce: Option<u64>,
+    pub fence: Option<PayerFence>,
+}
+
+impl PayerCommitments {
+    /// Last nonce this return may use while leaving feasible windows for the older returns.
+    pub fn nonce_limit(&self, max_nonce: u64) -> Option<u64> {
+        let mut windows = self
+            .nonce_windows
+            .iter()
+            .map(|(calls, cap)| (cap.unwrap_or(max_nonce), *calls))
+            .collect::<Vec<_>>();
+        windows.sort_unstable();
+        let mut used = 0u128;
+        let mut limit = u128::from(max_nonce);
+        for (cap, calls) in windows {
+            used += u128::from(calls);
+            limit = limit.min(u128::from(cap).checked_sub(used)?);
+        }
+        Some(limit as u64)
+    }
+}
+
+pub struct PayerFence {
+    key: String,
+    claim: String,
+}
+
+fn return_path(key: &str) -> Option<(&str, &str)> {
+    let (domain, id) = key.strip_prefix("nb2/v1/")?.split_once("/return/")?;
+    [domain, id]
+        .into_iter()
+        .all(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+        .then_some((domain, id))
+}
+
 impl Journal {
     pub fn new(store: Arc<dyn JournalStore>, domain: [u8; 32]) -> Self {
         Journal {
@@ -538,7 +591,168 @@ impl Journal {
         Ok(out)
     }
 
-    /// A shared store permits one outstanding ERC20 return per EVM payer and chain.
+    /// Record the highest signed nonce before offering an exact transaction to any RPC.
+    pub fn retain_payer_send(&self, record: &ReturnRecord, raw: &[u8]) -> Result<()> {
+        let tx = decode_signed_tx(raw).map_err(Error::Other)?;
+        let key = format!(
+            "nb2/payer-sends/v1/{}/{}/{}/{}",
+            tx.request.chain_id,
+            to_hex(&tx.from),
+            &record.base.domain[2..],
+            &record.return_id[2..]
+        );
+        loop {
+            let previous = self.store.get(&key)?;
+            if previous
+                .as_deref()
+                .map(undec64)
+                .transpose()?
+                .is_some_and(|n| n >= tx.request.nonce)
+                || self
+                    .store
+                    .put_if(&key, previous.as_deref(), &dec(tx.request.nonce))?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Register separately retained signed packets before an upgraded wallet can reuse a payer.
+    pub fn index_payer_sends(&self, record: &ReturnRecord, signed: &[&[u8]]) -> Result<()> {
+        for raw in signed {
+            self.retain_payer_send(record, raw)?;
+        }
+        self.store.put_if(
+            &format!(
+                "nb2/payer-index/v1/{}/{}",
+                &record.base.domain[2..],
+                &record.return_id[2..]
+            ),
+            None,
+            "1",
+        )?;
+        Ok(())
+    }
+
+    fn other_payer_resources(
+        &self,
+        chain_id: u64,
+        payer: &[u8],
+        target: &str,
+        owns_slot: bool,
+        check: &PayerCheck<'_>,
+    ) -> Result<PayerCommitments> {
+        let address = hex(payer);
+        let sends = format!("nb2/payer-sends/v1/{chain_id}/{}/", to_hex(payer));
+        let (own_domain, own_id) = return_path(target).expect("validated journal key");
+        let own_sends = format!("{sends}{own_domain}/{own_id}");
+        let mut highest = None;
+        let mut out = PayerCommitments::default();
+        let mut draining = false;
+        let mut include_nonce =
+            |nonce| highest = Some(highest.map_or(nonce, |previous: u64| previous.max(nonce)));
+        for key in self.store.list("nb2/v1/")? {
+            let Some((domain, id)) = return_path(&key) else {
+                continue;
+            };
+            let Some(raw) = self.store.get(&key)? else {
+                return refuse(
+                    WalletReason::JournalNotPersisted,
+                    "return disappeared during payer reconciliation",
+                );
+            };
+            let rec: ReturnRecord =
+                serde_json::from_str(&raw).map_err(|err| Error::Other(err.to_string()))?;
+            if rec.base.domain != format!("0x{domain}")
+                || rec.return_id != format!("0x{id}")
+                || rec.base.kind != "return"
+                || rec.base.version != JOURNAL_VERSION
+                || rec.base.format != JOURNAL_FORMAT
+            {
+                return refuse(WalletReason::BadInput, "invalid return in shared journal");
+            }
+            let executing =
+                rec.extra.get("executionPayer").and_then(Value::as_str) == Some(&address);
+            let active = rec.status != "planned"
+                && rec.status != "paid"
+                && rec.extra.contains_key("recovery")
+                && (rec.payer.as_deref().unwrap_or(&rec.recipient) == address || executing);
+            if key == target {
+                draining = active;
+                continue;
+            }
+            for send in &rec.sends {
+                let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
+                if tx.request.chain_id == chain_id && tx.from.as_slice() == payer {
+                    include_nonce(tx.request.nonce);
+                }
+            }
+            if self
+                .store
+                .get(&format!("nb2/domain-chain/v1/{domain}"))?
+                .as_deref()
+                .map(undec64)
+                .transpose()?
+                .is_some_and(|known| known != chain_id)
+            {
+                continue;
+            }
+            if rec.status == "paid"
+                && executing
+                && self
+                    .store
+                    .get(&format!("nb2/payer-index/v1/{domain}/{id}"))?
+                    .as_deref()
+                    != Some("1")
+            {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "paid return needs its local signed sends indexed",
+                );
+            }
+            if active {
+                let recovery = &rec.extra["recovery"];
+                out.fees += undec(recovery["totalFee"].as_str().unwrap_or(""))?;
+                let calls = undec64(recovery["calls"].as_str().unwrap_or(""))?;
+                out.calls += u128::from(calls);
+                let cap = recovery["envelope"]["maxNonce"]
+                    .as_str()
+                    .map(undec64)
+                    .transpose()?;
+                out.nonce_windows.push((calls, cap));
+            }
+        }
+        for key in self.store.list(&sends)? {
+            if key == own_sends {
+                continue;
+            }
+            let Some(value) = self.store.get(&key)? else {
+                return refuse(
+                    WalletReason::JournalNotPersisted,
+                    "signed nonce disappeared during payer reconciliation",
+                );
+            };
+            include_nonce(undec64(&value)?);
+        }
+        if let Some(nonce) = highest {
+            let finalized = check.finalized_nonce.map(|read| read()).transpose()?;
+            if finalized.map_or(true, |finalized| finalized <= nonce) {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "payer has a local signed nonce awaiting finalization",
+                );
+            }
+            out.finalized_nonce = finalized;
+        }
+        if out.calls != 0 && (!check.drain || (!draining && !owns_slot)) {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "payer already has an outstanding ERC20 return",
+            );
+        }
+        Ok(out)
+    }
+
     pub fn check_return_payer(
         &self,
         chain_id: u64,
@@ -546,61 +760,95 @@ impl Journal {
         id: &str,
         reserve: bool,
     ) -> Result<()> {
+        self.check_payer(chain_id, payer, id, reserve, &PayerCheck::default())
+            .map(|_| ())
+    }
+
+    /// Admit one new return per payer. Existing funded returns can drain in sequence.
+    pub fn check_payer(
+        &self,
+        chain_id: u64,
+        payer: &[u8],
+        id: &str,
+        reserve: bool,
+        check: &PayerCheck<'_>,
+    ) -> Result<PayerCommitments> {
         if payer.len() != 20 {
             return refuse(WalletReason::BadInput, "invalid ERC20 payer");
         }
         unhex_n::<32>(id)?;
+        let domain_key = format!("nb2/domain-chain/v1/{}", to_hex(&self.domain));
+        self.store.put_if(&domain_key, None, &dec(chain_id))?;
+        if self.store.get(&domain_key)?.as_deref() != Some(&dec(chain_id)) {
+            return refuse(
+                WalletReason::BadInput,
+                "journal domain has another chain ID",
+            );
+        }
         let key = format!("nb2/payer/v1/{chain_id}/{}", to_hex(payer));
         let target = self.key("return", Some(&id[2..]));
-        let address = hex(payer);
-        let occupied = || {
-            fail_d(
-                Rule::CapacityPreflight,
-                "payer already has an outstanding ERC20 return",
-            )
-        };
-        for other in self.returns()? {
-            if other.return_id != id
-                && other.status != "planned"
-                && other.status != "paid"
-                && other.extra.get("recovery").is_some()
-                && (other.payer.as_deref().unwrap_or(&other.recipient) == address
-                    || other.extra.get("executionPayer").and_then(Value::as_str) == Some(&address))
-            {
-                return occupied();
-            }
-        }
         loop {
             let held = self.store.get(&key)?;
-            if held.as_deref() == Some(&target) {
-                return Ok(());
-            }
-            if let Some(held) = held.as_deref() {
-                let valid = held
-                    .strip_prefix("nb2/v1/")
-                    .and_then(|s| s.split_once("/return/"));
-                if !valid.is_some_and(|(domain, id)| {
-                    [domain, id].into_iter().all(|s| {
-                        s.len() == 64
-                            && s.bytes()
-                                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                    })
-                }) {
+            let owner = held
+                .as_deref()
+                .map(|s| s.split('#').next().expect("first component"));
+            if let Some(owner) = owner.filter(|s| !s.is_empty() && *s != target) {
+                if return_path(owner).is_none() {
                     return refuse(WalletReason::BadInput, "invalid ERC20 payer reservation");
                 }
-                let previous = self.store.get(held)?;
-                if !previous
+                if !self
+                    .store
+                    .get(owner)?
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<ReturnRecord>(s).ok())
                     .is_some_and(|r| r.status == "paid" && r.paid.is_some())
                 {
-                    return occupied();
+                    return fail_d(
+                        Rule::CapacityPreflight,
+                        "payer already has an outstanding ERC20 return",
+                    );
                 }
             }
-            if !reserve || self.store.put_if(&key, held.as_deref(), &target)? {
-                return Ok(());
+            let mut out = self.other_payer_resources(
+                chain_id,
+                payer,
+                &target,
+                owner == Some(&target),
+                check,
+            )?;
+            if owner == Some(&target) {
+                if !reserve
+                    || held.as_deref() == Some(&target)
+                    || self.store.put_if(&key, held.as_deref(), &target)?
+                {
+                    return Ok(out);
+                }
+                continue;
             }
+            if !reserve {
+                return Ok(out);
+            }
+            let claim = check
+                .fence
+                .map_or_else(|| target.clone(), |fence| format!("{target}#{fence}"));
+            if !self.store.put_if(&key, held.as_deref(), &claim)? {
+                continue;
+            }
+            if check.fence.is_some() {
+                out.fence = Some(PayerFence { key, claim });
+            }
+            return Ok(out);
         }
+    }
+
+    pub fn cancel_unsigned_return(&self, id: &str, fence: PayerFence) -> Result<()> {
+        if self
+            .ret(id)?
+            .is_some_and(|r| r.status == "planned" && r.burn_request.is_none())
+        {
+            self.store.put_if(&fence.key, Some(&fence.claim), "")?;
+        }
+        Ok(())
     }
 }
 

@@ -27,7 +27,7 @@ import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, 
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
-  Journal, dec, hex, undec, unhex, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
+  Journal, dec, hex, undec, unhex, payerNonceLimit, type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
 import { recoveredSettlementEta, recoveryGeneration, type RecoveryDeployment } from './recovery.js';
 import { preflightRecovery, quoteErc20Call, quoteOrdinaryExecution, type Erc20SigningBounds, type OrdinaryCalibrationRange,
@@ -129,6 +129,19 @@ export async function previewErc20Recipient(evm: EvmReader, cfg: Config, recipie
     if (marker && eq(marker, assetSelector('PayoutPreviewPassed()'))) return;
   }
   return refuse('RecipientRefused', 'the ERC20 payout simulation did not confirm an exact transfer');
+}
+
+/** Verify the three deployed dependencies against the authenticated recovery runtime's immutables. */
+export async function verifyRecoveryDependencies(evm: EvmReader, recovery: Uint8Array): Promise<void> {
+  const [receipts, lineage, receiptHash, lineageHash, registryHash] = await Promise.all(
+    ['RECEIPTS()', 'LINEAGE()', 'RECEIPTS_HASH()', 'LINEAGE_HASH()', 'REGISTRY_HASH()'].map((getter) => evm.call(recovery, assetSelector(getter))));
+  const address = (word: Uint8Array) => word.length === 32 && beInt(word.subarray(0, 12)) === 0n ? word.subarray(12) : fail('CapacityPreflight', 'invalid recovery helper address');
+  const helpers = [address(receipts), address(lineage), unhex('0xff00000000000000000000000000000000000002')];
+  const expected = [receiptHash, lineageHash, registryHash];
+  const runtimes = await Promise.all(helpers.map((helper) => evm.code(helper)));
+  if (runtimes.some((code, i) => code.length === 0 || !eq(HE(code), expected[i]))) {
+    fail('CapacityPreflight', 'recovery dependency runtime differs from its pinned hash');
+  }
 }
 /** The deployment manifest pins outside D (section 4.3; the manifest schema is NB2-09's). */
 export interface DeploymentPins {
@@ -1245,20 +1258,35 @@ export class NativeBridgeV2 {
 
   private async checkErc20Funds(record: ReturnRecord, limits: RecoveryLimits, replacing?: bigint) {
     const payer = unhex(record.payer ?? record.recipient);
-    await this.journal.checkReturnPayer(this.cfg.chainId, payer, record.returnId);
-    const [balance, pending, nonce, fees] = await Promise.all([
-      this.evm.balance(payer), this.evm.balance(payer, 'pending'), replacing ?? this.evm.nonce(payer), this.evm.fees(),
+    const other = await this.checkErc20Payer(record, payer);
+    const [free, nonce, fees] = await Promise.all([
+      this.freeErc20PayerBalance(payer, other), replacing ?? this.evm.nonce(payer), this.evm.fees(),
     ]);
     const currentBid = 2n * fees.baseFee + fees.priority;
     if (currentBid > limits.maxFeePerGas || fees.priority > limits.maxPriorityFeePerGas) {
       fail('CapacityPreflight', 'current fees exceed the continuation bid limits');
     }
-    const free = balance < pending ? balance : pending;
-    return { nonce, balance: free < limits.balance ? free : limits.balance };
+    return { nonce: other.finalizedNonce !== undefined && other.finalizedNonce > nonce ? other.finalizedNonce : nonce,
+      maxNonce: payerNonceLimit(limits.maxNonce, other), balance: free < limits.balance ? free : limits.balance };
   }
 
-  private checkErc20Reserve(plan: NonNullable<ReturnRecord['recovery']>, limits: RecoveryLimits, funds: { nonce: bigint; balance: bigint }): void {
-    if (funds.nonce + undec(plan.calls) - 1n > limits.maxNonce) fail('CapacityPreflight', 'continuation schedule exceeds the declared nonce horizon');
+  private async freeErc20PayerBalance(payer: Uint8Array, other: PayerCommitments): Promise<bigint> {
+    const [balance, pending, finalized] = await Promise.all([this.evm.balance(payer), this.evm.balance(payer, 'pending'),
+      other.finalizedNonce === undefined ? undefined : this.evm.balance(payer, 'finalized')]);
+    const visible = balance < pending ? balance : pending;
+    const free = (finalized !== undefined && finalized < visible ? finalized : visible) - other.fees;
+    return free > 0n ? free : 0n;
+  }
+
+  /** Check persisted payer commitments, including nonces omitted from the pending RPC view. */
+  public checkErc20Payer(record: ReturnRecord, payer: Uint8Array, reserve = false, fence?: string) {
+    return this.journal.checkReturnPayer(this.cfg.chainId, payer, record.returnId, reserve, {
+      mode: record.status === 'planned' ? 'admit' : 'drain', finalizedNonce: () => this.evm.nonce(payer, 'finalized'), fence,
+    });
+  }
+
+  private checkErc20Reserve(plan: NonNullable<ReturnRecord['recovery']>, funds: { nonce: bigint; maxNonce: bigint; balance: bigint }): void {
+    if (funds.nonce + undec(plan.calls) - 1n > funds.maxNonce) fail('CapacityPreflight', 'continuation schedule exceeds the declared nonce horizon');
     if (undec(plan.totalFee) > funds.balance) fail('CapacityPreflight', 'insufficient free payer balance');
   }
 
@@ -1279,6 +1307,7 @@ export class NativeBridgeV2 {
         !eq(HE(runtime), deployment.runtimeHash) || !eq(HE(vault), deployment.vaultRuntimeHash)) {
       fail('CapacityPreflight', 'continuation calibration differs from the deployed graph');
     }
+    await verifyRecoveryDependencies(this.evm, recovery);
     const limits = this.erc20Limits(input);
     const funds = await this.checkErc20Funds(record, limits, replacing);
     const a = undec(record.a);
@@ -1300,7 +1329,7 @@ export class NativeBridgeV2 {
         maxFeePerGas: dec(limits.maxFeePerGas), maxPriorityFeePerGas: dec(limits.maxPriorityFeePerGas) },
       ordinary: ordinary && { gas: dec(ordinary.gas), calldataBytes: ordinary.calldataBytes,
         maxFeePerGas: dec(limits.maxFeePerGas), attemptsBeforeFallback: dec(plan.priorAttempts) } };
-    this.checkErc20Reserve(priced, limits, funds);
+    this.checkErc20Reserve(priced, funds);
     return priced;
   }
 
@@ -1470,12 +1499,25 @@ export class NativeBridgeV2 {
       await this.admitReturn(rec, held.amount, admissionSnapshot);
       await previewErc20Recipient(this.evm, this.cfg, recipient, held.amount);
       const R = encodeReturnData({ d: this.domain, asset: this.cfg.asset, recipient, amount: held.amount, minIndex: undec(rec.a) });
-      if (this.cfg.erc20) {
-        await this.journal.checkReturnPayer(this.cfg.chainId, unhex(rec.payer ?? rec.recipient), rec.returnId, true);
-        const limits = this.erc20Limits(admissionSnapshot!.erc20Recovery!);
-        this.checkErc20Reserve(rec.recovery!, limits, await this.checkErc20Funds(rec, limits));
+      const { cancel } = this.cfg.erc20 ? await this.checkErc20Payer(rec, unhex(rec.payer ?? rec.recipient), true, hex(freshMask())) : {};
+      let signing = false;
+      let declined = false;
+      let signed: Awaited<ReturnType<typeof transferRequest>>;
+      try {
+        if (this.cfg.erc20) {
+          this.checkErc20Reserve(rec.recovery!, await this.checkErc20Funds(rec, this.erc20Limits(admissionSnapshot!.erc20Recovery!)));
+          await this.journal.indexPayerSends(rec, []);
+        }
+        signed = await transferRequest(source, { publicKey: owner.publicKey, signUnlock: async (message) => {
+          signing = true;
+          try { return await owner.signUnlock(message); }
+          catch (e) { declined = e instanceof WalletError && e.reason === 'SigningDeclined'; throw e; }
+        } }, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
+      } catch (e) {
+        if (!signing || declined) await cancel?.();
+        throw e;
       }
-      const { tx, cd } = await transferRequest(source, owner, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
+      const { tx, cd } = signed;
       rec.burnTx = hex(tx);
       rec.burnRequest = hex(cd);
       const request = parseCertification(cd);
@@ -1639,8 +1681,14 @@ export class NativeBridgeV2 {
               }) || request.maxFeePerGas > undec(ordinary.maxFeePerGas) || !options.admit) {
               fail('CapacityPreflight', 'ordinary attempt exceeds its signing reserve');
             }
+            const other = await this.checkErc20Payer(fresh, signer.address, true);
+            const admitted = fresh.recovery?.envelope?.maxNonce;
+            const maxNonce = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
+            if (request.nonce < (other.finalizedNonce ?? 0n) || request.nonce > payerNonceLimit(maxNonce, other) ||
+                request.gas * request.maxFeePerGas > await this.freeErc20PayerBalance(signer.address, other)) {
+              fail('CapacityPreflight', 'ordinary attempt exceeds the remaining payer balance or nonce horizon');
+            }
           }
-          if (this.cfg.erc20) await this.journal.checkReturnPayer(this.cfg.chainId, signer.address, fresh.returnId, true);
           await options.admit?.(request, fresh.sends);
         }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
@@ -1656,6 +1704,7 @@ export class NativeBridgeV2 {
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.saneHead());
+      if (this.cfg.erc20) await this.journal.retainPayerSend(fresh, tx.raw);
       await this.journal.putReturn(fresh);
       expired = undefined;
       const r = await this.broadcastAndWait(tx);
@@ -2006,7 +2055,7 @@ export class NativeBridgeV2 {
         return { state: 'pending', txHash };
       }
       if (resubmit) {
-        if (this.cfg.erc20) await this.journal.checkReturnPayer(this.cfg.chainId, from, rec.returnId, true);
+        if (this.cfg.erc20) await this.journal.retainPayerSend(rec, raw);
         try { await this.evm.sendRaw(raw); }
         catch (error) {
           if (onExpired && error instanceof RpcError && /replacement transaction underpriced/i.test(error.message) &&

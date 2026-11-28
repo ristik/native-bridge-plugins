@@ -151,6 +151,8 @@ impl fmt::Display for Nb2Error {
 /// Non-rule outcomes the plug-in reports, and the plug-in's own safety refusals of NB2-07.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletReason {
+    /// The signer guarantees that no signature was produced.
+    SigningDeclined,
     /// A plain state() read on a deployment without stateReadOnly: not evidence (section 12.2).
     StateReadNotAdmitted,
     /// The node does not hold the block on its canonical chain: re-resolve and retry (section 12.7).
@@ -190,6 +192,7 @@ pub enum WalletReason {
 impl WalletReason {
     pub fn name(self) -> &'static str {
         match self {
+            WalletReason::SigningDeclined => "SigningDeclined",
             WalletReason::StateReadNotAdmitted => "StateReadNotAdmitted",
             WalletReason::CompanionUnknown => "CompanionUnknown",
             WalletReason::CompanionProvider => "CompanionProvider",

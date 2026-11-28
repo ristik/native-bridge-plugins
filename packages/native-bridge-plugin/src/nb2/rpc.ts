@@ -628,7 +628,7 @@ export class EvmReader {
     return bytesOf(await this.rpc.call('eth_getCode', [hexOf(address), 'latest']), 'eth_getCode');
   }
 
-  public async balance(address: Uint8Array, tag: 'latest' | 'pending' | bigint = 'latest'): Promise<bigint> {
+  public async balance(address: Uint8Array, tag: 'latest' | 'pending' | 'finalized' | bigint = 'latest'): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_getBalance', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getBalance');
   }
 
@@ -651,7 +651,7 @@ export class EvmReader {
   }
 
   /** The account nonce: 'pending' counts the pool (for signing), 'latest' only mined transactions (for deciding a send is dead). */
-  public async nonce(address: Uint8Array, tag: 'pending' | 'latest' | bigint = 'pending'): Promise<bigint> {
+  public async nonce(address: Uint8Array, tag: 'pending' | 'latest' | 'finalized' | bigint = 'pending'): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_getTransactionCount', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getTransactionCount');
   }
 

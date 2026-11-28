@@ -18,21 +18,62 @@ struct Chain {
     blocked: AtomicBool,
     probes: AtomicUsize,
     balance: AtomicU64,
+    bad_dependency: AtomicUsize,
+    finalized_nonce: AtomicU64,
+    pending_reads: AtomicUsize,
+    refuse_nonce_at: AtomicUsize,
 }
+
+const RECEIPT_HELPER: [u8; 20] = [0x76; 20];
+const LINEAGE_HELPER: [u8; 20] = [0x77; 20];
+const REGISTRY_HELPER: [u8; 20] = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
 impl JsonRpc for Chain {
     fn call(&self, method: &str, params: Value) -> core::result::Result<Value, RpcError> {
         Ok(match method {
-            "eth_getCode" => json!(if params[0] == hex0x(&self.recovery) {
-                "0x6000"
-            } else {
-                "0x"
-            }),
+            "eth_getCode" => {
+                let helper = [RECEIPT_HELPER, LINEAGE_HELPER, REGISTRY_HELPER]
+                    .iter()
+                    .position(|a| params[0] == hex0x(a));
+                match helper {
+                    Some(i) if self.bad_dependency.load(Ordering::SeqCst) == i + 1 => {
+                        json!("0x600f")
+                    }
+                    Some(i) => json!(hex0x(&[0x60, i as u8])),
+                    None if params[0] == hex0x(&self.recovery) => json!("0x6000"),
+                    None => json!("0x"),
+                }
+            }
             "eth_getBlockByNumber" => json!({"baseFeePerGas": "0x3"}),
             "eth_getBalance" => json!(format!("0x{:x}", self.balance.load(Ordering::SeqCst))),
-            "eth_getTransactionCount" => json!("0x1"),
+            "eth_getTransactionCount" if params[1] == "finalized" => json!(format!(
+                "0x{:x}",
+                self.finalized_nonce.load(Ordering::SeqCst)
+            )),
+            "eth_getTransactionCount" => {
+                let read = self.pending_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                json!(if self.refuse_nonce_at.load(Ordering::SeqCst) == read {
+                    "0x100"
+                } else {
+                    "0x1"
+                })
+            }
             "eth_maxPriorityFeePerGas" => json!("0x1"),
             "eth_call" if params[0]["data"] == hex0x(&sel("state()")) => json!(hex0x(&[0; 192])),
+            "eth_call" if params[0]["to"] == hex0x(&self.recovery) => {
+                let data = &params[0]["data"];
+                if data == &hex0x(&sel("RECEIPTS()")) {
+                    json!(hex0x(&address_word(&RECEIPT_HELPER)))
+                } else if data == &hex0x(&sel("LINEAGE()")) {
+                    json!(hex0x(&address_word(&LINEAGE_HELPER)))
+                } else {
+                    let index = ["RECEIPTS_HASH()", "LINEAGE_HASH()", "REGISTRY_HASH()"]
+                        .iter()
+                        .position(|getter| data == &hex0x(&sel(getter)))
+                        .unwrap();
+                    json!(hex0x(&he(&[&[0x60, index as u8]])))
+                }
+            }
             "eth_call" => {
                 assert!(params[0]["data"]
                     .as_str()
@@ -197,6 +238,10 @@ fn return_bridge(
         blocked: AtomicBool::new(false),
         probes: AtomicUsize::new(0),
         balance: AtomicU64::new(balance),
+        bad_dependency: AtomicUsize::new(0),
+        finalized_nonce: AtomicU64::new(1),
+        pending_reads: AtomicUsize::new(0),
+        refuse_nonce_at: AtomicUsize::new(0),
     });
     let pins = DeploymentPins {
         gamma,
@@ -649,4 +694,294 @@ fn separate_rust_journals_cannot_reserve_the_same_payer_concurrently() {
             .rule,
         Rule::CapacityPreflight
     );
+}
+
+#[test]
+fn mismatched_dependencies_keep_the_holder_signer_untouched() {
+    let (bridge, rpc, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let plan = bridge
+        .plan_return(&held, &[0xab; 20], &[0xcd; 20], Some(0))
+        .unwrap();
+    for i in 1..=3 {
+        rpc.bad_dependency.store(i, Ordering::SeqCst);
+        assert!(bridge
+            .burn(&plan.return_id, &NeverSign)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned hash"));
+    }
+    assert_eq!(
+        bridge.return_record(&plan.return_id).unwrap().status,
+        "planned"
+    );
+}
+
+#[test]
+fn peer_paid_holds_the_payer_until_the_local_recovery_nonce_is_finalized() {
+    use super::super::evm::LocalKeySigner;
+    let (bridge, rpc, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
+    let recipient = [0xab; 20];
+    let planned = bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap();
+    let mut paid = planned.record;
+    paid.return_id = hex(&[0xec; 32]);
+    bridge.journal.put_return(&paid).unwrap();
+    bridge
+        .journal
+        .check_return_payer(bridge.cfg.chain_id, &payer, &paid.return_id, true)
+        .unwrap();
+    let packet = sign_tx(
+        &signer,
+        &TxRequest {
+            chain_id: bridge.cfg.chain_id,
+            nonce: 7,
+            max_priority_fee_per_gas: 1u8.into(),
+            max_fee_per_gas: 10u8.into(),
+            gas: 2_000_000,
+            to: rpc.recovery,
+            value: BigUint::default(),
+            data: vec![0x11],
+        },
+    )
+    .unwrap();
+    bridge
+        .journal
+        .index_payer_sends(&paid, &[&packet.raw])
+        .unwrap();
+    paid.status = "paid".into();
+    paid.paid = Some(PaidRecord {
+        tx_hash: hex(&[0xdd; 32]),
+        block_number: "9".into(),
+        extra: Default::default(),
+    });
+    bridge.journal.put_return(&paid).unwrap();
+    rpc.finalized_nonce.store(7, Ordering::SeqCst);
+    assert!(bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap_err()
+        .to_string()
+        .contains("signed nonce awaiting finalization"));
+    rpc.finalized_nonce.store(8, Ordering::SeqCst);
+    bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap();
+}
+
+fn fixture_owner(held: &[u8]) -> super::super::tokenops::LocalOwner {
+    let token = decode_token(held).unwrap();
+    let parent = &token.ancestors[0].mint;
+    let parent_id = token_id_of(&parent.salt, parent.network);
+    let seed = format!("nb2-key:flat-child-0-{}", to_hex(&parent_id[..4]));
+    local_owner(&hu(&[seed.as_bytes(), &[0]]))
+}
+
+#[test]
+fn declined_signing_cancels_but_an_ambiguous_signer_keeps_the_payer() {
+    struct DecliningOwner([u8; 33], bool);
+    impl OwnerSigner for DecliningOwner {
+        fn public_key(&self) -> [u8; 33] {
+            self.0
+        }
+        fn sign_unlock(&self, _: &[u8; 32]) -> core::result::Result<[u8; 65], String> {
+            unreachable!()
+        }
+        fn sign_unlock_for_burn(&self, _: &[u8; 32]) -> Result<[u8; 65]> {
+            if self.1 {
+                refuse(WalletReason::SigningDeclined, "owner declined")
+            } else {
+                Err(Error::Other("signer disconnected".into()))
+            }
+        }
+    }
+    let (bridge, rpc, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let payer = [0xcd; 20];
+    let plan = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap();
+    let other = hex(&[0xfd; 32]);
+    rpc.refuse_nonce_at.store(
+        rpc.pending_reads.load(Ordering::SeqCst) + 2,
+        Ordering::SeqCst,
+    );
+    assert!(bridge
+        .burn(&plan.return_id, &NeverSign)
+        .unwrap_err()
+        .to_string()
+        .contains("declared nonce horizon"));
+    bridge
+        .journal
+        .check_return_payer(bridge.cfg.chain_id, &payer, &other, false)
+        .unwrap();
+    let candidate = fixture_owner(&held).public_key();
+    assert_eq!(
+        bridge
+            .burn(&plan.return_id, &DecliningOwner(candidate, true))
+            .unwrap_err()
+            .reason(),
+        Some(WalletReason::SigningDeclined)
+    );
+    bridge
+        .journal
+        .check_return_payer(bridge.cfg.chain_id, &payer, &other, false)
+        .unwrap();
+    assert!(bridge
+        .burn(&plan.return_id, &DecliningOwner(candidate, false))
+        .unwrap_err()
+        .to_string()
+        .contains("signer disconnected"));
+    assert!(bridge
+        .journal
+        .check_return_payer(bridge.cfg.chain_id, &payer, &other, false)
+        .unwrap_err()
+        .to_string()
+        .contains("outstanding ERC20 return"));
+}
+
+#[test]
+fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
+    let (bridge, _, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let chain_id = bridge.cfg.chain_id;
+    let payer = [0xcd; 20];
+    let recipient = [0xab; 20];
+    let plan = bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap();
+    let old_a = Journal::new(bridge.journal.store.clone(), [0x01; 32]);
+    let old_b = Journal::new(bridge.journal.store.clone(), [0x02; 32]);
+    let off_chain = Journal::new(bridge.journal.store.clone(), [0x03; 32]);
+    let old = |journal: &Journal, id: u8, calls: &str, fee: &str| {
+        let mut record = plan.record.clone();
+        record.base = journal.base("return");
+        record.return_id = hex(&[id; 32]);
+        record.status = "burned".into();
+        record.extra["recovery"]["calls"] = json!(calls);
+        record.extra["recovery"]["totalFee"] = json!(fee);
+        record
+    };
+    let mut a = old(&old_a, 1, "6", "60");
+    let mut b = old(&old_b, 2, "7", "70");
+    let c = old(&off_chain, 3, "80", "800");
+    off_chain
+        .check_return_payer(chain_id + 1, &payer, &c.return_id, false)
+        .unwrap();
+    off_chain.put_return(&c).unwrap();
+    old_a.put_return(&a).unwrap();
+    old_b.put_return(&b).unwrap();
+    assert!(bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap_err()
+        .to_string()
+        .contains("outstanding ERC20 return"));
+    let drain = PayerCheck {
+        drain: true,
+        ..Default::default()
+    };
+    let commitment = old_a
+        .check_payer(chain_id, &payer, &a.return_id, true, &drain)
+        .unwrap();
+    assert_eq!(commitment.fees, 70u8.into());
+    assert_eq!(commitment.calls, 7);
+    assert_eq!(commitment.nonce_limit(255), Some(248));
+    assert_eq!(commitment.nonce_limit(245), Some(245));
+    assert!(old_b
+        .check_payer(chain_id, &payer, &b.return_id, true, &drain)
+        .is_err());
+    a.status = "paid".into();
+    a.paid = Some(PaidRecord {
+        tx_hash: hex(&[1; 32]),
+        block_number: "21".into(),
+        extra: Default::default(),
+    });
+    old_a.put_return(&a).unwrap();
+    assert_eq!(
+        old_b
+            .check_payer(chain_id, &payer, &b.return_id, true, &drain)
+            .unwrap()
+            .calls,
+        0
+    );
+    b.status = "paid".into();
+    b.paid = Some(PaidRecord {
+        tx_hash: hex(&[2; 32]),
+        block_number: "22".into(),
+        extra: Default::default(),
+    });
+    old_b.put_return(&b).unwrap();
+    bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap();
+}
+
+#[test]
+fn stale_cancellation_cannot_release_a_retry_claim() {
+    let (bridge, _, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let payer = [0xcd; 20];
+    let plan = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap();
+    let chain = bridge.cfg.chain_id;
+    let id = &plan.record.return_id;
+    let mut claimed = bridge
+        .journal
+        .check_payer(
+            chain,
+            &payer,
+            id,
+            true,
+            &PayerCheck {
+                fence: Some("initial"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let retry = Journal::new(bridge.journal.store.clone(), bridge.domain);
+    assert!(retry
+        .check_payer(
+            chain,
+            &payer,
+            id,
+            true,
+            &PayerCheck {
+                fence: Some("retry"),
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .fence
+        .is_none());
+    bridge
+        .journal
+        .cancel_unsigned_return(id, claimed.fence.take().unwrap())
+        .unwrap();
+    assert!(retry
+        .check_return_payer(chain, &payer, &hex(&[0xde; 32]), true)
+        .is_err());
 }

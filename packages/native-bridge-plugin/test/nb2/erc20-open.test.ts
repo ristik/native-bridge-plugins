@@ -10,7 +10,8 @@ import { decodeConfig, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { decodeReceiptBacking, depositedData, TOPIC } from '../../src/nb2/deposit.js';
 import { signTx } from '../../src/nb2/evm.js';
-import { MemoryJournalStore } from '../../src/nb2/journal.js';
+import { Journal, MemoryJournalStore, payerNonceLimit } from '../../src/nb2/journal.js';
+import { WalletError } from '../../src/nb2/errors.js';
 import { type RecoveryCalibrationRange, type RecoveryShape } from '../../src/nb2/recovery-cost.js';
 import { RpcError, type JsonRpc } from '../../src/nb2/rpc.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
@@ -64,16 +65,31 @@ async function world() {
   const agg = new FakeAggregator(tip, false, 2n);
 
   let preview: 'exact' | 'blocked' = 'exact';
+  let badDependency = -1;
+  let finalNonce = 0n;
+  let pendingNonce: bigint | undefined;
+  const dependencies = [new Uint8Array(20).fill(0x76), new Uint8Array(20).fill(0x77), bytes('0xff00000000000000000000000000000000000002')];
+  const dependencyCode = dependencies.map((_, i) => Uint8Array.of(0x60, i));
   let probes = 0;
   const rpc: JsonRpc = {
     async call<T>(method: string, params: unknown[]): Promise<T> {
       if (method === 'eth_getCode' && typeof params[0] === 'string') {
+        const helper = dependencies.findIndex((address) => hex(address) === params[0]);
+        if (helper !== -1) return (helper === badDependency ? '0x600f' : hex(dependencyCode[helper])) as T;
         const runtime = deployment.code[params[0].toLowerCase()];
         if (runtime) return runtime as T;
       }
+      if (method === 'eth_getTransactionCount' && params[1] === 'finalized') return ('0x' + finalNonce.toString(16)) as T;
+      if (method === 'eth_getTransactionCount' && params[1] === 'pending' && pendingNonce !== undefined) return ('0x' + pendingNonce.toString(16)) as T;
       if (method === 'eth_getBlockByNumber' && params[0] === '0x0') return deployment.genesis as T;
       if (method === 'eth_call') {
         const { to, data, gas } = params[0] as { to: string; data: string; gas?: string };
+        if (to === a.recovery.toLowerCase()) {
+          if (data === selector('RECEIPTS()')) return hex(addressWord(dependencies[0])) as T;
+          if (data === selector('LINEAGE()')) return hex(addressWord(dependencies[1])) as T;
+          const helper = ['RECEIPTS_HASH()', 'LINEAGE_HASH()', 'REGISTRY_HASH()'].findIndex((getter) => data === selector(getter));
+          if (helper !== -1) return hex(HE(dependencyCode[helper])) as T;
+        }
         if (to === factory) {
           if (data === selector('config(address)') + toHex(addressWord(cfg.erc20!.token))) return a.config as T;
           if (data === selector('VAULT_INITCODE_HASH()')) return deployment.vaultInitcodeHash as T;
@@ -105,7 +121,9 @@ async function world() {
         activationTx: activation.tx, fundingQualified: true },
     } };
   };
-  return { agg, a, cfg, call, payer, tip, activationRound, options, blockRecipient: () => { preview = 'blocked'; }, probes: () => probes };
+  return { agg, a, cfg, call, payer, tip, activationRound, options, blockRecipient: () => { preview = 'blocked'; }, probes: () => probes,
+    setBadDependency: (value: number) => { badDependency = value; }, finalized: (nonce: bigint) => { finalNonce = nonce; },
+    pending: (nonce?: bigint) => { pendingNonce = nonce; } };
 }
 
 test('normal ERC20 open authenticates the second deployed activation and refreshes genesis-only trust', async () => {
@@ -205,6 +223,12 @@ test('the second deposit in one certified receipt mints and the bridge prices th
   await assert.rejects(bridge.burn(planned.returnId, signer, { erc20Recovery: {
     ...input, calibration: { ...input.calibration, ranges: singletonRuns }, signingBounds: { ...input.signingBounds!, maxRunCalls: 1 },
   } }), /Run schedule exceeds the qualified progress window/);
+  for (let helper = 0; helper < 3; helper++) {
+    x.setBadDependency(helper);
+    await assert.rejects(bridge.burn(planned.returnId, signer, admission), /pinned hash/);
+    assert.equal(signatures, 0);
+  }
+  x.setBadDependency(-1);
   const before = x.agg.calls;
   x.blockRecipient();
   await assert.rejects(bridge.burn(planned.returnId, signer, admission), { reason: 'RecipientRefused' });
@@ -255,4 +279,93 @@ test('separate ERC20 SDK instances sharing a store reserve the payer before eith
   erc20Recovery.limits.maxNonce++;
   await bridge.burn(loser.returnId, signer, admission);
   assert.equal(signed, 2);
+});
+
+test('peer Paid keeps the payer unavailable while a local recovery nonce can still be included', async () => {
+  const { x, bridge, owner, firstHeld, held } = await heldPair();
+  const admission = { erc20Recovery: admissionFor(x) };
+  const first = await bridge.planReturn(firstHeld, recipient, x.payer.address, { admission });
+  await bridge.burn(first.returnId, owner, admission);
+  const raw = await signTx(x.payer, { chainId: x.cfg.chainId, nonce: 7n, gas: 2_000_000n,
+    maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
+  const paid = (await bridge.journal.retForUpdate(hex(first.returnId)))!;
+  await bridge.journal.retainPayerSend(paid, raw.raw);
+  await bridge.journal.putReturn({ ...paid, status: 'paid', paid: { txHash: hex(key('peer-paid')), blockNumber: '190' } });
+  x.finalized(7n);
+  await assert.rejects(bridge.planReturn(held, recipient, x.payer.address, { admission }), /signed nonce awaiting finalization/);
+  x.finalized(8n);
+  await bridge.planReturn(held, recipient, x.payer.address, { admission });
+});
+
+test('an unsigned refusal releases the payer and an ambiguous signer response keeps its claim', async () => {
+  class Store extends MemoryJournalStore {
+    onClaim?: () => void;
+    override async putIf(key: string, expected: string | null, value: string): Promise<boolean> {
+      const written = await super.putIf(key, expected, value);
+      if (written && key.startsWith('nb2/payer/v1/') && value.includes('#')) this.onClaim?.();
+      return written;
+    }
+  }
+  const store = new Store();
+  const { x, bridge, owner, firstHeld, held } = await heldPair(store);
+  const admission = { erc20Recovery: admissionFor(x) };
+  const a = await bridge.planReturn(firstHeld, recipient, x.payer.address, { admission });
+  const b = await bridge.planReturn(held, recipient, x.payer.address, { admission });
+  store.onClaim = () => x.pending(256n);
+  await assert.rejects(bridge.burn(a.returnId, { ...owner, signUnlock: async () => assert.fail('nonce recheck must precede signing') }, admission), /declared nonce horizon/);
+  store.onClaim = undefined;
+  x.pending();
+  await bridge.planReturn(held, recipient, x.payer.address, { admission });
+  await assert.rejects(bridge.burn(a.returnId, { ...owner, signUnlock: async () => { throw new WalletError('SigningDeclined'); } }, admission), { reason: 'SigningDeclined' });
+  await assert.rejects(bridge.burn(b.returnId, { ...owner, signUnlock: async () => { throw new Error('signer disconnected'); } }, admission), /signer disconnected/);
+  assert.equal((await bridge.journal.ret(hex(b.returnId)))?.status, 'planned');
+  await assert.rejects(bridge.burn(a.returnId, owner, admission), /outstanding ERC20 return/);
+});
+
+test('legacy returns across domains keep their budgets and can claim the payer in sequence', async () => {
+  const { x, bridge, held, store } = await heldPair();
+  const chainId = x.cfg.chainId;
+  const payer = x.payer.address;
+  const admission = { erc20Recovery: admissionFor(x) };
+  const planned = await bridge.planReturn(held, recipient, payer, { admission });
+  const a = new Journal(store, key('old vault a'));
+  const b = new Journal(store, key('old vault b'));
+  const another = new Journal(store, key('known different chain'));
+  const old = (journal: Journal, tag: string, calls: string, totalFee: string) => ({
+    ...planned.record, ...journal.base(), returnId: hex(key(tag)), status: 'burned' as const,
+    recovery: { ...planned.record.recovery!, calls, totalFee },
+  });
+  const first = old(a, 'legacy return a', '6', '60');
+  const second = old(b, 'legacy return b', '7', '70');
+  const offChain = old(another, 'unrelated chain return', '80', '800');
+  await another.checkReturnPayer(chainId + 1n, payer, offChain.returnId);
+  await another.putReturn(offChain);
+  await a.putReturn(first);
+  await b.putReturn(second);
+
+  await assert.rejects(bridge.planReturn(held, recipient, payer, { admission }), /outstanding ERC20 return/);
+  const other = await a.checkReturnPayer(chainId, payer, first.returnId, true, { mode: 'drain' });
+  assert.equal(other.fees, 70n);
+  assert.equal(other.calls, 7n);
+  assert.equal(payerNonceLimit(255n, other), 248n);
+  assert.equal(payerNonceLimit(245n, other), 245n, 'the current return may have an earlier deadline');
+  await assert.rejects(b.checkReturnPayer(chainId, payer, second.returnId, true, { mode: 'drain' }), /outstanding ERC20 return/);
+  await a.retForUpdate(first.returnId);
+  await a.putReturn({ ...first, status: 'paid', paid: { txHash: hex(key('legacy paid a')), blockNumber: '21' } });
+  assert.equal((await b.checkReturnPayer(chainId, payer, second.returnId, true, { mode: 'drain' })).calls, 0n);
+  await b.retForUpdate(second.returnId);
+  await b.putReturn({ ...second, status: 'paid', paid: { txHash: hex(key('legacy paid b')), blockNumber: '22' } });
+  await bridge.planReturn(held, recipient, payer, { admission });
+});
+
+test('a stale unsigned cancellation cannot release a concurrent retry’s payer claim', async () => {
+  const { x, bridge, held } = await heldPair();
+  const planned = await bridge.planReturn(held, recipient, x.payer.address, { admission: { erc20Recovery: admissionFor(x) } });
+  const journal = bridge.journal;
+  const { cancel } = await journal.checkReturnPayer(x.cfg.chainId, x.payer.address, planned.record.returnId, true, { fence: hex(key('first attempt')) });
+  assert.ok(cancel);
+  const retry = new Journal(journal.store, bridge.domain);
+  await retry.checkReturnPayer(x.cfg.chainId, x.payer.address, planned.record.returnId, true, { fence: hex(key('retry')) });
+  await cancel();
+  await assert.rejects(journal.checkReturnPayer(x.cfg.chainId, x.payer.address, hex(key('other return')), true), /outstanding ERC20 return/);
 });

@@ -12,8 +12,9 @@
  * (they exceed 2^53). A record is written whole; `put` resolves only once the record is durable. The plug-in writes each record
  * BEFORE the step it enables (secret before value, burn request before certification, every signed transaction before broadcast).
  */
-import { fromHex, toHex } from '../bytes.js';
+import { eq as eqBytes, fromHex, toHex } from '../bytes.js';
 import { fail, refuse } from './errors.js';
+import { decodeSignedTx } from './evm.js';
 
 export const JOURNAL_FORMAT = 'unicity-nb2-journal';
 export const JOURNAL_VERSION = 1;
@@ -204,6 +205,37 @@ export function undec(s: Dec): bigint {
   return BigInt(s);
 }
 
+const returnKey = /^nb2\/v1\/([0-9a-f]{64})\/return\/([0-9a-f]{64})$/;
+
+export interface PayerCheck {
+  mode?: 'admit' | 'drain';
+  finalizedNonce?: () => Promise<bigint>;
+  /** A unique fence for a new holder signing attempt. */
+  fence?: Hex;
+}
+
+export interface PayerCommitments {
+  fees: bigint;
+  calls: bigint;
+  nonceWindows?: { calls: bigint; maxNonce?: bigint }[];
+  finalizedNonce?: bigint;
+  cancel?: () => Promise<void>;
+}
+
+/** Last nonce this return may use while leaving feasible nonce windows for the older returns. */
+export function payerNonceLimit(maxNonce: bigint, other: PayerCommitments): bigint {
+  const windows = (other.nonceWindows ?? []).map((w) => ({ ...w, maxNonce: w.maxNonce ?? maxNonce }));
+  windows.sort((a, b) => a.maxNonce === b.maxNonce ? 0 : a.maxNonce < b.maxNonce ? -1 : 1);
+  let calls = 0n;
+  let limit = maxNonce;
+  for (const window of windows) {
+    calls += window.calls;
+    const before = window.maxNonce - calls;
+    if (before < limit) limit = before;
+  }
+  return limit;
+}
+
 /** The typed journal over a store, keyed by deployment. */
 export class Journal {
   public readonly prefix: string;
@@ -311,32 +343,124 @@ export class Journal {
     return out;
   }
 
-  /** A shared store permits one outstanding ERC20 return per EVM payer and chain. */
-  public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false): Promise<void> {
-    if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
-    const key = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
-    const target = this.key('return', id.slice(2));
-    // Older journals have no payer slot. Respect their funded returns before claiming one.
-    for (const other of await this.returns()) {
-      if (other.returnId !== id && other.status !== 'planned' && other.status !== 'paid' && other.recovery &&
-        ((other.payer ?? other.recipient) === hex(payer) || other.executionPayer === hex(payer))) {
-        fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
-      }
+  public async allReturns(): Promise<{ key: string; record: ReturnRecord }[]> {
+    const records: { key: string; record: ReturnRecord }[] = [];
+    for (const key of await this.store.list('nb2/v1/')) {
+      const match = returnKey.exec(key);
+      if (!match) continue;
+      const raw = await this.store.get(key);
+      if (raw === null) refuse('JournalNotPersisted', 'return disappeared during payer reconciliation');
+      const record = JSON.parse(raw) as ReturnRecord;
+      if (record.domain !== '0x' + match[1] || record.returnId !== '0x' + match[2] || record.kind !== 'return'
+        || record.format !== JOURNAL_FORMAT || record.version !== JOURNAL_VERSION) refuse('BadInput', 'invalid return in shared journal');
+      records.push({ key, record });
     }
+    return records;
+  }
+
+  /** Record the highest signed nonce before offering an exact transaction to any RPC. */
+  public async retainPayerSend(record: ReturnRecord, raw: Uint8Array): Promise<void> {
+    const { from, request } = decodeSignedTx(raw);
+    const key = `nb2/payer-sends/v1/${request.chainId}/${toHex(from)}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
     for (;;) {
-      const held = await this.store.get(key);
-      if (held === target) return;
-      if (held !== null) {
-        if (!/^nb2\/v1\/[0-9a-f]{64}\/return\/[0-9a-f]{64}$/.test(held)) refuse('BadInput', 'invalid ERC20 payer reservation');
-        const raw = await this.store.get(held);
-        const previous = raw === null ? null : JSON.parse(raw) as ReturnRecord;
-        if (previous?.status !== 'paid' || !previous.paid) {
-          fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
-        }
-      }
-      if (!reserve || await this.store.putIf(key, held, target)) return;
+      const previous = await this.store.get(key);
+      if ((previous !== null && undec(previous) >= request.nonce) || await this.store.putIf(key, previous, dec(request.nonce))) return;
     }
   }
+
+  /** Mark a return only after indexing every separately journaled signed recovery packet. */
+  public async indexPayerSends(record: ReturnRecord, raw: readonly Uint8Array[]): Promise<void> {
+    for (const signed of raw) await this.retainPayerSend(record, signed);
+    const key = `nb2/payer-index/v1/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+    await this.store.putIf(key, null, '1');
+  }
+
+  private async payerCommitments(chainId: bigint, payer: Uint8Array, target: string, ownsSlot: boolean, options: PayerCheck): Promise<PayerCommitments> {
+    const address = hex(payer);
+    const path = `nb2/payer-sends/v1/${chainId}/${toHex(payer)}/`;
+    const [, domain, id] = returnKey.exec(target)!;
+    const own = `${domain}/${id}`;
+    let highest: bigint | undefined;
+    const commitment: PayerCommitments = { fees: 0n, calls: 0n };
+    const includeNonce = (nonce: bigint) => { if (highest === undefined || nonce > highest) highest = nonce; };
+    const active = (rec: ReturnRecord) => rec.status !== 'planned' && rec.status !== 'paid' && !!rec.recovery &&
+      ((rec.payer ?? rec.recipient) === address || rec.executionPayer === address);
+    let draining = false;
+    for (const { key, record: rec } of await this.allReturns()) {
+      if (key === target) {
+        draining = active(rec);
+        continue;
+      }
+      for (const send of rec.sends) {
+        const { from, request } = decodeSignedTx(unhex(send.raw));
+        if (request.chainId === chainId && eqBytes(from, payer)) includeNonce(request.nonce);
+      }
+      const registered = await this.store.get(`nb2/domain-chain/v1/${rec.domain.slice(2)}`);
+      // Pre-upgrade returns without chain metadata remain protected until their domain is opened.
+      if (registered !== null && undec(registered) !== chainId) continue;
+      if (rec.status === 'paid' && rec.executionPayer === address &&
+          await this.store.get(`nb2/payer-index/v1/${rec.domain.slice(2)}/${rec.returnId.slice(2)}`) !== '1') {
+        fail('CapacityPreflight', 'paid return needs its local signed sends indexed');
+      }
+      if (!active(rec)) continue;
+      commitment.fees += undec(rec.recovery!.totalFee);
+      const calls = undec(rec.recovery!.calls);
+      commitment.calls += calls;
+      const cap = rec.recovery!.envelope?.maxNonce;
+      (commitment.nonceWindows ??= []).push({ calls, maxNonce: cap === undefined ? undefined : undec(cap) });
+    }
+    for (const key of await this.store.list(path)) {
+      if (key === path + own) continue;
+      const value = await this.store.get(key);
+      if (value === null) refuse('JournalNotPersisted', 'signed nonce disappeared during payer reconciliation');
+      includeNonce(undec(value));
+    }
+    if (highest !== undefined) {
+      const finalized = await options.finalizedNonce?.();
+      if (finalized === undefined || finalized <= highest) fail('CapacityPreflight', 'payer has a local signed nonce awaiting finalization');
+      commitment.finalizedNonce = finalized;
+    }
+    if (commitment.calls !== 0n && (options.mode !== 'drain' || (!draining && !ownsSlot))) {
+      fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
+    }
+    return commitment;
+  }
+
+  /** Admit one new return per payer. Existing funded returns can drain in sequence. */
+  public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false, options: PayerCheck = {}): Promise<PayerCommitments> {
+    if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
+    const domainKey = `nb2/domain-chain/v1/${toHex(this.domain)}`;
+    await this.store.putIf(domainKey, null, dec(chainId));
+    if (await this.store.get(domainKey) !== dec(chainId)) refuse('BadInput', 'journal domain has another chain ID');
+    const key = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
+    const target = this.key('return', id.slice(2));
+    for (;;) {
+      const held = await this.store.get(key);
+      const owner = held?.split('#')[0];
+      if (owner && owner !== target) {
+        if (!returnKey.test(owner)) refuse('BadInput', 'invalid ERC20 payer reservation');
+        const raw = await this.store.get(owner);
+        const previous = raw === null ? null : JSON.parse(raw) as ReturnRecord;
+        if (previous?.status !== 'paid' || !previous.paid) fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
+      }
+      const commitment = await this.payerCommitments(chainId, payer, target, owner === target, options);
+      if (owner === target) {
+        if (!reserve || held === target) return commitment;
+        // A concurrent retry adopts the reservation. The old attempt can no longer cancel it.
+        if (await this.store.putIf(key, held!, target)) return commitment;
+        continue;
+      }
+      if (!reserve) return commitment;
+      const claimed = options.fence ? target + '#' + options.fence : target;
+      if (!await this.store.putIf(key, held, claimed)) continue;
+      if (options.fence) commitment.cancel = async () => {
+        const current = await this.ret(id);
+        if (current?.status === 'planned' && !current.burnRequest) await this.store.putIf(key, claimed, '');
+      };
+      return commitment;
+    }
+  }
+
 }
 
 /**

@@ -36,7 +36,11 @@ a record. Within one process, calls on the same record are serialized.
 
 `<D>` is the deployment domain `D = H_U(Γ)`, in lowercase hex without `0x`. A record whose `domain` differs from its key's is refused.
 
-ERC20 returns also use `nb2/payer/v1/<chainId>/<payer>`, with a decimal chain ID and lowercase payer address without `0x`. Its value is the full return record key. Both SDKs claim the payer with the store's durable compare-and-swap before signing. A different outstanding return uses a different payer, even across vault domains in the same store. The same return can retry after interruption. A verified Paid entry makes its payer available for the next claim.
+ERC20 returns also use `nb2/payer/v1/<chainId>/<payer>`, with a decimal chain ID and lowercase payer address without `0x`. Its value is the full return record key, optionally followed by `#` and a unique signing-attempt fence. Both SDKs claim the payer with the store's durable compare-and-swap before signing. After a failed pre-sign check or an explicit `SigningDeclined`, only the holder of the matching fence can clear the claim. A concurrent retry adopts the claim and disables the old cancellation. Ambiguous signing retains the claim.
+
+`nb2/domain-chain/v1/<D>` associates a vault domain with its chain. Outstanding pre-upgrade returns are read across the shared store. A legacy domain with no chain association is treated as a possible commitment for the payer until its chain is established. Funded legacy returns may drain in sequence while retaining the other returns' quoted fees and nonce capacity. A new burn waits until the older commitments clear.
+
+`nb2/payer-sends/v1/<chainId>/<payer>/<D>/<id>` records the greatest locally signed nonce for a return. `nb2/payer-index/v1/<D>/<id>` records completion of indexing separately journaled packets. The wallet indexes pending, replaced and retained recovery packets when it opens. A certified peer Paid can settle the return while a local packet still has a live nonce. Payer reuse waits for the configured execution RPC's finalized account nonce to pass the greatest committed nonce. Admission also accounts for that finalized nonce and reads the finalized balance when reconciling a previously signed commitment.
 
 ## Encodings
 
