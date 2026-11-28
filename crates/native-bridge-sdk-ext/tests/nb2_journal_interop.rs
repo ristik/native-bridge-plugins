@@ -14,10 +14,12 @@ use native_bridge_sdk_ext::nb2::bridge::NativeBridgeV2;
 use std::sync::atomic::Ordering;
 
 use native_bridge_sdk_ext::nb2::abi::deposit_calldata;
-use native_bridge_sdk_ext::nb2::deposit::first_owner_of;
-use native_bridge_sdk_ext::nb2::errors::WalletReason;
+use native_bridge_sdk_ext::nb2::deposit::{
+    decode_receipt_backing, encode_receipt_backing, first_owner_of, limits::RECEIPT_LEAF_NODE_BYTES,
+};
+use native_bridge_sdk_ext::nb2::errors::{Rule, WalletReason};
 use native_bridge_sdk_ext::nb2::evm::{sign_tx, EvmSigner, TxRequest};
-use native_bridge_sdk_ext::nb2::journal::{unhex_n, MemoryJournalStore};
+use native_bridge_sdk_ext::nb2::journal::{unhex, unhex_n, MemoryJournalStore};
 use native_bridge_sdk_ext::nb2::tokenops::{local_owner, OwnerSigner};
 use native_bridge_sdk_ext::nb2::util::hex0x;
 use nb2_world::*;
@@ -30,6 +32,44 @@ const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/nb2-journal/
 
 fn big(v: u64) -> BigUint {
     BigUint::from(v)
+}
+
+#[test]
+fn an_older_proven_deposit_reports_its_oversized_receipt() {
+    let w = setup();
+    let b = NativeBridgeV2::open(w.options(WALLET, World::store())).unwrap();
+    let payer = w.evm_account("cached deposit payer");
+    let owner = local_owner(&key("cached deposit owner"));
+    let plan = b.plan_deposit(&big(7), &owner.public_key()).unwrap();
+    b.submit_deposit(&plan, &payer).unwrap();
+    b.collect_deposit_proof(plan.intent).unwrap();
+    let mut saved = b.journal.deposit(plan.intent).unwrap().unwrap();
+    let mut j = decode_receipt_backing(&unhex(saved.reason.as_ref().unwrap()).unwrap()).unwrap();
+    j.proof
+        .nodes
+        .last_mut()
+        .unwrap()
+        .resize(RECEIPT_LEAF_NODE_BYTES + 1, 0);
+    saved.reason = Some(hex0x(&encode_receipt_backing(&j)));
+    b.journal.put_deposit(&saved).unwrap();
+    let calls = w.agg.st.lock().unwrap().calls;
+    for err in [
+        b.collect_deposit_proof(plan.intent).unwrap_err(),
+        b.mint(plan.intent).unwrap_err(),
+    ] {
+        let err = err.rule().unwrap();
+        assert_eq!(err.rule, Rule::InputTooLarge);
+        assert!(err
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("deposit receipt exceeds the offline proof limits"));
+    }
+    assert_eq!(
+        b.journal.deposit(plan.intent).unwrap().unwrap().status,
+        "proven"
+    );
+    assert_eq!(w.agg.st.lock().unwrap().calls, calls);
 }
 
 /// Stage A in a fresh world; the snapshot after it. Every intermediate state the journal can hold is left for stage B:

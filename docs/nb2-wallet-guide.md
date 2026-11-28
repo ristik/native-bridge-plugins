@@ -115,6 +115,13 @@ for pending and completed attempts. Ordinary and recovered attempts from the sam
 share a total fee budget in the local return journal. Use a dedicated payer account while
 this flow is active.
 
+Run and Advance checkpoints also need a reader that serves `eth_getProof` by block hash for the
+vault account and its head slots. If the primary RPC does not serve it, include a proof-capable
+execution or archive RPC in `archives`. The wallet verifies this proof against the latest certified
+execution block it can authenticate across the configured readers before checking the entire sealed
+suffix. The previous-buffer shortcut is available only for terminal settlement, where the vault
+checks that buffer itself.
+
 ```sh
 nb2-wallet plan-return coin --recipient "$RECIPIENT" --return-policy payer.json
 nb2-wallet burn coin --recipient "$RECIPIENT" --return-policy payer.json --backup coin.private.json

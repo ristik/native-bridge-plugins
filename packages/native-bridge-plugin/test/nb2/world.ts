@@ -151,7 +151,15 @@ export class FakeAggregator implements Aggregator {
 
 interface Log { address: Uint8Array; topics: Uint8Array[]; data: Uint8Array }
 interface Rcpt { status: 0n | 1n; logs: Log[]; tx: Uint8Array; from: Uint8Array; revert: Uint8Array | null; gas: bigint; type: number }
-interface Block { header: Header; hash: Uint8Array; uc: Uint8Array | null; rootInput?: Uint8Array; receipts: Rcpt[]; raws: Uint8Array[] }
+interface Block { header: Header; hash: Uint8Array; uc: Uint8Array | null; rootInput?: Uint8Array; receipts: Rcpt[]; raws: Uint8Array[]; slots: bigint[] }
+
+function vaultStorage(slots: bigint[]): [Uint8Array, Uint8Array][] {
+  return slots.flatMap((value, i) => value === 0n ? [] : [[HE(u256(i)), rlpUintEnc(value)]]);
+}
+
+function vaultAccount(storageRoot: Uint8Array, code: Uint8Array): [Uint8Array, Uint8Array][] {
+  return [[HE(VAULT), rlpList([rlpUintEnc(0), rlpUintEnc(0), rlpBytes(storageRoot), rlpBytes(HE(code))])]];
+}
 
 export interface Faults {
   /** The next N sends are included but answered with HTTP 503 (partial broadcast, #1121). */
@@ -227,9 +235,15 @@ export class FakeChain implements JsonRpc {
       return concat(Uint8Array.of(2), rlpList([rlpUintEnc(r.status), rlpUintEnc(cum), rlpBytes(new Uint8Array(256)), logs]));
     });
     const trie = buildTrie(enc.map((e, i) => [rlpIndexKey(i), e]), null);
+    const s = this.vault.state();
+    const slots = [(s.deposits << 200n) | (s.segment << 152n) | (s.population << 144n) | s.outstanding, 0n, 0n];
+    slots[1 + Number(s.segment % 2n)] = beInt(s.head);
+    slots[2 - Number(s.segment % 2n)] = beInt(s.previousHead);
+    const storage = buildTrie(vaultStorage(slots), null);
+    const state = buildTrie(vaultAccount(storage.root, this.vaultCode), null);
     const header: Header = {
       parentHash: n === 0n ? new Uint8Array(32) : this.blocks[Number(n) - 1].hash, ommersHash: EMPTY_UNCLE_HASH, beneficiary: new Uint8Array(20),
-      stateRoot: sha(concat(ascii('state'), u256(n), ...raws)), transactionsRoot: buildTrie(raws.map((raw, i) => [rlpIndexKey(i), raw]), null).root, receiptsRoot: trie.root,
+      stateRoot: state.root, transactionsRoot: buildTrie(raws.map((raw, i) => [rlpIndexKey(i), raw]), null).root, receiptsRoot: trie.root,
       logsBloom: new Uint8Array(256), difficulty: 0n, number: n, gasLimit: 30_000_000n, gasUsed: cum, timestamp: 1_700_000_000n + n, extraData: new Uint8Array(),
       mixHash: new Uint8Array(32), nonce: new Uint8Array(8), baseFeePerGas: 7n, withdrawalsRoot: EMPTY_TRIE_ROOT, blobGasUsed: 0n, excessBlobGas: 0n,
       parentBeaconBlockRoot: new Uint8Array(32),
@@ -241,7 +255,7 @@ export class FakeChain implements JsonRpc {
       ? fixtureRootInput(parent.uc!, parent.hash) : undefined;
     if (rootInput) header.extraData = HU(rootInput);
     const hash = HE(encodeHeader(header));
-    this.blocks.push({ header, hash, uc: null, rootInput, receipts, raws });
+    this.blocks.push({ header, hash, uc: null, rootInput, receipts, raws, slots });
   }
 
   /** The verifier inside the vault: the plug-in's own relation (the Solidity verifier is NB2-05's). */
@@ -369,6 +383,16 @@ export class FakeChain implements JsonRpc {
         if (p.length !== 2 || p[1] !== false) throw new RpcError(400, 0, 'eth_getBlockByHash takes [hash, false]');
         const b = this.blocks.find((x) => h(x.hash) === p[0]);
         return b ? this.headerJson(b) : null;
+      }
+      case 'eth_getProof': {
+        const b = this.blocks.find((x) => h(x.hash) === p[2]?.blockHash);
+        if (!b || p[0] !== h(VAULT) || p[2]?.requireCanonical !== true) return null;
+        const storage = vaultStorage(b.slots);
+        const { root } = buildTrie(storage, null);
+        return {
+          accountProof: buildTrie(vaultAccount(root, this.vaultCode), HE(VAULT)).path.map(h),
+          storageProof: (p[1] as string[]).map((key) => ({ key, proof: buildTrie(storage, HE(u256(BigInt(key)))).path.map(h) })),
+        };
       }
       case 'eth_getRawTransactionByBlockHashAndIndex': {
         const b = this.blocks.find((x) => h(x.hash) === p[0]);

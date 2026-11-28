@@ -13,13 +13,13 @@ import { TOPIC, encodeDepositProof, type DepositProof } from './deposit.js';
 import { Nb2Error, WalletError, fail, refuse } from './errors.js';
 import { bindHeader, decodeHeader, encodeHeader, type Header } from './header.js';
 import { HE, HU } from './crypto.js';
-import { buildTrie, mptVerify } from './mpt.js';
-import { rlpBytes, rlpIndexKey, rlpList, rlpUintEnc } from './rlp.js';
+import { buildTrie, mptLookup, mptVerify } from './mpt.js';
+import { rlpBytes, rlpDecode, rlpIndexKey, rlpList, rlpUint, rlpUintEnc } from './rlp.js';
 import type { Config } from './config.js';
 import { checkCompanion } from './rules.js';
 import { array, isBytes, isUint, scanNative, u256 } from './cbor.js';
 
-import type { RecoveryEvent, RecoveryReceiptSource } from './recovery.js';
+import type { CertifiedVaultHead, RecoveryEvent, RecoveryReceiptSource } from './recovery.js';
 import { decodeUc, verifyEvmUc, type TrustInput } from './trust.js';
 
 export const LOG_BLOCK_RANGE = 10_000n;
@@ -626,6 +626,59 @@ export class EvmReader {
 
   public async vaultState(vault: Uint8Array): Promise<VaultState> {
     return decodeStateReturn(await this.call(vault, SELECTOR.state));
+  }
+
+  /** Authenticate this reader's newest execution block with a child carrying its certificate. */
+  public async certifiedExecutionHead(cfg: Config, trust: TrustInput): Promise<{ header: Header; hash: Uint8Array }> {
+    const number = await this.blockNumber() - 1n;
+    const block = number < 0n ? null : await this.headerByNumber(number);
+    if (block === null || block.header.number !== number) return refuse('EvidenceMissing', 'no header for the certified vault state');
+    await this.certificateOf(block.header, block.hash, true, undefined, async (raw) => {
+      const uc = await verifyEvmUc(trust, raw, cfg);
+      bindHeader(encodeHeader(block.header), uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
+    });
+    return block;
+  }
+
+  /** Open the pinned vault's accounting and head slots at an already UC-authenticated header. */
+  public async vaultHeadAt(cfg: Config, block: { header: Header; hash: Uint8Array }, vaultCodeHash: Uint8Array): Promise<CertifiedVaultHead> {
+    // Both vault variants share this layout. Slot 0 packs the 48-bit segment at bit 152;
+    // slots 1 and 2 hold the alternating heads. Pin every proof read to the same block.
+    const slots = [u256(0), u256(1), u256(2)];
+    const proof = await this.rpc.call<{ accountProof: unknown; storageProof: { key: unknown; proof: unknown }[] } | null>(
+      'eth_getProof', [hexOf(cfg.vault), slots.map(hexOf), { blockHash: hexOf(block.hash), requireCanonical: true }]);
+    if (proof === null) return refuse('EvidenceMissing', 'no account and storage proof for the certified vault state');
+    const nodesOf = (nodes: unknown): Uint8Array[] => {
+      if (!Array.isArray(nodes) || nodes.length > 65 || nodes.some((n) => typeof n !== 'string' || n.length > 2050)) {
+        return refuse('ProviderFault', 'invalid vault state proof path');
+      }
+      return nodes.map((n) => bytesOf(n, 'vault state proof node'));
+    };
+    try {
+      const account = rlpDecode(mptVerify(block.header.stateRoot, HE(cfg.vault), nodesOf(proof.accountProof)));
+      if (!account.list || account.kids.length !== 4) throw new Error('account framing');
+      const [, , storageRoot, codeHash] = account.kids;
+      if (storageRoot.list || storageRoot.str.length !== 32 || codeHash.list || !eq(codeHash.str, vaultCodeHash)) {
+        throw new Error('vault account does not match the pinned runtime');
+      }
+      if (!Array.isArray(proof.storageProof) || proof.storageProof.length !== slots.length) throw new Error('wrong storage slots');
+      const values = new Map<bigint, bigint>();
+      for (const row of proof.storageProof) {
+        if (typeof row.key !== 'string' || !/^0x[0-9a-f]{1,64}$/i.test(row.key)) throw new Error('wrong storage key');
+        const slot = BigInt(row.key);
+        if (slot >= BigInt(slots.length) || values.has(slot)) throw new Error('unexpected or duplicate storage key');
+        const value = mptLookup(storageRoot.str, HE(slots[Number(slot)]), nodesOf(row.proof));
+        const word = value === null ? 0n : rlpUint(rlpDecode(value));
+        if (word === null || (value !== null && word === 0n)) throw new Error('noncanonical storage value');
+        values.set(slot, word);
+      }
+      const segment = (values.get(0n)! >> 152n) & ((1n << 48n) - 1n);
+      const head = values.get(1n + segment % 2n)!;
+      if (head === 0n) throw new Error('active vault head is absent');
+      return { segment, head: u256(head) };
+    } catch (e) {
+      return refuse('ProviderFault', `vault state proof does not verify: ${(e as Error).message}`);
+    }
   }
 
   public async vaultConfig(vault: Uint8Array): Promise<Uint8Array> {

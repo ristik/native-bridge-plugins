@@ -667,17 +667,29 @@ export class NativeBridgeV2 {
       if (ev.v !== amount || !eq(ev.firstOwner, firstOwner)) refuse('ProviderFault', 'the certified deposit is not the planned one');
       return { receiptProof: rp.encoded, reason };
     } catch (e) {
-      if (e instanceof Nb2Error && e.innermost === 'InputTooLarge') {
-        fail('InputTooLarge', 'this deposit receipt exceeds the offline proof limits for this release');
-      }
-      throw e;
+      return this.depositProofError(e);
+    }
+  }
+
+  private depositProofError(e: unknown): never {
+    if (e instanceof Nb2Error && e.innermost === 'InputTooLarge') {
+      fail('InputTooLarge', 'this deposit receipt exceeds the offline proof limits for this release');
+    }
+    throw e;
+  }
+
+  private decodeDepositReason(reason: Uint8Array): ReturnType<typeof decodeReceiptBacking> {
+    try {
+      return decodeReceiptBacking(reason);
+    } catch (e) {
+      return this.depositProofError(e);
     }
   }
 
   /** The ordinary mint with reason J, certified by the aggregator and verified offline. */
   private async mintWith(reason: Uint8Array, ownerKey: Uint8Array, amount: bigint,
     saved: string | undefined, save: (proof: string) => Promise<void>, recoverProof?: boolean): Promise<Uint8Array> {
-    const j = decodeReceiptBacking(reason);
+    const j = this.decodeDepositReason(reason);
     const m = {
       network: this.cfg.network, recipient: signaturePredicate(ownerKey), salt: depositSalt(this.domain, j.n, j.r), type: this.cfg.ty,
       justification: reason, data: valueData(this.cfg.aid, amount), deadline: null,
@@ -698,7 +710,11 @@ export class NativeBridgeV2 {
   public collectDepositProof(intent: bigint): Promise<{ reason: Uint8Array; depositNumber: bigint }> {
     return this.locked(`deposit/${intent}`, async () => {
       const rec = await this.depositRecord(intent);
-      if (rec.status === 'proven' || rec.status === 'minted') return { reason: unhex(rec.reason!), depositNumber: undec(rec.depositNumber!) };
+      if (rec.status === 'proven' || rec.status === 'minted') {
+        const reason = unhex(rec.reason!);
+        if (rec.status === 'proven') this.decodeDepositReason(reason);
+        return { reason, depositNumber: undec(rec.depositNumber!) };
+      }
       if (rec.status !== 'deposited') refuse('NotPending', `intent ${intent} is ${rec.status}: submit the deposit first`);
       const n = undec(rec.depositNumber!);
       const p = await this.proveDeposit(intent, unhex(rec.depositTx!), n, undec(rec.amount), unhex(rec.firstOwner));

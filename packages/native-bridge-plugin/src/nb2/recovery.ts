@@ -24,6 +24,9 @@ const u32 = (n: number | bigint): Uint8Array => be(n, 4);
 const blob = (data: Uint8Array): Uint8Array => concat(u32(data.length), data);
 export const recoveryGeneration = (salt: Uint8Array, domain: Uint8Array): Uint8Array => hash('GEN', salt, domain);
 
+/** A sealed endpoint opened against a UC-certified vault state root. */
+export interface CertifiedVaultHead { segment: bigint; head: Uint8Array }
+
 const topics = {
   progress: HE(ascii('NB2Progress11(bytes32,uint64,bytes32)')),
   complete: HE(ascii('NB2Complete11(bytes32,uint64,bytes32,bytes32,uint64,bytes32,address,uint256)')),
@@ -456,8 +459,25 @@ export class RecoverySession {
    */
   async archivedGaps(trust: TrustInput, start: bigint, head: Uint8Array,
     logs: readonly { index: bigint; data: Uint8Array }[], terminalSeal: Uint8Array, limit: number): Promise<Uint8Array[]> {
+    if (logs.length === 0) fail('Shape', 'archived seal range is empty');
+    const receipt = Uint8Array.from(terminalSeal);
+    return this.foldArchivedGaps(start, head, logs, limit, async (end, after) => {
+      await this.authority.accept(trust, this.cfg);
+      const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, await this.authority.checkpoint, receipt);
+      return segment.index === end - 1n && eq(segment.after, after);
+    });
+  }
+
+  /** Open the full suffix to the current endpoint returned by the certified state reader. */
+  archivedGapsAtHead(start: bigint, head: Uint8Array, logs: readonly { index: bigint; data: Uint8Array }[],
+    anchor: CertifiedVaultHead, limit: number): Promise<Uint8Array[]> {
+    return this.foldArchivedGaps(start, head, logs, limit, (end, after) => end === anchor.segment && eq(after, anchor.head));
+  }
+
+  private async foldArchivedGaps(start: bigint, head: Uint8Array, logs: readonly { index: bigint; data: Uint8Array }[],
+    limit: number, matchesAnchor: (end: bigint, head: Uint8Array) => boolean | Promise<boolean>): Promise<Uint8Array[]> {
     const end = start + BigInt(logs.length);
-    if (start < this.verdict.minSegment || end > MAX_SEGMENT || head.length !== 32 || logs.length === 0 ||
+    if (start < this.verdict.minSegment || end > MAX_SEGMENT || head.length !== 32 ||
       !Number.isInteger(limit) || limit < 0 || limit > 1024) fail('Shape', 'archived gap range');
     const paths: Uint8Array[] = [];
     let before: Uint8Array = Uint8Array.from(head);
@@ -469,10 +489,7 @@ export class RecoverySession {
       else if (i < limit) paths.push(GapTree.build(segment.z)!.prove(this.verdict.eta)!);
       before = segment.after;
     }
-    const receipt = Uint8Array.from(terminalSeal);
-    await this.authority.accept(trust, this.cfg);
-    const { segment } = await verifySealReceipt(this.cfg, this.verdict.domain, await this.authority.checkpoint, receipt);
-    if (segment.index !== end - 1n || !eq(segment.after, before)) fail('SegmentLog', 'archived seals do not fold to the certified vault head');
+    if (!await matchesAnchor(end, before)) fail('SegmentLog', 'archived seals do not fold to the certified vault head');
     if (paid !== undefined) refuse('AlreadyPaid', `return appears in certified sealed segment ${paid}`);
     return paths;
   }

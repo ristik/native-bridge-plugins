@@ -1307,19 +1307,7 @@ impl NativeBridgeV2 {
             proof: rp.proof,
         });
         // Enforce the offline verifier's framing before persisting a mint reason.
-        let j = decode_receipt_backing(&reason).map_err(|err| {
-            if err
-                .rule()
-                .is_some_and(|error| error.rule == Rule::InputTooLarge)
-            {
-                Error::Rule(Nb2Error::with_detail(
-                    Rule::InputTooLarge,
-                    "this deposit receipt exceeds the offline proof limits for this release",
-                ))
-            } else {
-                err
-            }
-        })?;
+        let j = Self::decode_deposit_reason(&reason)?;
         let ev =
             self.retrying_trust(|t| verify_deposit_evidence(&self.cfg, &self.domain, t, &j))?;
         if ev.v != *amount || ev.first_owner != first_owner {
@@ -1331,9 +1319,25 @@ impl NativeBridgeV2 {
         Ok((rp.encoded, reason))
     }
 
+    fn decode_deposit_reason(reason: &[u8]) -> Result<ReceiptBacking> {
+        decode_receipt_backing(reason).map_err(|err| {
+            if err
+                .rule()
+                .is_some_and(|error| error.innermost() == Rule::InputTooLarge)
+            {
+                Error::Rule(Nb2Error::with_detail(
+                    Rule::InputTooLarge,
+                    "this deposit receipt exceeds the offline proof limits for this release",
+                ))
+            } else {
+                err
+            }
+        })
+    }
+
     /// The ordinary mint with reason J, certified by the aggregator and verified offline.
     fn mint_with(&self, reason: &[u8], owner_key: &[u8], amount: &BigUint) -> Result<Vec<u8>> {
-        let j = decode_receipt_backing(reason)?;
+        let j = Self::decode_deposit_reason(reason)?;
         let m = MintTx {
             network: self.cfg.network,
             recipient: signature_predicate(owner_key),
@@ -1359,8 +1363,12 @@ impl NativeBridgeV2 {
         self.locked(&format!("deposit/{intent}"), || {
             let mut rec = self.deposit_record(intent)?;
             if rec.status == "proven" || rec.status == "minted" {
+                let reason = unhex(rec.reason.as_deref().unwrap_or(""))?;
+                if rec.status == "proven" {
+                    Self::decode_deposit_reason(&reason)?;
+                }
                 return Ok((
-                    unhex(rec.reason.as_deref().unwrap_or(""))?,
+                    reason,
                     undec64(rec.deposit_number.as_deref().unwrap_or(""))?,
                 ));
             }
