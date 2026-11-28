@@ -258,7 +258,7 @@ export interface RedeemOptions {
   recovery?: Uint8Array;
   envelope?: ReturnAdmission['ordinaryEnvelope'];
   archives?: readonly EvmReader[];
-  /** Current payer authorization for taking an exclusive legacy ERC20 slot. */
+  /** Current payer authorization for a contested ERC20 claim. */
   erc20Policy?: Omit<RecoveryLimits, 'chainId' | 'worstCaseEnvelope' | 'balance'>;
   erc20Recovery?: Pick<Erc20ReturnRecovery, 'deployment' | 'calibration'>;
   admit?: (request: TxRequest, prior: readonly SendRecord[], remainingFee?: bigint) => Promise<void>;
@@ -393,7 +393,7 @@ export class NativeBridgeV2 {
         if (!opts.pins.erc20) return refuse('BadDeployment', 'the ERC20 activation pins are missing');
         await checkErc20Activation(b.evm, b.cfg, opts.pins.gamma, opts.pins.erc20,
           opts.pins.vaultRuntimeCodeHash, opts.pins.deploymentBlock, (verify) => b.retryingTrust(verify));
-        await b.journal.registerPayerChain(b.cfg.chainId);
+        await b.journal.openErc20PayerJournal(b.cfg.chainId);
       }
     }
     return b;
@@ -1157,11 +1157,13 @@ export class NativeBridgeV2 {
         }
       }
       const existing = await this.journal.retForUpdate(hex(returnId));
+      if (existing && this.cfg.erc20) await this.journal.requireErc20ReturnState(this.cfg.chainId, existing);
       if (existing !== null && existing.status !== 'planned') refuse('NotPending', `this part's return is already ${existing.status}`);
       const record: ReturnRecord = {
         ...this.journal.base(), kind: 'return', returnId: hex(returnId), source: hex(token), amount: dec(held.amount), recipient: hex(recipient), a: dec(a),
         startHead: hex(startHead), fromBlock: dec(fromBlock), ...(sealReceipt ? { sealReceipt: hex(sealReceipt) } : {}), payer: hex(payer), status: 'planned', sends: [],
       };
+      if (this.cfg.erc20) record.erc20PayerState = 1;
       const pf = await this.admitReturn(record, held.amount, opts.admission);
       await this.journal.putReturn(record);
       return { returnId, amount: held.amount, recipient, a, cObs: pf.cObs, pNow: pf.pNow, pMax: pf.pMax, marginSegments: pf.pMax - pf.need, gasLimit: pf.gas, warnings, record };
@@ -1413,6 +1415,7 @@ export class NativeBridgeV2 {
     const { source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator } = rec;
     const verified: ReturnRecord = { ...this.journal.base(), kind: 'return', status: 'burn-requested', sends: [],
       source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator };
+    if (this.cfg.erc20) verified.erc20PayerState = 1;
     if (burned) {
       const part = decodeEvidence(evidenceOf(burned));
       const final = part.proofs.at(-1);
@@ -1428,6 +1431,7 @@ export class NativeBridgeV2 {
     }
     return this.locked(`return/${returnId.slice(2)}`, async () => {
       const existing = await this.journal.retForUpdate(returnId);
+      if (existing && this.cfg.erc20) await this.journal.requireErc20ReturnState(this.cfg.chainId, existing);
       if (existing?.burnRequest !== undefined &&
         (existing.burnRequest !== burnRequest || existing.burnTx !== burnTx || existing.returnId !== returnId ||
           existing.source !== source || existing.amount !== amount || existing.recipient !== recipient || existing.a !== a ||
@@ -1476,7 +1480,9 @@ export class NativeBridgeV2 {
   }
 
   private async returnRecord(id: Uint8Array): Promise<ReturnRecord> {
-    return (await this.journal.retForUpdate(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
+    const record = (await this.journal.retForUpdate(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
+    if (this.cfg.erc20) await this.journal.requireErc20ReturnState(this.cfg.chainId, record);
+    return record;
   }
 
   /**

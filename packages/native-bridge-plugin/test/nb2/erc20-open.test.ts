@@ -9,7 +9,7 @@ import { ascii, u256 } from '../../src/nb2/cbor.js';
 import { decodeConfig, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { decodeReceiptBacking, depositedData, TOPIC } from '../../src/nb2/deposit.js';
-import { LocalKeySigner, decodeSignedTx, signTx } from '../../src/nb2/evm.js';
+import { LocalKeySigner, signTx } from '../../src/nb2/evm.js';
 import { Journal, MemoryJournalStore, continuationReserve, payerNonceLimit } from '../../src/nb2/journal.js';
 import { WalletError } from '../../src/nb2/errors.js';
 import { quoteErc20Call, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, quoteScheduledRecoveryRuns,
@@ -290,6 +290,7 @@ test('peer Paid keeps the payer unavailable while a local recovery nonce can sti
   const raw = await signTx(x.payer, { chainId: x.cfg.chainId, nonce: 7n, gas: 2_000_000n,
     maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
   const paid = (await bridge.journal.retForUpdate(hex(first.returnId)))!;
+  await bridge.journal.preparePayerSigning(paid, x.cfg.chainId, x.payer.address);
   await bridge.journal.retainPayerSend(paid, raw.raw);
   await bridge.journal.putReturn({ ...paid, status: 'paid', paid: { txHash: hex(key('peer-paid')), blockNumber: '190' } });
   x.finalized(7n);
@@ -323,7 +324,7 @@ test('an unsigned refusal releases the payer and an ambiguous signer response ke
   await assert.rejects(bridge.burn(a.returnId, owner, admission), /outstanding ERC20 return/);
 });
 
-test('legacy returns across domains keep their budgets and can claim the payer in sequence', async () => {
+test('funded returns across domains keep their budgets and can claim the payer in sequence', async () => {
   const { x, bridge, held, store } = await heldPair();
   const chainId = x.cfg.chainId;
   const payer = x.payer.address;
@@ -341,6 +342,8 @@ test('legacy returns across domains keep their budgets and can claim the payer i
   const offChain = old(another, 'unrelated chain return', '80', '800');
   await another.checkReturnPayer(chainId + 1n, payer, offChain.returnId);
   await another.putReturn(offChain);
+  await a.registerPayerChain(chainId);
+  await b.registerPayerChain(chainId);
   await a.putReturn(first);
   await b.putReturn(second);
 
@@ -361,32 +364,43 @@ test('legacy returns across domains keep their budgets and can claim the payer i
   await bridge.planReturn(held, recipient, payer, { admission });
 });
 
-test('a legacy drain waits for active recovery packets to be indexed and finalized', async () => {
-  const { x, bridge, held, store } = await heldPair();
+test('ERC20 startup, signing and rebroadcast refuse pre-release records without changing the journal', async () => {
+  const { x, bridge, owner, held, store } = await heldPair();
+  const { chainId } = x.cfg;
   const payer = x.payer.address;
-  const chainId = x.cfg.chainId;
-  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
-  const a = new Journal(store, key('legacy execution domain'));
-  const active = { ...record, ...a.base(), returnId: hex(key('legacy execution return')), status: 'burned' as const, executionPayer: hex(payer) };
-  const claimant = { ...record, status: 'burned' as const };
-  await a.putReturn(active);
-  const obsolete = `nb2/payer-index/v1/${active.domain.slice(2)}/${active.returnId.slice(2)}`;
-  await store.putIf(obsolete, null, '1');
-  await bridge.journal.putReturn(claimant);
-  const drain = { mode: 'drain' as const, signingNonce: 7n, finalizedNonce: () => bridge.evm.nonce(payer, 'finalized') };
-  await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, drain), /local signed sends indexed/);
+  const admission = { erc20Recovery: admissionFor(x) };
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission });
+  await NativeBridgeV2.open({ ...x.options(), journal: store });
+  const old = { ...record, erc20PayerState: undefined, recovery: undefined };
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  const reopen = () => NativeBridgeV2.open({ ...x.options(), journal: store });
+  await bridge.journal.putReturn(old);
+  await assert.rejects(reopen(), refused);
+  await assert.rejects(bridge.burn(bytes(old.returnId), { ...owner, signUnlock: async () => assert.fail('holder signer reached') }, admission), refused);
+
   const tx = await signTx(x.payer, { chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
-    maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
-  await a.registerPayerChain(chainId);
-  await a.indexPayerSends(active, [tx.raw]);
-  x.finalized(7n);
-  await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, drain), /signed nonce awaiting finalization/);
+    maxPriorityFeePerGas: 1n, to: x.cfg.vault, value: 0n, data: new Uint8Array() });
+  const pending = { ...old, status: 'submitted' as const, executionPayer: hex(payer), sends: [bridge['sendRecord'](tx)] };
+  const scope = `${chainId}/${toHex(payer)}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+  const watermark = `nb2/payer-sends/v1/${scope}`;
+  // The old journal knew about a lower signed nonce but had no signed fee for it.
+  await store.putIf(watermark, null, '2');
+  await bridge.journal.putReturn(pending);
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(reopen(), refused);
+    await assert.rejects(bridge.submitRedeem(bytes(old.returnId), { address: payer, signTransaction: async () => assert.fail('EVM signer reached') }), refused);
+    await assert.rejects(bridge.journal.preparePayerBroadcast(pending, chainId, tx.raw), refused);
+    assert.equal(await store.get(watermark), '2');
+    assert.equal(await store.get(`nb2/payer-fee-index/v2/${scope}`), null);
+    assert.deepEqual(await store.list(`nb2/payer-fees/v1/${scope}/`), []);
+  }
+  await bridge.journal.putReturn({ ...pending, status: 'paid', paid: { txHash: hex(tx.hash), blockNumber: '21' } });
   x.finalized(8n);
-  const other = await bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, { ...drain, signingNonce: 8n });
-  assert.equal(other.fees, BigInt(active.recovery!.totalFee));
+  await assert.rejects(reopen(), refused);
+  await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, hex(key('new return after unsupported Paid'))), refused);
 });
 
-test('a legacy claimant must leave a feasible full schedule for the earlier nonce deadline', async () => {
+test('a claimant must leave a feasible full schedule for the earlier nonce deadline', async () => {
   const store = new MemoryJournalStore();
   const { x, bridge, held } = await heldPair(store);
   const payer = x.payer.address;
@@ -400,6 +414,8 @@ test('a legacy claimant must leave a feasible full schedule for the earlier nonc
   });
   const later = legacy(a, '15');
   const earlier = legacy(b, '8');
+  await a.registerPayerChain(chainId);
+  await b.registerPayerChain(chainId);
   await a.putReturn(later);
   await b.putReturn(earlier);
   const drain = { mode: 'drain' as const, signingNonce: 0n, finalizedNonce: async () => 8n };
@@ -413,7 +429,7 @@ test('a legacy claimant must leave a feasible full schedule for the earlier nonc
   }
 });
 
-test('finalized Runs let both legacy returns drain at the exact 15/8 nonce and balance boundary', async () => {
+test('finalized Runs let both funded returns drain at the exact 15/8 nonce and balance boundary', async () => {
   const { x, bridge, held, store } = await heldPair();
   const payer = x.payer.address;
   const { chainId } = x.cfg;
@@ -429,11 +445,12 @@ test('finalized Runs let both legacy returns drain at the exact 15/8 nonce and b
   const earlier = legacy(b, '8');
   const checkpoints = [key('later checkpoint'), key('earlier checkpoint')];
   for (const [index, journal, legacy] of [[0, a, later], [1, b, earlier]] as const) {
-    await journal.putReturn(legacy);
     const raw = await signTx(x.payer, { chainId, nonce: BigInt(index), gas: 100_000n, maxFeePerGas: 10n,
       maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
     await journal.registerPayerChain(chainId);
-    await journal.indexPayerSends(legacy, [raw.raw]);
+    await journal.preparePayerSigning({ ...legacy, executionPayer: undefined }, chainId, payer);
+    await journal.retainPayerSend(legacy, raw.raw);
+    await journal.putReturn(legacy);
     await journal.indexRecoveryProgress(chainId, legacy, 1n, { blockNumber: BigInt(index + 20), blockHash: checkpoints[index] }, 80n);
   }
   let finalizedNonce = 2n;
@@ -532,7 +549,7 @@ test('contested ordinary signing checks fallback signed bytes and per-packet fee
   });
 });
 
-test('ordinary takeover migrates local Run fees and preserves the higher replacement fee', async () => {
+test('ordinary takeover counts indexed Run fees and preserves the higher replacement fee', async () => {
   const { x, bridge, held } = await heldPair();
   const payer = x.payer.address;
   const { chainId, K } = x.cfg;
@@ -541,45 +558,19 @@ test('ordinary takeover migrates local Run fees and preserves the higher replace
   const first = { ...record, status: 'burned' as const, executionPayer: hex(payer) };
   const other = { ...record, status: 'burned' as const, returnId: hex(key('other legacy return waits during fee reconciliation')) };
   const journal = bridge.journal;
-  await journal.putReturn(first);
   await journal.putReturn(other);
   const request = { chainId, nonce: 1n, gas: 100_000n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n,
     to: x.cfg.vault, value: 0n, data: new Uint8Array(68) };
   const raw = (signer: typeof x.payer, gas: bigint, chain = chainId, nonce = 0n, maxFeePerGas = 10n) =>
     signTx(signer, { ...request, gas, chainId: chain, nonce, maxFeePerGas, to: bytes(x.a.recovery) }).then((signed) => signed.raw);
-  const id = `${first.domain.slice(2)}/${first.returnId.slice(2)}`;
-  const watermark = `nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${id}`;
-  const feeIndex = `nb2/payer-fee-index/v2/${chainId}/${toHex(payer)}/${id}`;
-  const legacy = new Journal(journal.store, key('unregistered legacy fee domain'));
-  const unregistered = { ...first, ...legacy.base(), returnId: hex(key('unregistered execution return')) };
-  const foreign = await raw(x.payer, 200n, chainId + 1n);
-  const local = await raw(x.payer, 2n);
-  await legacy.putReturn(unregistered);
-  await legacy.indexPayerSends(unregistered, [foreign]);
-  assert.equal(await journal.store.get(`nb2/domain-chain/v1/${toHex(legacy.domain)}`), null);
-  assert.deepEqual(await journal.store.list(`nb2/payer-fee-index/v2/`), []);
-  await legacy.registerPayerChain(chainId);
-  // The old unscoped marker could have been written by the foreign packet.
-  await journal.store.putIf(`nb2/payer-fee-index/v1/${toHex(legacy.domain)}/${unregistered.returnId.slice(2)}`, null, '1');
-  await legacy.indexPayerSends(unregistered, [foreign, await raw(new LocalKeySigner(key('different local payer')), 200n)]);
-  const beforeBinding = { ...unregistered, executionPayer: undefined };
-  await assert.rejects(legacy.preparePayerSigning(beforeBinding, chainId, payer), /local signed fees indexed/);
-  await assert.rejects(legacy.payerFees(unregistered, chainId, payer, 0n), /local signed fees indexed/);
-  await assert.rejects(legacy.preparePayerBroadcast(unregistered, chainId, local), /local signed fees indexed/);
-  await assert.rejects(legacy.preparePayerBroadcast(unregistered, chainId, foreign), /belongs to another chain/);
-  await legacy.indexPayerSends(unregistered, [local]);
-  const lower = await raw(x.payer, 1n);
-  await legacy.preparePayerBroadcast(unregistered, chainId, lower);
-  assert.deepEqual(await legacy.payerFees(unregistered, chainId, payer, 0n), { prior: 0n, atNonce: 20n });
-  await legacy.putReturn({ ...unregistered, status: 'paid' });
+  await journal.preparePayerSigning(record, chainId, payer);
+  await journal.retainPayerSend(first, await raw(x.payer, 2n));
+  await journal.retainPayerSend(first, await raw(x.payer, 1n));
+  await journal.retainPayerSend(first, await raw(x.payer, 200n, chainId, request.nonce));
+  await journal.putReturn(first);
   const second = new LocalKeySigner(key('other scoped execution payer'));
-  await assert.rejects(legacy.preparePayerSigning(beforeBinding, chainId, second.address), /bound to execution payer/);
-  await assert.rejects(legacy.preparePayerBroadcast(unregistered, chainId, await raw(second, 200n)), /bound to execution payer/);
-  const oldOrdinary = { ...unregistered, returnId: hex(key('ordinary-only legacy return')), executionPayer: undefined,
-    sends: [{ raw: hex(local), hash: hex(decodeSignedTx(local).hash), nonce: '0', gas: '2', at: '0' }] };
-  await legacy.putReturn(oldOrdinary);
-  await legacy.preparePayerBroadcast(oldOrdinary, chainId, local);
-  assert.deepEqual(await legacy.payerFees(oldOrdinary, chainId, payer, 0n), { prior: 0n, atNonce: 20n });
+  await assert.rejects(journal.preparePayerSigning(record, chainId, second.address), /bound to execution payer/);
+  await assert.rejects(journal.preparePayerBroadcast(first, chainId, await raw(second, 200n)), /bound to execution payer/);
   const plan = first.recovery!;
   const policy = { ...erc20Recovery.limits, chainId, maxFeePerGas: 20n };
   const attempts = BigInt(plan.ordinary!.attemptsBeforeFallback);
@@ -594,26 +585,6 @@ test('ordinary takeover migrates local Run fees and preserves the higher replace
   bridge.evm.isFinalizedBlock = async () => true;
   x.finalized(1n);
   const opts = { erc20Recovery, admit: async () => assert.fail('budget refusal must precede admission') };
-  assert.equal(await journal.store.get(watermark), null);
-  assert.equal(await journal.store.get(feeIndex), null);
-  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
-    ...opts, erc20Policy: { ...policy, feeBudget: suffix },
-  }), /local signed fees indexed/);
-  await journal.indexPayerSends(first, []);
-  assert.equal(await journal.store.get(feeIndex), null);
-  await journal.indexPayerSends(first, [await raw(x.payer, 200n, chainId + 1n)]);
-  assert.equal(await journal.store.get(feeIndex), null);
-  await journal.store.putIf(watermark, null, '0');
-  await journal.indexPayerSends(first, []);
-  assert.equal(await journal.store.get(feeIndex), null);
-  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
-    ...opts, erc20Policy: { ...policy, feeBudget: suffix + 20n },
-  }), /local signed fees indexed/);
-  await journal.indexPayerSends(first, await Promise.all([
-    raw(x.payer, 2n), raw(x.payer, 1n), raw(new LocalKeySigner(key('peer Run signer')), 200n),
-    raw(x.payer, 200n, chainId + 1n), raw(x.payer, 200n, chainId, request.nonce),
-  ]));
-  assert.equal(await journal.store.get(feeIndex), '1');
   assert.deepEqual(await journal.payerFees(first, chainId, payer, request.nonce), { prior: 20n, atNonce: 2000n });
   await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
     ...opts, erc20Policy: { ...policy, feeBudget: suffix + 19n },
@@ -655,6 +626,8 @@ test('a finalized Run retains unused ordinary retry nonces and fees', async () =
   assert.equal((await other()).fees, 100n);
   const send = await signTx(x.payer, { chainId, nonce: 1n, gas: 10n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n,
     to: x.cfg.vault, value: 0n, data: new Uint8Array(68) });
+  await journal.preparePayerSigning(b, chainId, payer);
+  await journal.retainPayerSend(b, send.raw);
   await journal.putReturn({ ...b, sends: [bridge['sendRecord'](send)] });
   assert.equal((await other()).calls, 8n);
   assert.equal((await other()).fees, 90n);

@@ -502,7 +502,7 @@ impl NativeBridgeV2 {
         }
         if b.cfg.erc20.is_some() {
             b.verify_erc20_activation()?;
-            b.journal.register_payer_chain(b.cfg.chain_id)?;
+            b.journal.open_erc20_payer_journal(b.cfg.chain_id)?;
         }
         Ok(b)
     }
@@ -1881,8 +1881,14 @@ impl NativeBridgeV2 {
                 paid: None,
                 extra: Default::default(),
             };
+            if self.cfg.erc20.is_some() {
+                record.extra.insert("erc20PayerState".into(), json!(1));
+            }
             let (c_obs, ordinary) = self.admit_return(&mut record, token, &held.amount, &recipient, a, payer)?;
             if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
+                if self.cfg.erc20.is_some() {
+                    self.journal.require_erc20_return_state(self.cfg.chain_id, &existing)?;
+                }
                 if existing.status != "planned" {
                     return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
                 }
@@ -2078,7 +2084,13 @@ impl NativeBridgeV2 {
 
     fn return_record(&self, id: &[u8; 32]) -> Result<ReturnRecord> {
         match self.journal.ret_for_update(&hex(id))? {
-            Some(r) => Ok(r),
+            Some(r) => {
+                if self.cfg.erc20.is_some() {
+                    self.journal
+                        .require_erc20_return_state(self.cfg.chain_id, &r)?;
+                }
+                Ok(r)
+            }
             None => refuse(
                 WalletReason::JournalNotPersisted,
                 format!("no journal entry for return {}", hex(id)),
@@ -2651,8 +2663,11 @@ impl NativeBridgeV2 {
         signer: &dyn EvmSigner,
     ) -> Result<ReconcileResult> {
         let mut expired = None;
-        let prior =
-            self.reconcile_inner_with_expiry(return_id, &mut expired, Some(&signer.address()))?;
+        let prior = self.reconcile_inner_with_expiry(
+            return_id,
+            &mut expired,
+            self.cfg.erc20.as_ref().map(|_| signer.address()).as_ref(),
+        )?;
         if !matches!(prior, ReconcileResult::NotPaid { .. })
             && !expired
                 .as_ref()
@@ -3144,11 +3159,11 @@ impl NativeBridgeV2 {
         signer: &dyn EvmSigner,
         request: &TxRequest,
     ) -> Result<SignedTx> {
-        let payer = signer.address();
-        record.require_execution_payer(&payer)?;
         if self.cfg.erc20.is_none() {
             return sign_tx(signer, request);
         }
+        let payer = signer.address();
+        record.require_execution_payer(&payer)?;
         let Some(policy) = &self.erc20_return_recovery else {
             return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
         };

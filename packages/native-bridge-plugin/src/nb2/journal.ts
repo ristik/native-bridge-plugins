@@ -179,6 +179,8 @@ export interface ReturnRecord extends Base {
   burned?: Hex;
   eta?: Hex;
   sends: SendRecord[];
+  /** Written when this journal creates an ERC20 return under the payer-slot protocol. */
+  erc20PayerState?: 1;
   /** The payer of the first durable payout send, shared by both routes. */
   executionPayer?: Hex;
   /** A mined payment hint whose certified proof is still being fetched. */
@@ -299,6 +301,10 @@ export function executionPayerOf(record: ReturnRecord): Uint8Array | undefined {
 function requireExecutionPayer(record: ReturnRecord, payer: Uint8Array): void {
   const bound = executionPayerOf(record);
   if (bound && !eqBytes(bound, payer)) refuse('NotPending', `return is bound to execution payer ${hex(bound)}`);
+}
+
+export function unsupportedErc20Return(): never {
+  return refuse('BadInput', 'unsupported pre-release ERC20 record: start a fresh wallet');
 }
 
 /** The typed journal over a store, keyed by deployment. */
@@ -459,85 +465,67 @@ export class Journal {
     if (!await this.payerHistoryComplete(path)) refuse('JournalNotPersisted', 'payer fee index completion was not persisted');
   }
 
-  /** Import the caller's complete local signed history. Unregistered domains cannot be marked complete. */
-  public async indexPayerSends(record: ReturnRecord, raw: readonly Uint8Array[]): Promise<void> {
+  /** Check stored ERC20 state before opening the domain or acting on a return. */
+  public async requireErc20ReturnState(chainId: bigint, record: ReturnRecord): Promise<void> {
     const chain = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
-    const bound = executionPayerOf(record);
-    const covered = new Map<string, bigint>();
-    for (const [index, signed] of [...raw, ...record.sends.map(({ raw }) => unhex(raw))].entries()) {
-      const { from, request } = decodeSignedTx(signed);
-      if (chain !== dec(request.chainId) || (bound && !eqBytes(bound, from))) continue;
-      await this.retainPayerSend(record, signed);
-      // Ordinary records alone cannot prove the separate recovery history of a recorded executor.
-      const path = this.payerSendPath(request.chainId, from, record);
-      if (record.executionPayer !== undefined && index >= raw.length && !covered.has(path)) continue;
-      if (!covered.has(path) || request.nonce > covered.get(path)!) covered.set(path, request.nonce);
-    }
-    for (const [path, highest] of covered) {
-      if (await this.store.get(`nb2/payer-sends/v1/${path}`) === dec(highest)) {
-        await this.completePayerHistory(path);
+    if (chain !== dec(chainId)) unsupportedErc20Return();
+    const payer = executionPayerOf(record);
+    if (payer) {
+      const path = this.payerSendPath(chainId, payer, record);
+      const highest = await this.store.get(`nb2/payer-sends/v1/${path}`);
+      if (!await this.payerHistoryComplete(path) || highest === null) unsupportedErc20Return();
+      const fees = `nb2/payer-fees/v1/${path}/`;
+      if (record.status === 'paid' ? !(await this.store.list(fees)).length : await this.store.get(fees + highest) === null) {
+        unsupportedErc20Return();
       }
+      for (const { raw } of record.sends) {
+        await this.requireIndexedPayerSend(chainId, record, unhex(raw), undec(highest));
+      }
+      return;
     }
+    if (record.status === 'submitted') unsupportedErc20Return();
+    if (record.erc20PayerState === 1) return;
+    // Funded returns already admitted under the payer-slot protocol may predate the record flag.
+    const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
+    const owner = `nb2/v1/${record.domain.slice(2)}/return/${record.returnId.slice(2)}`;
+    if (slot?.split('#')[0] !== owner) unsupportedErc20Return();
   }
 
-  /** Migrate ordinary sends after the wallet has established that its local recovery journal contains no sends. */
-  public async indexOrdinaryPayerSends(record: ReturnRecord, chainId: bigint): Promise<void> {
-    const payer = executionPayerOf(record);
-    if (!payer || !record.sends.length) return;
-    const path = this.payerSendPath(chainId, payer, record);
-    if (await this.payerHistoryComplete(path)) return;
-    const ordinary = record.sends.map(({ raw }) => unhex(raw));
-    const maxima = new Map<bigint, bigint>();
-    for (const raw of ordinary) {
-      const { from, request } = decodeSignedTx(raw);
-      if (request.chainId !== chainId || !eqBytes(from, payer)) return;
-      const fee = request.gas * request.maxFeePerGas;
-      if (fee > (maxima.get(request.nonce) ?? 0n)) maxima.set(request.nonce, fee);
+  public async openErc20PayerJournal(chainId: bigint): Promise<void> {
+    for (const record of await this.returns()) await this.requireErc20ReturnState(chainId, record);
+    await this.registerPayerChain(chainId);
+  }
+
+  private async requireIndexedPayerSend(chainId: bigint, record: ReturnRecord, raw: Uint8Array, highest?: bigint): Promise<void> {
+    const { from, request } = decodeSignedTx(raw);
+    if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
+    requireExecutionPayer(record, from);
+    const path = this.payerSendPath(chainId, from, record);
+    const fee = await this.store.get(`nb2/payer-fees/v1/${path}/${request.nonce}`);
+    const watermark = highest === undefined ? await this.store.get(`nb2/payer-sends/v1/${path}`) : dec(highest);
+    if (watermark === null || undec(watermark) < request.nonce || fee === null || undec(fee) < request.gas * request.maxFeePerGas) {
+      unsupportedErc20Return();
     }
-    const prefix = `nb2/payer-fees/v1/${path}/`;
-    for (const key of await this.store.list(prefix)) {
-      const value = await this.store.get(key);
-      const fee = maxima.get(undec(key.slice(prefix.length)));
-      if (value === null || fee === undefined || undec(value) > fee) return;
-    }
-    const claim = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(payer)}`);
-    const [owner, state] = claim?.split('#') ?? [];
-    const returned = `nb2/v1/${record.domain.slice(2)}/return/${record.returnId.slice(2)}`;
-    if (owner === returned && state?.startsWith('nonce:') && !maxima.has(undec(state.slice(6)))) return;
-    await this.indexPayerSends(record, ordinary);
   }
 
   /** Read the maximum signed fee at each nonce across both return routes. */
   public async payerFeeMaxima(record: ReturnRecord, chainId: bigint, payer: Uint8Array): Promise<Map<bigint, bigint>> {
     if (record.domain !== hex(this.domain)) refuse('BadInput', 'return belongs to another payer journal domain');
-    if (await this.store.get(`nb2/domain-chain/v1/${toHex(this.domain)}`) !== dec(chainId)) {
-      fail('CapacityPreflight', 'payer fee history needs an authenticated chain association');
-    }
     requireExecutionPayer(record, payer);
     const history = await this.ret(record.returnId) ?? record;
     requireExecutionPayer(history, payer);
     const path = this.payerSendPath(chainId, payer, history);
-    const ordinary = history.sends.map(({ raw }) => decodeSignedTx(unhex(raw))).filter(({ from, request }) =>
-      request.chainId === chainId && eqBytes(from, payer));
-    if (history.executionPayer === undefined && ordinary.length > 0 && !await this.payerHistoryComplete(path)) {
-      await this.indexPayerSends(history, []);
-    }
+    await this.requireErc20ReturnState(chainId, history);
     const prefix = `nb2/payer-fees/v1/${path}/`;
     const keys = await this.store.list(prefix);
-    if ((history.executionPayer !== undefined || ordinary.length > 0 || keys.length > 0 ||
-        await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) && !await this.payerHistoryComplete(path)) {
-      fail('CapacityPreflight', 'return needs its local signed fees indexed');
-    }
+    if ((keys.length > 0 || await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) &&
+        !await this.payerHistoryComplete(path)) unsupportedErc20Return();
     const fees = new Map<bigint, bigint>();
-    const recordFee = (nonce: bigint, fee: bigint) => {
-      if (fee > (fees.get(nonce) ?? 0n)) fees.set(nonce, fee);
-    };
     for (const key of keys) {
       const value = await this.store.get(key);
       if (value === null) refuse('JournalNotPersisted', 'signed fee disappeared during payer reconciliation');
-      recordFee(undec(key.slice(prefix.length)), undec(value));
+      fees.set(undec(key.slice(prefix.length)), undec(value));
     }
-    for (const { request } of ordinary) recordFee(request.nonce, request.gas * request.maxFeePerGas);
     return fees;
   }
 
@@ -548,15 +536,14 @@ export class Journal {
     return fees;
   }
 
-  /** Revalidate an exact signed packet's scope and retain its maximum before handing it to an RPC. */
+  /** Check the original payer and the indexed exact packet before any RPC send. */
   public async preparePayerBroadcast(record: ReturnRecord, chainId: bigint, raw: Uint8Array): Promise<void> {
     const { from, request } = decodeSignedTx(raw);
     if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
-    await this.payerFeeMaxima(record, chainId, from);
-    if (!await this.payerHistoryComplete(this.payerSendPath(chainId, from, record))) {
-      fail('CapacityPreflight', 'return needs its local signed fees indexed');
-    }
-    await this.retainPayerSend(record, raw);
+    const history = await this.ret(record.returnId) ?? record;
+    await this.payerFeeMaxima(history, chainId, from);
+    if (!await this.payerHistoryComplete(this.payerSendPath(chainId, from, history))) unsupportedErc20Return();
+    await this.requireIndexedPayerSend(chainId, history, raw);
   }
 
   public async payerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, nonce: bigint): Promise<{ prior: bigint; atNonce: bigint }> {
@@ -625,6 +612,7 @@ export class Journal {
         draining = active(rec);
         continue;
       }
+      if (await this.store.get(`nb2/domain-chain/v1/${rec.domain.slice(2)}`) !== dec(chainId)) continue;
       const ordinary = new Set<bigint>();
       for (const send of rec.sends) {
         const { from, request } = decodeSignedTx(unhex(send.raw));
@@ -633,12 +621,8 @@ export class Journal {
           ordinary.add(request.nonce);
         }
       }
-      const registered = await this.store.get(`nb2/domain-chain/v1/${rec.domain.slice(2)}`);
-      // Pre-upgrade returns without chain metadata remain protected until their domain is opened.
-      if (registered !== null && undec(registered) !== chainId) continue;
-      if (rec.status !== 'planned' && rec.executionPayer === address &&
-          (registered === null || !await this.payerHistoryComplete(this.payerSendPath(chainId, payer, rec)))) {
-        fail('CapacityPreflight', 'another return needs its local signed sends indexed');
+      if (active(rec) || ordinary.size > 0 || rec.executionPayer === address) {
+        await this.requireErc20ReturnState(chainId, rec);
       }
       if (!active(rec)) continue;
       const progress = await this.finalizedRecoveryProgress(chainId, rec, options.finalizedBlock);
@@ -671,6 +655,8 @@ export class Journal {
   public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false, options: PayerCheck = {}): Promise<PayerCommitments> {
     if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
     if (options.fence && options.signingNonce !== undefined) refuse('BadInput', 'payer claim cannot sign both a burn and an EVM packet');
+    const record = await this.ret(id);
+    if (record) await this.requireErc20ReturnState(chainId, record);
     await this.registerPayerChain(chainId);
     const key = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
     const target = this.key('return', id.slice(2));
@@ -704,6 +690,7 @@ export class Journal {
         if (!current || current.status === 'paid' || current.status === 'planned') {
           fail('CapacityPreflight', 'return is no longer eligible for payer signing');
         }
+        await this.requireErc20ReturnState(chainId, current);
         if (nonce !== undefined) requireExecutionPayer(current, payer);
         const admitted = current.recovery?.envelope?.maxNonce;
         const cap = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);

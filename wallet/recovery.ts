@@ -7,7 +7,7 @@ import {
   AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, VANISHED_CLAIM_HORIZON, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
   buildParams, checkRemainingRecoveryRuns, continuationReserve, decodeSignedTx, evidenceOf, executionPayerOf, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch,
   quoteScheduledRecoveryRuns, recoveryCatchUpCalls, recoveryGeneration, remainingOrdinaryAttempts,
-  payerNonceLimit, quoteErc20Call, quoteOrdinaryExecution, recoveryRpcSource, replacementBid, signTx, verifyRecoveryDependencies, type PayerCommitments, type Erc20ReturnRecovery, type Erc20SigningBounds,
+  payerNonceLimit, quoteErc20Call, quoteOrdinaryExecution, recoveryRpcSource, replacementBid, signTx, unsupportedErc20Return, verifyRecoveryDependencies, type PayerCommitments, type Erc20ReturnRecovery, type Erc20SigningBounds,
   type OrdinaryCalibrationRange, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
   type RecoveryDeployment, type RecoveryEvent, type RecoveryLimits, type RecoveryQuote, type RecoveryReceipt,
   type ReturnAdmission, type ReturnRecord, type ReconcileResult, type TrustInput, type SendRecord, type RedeemOptions, type ReturnEvidence,
@@ -157,6 +157,7 @@ async function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ord
   const raw = [...ordinary.map((send) => send.raw), ...recoveryPackets(recovery)];
   const byNonce = w.bridge.cfg.erc20 ? await w.bridge.journal.payerFeeMaxima(rec, w.bridge.cfg.chainId, payer) : new Map<bigint, bigint>();
   const legacy = uint(recovery?.fees ?? '0');
+  if (w.bridge.cfg.erc20 && legacy !== 0n) unsupportedErc20Return();
   for (const signed of raw) {
     const { request, from } = decodeSignedTx(bytes(signed));
     if (!eq(from, payer) || request.chainId !== w.bridge.cfg.chainId) continue;
@@ -584,30 +585,17 @@ function recoveryPackets(saved?: RecoveryJournal): string[] {
   return raw;
 }
 
-/** Import the pre-upgrade wallet's separately durable signed packets into the shared payer journal. */
-export async function indexLocalRecoverySends(w: Wallet): Promise<void> {
-  await w.bridge.journal.registerPayerChain(w.bridge.cfg.chainId);
-  for (const { record } of await w.bridge.journal.allReturns()) {
-    const saved = record.domain === hx(w.bridge.domain) ? loadRecovery(w, record) : undefined;
-    const signed = recoveryPackets(saved).map((packet) => bytes(packet));
-    if (saved && !signed.length && record.executionPayer && record.sends.length && record.recovery && record.burned &&
-        saved.version === 1 && !saved.complete && !saved.cuts.length && uint(saved.fees ?? '0') === 0n &&
-        !saved.ordinaryHandoff && !Object.keys(saved.signerEpochs ?? {}).length) {
-      const evidence = evidenceOf(bytes(record.burned));
-      if (saved.evidence === hx(evidence) && saved.evidenceBytes === evidence.length && saved.generation === record.recovery.generation) {
-        await w.bridge.journal.indexOrdinaryPayerSends(record, w.bridge.cfg.chainId);
-      }
-    }
-    await w.bridge.journal.indexPayerSends(record, signed);
-    if (record.status !== 'paid' && record.recovery && saved && (saved.cuts.length || saved.complete)) {
-      const release = recoveryRelease(w);
-      await checkGraph(w, release);
-      const active = activeRecovery(record, saved);
-      const session = await openSession(w, release, active);
-      await replay(w, session, active, saved);
-    }
+/** Check the separate wallet journal against the already durable ERC20 payer state. */
+export async function checkLocalErc20Returns(w: Wallet): Promise<void> {
+  const { journal, cfg } = w.bridge;
+  for (const record of await journal.returns()) {
+    await journal.requireErc20ReturnState(cfg.chainId, record);
+    const saved = loadRecovery(w, record);
+    if (uint(saved?.fees ?? '0') !== 0n) unsupportedErc20Return();
+    for (const raw of recoveryPackets(saved)) await journal.preparePayerBroadcast(record, cfg.chainId, bytes(raw));
   }
 }
+
 export function hasPeerComplete(w: Wallet, rec: ReturnRecord): boolean {
   return loadRecovery(w, rec)?.complete !== undefined;
 }

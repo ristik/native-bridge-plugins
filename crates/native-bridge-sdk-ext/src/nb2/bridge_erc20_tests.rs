@@ -788,7 +788,11 @@ fn peer_paid_holds_the_payer_until_the_local_recovery_nonce_is_finalized() {
     .unwrap();
     bridge
         .journal
-        .index_payer_sends(&paid, &[&packet.raw])
+        .prepare_payer_signing(&paid, bridge.cfg.chain_id, &payer)
+        .unwrap();
+    bridge
+        .journal
+        .retain_payer_send(&paid, &packet.raw)
         .unwrap();
     paid.status = "paid".into();
     paid.paid = Some(PaidRecord {
@@ -962,7 +966,7 @@ fn declined_signing_cancels_but_an_ambiguous_signer_keeps_the_payer() {
 }
 
 #[test]
-fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
+fn funded_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
     let (bridge, rpc, held) = return_bridge(
         24_000_001,
         1_000_000_000_000,
@@ -994,6 +998,8 @@ fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
         .check_return_payer(chain_id + 1, &payer, &c.return_id, false)
         .unwrap();
     off_chain.put_return(&c).unwrap();
+    old_a.register_payer_chain(chain_id).unwrap();
+    old_b.register_payer_chain(chain_id).unwrap();
     old_a.put_return(&a).unwrap();
     old_b.put_return(&b).unwrap();
     assert!(bridge
@@ -1049,90 +1055,100 @@ fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
 }
 
 #[test]
-fn active_legacy_packets_must_be_indexed_and_finalized_before_another_return_drains() {
+fn erc20_startup_signing_and_rebroadcast_refuse_pre_release_records_without_indexing_them() {
     use super::super::evm::LocalKeySigner;
     let (bridge, rpc, held) = return_bridge(
-        24_000_001,
+        6_000_000,
         1_000_000_000_000,
         1_000_000_000_000,
         Arc::new(NeverSign),
     );
     let signer = LocalKeySigner::new(&[0x35; 32]);
     let payer = signer.address();
-    let chain_id = bridge.cfg.chain_id;
-    let mut claimant = bridge
+    let chain = bridge.cfg.chain_id;
+    let journal = &bridge.journal;
+    let mut record = bridge
         .plan_return(&held, &[0xab; 20], &payer, Some(0))
         .unwrap()
         .record;
-    claimant.status = "burned".into();
-    bridge.journal.put_return(&claimant).unwrap();
-    let other = Journal::new(bridge.journal.store.clone(), [0xa1; 32]);
-    let mut active = claimant.clone();
-    active.base = other.base("return");
-    active.return_id = hex(&[0xa2; 32]);
-    active
+    let id = unhex_n::<32>(&record.return_id).unwrap();
+    journal.open_erc20_payer_journal(chain).unwrap();
+    record.extra.remove("erc20PayerState");
+    record.extra.remove("recovery");
+    journal.put_return(&record).unwrap();
+    let assert_refused = |error: Error| {
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported pre-release ERC20 record: start a fresh wallet"),
+            "{error}"
+        );
+    };
+    assert_refused(journal.open_erc20_payer_journal(chain).unwrap_err());
+    assert_refused(bridge.burn(&id, &NeverSign).unwrap_err());
+    let request = TxRequest {
+        chain_id: chain,
+        nonce: 7,
+        max_priority_fee_per_gas: 1u8.into(),
+        max_fee_per_gas: 10u8.into(),
+        gas: 100_000,
+        to: bridge.cfg.vault,
+        value: BigUint::default(),
+        data: vec![],
+    };
+    let packet = sign_tx(&signer, &request).unwrap();
+    record.status = "submitted".into();
+    record
         .extra
         .insert("executionPayer".into(), json!(hex(&payer)));
-    other.put_return(&active).unwrap();
-    let obsolete = format!(
-        "nb2/payer-index/v1/{}/{}",
-        &active.base.domain[2..],
-        &active.return_id[2..]
+    record.sends.push(bridge.send_record(&packet));
+    let scope = format!(
+        "{chain}/{}/{}/{}",
+        to_hex(&payer),
+        &record.base.domain[2..],
+        &record.return_id[2..]
     );
-    other.store.put_if(&obsolete, None, "1").unwrap();
-
-    let drain = PayerCheck {
-        drain: true,
-        signing_nonce: Some(7),
-        finalized_nonce: Some(&|| bridge.evm.nonce(&payer, "finalized")),
-        ..Default::default()
-    };
-    let claim = |check: &PayerCheck<'_>| {
-        bridge
-            .journal
-            .check_payer(chain_id, &payer, &claimant.return_id, true, check)
-    };
-    assert!(claim(&drain)
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("local signed sends indexed"));
-    let packet = sign_tx(
-        &signer,
-        &TxRequest {
-            chain_id,
-            nonce: 7,
-            max_priority_fee_per_gas: 1u8.into(),
-            max_fee_per_gas: 10u8.into(),
-            gas: 100_000,
-            to: rpc.recovery,
-            value: BigUint::default(),
-            data: vec![],
-        },
-    )
-    .unwrap();
-    other.register_payer_chain(chain_id).unwrap();
-    other.index_payer_sends(&active, &[&packet.raw]).unwrap();
-    rpc.finalized_nonce.store(7, Ordering::SeqCst);
-    assert!(claim(&drain)
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("signed nonce awaiting finalization"));
+    let watermark = format!("nb2/payer-sends/v1/{scope}");
+    journal.store.put_if(&watermark, None, "2").unwrap();
+    journal.put_return(&record).unwrap();
+    for _ in 0..2 {
+        assert_refused(journal.open_erc20_payer_journal(chain).unwrap_err());
+        assert_refused(bridge.submit_redeem(&id, &signer).unwrap_err());
+        assert_refused(
+            journal
+                .prepare_payer_broadcast(&record, chain, &packet.raw)
+                .unwrap_err(),
+        );
+        assert_eq!(journal.store.get(&watermark).unwrap().as_deref(), Some("2"));
+        assert!(journal
+            .store
+            .get(&format!("nb2/payer-fee-index/v2/{scope}"))
+            .unwrap()
+            .is_none());
+        assert!(journal
+            .store
+            .list(&format!("nb2/payer-fees/v1/{scope}/"))
+            .unwrap()
+            .is_empty());
+    }
+    record.status = "paid".into();
+    record.paid = Some(PaidRecord {
+        tx_hash: hex(&packet.hash),
+        block_number: "21".into(),
+        extra: Default::default(),
+    });
+    journal.put_return(&record).unwrap();
     rpc.finalized_nonce.store(8, Ordering::SeqCst);
-    let commitments = claim(&PayerCheck {
-        signing_nonce: Some(8),
-        ..drain
-    })
-    .unwrap();
-    assert_eq!(
-        commitments.fees,
-        undec(active.extra["recovery"]["totalFee"].as_str().unwrap()).unwrap()
+    assert_refused(journal.open_erc20_payer_journal(chain).unwrap_err());
+    assert_refused(
+        journal
+            .check_return_payer(chain, &payer, &hex(&[0x38; 32]), false)
+            .unwrap_err(),
     );
 }
 
 #[test]
-fn legacy_claim_checks_all_remaining_calls_before_granting_exclusivity() {
+fn a_claim_checks_all_remaining_calls_before_granting_exclusivity() {
     let (bridge, _, held) = return_bridge(
         24_000_001,
         1_000_000_000_000,
@@ -1154,6 +1170,7 @@ fn legacy_claim_checks_all_remaining_calls_before_granting_exclusivity() {
         record.status = "burned".into();
         record.extra["recovery"]["calls"] = json!("8");
         record.extra["recovery"]["envelope"]["maxNonce"] = json!(cap);
+        journal.register_payer_chain(chain).unwrap();
         journal.put_return(&record).unwrap();
         record
     };
@@ -1194,7 +1211,7 @@ fn legacy_claim_checks_all_remaining_calls_before_granting_exclusivity() {
 }
 
 #[test]
-fn finalized_runs_free_exact_nonce_and_balance_windows_for_both_legacy_returns() {
+fn finalized_runs_free_exact_nonce_and_balance_windows_for_both_funded_returns() {
     use super::super::evm::LocalKeySigner;
     use super::super::recovery::RecoveryReceipt;
     let (bridge, rpc, held) = return_bridge(
@@ -1224,7 +1241,6 @@ fn finalized_runs_free_exact_nonce_and_balance_windows_for_both_legacy_returns()
         record.extra["recovery"]["totalFee"] = json!("100");
         record.extra["recovery"]["envelope"]["maxNonce"] = json!(cap);
         record.extra["recovery"]["envelope"]["maxFeePerGas"] = json!("1");
-        journal.put_return(&record).unwrap();
         let packet = sign_tx(
             &signer,
             &TxRequest {
@@ -1240,7 +1256,13 @@ fn finalized_runs_free_exact_nonce_and_balance_windows_for_both_legacy_returns()
         )
         .unwrap();
         journal.register_payer_chain(chain_id).unwrap();
-        journal.index_payer_sends(&record, &[&packet.raw]).unwrap();
+        let mut unsigned = record.clone();
+        unsigned.extra.remove("executionPayer");
+        journal
+            .prepare_payer_signing(&unsigned, chain_id, &payer)
+            .unwrap();
+        journal.retain_payer_send(&record, &packet.raw).unwrap();
+        journal.put_return(&record).unwrap();
         journal
             .index_recovery_progress(
                 chain_id,
@@ -1592,7 +1614,7 @@ fn contested_ordinary_signing_checks_fallback_signed_bytes_and_per_packet_fee() 
 }
 
 #[test]
-fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacement_fee() {
+fn ordinary_takeover_counts_indexed_run_fees_and_preserves_the_higher_replacement_fee() {
     use super::super::evm::LocalKeySigner;
     use super::super::recovery::RecoveryReceipt;
     let (mut bridge, rpc, held) = return_bridge(
@@ -1611,10 +1633,6 @@ fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacemen
     first.status = "burned".into();
     let mut other = first.clone();
     other.return_id = hex(&[0x33; 32]);
-    first
-        .extra
-        .insert("executionPayer".into(), json!(hex(&payer)));
-    bridge.journal.put_return(&first).unwrap();
     bridge.journal.put_return(&other).unwrap();
     let tx = TxRequest {
         chain_id: chain,
@@ -1641,112 +1659,21 @@ fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacemen
         .unwrap()
         .raw
     };
-    let run = raw(&signer, 2, chain, 0);
-    let id = format!("{}/{}", &first.base.domain[2..], &first.return_id[2..]);
-    let watermark = format!("nb2/payer-sends/v1/{chain}/{}/{id}", to_hex(&payer));
-    let fee_index = format!("nb2/payer-fee-index/v2/{chain}/{}/{id}", to_hex(&payer));
-    let legacy_domain = [0x72; 32];
-    let legacy = Journal::new(bridge.journal.store.clone(), legacy_domain);
-    let mut unregistered = first.clone();
-    unregistered.base.domain = hex(&legacy_domain);
-    unregistered.return_id = hex(&[0x73; 32]);
-    legacy.put_return(&unregistered).unwrap();
-    let foreign = raw(&signer, 200, chain + 1, 0);
-    let local = raw(&signer, 2, chain, 0);
-    legacy
-        .index_payer_sends(&unregistered, &[&foreign])
+    bridge
+        .journal
+        .prepare_payer_signing(&first, chain, &payer)
         .unwrap();
-    assert!(legacy
-        .store
-        .get(&format!("nb2/domain-chain/v1/{}", to_hex(&legacy_domain)))
-        .unwrap()
-        .is_none());
-    assert!(legacy
-        .store
-        .list("nb2/payer-fee-index/v2/")
-        .unwrap()
-        .is_empty());
-    legacy.register_payer_chain(chain).unwrap();
-    legacy
-        .store
-        .put_if(
-            &format!(
-                "nb2/payer-fee-index/v1/{}/{}",
-                to_hex(&legacy_domain),
-                &unregistered.return_id[2..]
-            ),
-            None,
-            "1",
-        )
-        .unwrap();
-    let different = raw(&LocalKeySigner::new(&[0x74; 32]), 200, chain, 0);
-    legacy
-        .index_payer_sends(&unregistered, &[&foreign, &different])
-        .unwrap();
-    let mut before_binding = unregistered.clone();
-    before_binding.extra.remove("executionPayer");
-    for error in [
-        legacy
-            .prepare_payer_signing(&before_binding, chain, &payer)
-            .unwrap_err(),
-        legacy
-            .payer_fee_maxima(&unregistered, chain, &payer)
-            .unwrap_err(),
-        legacy
-            .prepare_payer_broadcast(&unregistered, chain, &local)
-            .unwrap_err(),
+    for packet in [
+        raw(&signer, 2, chain, 0),
+        raw(&signer, 1, chain, 0),
+        raw(&signer, 200, chain, tx.nonce),
     ] {
-        assert!(
-            error.to_string().contains("local signed fees indexed"),
-            "{error}"
-        );
+        bridge.journal.retain_payer_send(&first, &packet).unwrap();
     }
-    let error = legacy
-        .prepare_payer_broadcast(&unregistered, chain, &foreign)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("belongs to another chain"),
-        "{error}"
-    );
-    legacy.index_payer_sends(&unregistered, &[&local]).unwrap();
-    legacy
-        .prepare_payer_broadcast(&unregistered, chain, &raw(&signer, 1, chain, 0))
-        .unwrap();
-    let fees = legacy.payer_fees(&unregistered, chain, &payer, 0).unwrap();
-    assert_eq!(fees.at_nonce, 20u8.into());
-    assert_eq!(fees.prior, BigUint::default());
-    unregistered.status = "paid".into();
-    legacy.put_return(&unregistered).unwrap();
-    let mut old_ordinary = unregistered.clone();
-    old_ordinary.return_id = hex(&[0x75; 32]);
-    old_ordinary.extra.remove("executionPayer");
-    old_ordinary.sends.push(
-        bridge.send_record(
-            &sign_tx(
-                &signer,
-                &TxRequest {
-                    gas: 2,
-                    chain_id: chain,
-                    nonce: 0,
-                    to: rpc.recovery,
-                    max_fee_per_gas: 10u8.into(),
-                    ..tx.clone()
-                },
-            )
-            .unwrap(),
-        ),
-    );
-    legacy.put_return(&old_ordinary).unwrap();
-    legacy
-        .prepare_payer_broadcast(&old_ordinary, chain, &local)
-        .unwrap();
-    assert_eq!(
-        legacy
-            .payer_fees(&old_ordinary, chain, &payer, 0)
-            .unwrap()
-            .at_nonce,
-        20u8.into()
-    );
+    first
+        .extra
+        .insert("executionPayer".into(), json!(hex(&payer)));
+    bridge.journal.put_return(&first).unwrap();
     let hash = he(&[&super::super::header::encode_header(
         &super::super::rpc::header_of_json(&finalized_header()).unwrap(),
     )]);
@@ -1803,41 +1730,6 @@ fn ordinary_takeover_migrates_local_run_fees_and_preserves_the_higher_replacemen
         fee_budget: needed.clone(),
         ..limits
     };
-    assert!(bridge.journal.store.get(&watermark).unwrap().is_none());
-    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
-    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
-    assert!(
-        error.to_string().contains("local signed fees indexed"),
-        "{error}"
-    );
-    bridge.journal.index_payer_sends(&first, &[]).unwrap();
-    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
-    bridge
-        .journal
-        .index_payer_sends(&first, &[&raw(&signer, 200, chain + 1, 0)])
-        .unwrap();
-    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
-    bridge.journal.store.put_if(&watermark, None, "0").unwrap();
-    bridge.journal.index_payer_sends(&first, &[]).unwrap();
-    assert!(bridge.journal.store.get(&fee_index).unwrap().is_none());
-    let peer = LocalKeySigner::new(&[0x36; 32]);
-    bridge
-        .journal
-        .index_payer_sends(
-            &first,
-            &[
-                &run,
-                &raw(&signer, 1, chain, 0),
-                &raw(&peer, 200, chain, 0),
-                &raw(&signer, 200, chain + 1, 0),
-                &raw(&signer, 200, chain, tx.nonce),
-            ],
-        )
-        .unwrap();
-    assert_eq!(
-        bridge.journal.store.get(&fee_index).unwrap().as_deref(),
-        Some("1")
-    );
     let fees = bridge
         .journal
         .payer_fees(&first, chain, &payer, tx.nonce)
@@ -1973,6 +1865,8 @@ fn finalized_runs_keep_ordinary_retries_reserved_until_their_nonces_are_used() {
         },
     )
     .unwrap();
+    journal.prepare_payer_signing(&b, chain_id, &payer).unwrap();
+    journal.retain_payer_send(&b, &tx.raw).unwrap();
     b.sends.push(bridge.send_record(&tx));
     journal.put_return(&b).unwrap();
     rpc.finalized_nonce.store(2, Ordering::SeqCst);
@@ -2023,9 +1917,15 @@ fn a_second_ordinary_payer_cannot_sign_or_rebroadcast_an_already_bound_return() 
         data: vec![0x11; 68],
     };
     let recovery = sign_tx(&first, &request).unwrap();
+    let mut unsigned = record.clone();
+    unsigned.extra.remove("executionPayer");
     bridge
         .journal
-        .index_payer_sends(&record, &[&recovery.raw])
+        .prepare_payer_signing(&unsigned, chain, &first.address())
+        .unwrap();
+    bridge
+        .journal
+        .retain_payer_send(&record, &recovery.raw)
         .unwrap();
     rpc.finalized_nonce.store(1, Ordering::SeqCst);
     assert_eq!(
@@ -2047,9 +1947,12 @@ fn a_second_ordinary_payer_cannot_sign_or_rebroadcast_an_already_bound_return() 
     for recorded in [true, false] {
         if !recorded {
             record.extra.remove("executionPayer");
-            record
-                .sends
-                .push(bridge.send_record(&sign_tx(&first, &next).unwrap()));
+            let ordinary = sign_tx(&first, &next).unwrap();
+            bridge
+                .journal
+                .retain_payer_send(&record, &ordinary.raw)
+                .unwrap();
+            record.sends.push(bridge.send_record(&ordinary));
         }
         bridge.journal.put_return(&record).unwrap();
         let mut before_binding = record.clone();

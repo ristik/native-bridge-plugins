@@ -573,6 +573,13 @@ fn payer_send_path(chain_id: u64, payer: &[u8], record: &ReturnRecord) -> String
     )
 }
 
+pub(crate) fn unsupported_erc20_return<T>() -> Result<T> {
+    refuse(
+        WalletReason::BadInput,
+        "unsupported pre-release ERC20 record: start a fresh wallet",
+    )
+}
+
 pub(crate) struct PayerFees {
     pub prior: BigUint,
     pub at_nonce: BigUint,
@@ -807,49 +814,116 @@ impl Journal {
         Ok(())
     }
 
-    /// Import complete local signed history. Unregistered domains cannot be marked complete.
-    pub fn index_payer_sends(&self, record: &ReturnRecord, signed: &[&[u8]]) -> Result<()> {
-        let chain = self
+    /// Check stored ERC20 state before opening the domain or acting on a return.
+    pub(crate) fn require_erc20_return_state(
+        &self,
+        chain_id: u64,
+        record: &ReturnRecord,
+    ) -> Result<()> {
+        let domain = &record.base.domain[2..];
+        if self
             .store
-            .get(&format!("nb2/domain-chain/v1/{}", &record.base.domain[2..]))?;
-        let ordinary = record
-            .sends
-            .iter()
-            .map(|send| unhex(&send.raw))
-            .collect::<Result<Vec<_>>>()?;
-        let bound = record.execution_payer()?;
-        let executor = record.extra.contains_key("executionPayer");
-        let mut covered = BTreeMap::<String, u64>::new();
-        for (index, raw) in signed
-            .iter()
-            .copied()
-            .chain(ordinary.iter().map(Vec::as_slice))
-            .enumerate()
+            .get(&format!("nb2/domain-chain/v1/{domain}"))?
+            .as_deref()
+            != Some(&dec(chain_id))
         {
-            let tx = decode_signed_tx(raw).map_err(Error::Other)?;
-            if chain.as_deref() != Some(&dec(tx.request.chain_id))
-                || bound.is_some_and(|payer| payer != tx.from)
-            {
-                continue;
-            }
-            self.retain_payer_send(record, raw)?;
-            let path = payer_send_path(tx.request.chain_id, &tx.from, record);
-            // Ordinary records alone cannot prove the separate recovery history of a recorded executor.
-            if executor && index >= signed.len() && !covered.contains_key(&path) {
-                continue;
-            }
-            let highest = covered.entry(path).or_default();
-            *highest = (*highest).max(tx.request.nonce);
+            return unsupported_erc20_return();
         }
-        for (path, highest) in covered {
-            if self
+        if let Some(payer) = record.execution_payer()? {
+            let path = payer_send_path(chain_id, &payer, record);
+            let highest = self
                 .store
                 .get(&format!("nb2/payer-sends/v1/{path}"))?
                 .as_deref()
-                == Some(&dec(highest))
-            {
-                self.complete_payer_history(&path)?;
+                .map(undec64)
+                .transpose()?;
+            let Some(highest) = highest else {
+                return unsupported_erc20_return();
+            };
+            if !self.payer_history_complete(&path)? {
+                return unsupported_erc20_return();
             }
+            let fees = format!("nb2/payer-fees/v1/{path}/");
+            let missing = if record.status == "paid" {
+                self.store.list(&fees)?.is_empty()
+            } else {
+                self.store.get(&format!("{fees}{highest}"))?.is_none()
+            };
+            if missing {
+                return unsupported_erc20_return();
+            }
+            for send in &record.sends {
+                self.require_indexed_payer_send(
+                    chain_id,
+                    record,
+                    &unhex(&send.raw)?,
+                    Some(highest),
+                )?;
+            }
+            return Ok(());
+        }
+        if record.status == "submitted" {
+            return unsupported_erc20_return();
+        }
+        if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1) {
+            return Ok(());
+        }
+        // Funded returns already admitted under the payer-slot protocol may predate the record flag.
+        let payer = unhex_n::<20>(record.payer.as_deref().unwrap_or(&record.recipient))?;
+        let slot = self
+            .store
+            .get(&format!("nb2/payer/v1/{chain_id}/{}", to_hex(&payer)))?;
+        let owner = format!("nb2/v1/{domain}/return/{}", &record.return_id[2..]);
+        if slot.as_deref().and_then(|value| value.split('#').next()) != Some(&owner) {
+            return unsupported_erc20_return();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn open_erc20_payer_journal(&self, chain_id: u64) -> Result<()> {
+        for record in self.returns()? {
+            self.require_erc20_return_state(chain_id, &record)?;
+        }
+        self.register_payer_chain(chain_id)
+    }
+
+    fn require_indexed_payer_send(
+        &self,
+        chain_id: u64,
+        record: &ReturnRecord,
+        raw: &[u8],
+        highest: Option<u64>,
+    ) -> Result<()> {
+        let tx = decode_signed_tx(raw).map_err(Error::Other)?;
+        if tx.request.chain_id != chain_id {
+            return refuse(
+                WalletReason::BadInput,
+                "signed payer packet belongs to another chain",
+            );
+        }
+        record.require_execution_payer(&tx.from)?;
+        let path = payer_send_path(chain_id, &tx.from, record);
+        let fee = self
+            .store
+            .get(&format!("nb2/payer-fees/v1/{path}/{}", tx.request.nonce))?
+            .as_deref()
+            .map(undec)
+            .transpose()?;
+        let watermark = match highest {
+            Some(highest) => Some(highest),
+            None => self
+                .store
+                .get(&format!("nb2/payer-sends/v1/{path}"))?
+                .as_deref()
+                .map(undec64)
+                .transpose()?,
+        };
+        if !watermark.is_some_and(|nonce| nonce >= tx.request.nonce)
+            || !fee.is_some_and(|fee| {
+                fee >= BigUint::from(tx.request.gas) * tx.request.max_fee_per_gas
+            })
+        {
+            return unsupported_erc20_return();
         }
         Ok(())
     }
@@ -867,57 +941,24 @@ impl Journal {
                 "return belongs to another payer journal domain",
             );
         }
-        if self
-            .store
-            .get(&format!("nb2/domain-chain/v1/{}", to_hex(&self.domain)))?
-            .as_deref()
-            != Some(&dec(chain_id))
-        {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "payer fee history needs an authenticated chain association",
-            );
-        }
         record.require_execution_payer(payer)?;
         let stored = self.ret(&record.return_id)?;
         let record = stored.as_ref().unwrap_or(record);
         record.require_execution_payer(payer)?;
         let path = payer_send_path(chain_id, payer, record);
-        let executor = record.extra.contains_key("executionPayer");
-        let ordinary = record
-            .sends
-            .iter()
-            .map(|send| decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other))
-            .collect::<Result<Vec<_>>>()?;
-        let has_ordinary = ordinary
-            .iter()
-            .any(|tx| tx.request.chain_id == chain_id && tx.from.as_slice() == payer);
-        if !executor && has_ordinary && !self.payer_history_complete(&path)? {
-            self.index_payer_sends(record, &[])?;
-        }
+        self.require_erc20_return_state(chain_id, record)?;
         let prefix = format!("nb2/payer-fees/v1/{path}/");
         let keys = self.store.list(&prefix)?;
-        if (executor
-            || has_ordinary
-            || !keys.is_empty()
+        if (!keys.is_empty()
             || self
                 .store
                 .get(&format!("nb2/payer-sends/v1/{path}"))?
                 .is_some())
             && !self.payer_history_complete(&path)?
         {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "return needs its local signed fees indexed",
-            );
+            return unsupported_erc20_return();
         }
-        let mut fees = BTreeMap::<u64, BigUint>::new();
-        let mut record_fee = |nonce, fee| {
-            let saved = fees.entry(nonce).or_default();
-            if *saved < fee {
-                *saved = fee;
-            }
-        };
+        let mut fees = BTreeMap::new();
         for key in keys {
             let Some(value) = self.store.get(&key)? else {
                 return refuse(
@@ -925,15 +966,7 @@ impl Journal {
                     "signed fee disappeared during payer reconciliation",
                 );
             };
-            record_fee(undec64(&key[prefix.len()..])?, undec(&value)?);
-        }
-        for tx in ordinary {
-            if tx.request.chain_id == chain_id && tx.from.as_slice() == payer {
-                record_fee(
-                    tx.request.nonce,
-                    BigUint::from(tx.request.gas) * tx.request.max_fee_per_gas,
-                );
-            }
+            fees.insert(undec64(&key[prefix.len()..])?, undec(&value)?);
         }
         Ok(fees)
     }
@@ -951,7 +984,7 @@ impl Journal {
         Ok(fees)
     }
 
-    /// Revalidate an exact signed packet's scope and retain its maximum before handing it to an RPC.
+    /// Check the original payer and the indexed exact packet before any RPC send.
     pub fn prepare_payer_broadcast(
         &self,
         record: &ReturnRecord,
@@ -965,14 +998,13 @@ impl Journal {
                 "signed payer packet belongs to another chain",
             );
         }
-        self.payer_fee_maxima(record, chain_id, &tx.from)?;
-        if !self.payer_history_complete(&payer_send_path(chain_id, &tx.from, record))? {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "return needs its local signed fees indexed",
-            );
+        let stored = self.ret(&record.return_id)?;
+        let history = stored.as_ref().unwrap_or(record);
+        self.payer_fee_maxima(history, chain_id, &tx.from)?;
+        if !self.payer_history_complete(&payer_send_path(chain_id, &tx.from, history))? {
+            return unsupported_erc20_return();
         }
-        self.retain_payer_send(record, raw)
+        self.require_indexed_payer_send(chain_id, history, raw, None)
     }
 
     pub(crate) fn payer_fees(
@@ -1135,6 +1167,14 @@ impl Journal {
                 draining = active;
                 continue;
             }
+            if self
+                .store
+                .get(&format!("nb2/domain-chain/v1/{domain}"))?
+                .as_deref()
+                != Some(&dec(chain_id))
+            {
+                continue;
+            }
             let mut ordinary = std::collections::BTreeSet::new();
             for send in &rec.sends {
                 let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
@@ -1143,24 +1183,8 @@ impl Journal {
                     ordinary.insert(tx.request.nonce);
                 }
             }
-            let registered = self
-                .store
-                .get(&format!("nb2/domain-chain/v1/{domain}"))?
-                .as_deref()
-                .map(undec64)
-                .transpose()?;
-            if registered.is_some_and(|known| known != chain_id) {
-                continue;
-            }
-            if rec.status != "planned"
-                && executing
-                && (registered.is_none()
-                    || !self.payer_history_complete(&payer_send_path(chain_id, payer, &rec))?)
-            {
-                return fail_d(
-                    Rule::CapacityPreflight,
-                    "another return needs its local signed sends indexed",
-                );
+            if active || !ordinary.is_empty() || executing {
+                self.require_erc20_return_state(chain_id, &rec)?;
             }
             if active {
                 let recovery = &rec.extra["recovery"];
@@ -1240,6 +1264,9 @@ impl Journal {
             );
         }
         unhex_n::<32>(id)?;
+        if let Some(record) = self.ret(id)? {
+            self.require_erc20_return_state(chain_id, &record)?;
+        }
         self.register_payer_chain(chain_id)?;
         let key = format!("nb2/payer/v1/{chain_id}/{}", to_hex(payer));
         let target = self.key("return", Some(&id[2..]));
@@ -1306,6 +1333,7 @@ impl Journal {
                         "return is no longer eligible for payer signing",
                     );
                 };
+                self.require_erc20_return_state(chain_id, &current)?;
                 if check.signing_nonce.is_some() {
                     current.require_execution_payer(payer)?;
                 }
