@@ -29,8 +29,9 @@ import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type R
 import {
   Journal, dec, hex, undec, unhex, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
-import { recoveredSettlementEta } from './recovery.js';
-import { quoteErc20Call, type Erc20SigningBounds } from './recovery-cost.js';
+import { recoveredSettlementEta, recoveryGeneration, type RecoveryDeployment } from './recovery.js';
+import { preflightRecovery, quoteErc20Call, quoteOrdinaryExecution, type Erc20SigningBounds, type OrdinaryCalibrationRange,
+  type RecoveryBacklog, type RecoveryCalibration, type RecoveryLimits } from './recovery-cost.js';
 import { burnIndex, capacityExceeded, capacityPreflight, maxProofs, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
 import { AmbiguousBroadcast, CERTIFICATION_DEPTH, EvmReader, ProofUnavailable, RpcError, revertDataOf, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
@@ -222,8 +223,20 @@ export interface ReturnPlan {
 export interface ReturnAdmission {
   ordinaryEnvelope?: { encodedBytes: bigint; gas: bigint; gasFor?: (shape: RedeemShape) => bigint | null };
   checkOrdinary?(record: ReturnRecord, gas: bigint): Promise<void>;
-  recover?(record: ReturnRecord, ordinary?: Pick<NonNullable<Erc20SigningBounds['ordinary']>, 'gas' | 'calldataBytes'>): Promise<NonNullable<ReturnRecord['recovery']>>;
+  /** Optional UCT admission policy. ERC20 uses the release inputs below. */
+  recover?(record: ReturnRecord): Promise<NonNullable<ReturnRecord['recovery']>>;
+  erc20Recovery?: Erc20ReturnRecovery;
   beforeCertification?(record: ReturnRecord): Promise<void>;
+}
+
+export interface Erc20ReturnRecovery {
+  deployment: RecoveryDeployment;
+  calibration: RecoveryCalibration;
+  backlog: Omit<RecoveryBacklog, 'signedStart' | 'observed'>;
+  limits: Omit<RecoveryLimits, 'chainId' | 'worstCaseEnvelope'>;
+  signingBounds?: Omit<Erc20SigningBounds, 'ordinary'>;
+  ordinaryAttempts?: Pick<NonNullable<Erc20SigningBounds['ordinary']>, 'attemptsBeforeFallback' | 'inclusionMs'>;
+  ordinaryRanges?: readonly OrdinaryCalibrationRange[];
 }
 
 export interface RedeemOptions {
@@ -1206,6 +1219,7 @@ export class NativeBridgeV2 {
   private async admitReturn(record: ReturnRecord, amount: bigint, admission?: ReturnAdmission) {
     this.requireErc20Qualification();
     delete record.recovery;
+    if (this.cfg.erc20) return this.admitErc20Return(record, amount, admission?.erc20Recovery);
     const a = undec(record.a);
     let ordinary: Awaited<ReturnType<NativeBridgeV2['preflight']>>;
     try {
@@ -1219,14 +1233,95 @@ export class NativeBridgeV2 {
       const observed = undec(record.recovery.observed);
       return { cObs: observed, pNow: observed > a ? observed - a : 0n, need: 0n, pMax: 0n, gas: 0n };
     }
-    if (this.cfg.erc20) {
-      if (!admission?.recover) return fail('CapacityPreflight', 'a bounded ERC20 continuation quote is required');
-      const { gas, calldataBytes } = ordinary;
-      const qualified = await admission.recover(structuredClone(record), { gas, calldataBytes });
-      if (!qualified.ordinary) fail('CapacityPreflight', 'a bounded ordinary attempt policy is required');
-      record.recovery = qualified;
-    }
     return ordinary;
+  }
+
+  private erc20Limits(input: Erc20ReturnRecovery): RecoveryLimits {
+    const { chainId } = this.cfg;
+    return { ...input.limits, chainId, worstCaseEnvelope: false,
+      signedBytes: Math.min(input.limits.signedBytes, Number(this.opts.pins.maxEncodedTxBytes)),
+      gas: input.limits.gas < this.opts.pins.userGasLimit ? input.limits.gas : this.opts.pins.userGasLimit };
+  }
+
+  private async checkErc20Funds(record: ReturnRecord, limits: RecoveryLimits, replacing?: bigint) {
+    const payer = unhex(record.payer ?? record.recipient);
+    await this.journal.checkReturnPayer(this.cfg.chainId, payer, record.returnId);
+    const [balance, pending, nonce, fees] = await Promise.all([
+      this.evm.balance(payer), this.evm.balance(payer, 'pending'), replacing ?? this.evm.nonce(payer), this.evm.fees(),
+    ]);
+    const currentBid = 2n * fees.baseFee + fees.priority;
+    if (currentBid > limits.maxFeePerGas || fees.priority > limits.maxPriorityFeePerGas) {
+      fail('CapacityPreflight', 'current fees exceed the continuation bid limits');
+    }
+    const free = balance < pending ? balance : pending;
+    return { nonce, balance: free < limits.balance ? free : limits.balance };
+  }
+
+  private checkErc20Reserve(plan: NonNullable<ReturnRecord['recovery']>, limits: RecoveryLimits, funds: { nonce: bigint; balance: bigint }): void {
+    if (funds.nonce + undec(plan.calls) - 1n > limits.maxNonce) fail('CapacityPreflight', 'continuation schedule exceeds the declared nonce horizon');
+    if (undec(plan.totalFee) > funds.balance) fail('CapacityPreflight', 'insufficient free payer balance');
+  }
+
+  /** Price a complete ERC20 continuation from release inputs, including when adopting an already signed burn. */
+  public async qualifyErc20Recovery(record: ReturnRecord, input: Erc20ReturnRecovery, replacing?: bigint) {
+    return this.quoteErc20Continuation(structuredClone(record), structuredClone(input), undefined, replacing);
+  }
+
+  private async quoteErc20Continuation(record: ReturnRecord, input: Erc20ReturnRecovery,
+    ordinary?: { gas: bigint; calldataBytes: number }, replacing?: bigint): Promise<NonNullable<ReturnRecord['recovery']>> {
+    const token = this.cfg.erc20?.token;
+    const pins = this.opts.pins.erc20;
+    if (!token || !pins) fail('CapacityPreflight', 'a pinned ERC20 deployment is required');
+    const recovery = erc20Create2(pins.factory, HE(addressWord(token)), pins.recoveryInitcodeHash);
+    const { deployment, calibration } = input;
+    const [runtime, vault] = await Promise.all([this.evm.code(recovery), this.evm.code(this.cfg.vault)]);
+    if (!eq(deployment.recovery, recovery) || !deployment.vaultRuntimeHash || !eq(deployment.vaultRuntimeHash, this.opts.pins.vaultRuntimeCodeHash) ||
+        !eq(HE(runtime), deployment.runtimeHash) || !eq(HE(vault), deployment.vaultRuntimeHash)) {
+      fail('CapacityPreflight', 'continuation calibration differs from the deployed graph');
+    }
+    const limits = this.erc20Limits(input);
+    const funds = await this.checkErc20Funds(record, limits, replacing);
+    const a = undec(record.a);
+    const { segment } = await this.evm.vaultState(this.cfg.vault);
+    const observed = segment > a ? segment : a;
+    const backlog = { ...input.backlog, signedStart: a, observed };
+    const bounds = input.signingBounds && { ...input.signingBounds,
+      ordinary: ordinary && { ...ordinary, attemptsBeforeFallback: input.ordinaryAttempts?.attemptsBeforeFallback ?? 0n,
+        inclusionMs: input.ordinaryAttempts?.inclusionMs ?? 0n } };
+    const plan = await this.retryingTrust((trust) => preflightRecovery(this.opts.pins.gamma, unhex(record.source), trust,
+      buildParams(this.opts.pins.build), deployment, calibration, { ...limits, balance: funds.balance }, backlog,
+      record.sealReceipt ? unhex(record.sealReceipt) : undefined, bounds));
+    const priced = { generation: hex(recoveryGeneration(deployment.salt, this.domain)),
+      calls: dec(BigInt(plan.run.length) + plan.advance.calls + 1n + plan.priorAttempts), totalFee: dec(plan.totalFee),
+      runCuts: plan.run.map((cut) => cut.shape.operations), advanceGaps: plan.advance.quote.shape.gaps,
+      observed: dec(observed), progressEnd: dec(observed + backlog.duringProgress), receiptP99Ms: dec(backlog.receiptP99Ms),
+      finalInclusionMs: dec(backlog.finalInclusionMs), qualifiedForMs: dec(backlog.qualifiedForMs),
+      envelope: { gas: dec(limits.gas), signedBytes: limits.signedBytes, calldataBytes: limits.calldataBytes, maxNonce: dec(limits.maxNonce),
+        maxFeePerGas: dec(limits.maxFeePerGas), maxPriorityFeePerGas: dec(limits.maxPriorityFeePerGas) },
+      ordinary: ordinary && { gas: dec(ordinary.gas), calldataBytes: ordinary.calldataBytes,
+        maxFeePerGas: dec(limits.maxFeePerGas), attemptsBeforeFallback: dec(plan.priorAttempts) } };
+    this.checkErc20Reserve(priced, limits, funds);
+    return priced;
+  }
+
+  private async admitErc20Return(record: ReturnRecord, amount: bigint, input?: Erc20ReturnRecovery) {
+    if (!input) fail('CapacityPreflight', 'a bounded ERC20 continuation quote is required');
+    input = structuredClone(input);
+    const a = undec(record.a);
+    const limits = this.erc20Limits(input);
+    let ordinary: Awaited<ReturnType<NativeBridgeV2['preflight']>> | undefined;
+    try {
+      const candidate = await this.preflight(unhex(record.source), amount, unhex(record.recipient), a, unhex(record.payer ?? record.recipient), {
+        ordinaryEnvelope: { encodedBytes: this.opts.pins.maxEncodedTxBytes, gas: limits.gas,
+          gasFor: input.ordinaryRanges && ((shape) => quoteOrdinaryExecution(shape, input!.ordinaryRanges!, this.opts.pins.gasReserve)) },
+      });
+      if (quoteErc20Call(candidate.calldataBytes, candidate.gas, limits)) ordinary = candidate;
+    } catch (e) {
+      if (!((e instanceof Nb2Error && e.rule === 'CapacityPreflight') || (e instanceof WalletError && e.reason === 'InsufficientFunds'))) throw e;
+    }
+    record.recovery = await this.quoteErc20Continuation(record, input, ordinary);
+    const observed = undec(record.recovery.observed);
+    return ordinary ?? { cObs: observed, pNow: observed - a, need: 0n, pMax: 0n, gas: 0n };
   }
 
   private async verifyReturnAnchor(rec: ReturnRecord): Promise<void> {
@@ -1352,8 +1447,7 @@ export class NativeBridgeV2 {
     const recoverProof = options?.recoverProof;
     return this.locked(`return/${toHex(returnId)}`, async () => {
       const record = await this.returnRecord(returnId);
-      const burn = () => this.burnInner(returnId, record, owner, admission, recipient, recoverProof);
-      return this.cfg.erc20 && record.status === 'planned' ? this.locked(`return-payer/${record.payer ?? record.recipient}`, burn) : burn();
+      return this.burnInner(returnId, record, owner, admission, recipient, recoverProof);
     });
   }
 
@@ -1371,9 +1465,16 @@ export class NativeBridgeV2 {
       if (rec.returnId !== hex(returnId) || !eq(HU(source), returnId) || held.amount !== undec(rec.amount)) {
         refuse('BadInput', 'planned return does not match the verified source and amount');
       }
-      await this.admitReturn(rec, held.amount, admission);
+      const admissionSnapshot = this.cfg.erc20 && admission?.erc20Recovery
+        ? { ...admission, erc20Recovery: structuredClone(admission.erc20Recovery) } : admission;
+      await this.admitReturn(rec, held.amount, admissionSnapshot);
       await previewErc20Recipient(this.evm, this.cfg, recipient, held.amount);
       const R = encodeReturnData({ d: this.domain, asset: this.cfg.asset, recipient, amount: held.amount, minIndex: undec(rec.a) });
+      if (this.cfg.erc20) {
+        await this.journal.checkReturnPayer(this.cfg.chainId, unhex(rec.payer ?? rec.recipient), rec.returnId, true);
+        const limits = this.erc20Limits(admissionSnapshot!.erc20Recovery!);
+        this.checkErc20Reserve(rec.recovery!, limits, await this.checkErc20Funds(rec, limits));
+      }
       const { tx, cd } = await transferRequest(source, owner, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
       rec.burnTx = hex(tx);
       rec.burnRequest = hex(cd);
@@ -1539,6 +1640,7 @@ export class NativeBridgeV2 {
               fail('CapacityPreflight', 'ordinary attempt exceeds its signing reserve');
             }
           }
+          if (this.cfg.erc20) await this.journal.checkReturnPayer(this.cfg.chainId, signer.address, fresh.returnId, true);
           await options.admit?.(request, fresh.sends);
         }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
@@ -1904,6 +2006,7 @@ export class NativeBridgeV2 {
         return { state: 'pending', txHash };
       }
       if (resubmit) {
+        if (this.cfg.erc20) await this.journal.checkReturnPayer(this.cfg.chainId, from, rec.returnId, true);
         try { await this.evm.sendRaw(raw); }
         catch (error) {
           if (onExpired && error instanceof RpcError && /replacement transaction underpriced/i.test(error.message) &&

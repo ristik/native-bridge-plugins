@@ -126,6 +126,51 @@ test('refused preflight never certifies a spend, and receive verifies the full p
   assert.equal(other.entry('coin').amount, '19');
 });
 
+test('Run replay consumes signed arrivals and preserves the other return’s payer reserve', async (t) => {
+  const { w, chain, deployment, cfg } = await setup(t);
+  const raw = w.release.recovery as { ranges: { max: { entry: string; operations: number; gaps: number } }[]; backlog: Record<string, string> };
+  raw.ranges = raw.ranges.filter(({ max }) => max.entry === 'run' ? max.operations === 1 : max.gaps <= 3);
+  Object.assign(raw.backlog, { duringProgress: '2', advancePeakSeals: '1', qualifiedForMs: '33025' });
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  assert.deepEqual(rec.recovery!.runCuts, [1, 1]);
+  assert.equal(rec.recovery!.advanceGaps, 3);
+  assert.equal(rec.recovery!.progressEnd, '2');
+  assert.equal(rec.recovery!.calls, '36'); // two Runs, 33 Advances and settlement
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  let packet = await session.run(0, 1, w.trust);
+  chain.coldCall = async (_vault, to, data) => {
+    if (!eq(to, deployment.recovery)) return;
+    assert.deepEqual(data, packet.calldata);
+    return [{ address: to, topics: packet.event.topics, data: packet.event.data }];
+  };
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  const path = join(w.dir, `recovery-${rec.returnId.slice(2)}.json`);
+  const { cuts } = JSON.parse(readFileSync(path, 'utf8'));
+  packet = await session.run(1, 1, w.trust, { seq: 1n, receipt: unhex(cuts[0].location.proof) });
+
+  // This fixture authenticates ordinary NB2 receipts and enables the ERC20 wallet's payer guard for execution.
+  w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const, payer: hx(w.signer.address) };
+  const store = w.bridge.journal;
+  await store.putReturn(other);
+  chain.fund(w.signer.address, BigInt(other.recovery!.totalFee) - chain.balanceOf(w.signer.address));
+  const state = w.bridge.evm.vaultState.bind(w.bridge.evm);
+  let segment = 2n;
+  w.bridge.evm.vaultState = async (vault) => ({ ...await state(vault), segment });
+  await assert.rejects(recoverStep(w, rec, caps), /payer already has an outstanding ERC20 return/);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 1);
+  await store.retForUpdate(other.returnId);
+  await store.putReturn({ ...other, status: 'paid' });
+  chain.fund(w.signer.address, 10n ** 18n);
+  segment = 3n;
+  await assert.rejects(recoverStep(w, rec, caps), /observed arrivals exceed the admitted Run endpoint/);
+  segment = 2n;
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 2);
+});
+
 test('a qualified ordinary envelope takes precedence over the cold route', async (t) => {
   const { w } = await setup(t, true);
   const plan = await planReturn(w, 'coin', undefined, undefined, { ...caps, calldataBytes: 393_216 });
@@ -1052,6 +1097,20 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   assert.deepEqual((await restoreReturn(reopened, portable)).sends, adopted.sends);
   const localPlan = await qualifyExistingRecovery(reopened, adopted, caps);
   assert.equal(localPlan.recovery, undefined);
+  // An imported Complete can only use funds left after the payer's outstanding ERC20 return.
+  const journalStore = reopened.bridge.journal;
+  reopened.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  const pledged = { ...localPlan, returnId: hx(key('pledged payer balance')), status: 'burned' as const,
+    payer: hx(reopened.signer.address), recovery: { ...cold.recovery!, totalFee: String(cost) } };
+  await journalStore.putReturn(pledged);
+  await journalStore.checkReturnPayer(cfg.chainId, reopened.signer.address, pledged.returnId, true);
+  chain.fund(reopened.signer.address, cost - chain.balanceOf(reopened.signer.address));
+  await assert.rejects(recoverStep(reopened, localPlan, caps), /payer already has an outstanding ERC20 return/);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).pending, undefined);
+  await journalStore.retForUpdate(pledged.returnId);
+  await journalStore.putReturn({ ...pledged, status: 'paid', paid: { txHash: hx(key('pledged return paid')), blockNumber: '1' } });
+  reopened.bridge.cfg.erc20 = undefined;
+  chain.fund(reopened.signer.address, 10n ** 18n);
   await assert.rejects(recoverStep(reopened, localPlan, { ...caps, feeBudget: cost - 1n }), { rule: 'CapacityPreflight' });
   chain.autoMine = false;
   assert.equal((await recoverStep(reopened, localPlan, { ...caps, feeBudget: cost })).state, 'pending');

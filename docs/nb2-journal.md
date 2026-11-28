@@ -36,6 +36,8 @@ a record. Within one process, calls on the same record are serialized.
 
 `<D>` is the deployment domain `D = H_U(Γ)`, in lowercase hex without `0x`. A record whose `domain` differs from its key's is refused.
 
+ERC20 returns also use `nb2/payer/v1/<chainId>/<payer>`, with a decimal chain ID and lowercase payer address without `0x`. Its value is the full return record key. Both SDKs claim the payer with the store's durable compare-and-swap before signing. A different outstanding return uses a different payer, even across vault domains in the same store. The same return can retry after interruption. A verified Paid entry makes its payer available for the next claim.
+
 ## Encodings
 
 - Byte strings: `0x` followed by lowercase hex.
@@ -166,6 +168,8 @@ hook and full burn verification before it can be used to redeem.
 
 Once a record holds `burnTx`, its burn never changes. Neither does `a`, so a refreshed witness only rebuilds the history. A record in
 `burn-requested` resubmits exactly `burnRequest`.
+
+The optional `recovery` record carries the signing schedule. `progressEnd` stores the highest segment already priced during sequential Run certification and any covered restore or fallback delay. `envelope` carries the ERC20 nonce, fee, gas and byte ceilings used to price the schedule.
 
 ## Send records
 

@@ -152,6 +152,7 @@ fn continuation(cfg: &Config, recovery: [u8; 20], fee_budget: u64) -> Erc20Retur
         signing_bounds: Erc20SigningBounds {
             fee_window_ms: 400_000,
             progress_window_ms: 100_000,
+            max_run_calls: 16,
             advance_window_ms: 2_000,
         },
         ordinary_attempts: Some((1, 1_000)),
@@ -484,6 +485,7 @@ fn erc20_caps_and_funding_limits_are_inclusive() {
         erc20_signing_reserve(
             12_000_000u64.into(),
             2,
+            2,
             &model.backlog,
             limits,
             bounds,
@@ -493,6 +495,7 @@ fn erc20_caps_and_funding_limits_are_inclusive() {
     let mut bounds = Erc20SigningBounds {
         fee_window_ms: 14_025,
         progress_window_ms: 10_000,
+        max_run_calls: 2,
         advance_window_ms: 2_000,
     };
     let mut payer = limits.clone();
@@ -502,6 +505,12 @@ fn erc20_caps_and_funding_limits_are_inclusive() {
         reserve(&payer, &bounds, Some(&ordinary)).unwrap(),
         (45_000_000u64.into(), 2)
     );
+    bounds.max_run_calls = 1;
+    assert!(reserve(&payer, &bounds, Some(&ordinary))
+        .unwrap_err()
+        .to_string()
+        .contains("Run schedule exceeds"));
+    bounds.max_run_calls = 2;
     payer.balance -= 1u8;
     assert!(reserve(&payer, &bounds, Some(&ordinary))
         .unwrap_err()
@@ -523,4 +532,121 @@ fn erc20_caps_and_funding_limits_are_inclusive() {
         .unwrap_err()
         .to_string()
         .contains("fee or inclusion windows"));
+}
+
+#[test]
+fn shared_erc20_payer_limits_match_the_typescript_routes() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../../tests/erc20-admission/payer-limits.json"
+    ))
+    .unwrap();
+    let n = |row: &Value, field: &str| row[field].as_u64().unwrap();
+    let mut limits = RecoveryLimits {
+        chain_id: n(&vector, "chainId"),
+        max_nonce: n(&vector, "maxNonce"),
+        max_fee_per_gas: n(&vector, "maxFeePerGas").into(),
+        max_priority_fee_per_gas: n(&vector, "maxPriorityFeePerGas").into(),
+        gas: 24_000_000,
+        signed_bytes: 524_288,
+        calldata_bytes: 393_216,
+        max_transaction_fee: None,
+        balance: 1_000_000_000u64.into(),
+        fee_budget: 1_000_000_000u64.into(),
+    };
+    let quote = |call: &Value, limits: &RecoveryLimits| {
+        quote_erc20_call(n(call, "calldataBytes") as usize, n(call, "gas"), limits)
+    };
+    let ordinary = &vector["ordinary"];
+    let recovery = &vector["recovery"];
+    assert_eq!(
+        quote(ordinary, &limits).unwrap().0 as u64,
+        n(ordinary, "signedBytes")
+    );
+    for row in vector["cases"].as_array().unwrap() {
+        limits.gas = n(row, "gas");
+        limits.signed_bytes = n(row, "signedBytes") as usize;
+        let route = if quote(recovery, &limits).is_none() {
+            "refused"
+        } else if quote(ordinary, &limits).is_some() {
+            "ordinary"
+        } else {
+            "continuation"
+        };
+        assert_eq!(row["route"], route);
+    }
+}
+
+#[test]
+fn ordinary_quote_above_the_payer_gas_limit_selects_continuation() {
+    let (mut bridge, _, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let recipient = [0xab; 20];
+    let payer = [0xcd; 20];
+    assert!(
+        !bridge
+            .plan_return(&held, &recipient, &payer, Some(0))
+            .unwrap()
+            .continuation_only
+    );
+    bridge.erc20_return_recovery.as_mut().unwrap().limits.gas = 4_000_000;
+    let plan = bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap();
+    assert!(plan.continuation_only);
+    assert!(plan.record.extra["recovery"].get("ordinary").is_none());
+}
+
+#[test]
+fn separate_rust_journals_cannot_reserve_the_same_payer_concurrently() {
+    use std::sync::Barrier;
+    struct RacingStore(MemoryJournalStore, Barrier);
+    impl JournalStore for RacingStore {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.0.get(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.0.list(prefix)
+        }
+        fn put_if(&self, key: &str, prior: Option<&str>, value: &str) -> Result<bool> {
+            if key.starts_with("nb2/payer/v1/") && prior.is_none() {
+                self.1.wait();
+            }
+            self.0.put_if(key, prior, value)
+        }
+    }
+    let store = Arc::new(RacingStore(MemoryJournalStore::new(), Barrier::new(2)));
+    let outcomes = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            Journal::new(store.clone(), [1; 32]).check_return_payer(
+                31337,
+                &[3; 20],
+                &hex(&[1; 32]),
+                true,
+            )
+        });
+        let b = scope.spawn(|| {
+            Journal::new(store.clone(), [2; 32]).check_return_payer(
+                31337,
+                &[3; 20],
+                &hex(&[2; 32]),
+                true,
+            )
+        });
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .into_iter()
+            .find_map(Result::err)
+            .unwrap()
+            .rule()
+            .unwrap()
+            .rule,
+        Rule::CapacityPreflight
+    );
 }

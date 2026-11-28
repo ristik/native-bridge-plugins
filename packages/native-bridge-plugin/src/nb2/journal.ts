@@ -13,7 +13,7 @@
  * BEFORE the step it enables (secret before value, burn request before certification, every signed transaction before broadcast).
  */
 import { fromHex, toHex } from '../bytes.js';
-import { refuse } from './errors.js';
+import { fail, refuse } from './errors.js';
 
 export const JOURNAL_FORMAT = 'unicity-nb2-journal';
 export const JOURNAL_VERSION = 1;
@@ -168,6 +168,10 @@ export interface ReturnRecord extends Base {
   recovery?: {
     generation: Hex; calls: Dec; totalFee: Dec; runCuts: number[]; advanceGaps: number;
     observed: Dec; receiptP99Ms: Dec; finalInclusionMs: Dec; qualifiedForMs: Dec;
+    /** Maximum segment already covered by the Run arrival allowance at signing. */
+    progressEnd?: Dec;
+    /** ERC20 signing ceilings used to price portable calls. */
+    envelope?: { gas: Dec; signedBytes: number; calldataBytes: number; maxNonce: Dec; maxFeePerGas: Dec; maxPriorityFeePerGas: Dec };
     ordinary?: { gas: Dec; calldataBytes: number; maxFeePerGas: Dec; attemptsBeforeFallback: Dec };
   };
   /** The certified burned part: the redeem evidence's token. */
@@ -305,6 +309,33 @@ export class Journal {
     const out: ReturnRecord[] = [];
     for (const k of keys) out.push((await this.read<ReturnRecord>(k, 'return'))!);
     return out;
+  }
+
+  /** A shared store permits one outstanding ERC20 return per EVM payer and chain. */
+  public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false): Promise<void> {
+    if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
+    const key = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
+    const target = this.key('return', id.slice(2));
+    // Older journals have no payer slot. Respect their funded returns before claiming one.
+    for (const other of await this.returns()) {
+      if (other.returnId !== id && other.status !== 'planned' && other.status !== 'paid' && other.recovery &&
+        ((other.payer ?? other.recipient) === hex(payer) || other.executionPayer === hex(payer))) {
+        fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
+      }
+    }
+    for (;;) {
+      const held = await this.store.get(key);
+      if (held === target) return;
+      if (held !== null) {
+        if (!/^nb2\/v1\/[0-9a-f]{64}\/return\/[0-9a-f]{64}$/.test(held)) refuse('BadInput', 'invalid ERC20 payer reservation');
+        const raw = await this.store.get(held);
+        const previous = raw === null ? null : JSON.parse(raw) as ReturnRecord;
+        if (previous?.status !== 'paid' || !previous.paid) {
+          fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
+        }
+      }
+      if (!reserve || await this.store.putIf(key, held, target)) return;
+    }
   }
 }
 

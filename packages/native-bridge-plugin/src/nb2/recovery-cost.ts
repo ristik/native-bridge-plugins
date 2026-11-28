@@ -1,7 +1,9 @@
 /** Cold admission is based on the complete signed EIP-1559 envelope and a pinned execution bound. */
 import { eq } from '../bytes.js';
+import { redeemCalldataLength } from './abi.js';
 import { decodeConfig, domainOf, MAX_SEGMENT, type Config, type Params } from './config.js';
 import { fail } from './errors.js';
+import type { RedeemShape } from './gas.js';
 import { rlpBytes, rlpList, rlpUintEnc } from './rlp.js';
 import { burnIndex, verifySealReceipt } from './rules.js';
 import { gapProofLen } from './segment.js';
@@ -197,6 +199,8 @@ export interface Erc20SigningBounds {
   feeWindowMs: bigint;
   /** Includes certification of the burn and all Run calls, restore and any delay before fallback. */
   progressWindowMs: bigint;
+  /** Maximum number of sequential Run certificates covered by the progress and arrival bounds. */
+  maxRunCalls: number;
   /** Worst time to inclusion and usable proof, over which advancePeakSeals is bounded. */
   advanceWindowMs: bigint;
   ordinary?: {
@@ -224,7 +228,7 @@ function recoveryGapNeed(backlog: RecoveryBacklog): bigint {
 }
 
 /** Reserve the greater route at the fee ceiling, plus each allowed pre-fallback charge. */
-export function erc20SigningReserve(recoveryFee: bigint, calls: bigint, backlog: RecoveryBacklog,
+export function erc20SigningReserve(recoveryFee: bigint, runCalls: number, calls: bigint, backlog: RecoveryBacklog,
   limits: RecoveryLimits, bounds?: Erc20SigningBounds): { totalFee: bigint; priorAttempts: bigint } {
   checkBacklogMeasurements(backlog);
   if (!validLimits(limits) || limits.maxFeePerGas <= 0n || limits.maxFeePerGas > U256_MAX
@@ -232,6 +236,9 @@ export function erc20SigningReserve(recoveryFee: bigint, calls: bigint, backlog:
   if (!bounds || [bounds.feeWindowMs, bounds.progressWindowMs, bounds.advanceWindowMs]
     .some((v) => typeof v !== 'bigint' || v <= 0n) || bounds.advanceWindowMs < backlog.receiptP99Ms) {
     fail('CapacityPreflight', 'unqualified ERC20 fee or inclusion windows');
+  }
+  if (!Number.isSafeInteger(bounds.maxRunCalls) || bounds.maxRunCalls < 1 || runCalls > bounds.maxRunCalls) {
+    fail('CapacityPreflight', 'Run schedule exceeds the qualified progress window');
   }
   const continuationMs = calls * bounds.advanceWindowMs + backlog.finalInclusionMs;
   if (continuationMs > backlog.qualifiedForMs || bounds.progressWindowMs + continuationMs > bounds.feeWindowMs) {
@@ -376,8 +383,23 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   const settle = quoteSettlementSuffixes(q, width, calibration, limits);
   if (settle === null) fail('CapacityPreflight', 'unqualified settlement suffix');
   const recoveryFee = run.reduce((sum, call) => sum + call.fee, 0n) + advance.fee * calls + settle.fee;
-  const { totalFee, priorAttempts } = cfg.erc20 ? erc20SigningReserve(recoveryFee, calls, backlog, limits, bounds)
+  const { totalFee, priorAttempts } = cfg.erc20 ? erc20SigningReserve(recoveryFee, run.length, calls, backlog, limits, bounds)
     : { totalFee: recoveryFee, priorAttempts: 0n };
   if (totalFee > limits.feeBudget || totalFee > limits.balance) fail('CapacityPreflight', 'insufficient recovery fee budget');
   return { run, advance: { quote: advance, calls }, settle, settlementMaxGaps: q - 1, totalFee, priorAttempts };
+}
+
+export interface OrdinaryCalibrationRange { maxEvidenceBytes: number; maxOperations: number; maxGaps: bigint; execution: bigint }
+
+export function quoteOrdinaryExecution(shape: RedeemShape, ranges: readonly OrdinaryCalibrationRange[], reserve: bigint): bigint | null {
+  const operations = shape.lineage.reduce((sum, level) => sum + 1 + level.transfers.length, shape.pendingTransactions);
+  let execution: bigint | undefined;
+  for (const range of ranges) {
+    if (shape.evidenceBytes <= range.maxEvidenceBytes && operations <= range.maxOperations && shape.proofs <= range.maxGaps &&
+        range.execution > 0n && (execution === undefined || range.execution < execution)) execution = range.execution;
+  }
+  if (execution === undefined) return null;
+  const history = shape.proofs === 0n ? 0 : 32 + Number(shape.proofs) * gapProofLen(shape.K);
+  const n = redeemCalldataLength(shape.evidenceBytes, history);
+  return 21_000n + 16n * BigInt(n) + (6n * execution + 4n) / 5n + (reserve > SEAL_RESERVE ? reserve : SEAL_RESERVE);
 }

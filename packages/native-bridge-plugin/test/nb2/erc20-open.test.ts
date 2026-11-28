@@ -10,7 +10,8 @@ import { decodeConfig, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { decodeReceiptBacking, depositedData, TOPIC } from '../../src/nb2/deposit.js';
 import { signTx } from '../../src/nb2/evm.js';
-import { preflightRecovery, type RecoveryCalibrationRange, type RecoveryShape } from '../../src/nb2/recovery-cost.js';
+import { MemoryJournalStore } from '../../src/nb2/journal.js';
+import { type RecoveryCalibrationRange, type RecoveryShape } from '../../src/nb2/recovery-cost.js';
 import { RpcError, type JsonRpc } from '../../src/nb2/rpc.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { decodeUc } from '../../src/nb2/trust.js';
@@ -121,9 +122,9 @@ test('normal ERC20 open authenticates the second deployed activation and refresh
   await assert.rejects(NativeBridgeV2.open({ ...x.options(), refreshTrust: async () => closed.trust }), { rule: 'DepositUC' });
 });
 
-test('the second deposit in one certified receipt mints, and each new burn requires a continuation quote and fresh probe', async () => {
+async function heldPair(store = new MemoryJournalStore()) {
   const x = await world();
-  const bridge = await NativeBridgeV2.open(x.options());
+  const bridge = await NativeBridgeV2.open({ ...x.options(), journal: store });
   const owner = localOwner(key('ERC20 batch owner'));
   const first = await bridge.planDeposit(10n, owner.publicKey, 10n);
   const second = await bridge.planDeposit(20n, owner.publicKey, 20n);
@@ -137,10 +138,13 @@ test('the second deposit in one certified receipt mints, and each new burn requi
   const held = await bridge.mint(second.intent);
   assert.equal((await bridge.verifyToken(held)).amount, 20n);
 
-  const recipient = bytes('0x' + 'ab'.repeat(20));
-  let ordinaryChecks = 0;
-  let continuationChecks = 0;
-  let feeBudget = 16_000_000n;
+  await bridge.submitDeposit(first, x.payer);
+  await bridge.collectDepositProof(first.intent);
+  const firstHeld = await bridge.mint(first.intent);
+  return { x, bridge, owner, held, firstHeld, store };
+}
+
+function admissionFor(x: Awaited<ReturnType<typeof world>>): NonNullable<ReturnAdmission['erc20Recovery']> {
   const graph = {
     salt: x.cfg.erc20!.generation, pins: x.cfg.erc20!.pins, recovery: bytes(x.a.recovery),
     runtimeHash: HE(bytes(deployment.code[x.a.recovery.toLowerCase()])),
@@ -156,39 +160,99 @@ test('the second deposit in one certified receipt mints, and each new burn requi
     if (gaps !== 0) range('advanceGaps', 0, gaps);
     range('redeemRecovered', 0, gaps);
   }
-  const admission: ReturnAdmission = {
-    ordinaryEnvelope: { encodedBytes: 524_288n, gas: 24_000_000n, gasFor: () => 1_000_000n },
-    checkOrdinary: async (_, gas) => {
-      const fees = await bridge.evm.fees();
-      const cost = gas * (2n * fees.baseFee + fees.priority);
-      assert.ok(cost > 0n && cost <= feeBudget && cost <= await bridge.evm.balance(x.payer.address));
-      ordinaryChecks++;
-    },
-    recover: async (_, ordinary) => {
-      continuationChecks++;
-      const plan = await preflightRecovery(x.options().pins.gamma, held, x.tip.trust, PRODUCTION_PARAMS, graph, { ...graph, ranges }, {
-        signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, chainId: x.cfg.chainId,
-        maxNonce: 255n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n, balance: 10n ** 20n, feeBudget,
-      }, {
-        signedStart: 0n, observed: 0n, duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n,
-        receiptP99Ms: 1000n, advancePeakSeals: 1n, finalInclusionMs: 25n, finalPeakSeals: 1n, qualifiedForMs: 200_000n,
-      }, undefined, { feeWindowMs: 400_000n, progressWindowMs: 100_000n, advanceWindowMs: 2000n,
-        ordinary: ordinary && { ...ordinary, attemptsBeforeFallback: 1n, inclusionMs: 1000n } });
-      return { generation: hex(graph.salt), calls: String(BigInt(plan.run.length) + plan.advance.calls + 1n),
-        totalFee: String(plan.totalFee), runCuts: plan.run.map((cut) => cut.shape.operations), advanceGaps: plan.advance.quote.shape.gaps,
-        ordinary: ordinary && { gas: String(ordinary.gas), calldataBytes: ordinary.calldataBytes, maxFeePerGas: '10', attemptsBeforeFallback: '1' },
-        observed: '0', receiptP99Ms: '1000', finalInclusionMs: '25', qualifiedForMs: '200000' };
-    },
+  return { deployment: graph, calibration: { ...graph, ranges },
+    limits: { signedBytes: 524_288, calldataBytes: 393_216, gas: 24_000_000n, maxNonce: 255n,
+      maxFeePerGas: 30n, maxPriorityFeePerGas: 2n, balance: 10n ** 20n, feeBudget: 10n ** 20n },
+    backlog: { duringProgress: 3n, peakSeals: 1n, elapsedMs: 1000n, receiptP99Ms: 1000n,
+      advancePeakSeals: 1n, finalInclusionMs: 25n, finalPeakSeals: 1n, qualifiedForMs: 200_000n },
+    signingBounds: { feeWindowMs: 400_000n, progressWindowMs: 100_000n, maxRunCalls: 2, advanceWindowMs: 2000n },
+    ordinaryAttempts: { attemptsBeforeFallback: 1n, inclusionMs: 1000n },
+    ordinaryRanges: [{ maxEvidenceBytes: 100_000, maxOperations: 16, maxGaps: 64n, execution: 4_000_000n }],
   };
-  await assert.rejects(bridge.planReturn(held, recipient, x.payer.address, { admission }), /insufficient authorized fee budget/);
-  assert.equal(ordinaryChecks, 1);
-  assert.equal(continuationChecks, 1);
-  feeBudget = 10n ** 20n;
+}
+
+const recipient = bytes('0x' + 'ab'.repeat(20));
+
+test('the second deposit in one certified receipt mints and the bridge prices the ERC20 burn before calling the signer', async () => {
+  const { x, bridge, owner, held } = await heldPair();
+  const input = admissionFor(x);
+  const admission = { erc20Recovery: input };
+  await assert.rejects(bridge.planReturn(held, recipient, x.payer.address, { admission: {
+    erc20Recovery: { ...input, limits: { ...input.limits, feeBudget: 16_000_000n } },
+  } }), /insufficient authorized fee budget/);
   const planned = await bridge.planReturn(held, recipient, x.payer.address, { admission });
+  assert.ok(planned.record.recovery?.ordinary);
+  const capped = await bridge.planReturn(held, recipient, x.payer.address, { admission: {
+    erc20Recovery: { ...input, limits: { ...input.limits, gas: 4_000_000n } },
+  } });
+  assert.equal(capped.gasLimit, 0n);
+  assert.equal(capped.record.recovery?.ordinary, undefined);
+  assert.equal(planned.record.recovery.progressEnd, '3');
+  let signatures = 0;
+  const signer = { ...owner, signUnlock: (hash: Uint8Array) => { signatures++; return owner.signUnlock(hash); } };
+  let called = false;
+  await assert.rejects(bridge.burn(planned.returnId, signer, {
+    recover: async () => {
+      called = true;
+      return { ...planned.record.recovery!, runCuts: [], calls: '0', totalFee: '0' };
+    },
+  }), /bounded ERC20 continuation quote/);
+  assert.equal(called, false);
+  await assert.rejects(bridge.burn(planned.returnId, signer, { erc20Recovery: {
+    ...input, calibration: { ...input.calibration, ranges: input.calibration.ranges.filter((r) => r.max.entry !== 'run') },
+  } }), /indivisible run operation/);
+  const singletonRuns = input.calibration.ranges.filter((r) => r.max.entry !== 'run' || r.max.operations === 1);
+  await assert.rejects(bridge.burn(planned.returnId, signer, { erc20Recovery: {
+    ...input, calibration: { ...input.calibration, ranges: singletonRuns }, signingBounds: { ...input.signingBounds!, maxRunCalls: 1 },
+  } }), /Run schedule exceeds the qualified progress window/);
   const before = x.agg.calls;
   x.blockRecipient();
-  await assert.rejects(bridge.burn(planned.returnId, owner, admission), { reason: 'RecipientRefused' });
-  assert.equal(x.probes(), 3);
-  assert.equal((await bridge.journal.retForUpdate(hex(planned.returnId)))?.status, 'planned');
+  await assert.rejects(bridge.burn(planned.returnId, signer, admission), { reason: 'RecipientRefused' });
+  assert.equal(signatures, 0);
+  assert.equal((await bridge.journal.ret(hex(planned.returnId)))?.status, 'planned');
   assert.equal(x.agg.calls, before);
+});
+
+test('separate ERC20 SDK instances sharing a store reserve the payer before either signer can commit', async () => {
+  class RacingStore extends MemoryJournalStore {
+    private attempts = 0;
+    private release!: () => void;
+    private readonly bothReady = new Promise<void>((resolve) => { this.release = resolve; });
+    override async putIf(key: string, expected: string | null, value: string): Promise<boolean> {
+      if (key.startsWith('nb2/payer/v1/') && expected === null) {
+        if (++this.attempts === 2) this.release();
+        await this.bothReady;
+      }
+      return super.putIf(key, expected, value);
+    }
+  }
+  const store = new RacingStore();
+  const { x, bridge, owner, firstHeld, held } = await heldPair(store);
+  const peer = await NativeBridgeV2.open({ ...x.options(), journal: store });
+  const erc20Recovery = admissionFor(x);
+  const admission = { erc20Recovery };
+  const a = await bridge.planReturn(firstHeld, recipient, x.payer.address, { admission });
+  const b = await peer.planReturn(held, recipient, x.payer.address, { admission });
+  const calls = BigInt(a.record.recovery!.calls);
+  assert.equal(BigInt(b.record.recovery!.calls), calls);
+  erc20Recovery.limits.maxNonce = (await bridge.evm.nonce(x.payer.address)) + calls - 1n;
+  let signed = 0;
+  const signer = { ...owner, signUnlock: (hash: Uint8Array) => { signed++; return owner.signUnlock(hash); } };
+  const outcomes = await Promise.allSettled([bridge.burn(a.returnId, signer, admission), peer.burn(b.returnId, signer, admission)]);
+  assert.equal(signed, 1);
+  assert.equal(outcomes.filter((value) => value.status === 'fulfilled').length, 1);
+  const refused = outcomes.find((value) => value.status === 'rejected')!;
+  assert.match(String(refused.reason), /payer already has an outstanding ERC20 return/);
+  const loser = outcomes[0].status === 'rejected' ? a : b;
+  const winner = loser === a ? b : a;
+  await assert.rejects(bridge.burn(loser.returnId, signer, admission), /payer already has an outstanding ERC20 return/);
+  assert.equal(signed, 1);
+  const paid = (await bridge.journal.retForUpdate(hex(winner.returnId)))!;
+  await bridge.journal.putReturn({ ...paid, status: 'paid', paid: { txHash: hex(key('paid')), blockNumber: '1' } });
+  erc20Recovery.limits.maxNonce--;
+  await assert.rejects(bridge.burn(loser.returnId, signer, admission), /declared nonce horizon/);
+  assert.equal(signed, 1);
+  erc20Recovery.limits.maxNonce++;
+  await bridge.burn(loser.returnId, signer, admission);
+  assert.equal(signed, 2);
 });

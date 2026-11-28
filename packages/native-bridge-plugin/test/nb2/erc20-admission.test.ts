@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
-  erc20SigningReserve, quoteRecovery, quoteRunCut, recoveryCatchUpCalls, scheduleRecoveryRuns,
+  erc20SigningReserve, quoteErc20Call, quoteRecovery, quoteRunCut, recoveryCatchUpCalls, scheduleRecoveryRuns,
   type Erc20SigningBounds, type RecoveryBacklog, type RecoveryShape,
 } from '../../src/nb2/recovery-cost.js';
 
@@ -41,19 +42,20 @@ test('ERC20 builds a whole schedule with capped Resume cuts and refuses an indiv
 test('ERC20 uses net progress and reserves the larger route plus bounded attempts at the fee ceiling', () => {
   const backlog: RecoveryBacklog = { signedStart: 10n, observed: 7n, duringProgress: 1n, peakSeals: 1n, elapsedMs: 1000n,
     receiptP99Ms: 1_000n, advancePeakSeals: 2n, finalInclusionMs: 25n, finalPeakSeals: 1n, qualifiedForMs: 20_025n };
-  const bounds = { progressWindowMs: 10_000n, advanceWindowMs: 2_000n, feeWindowMs: 30_025n,
+  const bounds = { progressWindowMs: 10_000n, maxRunCalls: 2, advanceWindowMs: 2_000n, feeWindowMs: 30_025n,
     ordinary: { gas: 1_500_000n, calldataBytes: 120_004, attemptsBeforeFallback: 2n, inclusionMs: 2_000n } };
   const calls = recoveryCatchUpCalls(9, backlog);
   assert.equal(calls, 10n);
   const reserve = (funds = limits, windows: Erc20SigningBounds | undefined = bounds, recoveryFee = 12_000_000n) =>
-    erc20SigningReserve(recoveryFee, calls, backlog, funds, windows);
+    erc20SigningReserve(recoveryFee, 2, calls, backlog, funds, windows);
   const exact = { ...limits, balance: 45_000_000n, feeBudget: 45_000_000n };
   assert.deepEqual(reserve(exact), { totalFee: 45_000_000n, priorAttempts: 2n });
   assert.equal(reserve(limits, bounds, 40_000_000n).totalFee, 70_000_000n);
   assert.throws(() => reserve({ ...exact, balance: exact.balance - 1n }), /free payer balance/);
   assert.throws(() => reserve({ ...exact, feeBudget: exact.feeBudget - 1n }), /authorized fee budget/);
   assert.throws(() => reserve({ ...limits, maxFeePerGas: 0n }), /fee limits/);
-  assert.throws(() => erc20SigningReserve(1n, calls, backlog, limits), /fee or inclusion windows/);
+  assert.throws(() => erc20SigningReserve(1n, 2, calls, backlog, limits), /fee or inclusion windows/);
+  assert.throws(() => reserve(limits, { ...bounds, maxRunCalls: 1 }), /Run schedule exceeds/);
   assert.throws(() => reserve(limits, { ...bounds, advanceWindowMs: 999n }), /fee or inclusion windows/);
   assert.throws(() => reserve(limits, { ...bounds, feeWindowMs: 30_024n }), /signing horizon/);
   assert.throws(() => reserve(limits, { ...bounds, ordinary: { ...bounds.ordinary, attemptsBeforeFallback: 0n } }), /ordinary retry window/);
@@ -62,4 +64,17 @@ test('ERC20 uses net progress and reserves the larger route plus bounded attempt
   assert.throws(() => recoveryCatchUpCalls(9, { ...backlog, peakSeals: 5n }), /catch-up rate/);
   assert.throws(() => recoveryCatchUpCalls(9, { ...backlog, finalPeakSeals: 2n }), /final inclusion window/);
   assert.throws(() => recoveryCatchUpCalls(9, { ...backlog, qualifiedForMs: 10_024n }), /catch-up horizon/);
+});
+
+test('shared ERC20 payer ceilings select the same envelope and route as Rust', () => {
+  const vector = JSON.parse(readFileSync(new URL('../../../../tests/erc20-admission/payer-limits.json', import.meta.url), 'utf8'));
+  const payer = { ...limits, worstCaseEnvelope: false, chainId: BigInt(vector.chainId), maxNonce: BigInt(vector.maxNonce),
+    maxFeePerGas: BigInt(vector.maxFeePerGas), maxPriorityFeePerGas: BigInt(vector.maxPriorityFeePerGas) };
+  assert.equal(quoteErc20Call(vector.ordinary.calldataBytes, BigInt(vector.ordinary.gas), payer)?.signedBytes, vector.ordinary.signedBytes);
+  for (const row of vector.cases) {
+    const capped = { ...payer, signedBytes: row.signedBytes, gas: BigInt(row.gas) };
+    const fits = (call: typeof vector.ordinary) => quoteErc20Call(call.calldataBytes, BigInt(call.gas), capped) !== null;
+    const route = !fits(vector.recovery) ? 'refused' : fits(vector.ordinary) ? 'ordinary' : 'continuation';
+    assert.equal(route, row.route);
+  }
 });

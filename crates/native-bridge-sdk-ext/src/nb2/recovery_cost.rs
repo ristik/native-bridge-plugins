@@ -290,6 +290,8 @@ pub struct Erc20SigningBounds {
     pub fee_window_ms: u64,
     /// Includes burn and Run certification, covered restores and any delay before fallback.
     pub progress_window_ms: u64,
+    /// Maximum sequential Run certificates covered by the progress and arrival bounds.
+    pub max_run_calls: usize,
     /// Worst time to a usable advance proof, over which advance_peak_seals is bounded.
     pub advance_window_ms: u64,
 }
@@ -303,6 +305,7 @@ pub struct Erc20OrdinaryBound {
 
 pub fn erc20_signing_reserve(
     recovery_fee: BigUint,
+    run_calls: usize,
     calls: u64,
     backlog: &RecoveryBacklog,
     limits: &RecoveryLimits,
@@ -323,6 +326,12 @@ pub fn erc20_signing_reserve(
         return fail_d(
             Rule::CapacityPreflight,
             "unqualified ERC20 fee or inclusion windows",
+        );
+    }
+    if bounds.max_run_calls == 0 || run_calls > bounds.max_run_calls {
+        return fail_d(
+            Rule::CapacityPreflight,
+            "Run schedule exceeds the qualified progress window",
         );
     }
     let continuation_ms = u128::from(calls) * u128::from(bounds.advance_window_ms)
@@ -574,6 +583,7 @@ pub fn preflight_recovery_with_signing_bounds(
         };
         erc20_signing_reserve(
             total_fee,
+            run.len(),
             advance_calls,
             backlog,
             ctx.limits,

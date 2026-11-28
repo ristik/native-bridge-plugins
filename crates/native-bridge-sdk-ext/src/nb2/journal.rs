@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::errors::{refuse, Result, WalletReason};
+use super::errors::{fail_d, refuse, Result, Rule, WalletReason};
 use super::util::{from_hex, to_hex};
 
 pub const JOURNAL_FORMAT: &str = "unicity-nb2-journal";
@@ -536,6 +536,71 @@ impl Journal {
             }
         }
         Ok(out)
+    }
+
+    /// A shared store permits one outstanding ERC20 return per EVM payer and chain.
+    pub fn check_return_payer(
+        &self,
+        chain_id: u64,
+        payer: &[u8],
+        id: &str,
+        reserve: bool,
+    ) -> Result<()> {
+        if payer.len() != 20 {
+            return refuse(WalletReason::BadInput, "invalid ERC20 payer");
+        }
+        unhex_n::<32>(id)?;
+        let key = format!("nb2/payer/v1/{chain_id}/{}", to_hex(payer));
+        let target = self.key("return", Some(&id[2..]));
+        let address = hex(payer);
+        let occupied = || {
+            fail_d(
+                Rule::CapacityPreflight,
+                "payer already has an outstanding ERC20 return",
+            )
+        };
+        for other in self.returns()? {
+            if other.return_id != id
+                && other.status != "planned"
+                && other.status != "paid"
+                && other.extra.get("recovery").is_some()
+                && (other.payer.as_deref().unwrap_or(&other.recipient) == address
+                    || other.extra.get("executionPayer").and_then(Value::as_str) == Some(&address))
+            {
+                return occupied();
+            }
+        }
+        loop {
+            let held = self.store.get(&key)?;
+            if held.as_deref() == Some(&target) {
+                return Ok(());
+            }
+            if let Some(held) = held.as_deref() {
+                let valid = held
+                    .strip_prefix("nb2/v1/")
+                    .and_then(|s| s.split_once("/return/"));
+                if !valid.is_some_and(|(domain, id)| {
+                    [domain, id].into_iter().all(|s| {
+                        s.len() == 64
+                            && s.bytes()
+                                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                    })
+                }) {
+                    return refuse(WalletReason::BadInput, "invalid ERC20 payer reservation");
+                }
+                let previous = self.store.get(held)?;
+                if !previous
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<ReturnRecord>(s).ok())
+                    .is_some_and(|r| r.status == "paid" && r.paid.is_some())
+                {
+                    return occupied();
+                }
+            }
+            if !reserve || self.store.put_if(&key, held.as_deref(), &target)? {
+                return Ok(());
+            }
+        }
     }
 }
 
