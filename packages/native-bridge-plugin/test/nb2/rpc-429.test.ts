@@ -1,9 +1,11 @@
 /** Gateway rate limits are transport conditions: typed, retried briefly with jitter, and never mistaken for an answer. */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { toHex } from '../../src/bytes.js';
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
+import { HE } from '../../src/nb2/crypto.js';
 import { MemoryJournalStore } from '../../src/nb2/journal.js';
-import { EvmReader, HttpJsonRpc, RpcError, type JsonRpc } from '../../src/nb2/rpc.js';
+import { AmbiguousBroadcast, EvmReader, HttpJsonRpc, RpcError, type JsonRpc } from '../../src/nb2/rpc.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, setup } from './world.js';
 
@@ -155,6 +157,23 @@ for (const [name, unanswered] of [
     assert.equal(sends.length, 2);
   });
 }
+
+test('sendRaw requires the local hash in the acknowledgement and receipt reads accept null', async () => {
+  const raw = Uint8Array.of(1);
+  const hash = HE(raw);
+  const g = gateway([ok(null), ok(''), ok(`0x${'ff'.repeat(32)}`), ok(`0x${toHex(hash).toUpperCase()}`), ok(null)]);
+  const reader = new EvmReader(new HttpJsonRpc('http://x', { fetch: g.fetchFn }));
+  for (let i = 0; i < 3; i++) {
+    await assert.rejects(reader.sendRaw(raw), (e: unknown) => {
+      assert.ok(e instanceof AmbiguousBroadcast);
+      assert.deepEqual(e.txHash, hash);
+      return true;
+    });
+  }
+  assert.deepEqual(await reader.sendRaw(raw), hash);
+  assert.equal(await reader.receipt(hash), null);
+  assert.equal(g.calls.length, 5);
+});
 
 test('a network failure is a retryable RpcError and is not retried by the transport', async () => {
   const g = gateway([new TypeError('fetch failed')]);

@@ -323,39 +323,47 @@ export class EvmReader {
     return qtyOf(await this.rpc.call('eth_blockNumber', []), 'eth_blockNumber');
   }
 
-  /** The highest block this reader has served a header for: where a later sane-head search may start. */
-  private confirmedHead = -1n;
+  /** The last served head is a hint. A later call may reach a different backend. */
+  private confirmedHead = 0n;
 
   /**
    * The head every height-driven loop runs to (log scans, depth and horizon checks): this reader's `eth_blockNumber`, trusted only as
    * far as the reader serves the block at that height. A claimed head it does not serve (a lying or broken answer such as 0xffffffff)
-   * is replaced by the highest block it serves. Expand from the last confirmed block, then bisect the bracket. The number of reads
-   * grows with the distance to the served head. An honest reader costs one header read more.
+   * is replaced by a served height. Recheck the cached height, then expand up from a served header or down from a missing one
+   * before bisecting. An honest reader costs one header read more.
    */
   public async saneHead(): Promise<bigint> {
     const claimed = await this.blockNumber();
-    if (claimed <= this.confirmedHead) return claimed; // a lower answer (a lagging backend) only shortens a scan
-    const base = this.confirmedHead < 0n ? 0n : this.confirmedHead;
     if (await this.headerByNumber(claimed) !== null) {
-      if (claimed > this.confirmedHead) this.confirmedHead = claimed;
+      this.confirmedHead = claimed;
       return claimed;
     }
+    const base = this.confirmedHead < claimed ? this.confirmedHead : claimed;
     let lo = base;
     let hi = claimed;
-    for (let step = 1n; base + step < hi; step *= 2n) {
-      const probe = base + step;
-      if (await this.headerByNumber(probe) === null) {
-        hi = probe;
-        break;
+    if (base < hi && await this.headerByNumber(base) !== null) {
+      for (let step = 1n; base + step < hi; step *= 2n) {
+        const probe = base + step;
+        if (await this.headerByNumber(probe) === null) {
+          hi = probe;
+          break;
+        }
+        lo = probe;
       }
-      lo = probe;
+    } else {
+      for (let step = 1n; ; step *= 2n) {
+        if (lo === 0n) refuse('CompanionUnknown', `no header served at or below the claimed head ${claimed}`);
+        hi = lo;
+        lo = step < base ? base - step : 0n;
+        if (await this.headerByNumber(lo) !== null) break;
+      }
     }
     while (hi - lo > 1n) {
       const mid = lo + (hi - lo) / 2n;
       if (await this.headerByNumber(mid) !== null) lo = mid;
       else hi = mid;
     }
-    if (lo > this.confirmedHead) this.confirmedHead = lo;
+    this.confirmedHead = lo;
     return lo;
   }
 
@@ -736,15 +744,19 @@ export class EvmReader {
     }
   }
 
-  /** Submit a signed raw transaction and report missing or ambiguous transport answers. */
+  /** Submit a signed raw transaction and verify that a successful reply acknowledges its local hash. */
   public async sendRaw(raw: Uint8Array): Promise<Uint8Array> {
     const hash = HE(raw);
+    let ack: unknown;
     try {
-      await this.rpc.call('eth_sendRawTransaction', [hexOf(raw)]);
+      ack = await this.rpc.call('eth_sendRawTransaction', [hexOf(raw)]);
     } catch (e) {
       if (e instanceof RpcError && e.code === 0 && [0, 502, 503, 504].includes(e.status)) throw new AmbiguousBroadcast(hash, e.message);
       if (e instanceof RpcError && /already known|nonce too low/i.test(e.message)) return hash;
       throw e;
+    }
+    if (typeof ack !== 'string' || ack.toLowerCase() !== hexOf(hash)) {
+      throw new AmbiguousBroadcast(hash, 'RPC reply did not acknowledge the expected transaction hash');
     }
     return hash;
   }

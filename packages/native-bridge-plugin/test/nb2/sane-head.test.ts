@@ -10,7 +10,7 @@ import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { WalletError } from '../../src/nb2/errors.js';
 import { MemoryJournalStore } from '../../src/nb2/journal.js';
-import { EvmReader, type JsonRpc } from '../../src/nb2/rpc.js';
+import { EvmReader, qty, type JsonRpc } from '../../src/nb2/rpc.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { evmAccount, key, setup } from './world.js';
 
@@ -24,6 +24,18 @@ const counting = (inner: JsonRpc, head?: string) => {
     },
   };
   return { rpc, calls };
+};
+
+const limitedHead = (chain: JsonRpc, head: bigint) => {
+  const backend = { claimed: head, served: head };
+  const reader = new EvmReader({
+    call: <T>(method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_blockNumber') return Promise.resolve(qty(backend.claimed) as T);
+      if (method === 'eth_getBlockByNumber' && BigInt(params[0] as string) > backend.served) return Promise.resolve(null as T);
+      return chain.call<T>(method, params);
+    },
+  });
+  return { backend, reader };
 };
 
 test('saneHead: an honest head costs one header read and a lying head costs reads based on the served distance', async () => {
@@ -41,7 +53,39 @@ test('saneHead: an honest head costs one header read and a lying head costs read
   await chain.mine([]);
   lying.calls.clear();
   assert.equal(await reader.saneHead(), real + 1n);
-  assert.equal(lying.calls.get('eth_getBlockByNumber'), 3);
+  assert.equal(lying.calls.get('eth_getBlockByNumber'), 4);
+});
+
+test('saneHead rechecks lower and cached heights after a backend falls behind', async () => {
+  const { chain } = await setup();
+  while (chain.blocks.length <= 10) await chain.mine([]);
+  for (const claimed of [8n, 1_000n]) {
+    const { backend, reader } = limitedHead(chain, 10n);
+    assert.equal(await reader.saneHead(), 10n);
+    backend.claimed = claimed;
+    backend.served = 5n;
+    assert.equal(await reader.saneHead(), 5n, `backend claimed ${claimed}`);
+  }
+});
+
+test('saneHead reports an unknown head when every header is missing', async () => {
+  const { chain } = await setup();
+  for (const claimed of [0n, 1_000n]) {
+    const { backend, reader } = limitedHead(chain, claimed);
+    backend.served = -1n;
+    await assert.rejects(reader.saneHead(), { reason: 'CompanionUnknown' });
+  }
+});
+
+test('a stale cached head does not classify a missing child as pruned', async () => {
+  const { chain } = await setup();
+  while (chain.blocks.length <= 30) await chain.mine([]);
+  const { backend, reader } = limitedHead(chain, 30n);
+  assert.equal(await reader.saneHead(), 30n);
+  backend.claimed = 1_000n;
+  backend.served = 5n;
+  const { header, hash } = chain.blocks[5];
+  await assert.rejects(reader.certificateOf(header, hash), { reason: 'CompanionUnknown' });
 });
 
 test('headerByNumber and saneHead refuse a header served at the wrong height', async () => {

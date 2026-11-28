@@ -215,9 +215,9 @@ A provider that invents a Paid can delay a redemption, never stop it, and the va
 `AlreadyPaid` refuses a second payout if the claim was real after all.
 
 Every height-driven loop (log scans, depth and horizon checks) runs to `EvmReader.saneHead()`:
-the reader's `eth_blockNumber`, trusted only as far as the reader serves the block at that
-height. A head it does not serve (a lying `0xffffffff`) is bounded by a binary search for the
-highest served block, so it costs a few header reads, not a scan of the claimed range. A holder who learned of Paid before
+the reader's `eth_blockNumber`, checked against the header it serves at that height. If the
+header is missing, the wallet checks its cached height with the current reader and uses expanding
+probes and bisection to find a served height. If every probe misses, the head is unknown. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 
@@ -725,8 +725,8 @@ What the package's public gateway enforces, and what the plug-in does about it:
   block-range limit. It handles throttling by backing off on the original window.
 - The plug-in uses a 1 gwei priority fee fallback only for a successful HTTP response with JSON-RPC `-32601` from
   `eth_maxPriorityFeePerGas`. Transport failures and other RPC errors surface to the caller.
-- `eth_sendRawTransaction` is relayed to every validator. HTTP 502, 503, 504, a timeout, or another unanswered send can leave the
-  transaction in flight. The wallet reconciles the receipt by its local hash and checks `Paid(eta)` for redemption. When the
+- `eth_sendRawTransaction` is relayed to every validator. HTTP 502, 503, 504, a timeout, or a reply without the expected hash can leave
+  the transaction in flight. The wallet reconciles the receipt by its local hash and checks `Paid(eta)` for redemption. When the
   journal offers a pending send again, it uses the same signed bytes.
 - Retention: the nodes behind the gateway are proof sources, so companions, receipts and logs are served for the life of the deployment.
   Deposit evidence can be fetched at any time after the deposit's child block exists, and segment logs from the deployment block on. The
