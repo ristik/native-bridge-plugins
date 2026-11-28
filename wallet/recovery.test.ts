@@ -8,12 +8,14 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  CERTIFICATION_DEPTH, EvmReader, GapTree, Journal, NativeBridgeV2, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx, domainOf,
-  evidenceOf, firstOwnerOf, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
+  CERTIFICATION_DEPTH, EvmReader, GapTree, Journal, NativeBridgeV2, Nb2Error, SELECTOR, TOPIC, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx, domainOf,
+  evidenceOf, firstOwnerOf, nextHead, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryCalibration, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { ascii, u256 } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
+import { LIMITS, encodeReceiptBacking } from '../packages/native-bridge-plugin/src/nb2/deposit.js';
+import { segmentSealedData } from '../packages/native-bridge-plugin/src/nb2/segment.js';
 import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/token.js';
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
@@ -108,6 +110,353 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   return { w, open, root, cfg, chain, deployment, aggregator, dir, rpc, rpcOn, views, manifest };
 }
 
+async function sealTestSegments(chain: FakeChain, payer: Wallet, count: number, ...oversizedIndices: bigint[]) {
+  const cfg = payer.bridge.cfg;
+  const owner = firstOwnerOf(payer.owner(0).publicKey);
+  const marker = new Uint8Array(20).fill(0x62);
+  const previous = chain.coldCall;
+  chain.fund(payer.signer.address, 10n ** 18n);
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, marker)) return previous?.(vault, to, data);
+    const index = vault.c;
+    for (let i = 0n; i < cfg.K; i++) {
+      const id = HE(u256(index * cfg.K + i + 1n));
+      vault.deposit(1n, owner, id);
+      vault.redeem(id, index, new Uint8Array(), { ret: verdictAbi({
+        domain: chain.domain, eta: id, minSegment: index, asset: cfg.asset, recipient: payer.signer.address, amount: 1n,
+      }) });
+    }
+    return oversizedIndices.includes(index) ? [{ address: marker, topics: [], data: new Uint8Array(LIMITS.receiptLeafNodeBytes) }] : [];
+  };
+  try {
+    for (let i = 0; i < count; i++) {
+      const nonce = await payer.bridge.evm.nonce(payer.signer.address);
+      const tx = await signTx(payer.signer, { chainId: cfg.chainId, nonce, maxFeePerGas: 15n,
+        maxPriorityFeePerGas: 1n, gas: 1_000_000n, to: marker, value: 0n, data: new Uint8Array() });
+      await payer.bridge.evm.sendRaw(tx.raw);
+    }
+  } finally {
+    chain.coldCall = previous;
+  }
+}
+
+test('a deposit with an oversized certified receipt cannot mint offline', async (t) => {
+  const { w, chain, cfg, aggregator } = await setup(t);
+  const plan = await planDeposit(w, 'wide-deposit', 1n);
+  const padding = { address: new Uint8Array(20).fill(0x61), topics: [], data: new Uint8Array(LIMITS.receiptLeafNodeBytes) };
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, cfg.vault) || !eq(data, plan.calldata)) return undefined;
+    vault.deposit(plan.amount, plan.firstOwner, plan.rho);
+    return [padding];
+  };
+  const { txHash, depositNumber } = await sendDeposit(w, 'wide-deposit');
+  const receipt = await w.bridge.evm.mintReceiptProof(txHash, cfg.vault, false, TOPIC.Deposited, [TOPIC.Deposited, u256(depositNumber)]);
+  assert.ok(receipt.proof.nodes.at(-1)!.length > LIMITS.receiptLeafNodeBytes);
+  assert.ok(receipt.encoded.length < LIMITS.justificationBytes);
+  const calls = aggregator.calls;
+  await assert.rejects(mint(w, 'wide-deposit'), { rule: 'InputTooLarge', message: /deposit receipt exceeds the offline proof limits/ });
+  const pending = (await w.bridge.journal.deposit(plan.intent))!;
+  assert.equal(pending.status, 'deposited');
+  assert.equal(pending.reason, undefined);
+  assert.equal(aggregator.calls, calls);
+  // Emulate a journal written before the framing check was applied during collection.
+  await w.bridge.journal.putDeposit({ ...pending, status: 'proven', receiptProof: hx(receipt.encoded),
+    reason: hx(encodeReceiptBacking({ d: chain.domain, n: depositNumber, r: key('old cached secret'), proof: receipt.proof })) });
+  const diagnostic = { rule: 'InputTooLarge', message: /deposit receipt exceeds the offline proof limits/ };
+  await assert.rejects(w.bridge.collectDepositProof(plan.intent), diagnostic);
+  await assert.rejects(w.bridge.mint(plan.intent), diagnostic);
+  assert.equal((await w.bridge.journal.deposit(plan.intent))?.status, 'proven');
+  assert.equal(aggregator.calls, calls);
+});
+
+for (const oversizedIndex of [0, 2]) test(`continuation authenticates the whole archived suffix and settles with oversized seal ${oversizedIndex}`, async (t) => {
+  const { w, open, chain, cfg, deployment } = await setup(t);
+  const release = w.release.recovery as { ranges: { max: { entry: string; gaps: number } }[] };
+  release.ranges = release.ranges.filter(({ max }) => max.entry === 'run' || max.gaps <= 2);
+  const { eta } = await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const evidence = evidenceOf(unhex(rec.burned!));
+  const session = await RecoverySession.create(chain.gamma, evidence, new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const verdict = await verifyReturn(chain.gamma, evidence, w.trust, TEST_PARAMS);
+  const complete = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to, data) => {
+    if (!eq(to, deployment.recovery)) return;
+    assert.deepEqual(data, complete.calldata);
+    return [{ address: to, topics: complete.event.topics, data: complete.event.data }];
+  };
+  const checkpoint = await recoverStep(w, rec, caps);
+  assert.equal(checkpoint.state, 'checkpoint');
+  assert.ok('txHash' in checkpoint);
+  const completion = await recoveryRpcSource(w.bridge.evm, checkpoint.txHash)(deployment.recovery, complete.event);
+
+  await sealTestSegments(chain, await open('shared-seal-producer'), 3, BigInt(oversizedIndex));
+  assert.equal(chain.vault.c, 3n);
+  const before = unhex(rec.startHead);
+  const seals = await w.bridge.evm.segmentLogs(cfg.vault, BigInt(rec.fromBlock), 0n, 3n);
+  const oversized = await w.bridge.evm.receiptProof(seals[oversizedIndex].transactionHash, cfg.vault, TOPIC.SegmentSealed, true, seals[oversizedIndex]);
+  assert.ok(oversized.proof.nodes.at(-1)!.length > LIMITS.receiptLeafNodeBytes);
+  assert.ok(oversized.encoded.length < LIMITS.justificationBytes);
+  await assert.rejects(session.certifiedGaps(w.trust, BigInt(oversizedIndex), before, [oversized.encoded]),
+    (e: unknown) => e instanceof Nb2Error && e.rule === 'SealReceipt' && e.innermost === 'InputTooLarge');
+
+  const segments = chain.vault.events.flatMap((e) => e.name === 'SegmentSealed'
+    ? [{ index: e.segment, before: e.before, after: e.after, z: e.ids, root: GapTree.build(e.ids)!.root }] : []);
+  if (oversizedIndex === 0) {
+    const fetchLogs = w.bridge.evm.segmentLogs.bind(w.bridge.evm);
+    const counterfeitIds = [1n, 2n, 3n, 4n].map(u256);
+    const tail = segments[2];
+    const wrongData = segmentSealedData(tail.before, nextHead(chain.domain, tail.index, tail.before, GapTree.build(counterfeitIds)!.root), counterfeitIds);
+    const sign = t.mock.method(w.signer, 'signTransaction', async () => { throw new Error('signer reached'); });
+    const send = t.mock.method(w.bridge.evm, 'sendRaw', async () => { throw new Error('sender reached'); });
+    const payerBefore = chain.balanceOf(w.signer.address);
+    for (const [change, error] of [
+      [(rows: typeof seals) => rows.map((l) => eq(l.topics[1], u256(2)) ? { ...l, data: wrongData } : l), /do not fold to the certified vault head/],
+      [(rows: typeof seals) => rows.map((l) => eq(l.topics[1], u256(2)) ? { ...l, data: l.data.slice(0, -32) } : l), /SegmentLog: length/],
+      [(rows: typeof seals) => rows.filter((l) => !eq(l.topics[1], u256(2))), /archived segment range is incomplete/],
+    ] as const) {
+      w.bridge.evm.segmentLogs = async (...args) => change(await fetchLogs(...args));
+      await assert.rejects(recoverStep(w, rec, caps), error);
+      assert.equal(sign.mock.callCount(), 0);
+      assert.equal(send.mock.callCount(), 0);
+      assert.equal(chain.balanceOf(w.signer.address), payerBefore);
+    }
+    sign.mock.restore();
+    send.mock.restore();
+    w.bridge.evm.segmentLogs = fetchLogs;
+  } else {
+    const sign = t.mock.method(w.signer, 'signTransaction', async () => { throw new Error('signer reached'); });
+    const send = t.mock.method(w.bridge.evm, 'sendRaw', async () => { throw new Error('sender reached'); });
+    chain.faults.hideSegments.add(2n);
+    await assert.rejects(recoverStep(w, rec, caps), /no SegmentSealed log of segment 2/);
+    chain.faults.hideSegments.clear();
+    const call = w.bridge.evm.rpc.call.bind(w.bridge.evm.rpc);
+    const corrupt = t.mock.method(w.bridge.evm.rpc, 'call', async (method: string, params: unknown[]) => {
+      const answer = await call(method, params);
+      if (method !== 'eth_getProof') return answer;
+      const proof = answer as { accountProof: string[] };
+      return { ...proof, accountProof: ['0xc0'] };
+    });
+    await assert.rejects(recoverStep(w, rec, caps), /vault state proof does not verify/);
+    corrupt.mock.restore();
+    const state = await w.bridge.evm.vaultState(cfg.vault);
+    const ahead = t.mock.method(w.bridge.evm, 'vaultState', async () => ({ ...state, segment: state.segment + 1n }));
+    await assert.rejects(recoverStep(w, rec, caps), { reason: 'CompanionUnknown' });
+    ahead.mock.restore();
+    assert.equal(sign.mock.callCount(), 0);
+    assert.equal(send.mock.callCount(), 0);
+    sign.mock.restore();
+    send.mock.restore();
+  }
+
+  const paths = segments.map((e) => GapTree.build(e.z)!.prove(eta)!);
+  const advance = await session.gaps('advanceGaps', w.trust, completion, { seq: 1n }, paths.slice(0, 2), before);
+  assert.ok(advance.event && advance.head);
+  const gapEvent = advance.event;
+  chain.coldCall = async (_vault, to, data) => {
+    if (!eq(to, deployment.recovery)) return;
+    assert.deepEqual(data, advance.calldata);
+    return [{ address: to, topics: gapEvent.topics, data: gapEvent.data }];
+  };
+  const advanced = await recoverStep(w, rec, caps);
+  assert.equal(advanced.state, 'checkpoint');
+  assert.ok('txHash' in advanced);
+  const gapReceipt = await recoveryRpcSource(w.bridge.evm, advanced.txHash)(deployment.recovery, gapEvent);
+  const endpoint = oversizedIndex === 2 ? 2n : 3n;
+  const settle = await session.gaps('redeemRecovered', w.trust, gapReceipt,
+    { seq: 2n, cursor: { next: 2n, head: advance.head } }, paths.slice(2, Number(endpoint)));
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, cfg.vault) || hx(data.subarray(0, 4)) !== selector('redeemRecovered(bytes)')) return;
+    assert.deepEqual(data, settle.calldata);
+    const history = buildHistory(segments, eta, 0n, endpoint, before);
+    vault.redeem(eta, 0n, history.history, { ret: verdictAbi(verdict) });
+    return [];
+  };
+  assert.equal((await recoverStep(w, rec, caps)).state, 'paid');
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid' && eq(e.eta, eta)).length, 1);
+  assert.equal(chain.vault.q, 0n);
+});
+
+for (const empty of [false, true]) test(
+  empty ? 'certified state proof settles an empty suffix from a newer burn cursor' : 'two wide terminal receipts settle a short suffix authenticated by the certified state proof', async (t) => {
+  const { w, open, chain, cfg, deployment } = await setup(t);
+  if (empty) await sealTestSegments(chain, await open('before-burn'), 1);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  assert.ok(rec.recovery!.advanceGaps > 2);
+  const evidence = evidenceOf(unhex(rec.burned!));
+  const session = await RecoverySession.create(chain.gamma, evidence, new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const complete = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: to, topics: complete.event.topics, data: complete.event.data }] : undefined;
+  const step = await recoverStep(w, rec, caps);
+  assert.equal(step.state, 'checkpoint');
+  assert.ok('txHash' in step);
+  const proof = await recoveryRpcSource(w.bridge.evm, step.txHash)(deployment.recovery, complete.event);
+
+  const start = BigInt(rec.a);
+  const endpoint = start + (empty ? 0n : 2n);
+  if (empty) {
+    assert.ok(start > 0n);
+    const state = await w.bridge.evm.vaultState(cfg.vault);
+    t.mock.method(w.bridge.evm, 'vaultState', async () => ({ ...state, segment: start - 1n }));
+  } else {
+    await sealTestSegments(chain, await open('two-wide-seals'), 2, 0n, 1n);
+    const seals = await w.bridge.evm.segmentLogs(cfg.vault, BigInt(rec.fromBlock), start, endpoint);
+    assert.equal(seals.length, 2);
+    for (const seal of seals) {
+      const receipt = await w.bridge.evm.receiptProof(seal.transactionHash, cfg.vault, TOPIC.SegmentSealed, true, seal);
+      assert.ok(receipt.proof.nodes.at(-1)!.length > LIMITS.receiptLeafNodeBytes);
+    }
+  }
+  const before = unhex(rec.startHead);
+  const segments = chain.vault.events.filter((e) => e.name === 'SegmentSealed').filter((e) => e.segment >= start).map((e) =>
+    ({ index: e.segment, z: e.ids, before: e.before, after: e.after, root: GapTree.build(e.ids)!.root }));
+  const eta = session.redemptionId;
+  const gaps = segments.map((e) => GapTree.build(e.z)!.prove(eta)!);
+  const settle = await session.gaps('redeemRecovered', w.trust, proof, { seq: 1n }, gaps, empty ? undefined : before);
+  const verdict = await verifyReturn(chain.gamma, evidence, w.trust, TEST_PARAMS);
+  chain.coldCall = async (vault, to, data) => {
+    assert.deepEqual(to, cfg.vault);
+    assert.deepEqual(data, settle.calldata);
+    vault.redeem(eta, start, buildHistory(segments, eta, start, endpoint, before).history, { ret: verdictAbi(verdict) });
+    return [];
+  };
+  const stateProof = t.mock.method(w.bridge.evm, 'vaultHeadAt');
+  assert.equal((await recoverStep(w, rec, caps)).state, 'paid');
+  assert.equal(stateProof.mock.callCount(), 1);
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid' && eq(e.eta, eta)).length, 1);
+});
+
+test('reopen refuses an older certified checkpoint anchor before signing or broadcasting', async (t) => {
+  const { w, open, chain, rpcOn } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const older = chain.fork();
+  const oldHead = await new EvmReader(rpcOn(older)).certifiedExecutionHead(w.bridge.cfg, w.trust);
+  await sealTestSegments(chain, await open('anchor-seal-producer'), 1);
+  const newHead = await w.bridge.evm.certifiedExecutionHead(w.bridge.cfg, w.trust);
+  assert.ok(newHead.header.number > oldHead.header.number);
+  const unavailable = t.mock.method(w.bridge.evm, 'vaultHeadAt', async () => { throw new Error('proof unavailable'); });
+  await assert.rejects(recoverStep(w, rec, caps), /proof unavailable/);
+  unavailable.mock.restore();
+
+  const reopened = await open('holder', rpcOn(older));
+  const sign = t.mock.method(reopened.signer, 'signTransaction');
+  const send = t.mock.method(reopened.bridge.evm, 'sendRaw');
+  await assert.rejects(recoverStep(reopened, rec, caps), /behind the retained checkpoint anchor/);
+  assert.equal(sign.mock.callCount(), 0);
+  assert.equal(send.mock.callCount(), 0);
+
+  // A different certified hash at the retained height must also refuse.
+  while (BigInt(older.blocks.length) <= newHead.header.number + 1n) await older.mine([]);
+  const conflict = await reopened.bridge.evm.certifiedExecutionHead(w.bridge.cfg, w.trust);
+  assert.equal(conflict.header.number, newHead.header.number);
+  assert.notDeepEqual(conflict.hash, newHead.hash);
+  await assert.rejects(recoverStep(reopened, rec, caps), /conflicting certified execution heads at the retained checkpoint anchor/);
+  assert.equal(sign.mock.callCount(), 0);
+  assert.equal(send.mock.callCount(), 0);
+});
+
+for (const conflictFirst of [true, false]) test(`reopen refuses a retained checkpoint conflict from the ${conflictFirst ? 'first' : 'second'} reader despite a newer head`, async (t) => {
+  const { w, open, chain, rpc, rpcOn } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const fork = chain.fork();
+  await sealTestSegments(chain, await open('anchor-seal-producer'), 1);
+  const retained = await w.bridge.evm.certifiedExecutionHead(w.bridge.cfg, w.trust);
+  const unavailable = t.mock.method(w.bridge.evm, 'vaultHeadAt', async () => { throw new Error('proof unavailable'); });
+  await assert.rejects(recoverStep(w, rec, caps), /proof unavailable/);
+  unavailable.mock.restore();
+
+  const path = join(w.dir, `checkpoint-anchor-${hx(w.bridge.domain).slice(2)}.json`);
+  const saved = readFileSync(path, 'utf8');
+  assert.deepEqual(JSON.parse(saved), { height: String(retained.header.number), hash: hx(retained.hash) });
+  while (BigInt(fork.blocks.length) <= retained.header.number + 1n) await fork.mine([]);
+  const forkRpc = rpcOn(fork);
+  const conflict = await new EvmReader(forkRpc).certifiedExecutionHead(w.bridge.cfg, w.trust);
+  assert.equal(conflict.header.number, retained.header.number);
+  assert.notDeepEqual(conflict.hash, retained.hash);
+  await chain.mine([]);
+  const newer = await w.bridge.evm.certifiedExecutionHead(w.bridge.cfg, w.trust);
+  assert.ok(newer.header.number > retained.header.number);
+
+  const reopened = await open('holder', conflictFirst ? forkRpc : rpc);
+  const alternate = conflictFirst ? rpc : forkRpc;
+  const fetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: string, opts: RequestInit) => {
+    if (url !== 'http://archive.invalid') return fetch(url, opts);
+    const body = JSON.parse(String(opts.body));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: await alternate.call(body.method, body.params) }));
+  });
+  const sign = t.mock.method(reopened.signer, 'signTransaction');
+  const send = t.mock.method(reopened.bridge.evm, 'sendRaw');
+  await assert.rejects(recoverStep(reopened, rec, { ...caps, archives: ['http://archive.invalid'] }), {
+    reason: 'ProviderFault', message: /conflicting certified execution heads at the retained checkpoint anchor/,
+  });
+  assert.equal(readFileSync(path, 'utf8'), saved);
+  assert.equal(sign.mock.callCount(), 0);
+  assert.equal(send.mock.callCount(), 0);
+});
+
+test('Run uses the certified endpoint when the unsigned vault read omits an oversized seal', async (t) => {
+  const { w, open, chain, cfg } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  await sealTestSegments(chain, await open('run-seal-producer'), 1, 0n);
+  chain.faults.hideSegments.add(0n);
+  const state = await w.bridge.evm.vaultState(cfg.vault);
+  t.mock.method(w.bridge.evm, 'vaultState', async () => ({ ...state, segment: 0n }));
+  const sign = t.mock.method(w.signer, 'signTransaction');
+  const send = t.mock.method(w.bridge.evm, 'sendRaw');
+  await assert.rejects(recoverStep(w, rec, caps), /no SegmentSealed log of segment 0/);
+  assert.equal(sign.mock.callCount(), 0);
+  assert.equal(send.mock.callCount(), 0);
+});
+
+for (const badFirst of [true, false]) test(`terminal previous-buffer settlement tolerates a malformed ${badFirst ? 'first' : 'second'} reader`, async (t) => {
+  const { w, open, chain, cfg, deployment, rpc } = await setup(t);
+  const faulty: JsonRpc = { async call<T>(method: string, params: unknown[]): Promise<T> {
+    const answer = await rpc.call<T>(method, params);
+    if (method !== 'eth_getLogs') return answer;
+    return (answer as { topics: string[]; data: string }[]).map((row) =>
+      row.topics[0] === hx(TOPIC.SegmentSealed) && row.topics[1] === hx(u256(1)) ? { ...row, data: row.data.slice(0, -64) } : row) as T;
+  } };
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const session = await RecoverySession.create(chain.gamma, evidenceOf(unhex(rec.burned!)), new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const complete = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: to, topics: complete.event.topics, data: complete.event.data }] : undefined;
+  const step = await recoverStep(w, rec, caps);
+  assert.equal(step.state, 'checkpoint');
+  assert.ok('txHash' in step);
+  // Reopen the same journal for the faulty primary order.
+  const relay = badFirst ? await open('holder', faulty) : w;
+  await sealTestSegments(chain, await open('previous-buffer-producer'), 2, 1n);
+  const [first] = chain.vault.events.filter((e) => e.name === 'SegmentSealed');
+  const gap = GapTree.build(first.ids)!.prove(session.redemptionId)!;
+  const proof = await recoveryRpcSource(w.bridge.evm, step.txHash)(deployment.recovery, complete.event);
+  const settle = await session.gaps('redeemRecovered', w.trust, proof, { seq: 1n }, [gap], unhex(rec.startHead));
+  const verdict = await verifyReturn(chain.gamma, evidenceOf(unhex(rec.burned!)), w.trust, TEST_PARAMS);
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, cfg.vault) || hx(data.subarray(0, 4)) !== selector('redeemRecovered(bytes)')) return;
+    assert.deepEqual(data, settle.calldata);
+    const history = buildHistory([{ index: first.segment, z: first.ids, before: first.before, after: first.after, root: GapTree.build(first.ids)!.root }],
+      session.redemptionId, 0n, 1n, unhex(rec.startHead));
+    vault.redeem(session.redemptionId, 0n, history.history, { ret: verdictAbi(verdict) });
+    return [];
+  };
+  const alternate = badFirst ? rpc : faulty;
+  const fetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: string, opts: RequestInit) => {
+    if (url !== 'http://archive.invalid') return fetch(url, opts);
+    const body = JSON.parse(String(opts.body));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: await alternate.call(body.method, body.params) }));
+  });
+  assert.equal((await recoverStep(relay, rec, { ...caps, archives: ['http://archive.invalid'] })).state, 'paid');
+  assert.equal(chain.vault.events.filter((e) => e.name === 'Paid' && eq(e.eta, session.redemptionId)).length, 1);
+});
+
 test('refused preflight never certifies a spend, and receive verifies the full path and owner', async (t) => {
   const { w, open, aggregator, views } = await setup(t);
   const before = aggregator.calls;
@@ -127,7 +476,7 @@ test('refused preflight never certifies a spend, and receive verifies the full p
 });
 
 test('Run replay consumes signed arrivals and preserves the other return’s payer reserve', async (t) => {
-  const { w, chain, deployment, cfg } = await setup(t);
+  const { w, open, chain, deployment, cfg } = await setup(t);
   const raw = w.release.recovery as { ranges: { max: { entry: string; operations: number; gaps: number } }[]; backlog: Record<string, string> };
   raw.ranges = raw.ranges.filter(({ max }) => max.entry === 'run' ? max.operations === 1 : max.gaps <= 3);
   Object.assign(raw.backlog, { duringProgress: '2', advancePeakSeals: '1', qualifiedForMs: '33025' });
@@ -182,7 +531,9 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   chain.fund(w.signer.address, 10n ** 18n);
   segment = 3n;
   await assert.rejects(recoverStep(w, rec, caps), /observed arrivals exceed the admitted Run endpoint/);
-  segment = 2n;
+  w.bridge.evm.vaultState = state;
+  // The admitted two arrivals now need real, certified archived segments.
+  await sealTestSegments(chain, await open('run-replay-seal-producer'), 2);
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 2);
 
@@ -1351,6 +1702,66 @@ test('restore qualifies and keeps the same checkpoint that will execute across b
   chain.autoMine = false;
   assert.equal((await recoverStep(behind, imported, caps)).state, 'pending');
   assert.equal(JSON.parse(readFileSync(localFile(behind), 'utf8')).pending.cut.kind, 'settle');
+});
+
+test('portable Complete restart checks archived history before rebroadcasting the lower nonce', async (t) => {
+  const { w, dir, open, chain, deployment, manifest } = await setup(t);
+  const original = join(dir, 'before-run.json');
+  await burn(w, 'coin', undefined, undefined, caps, original);
+  const rec = await w.returnRecord('coin');
+  const relay = await open('unmined-run');
+  const relayed = await restoreReturn(relay, original);
+  chain.fund(relay.signer.address, 10n ** 18n);
+  const session = await RecoverySession.create(chain.gamma, evidenceOf(unhex(rec.burned!)), new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const complete = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: to, topics: complete.event.topics, data: complete.event.data }] : undefined;
+  chain.autoMine = false;
+  assert.equal((await recoverStep(relay, relayed, caps)).state, 'pending');
+  const journal = join(relay.dir, `recovery-${rec.returnId.slice(2)}.json`);
+  const raw = JSON.parse(readFileSync(journal, 'utf8')).pending.raw;
+  chain.dropPool();
+  chain.autoMine = true;
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  const portable = join(dir, 'external-complete.json');
+  await publishReturnBackup(w, rec, portable);
+  await restoreReturn(relay, portable);
+  const saved = JSON.parse(readFileSync(journal, 'utf8'));
+  assert.ok(saved.complete);
+  assert.deepEqual(saved.superseded, [raw]);
+  await sealTestSegments(chain, await open('restart-seal-producer'), 1);
+  chain.faults.hideSegments.add(0n);
+  const installed = readFileSync(manifest, 'utf8');
+  const stale = JSON.parse(installed);
+  stale.recovery.address = hx(new Uint8Array(20).fill(0x61));
+  writeFileSync(manifest, JSON.stringify(stale));
+  const staleWallet = await open('unmined-run');
+  const staleSend = t.mock.method(staleWallet.bridge.evm, 'sendRaw');
+  const staleSimulation = t.mock.method(staleWallet.bridge.evm, 'checkReturnImport');
+  await assert.rejects(recoverStep(staleWallet, relayed, caps), { reason: 'BadDeployment' });
+  assert.equal(staleSimulation.mock.callCount(), 0);
+  assert.equal(staleSend.mock.callCount(), 0);
+  assert.deepEqual(JSON.parse(readFileSync(journal, 'utf8')).superseded, [raw]);
+  writeFileSync(manifest, installed);
+  const restarted = await open('unmined-run');
+  const send = t.mock.method(restarted.bridge.evm, 'sendRaw');
+  const originalTx = decodeSignedTx(unhex(raw));
+  const unknown = await signTx(restarted.signer, { ...originalTx.request, data: unhex(selector('unrecognized(bytes)')) });
+  writeFileSync(journal, JSON.stringify({ ...saved, superseded: [hx(unknown.raw)],
+    signerEpochs: { [hx(unknown.hash)]: saved.signerEpochs[hx(originalTx.hash)] } }));
+  await assert.rejects(recoverStep(restarted, relayed, caps), /saved recovery packet does not call the installed recovery graph/);
+  assert.equal(send.mock.callCount(), 0);
+  writeFileSync(journal, JSON.stringify(saved));
+  const payerBefore = chain.balanceOf(restarted.signer.address);
+  await assert.rejects(recoverStep(restarted, relayed, caps), /no SegmentSealed log of segment 0/);
+  assert.equal(send.mock.callCount(), 0);
+  assert.equal(chain.balanceOf(restarted.signer.address), payerBefore);
+  assert.deepEqual(JSON.parse(readFileSync(journal, 'utf8')).superseded, [raw]);
+  chain.faults.hideSegments.clear();
+  chain.autoMine = false;
+  assert.equal((await recoverStep(restarted, relayed, caps)).state, 'pending');
+  assert.equal(send.mock.callCount(), 1);
+  assert.deepEqual(send.mock.calls[0].arguments[0], unhex(raw), 'replay preserves the exact transaction and nonce');
 });
 
 test('restore reconciles certified Paid before qualifying future packets', async (t) => {

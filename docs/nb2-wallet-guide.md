@@ -115,6 +115,13 @@ for pending and completed attempts. Ordinary and recovered attempts from the sam
 share a total fee budget in the local return journal. Use a dedicated payer account while
 this flow is active.
 
+Run and Advance checkpoints also need a reader that serves `eth_getProof` by block hash for the
+vault account and its head slots. If the primary RPC does not serve it, include a proof-capable
+execution or archive RPC in `archives`. The wallet verifies this proof against the latest certified
+execution block it can authenticate across the configured readers before checking the entire sealed
+suffix. The previous-buffer shortcut is available only for terminal settlement, where the vault
+checks that buffer itself.
+
 ```sh
 nb2-wallet plan-return coin --recipient "$RECIPIENT" --return-policy payer.json
 nb2-wallet burn coin --recipient "$RECIPIENT" --return-policy payer.json --backup coin.private.json
@@ -637,6 +644,8 @@ payments to the vault, so at K = 64 and one payment a second the history grows b
 segments of history at 72,852 / 126,393 / 661,926 gas, and the sealing return (the 64th payment of a segment) at up to 342,766.
 
 ## Limits
+
+**Known limitation.** A deposit whose receipt exceeds the proof limits cannot be recovered offline in this release. For a shared segment seal with an oversized receipt, the continuation wallet can reconstruct the history from archived segment IDs and authenticate it against a certified vault head. A receipt-bound fix is planned for the next generation. [bft-core #1355](https://github.com/ristik/bft-core/issues/1355)
 
 **The test vault.** The package deploys two vaults: the test build (K = 4, B = 2), whose manifest the lanes and the walkthrough use, and
 the production build (K = 64, B = 16) beside it. A segment seals every K payments, so at K = 4 the lane can rotate segments in a few

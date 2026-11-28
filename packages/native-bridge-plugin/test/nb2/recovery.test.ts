@@ -4,10 +4,26 @@ import { test } from 'node:test';
 import { gunzipSync } from 'node:zlib';
 import type { RecoveryCalibrationRange, RecoveryBacklog } from '../../src/nb2/recovery-cost.js';
 import { concat, fromHex } from '../../src/bytes.js';
-import { decodeConfig, decodeDepositProof, verifyReceiptLog, Nb2Error, PRODUCTION_PARAMS, RecoveryAuthority, RecoverySession, TrustInput, WalletError } from '../../src/nb2/index.js';
+import { decodeConfig, decodeDepositProof, verifyReceiptLog, Nb2Error, PRODUCTION_PARAMS, TEST_PARAMS, RecoveryAuthority, RecoverySession, TrustInput, WalletError } from '../../src/nb2/index.js';
 
 const fixtures = new URL('../../../../protocol/vectors/nb2-continuation-v1.1/', import.meta.url);
 const read = (file: string) => readFile(new URL(file, fixtures));
+
+test('shared archive fold vector authenticates the witness and detects membership beyond its limit', async () => {
+  const file = new URL('../../../../tests/fixtures/nb2-archive-fold.json', import.meta.url);
+  const f = JSON.parse(await readFile(file, 'utf8'));
+  const hex = (s: string) => fromHex(s.slice(2))!;
+  const gamma = hex(f.gamma);
+  const cfg = decodeConfig(gamma, TEST_PARAMS);
+  const trust = await TrustInput.fromBundle(hex(f.trustBundle), cfg.rootGenesis);
+  const { salt, recovery, runtimeHash, pins, vaultRuntimeHash } = f.deployment;
+  const session = await RecoverySession.create(gamma, hex(f.evidence), new RecoveryAuthority(trust, async () => undefined), TEST_PARAMS,
+    { salt: hex(salt), recovery: hex(recovery), runtimeHash: hex(runtimeHash), pins: hex(pins), vaultRuntimeHash: hex(vaultRuntimeHash) });
+  const fold = (example: { logs: { index: string; data: string }[]; terminalSeal: string }) => session.archivedGaps(trust, BigInt(f.start), hex(f.head),
+    example.logs.map(({ index, data }) => ({ index: BigInt(index), data: hex(data) })), hex(example.terminalSeal), f.limit);
+  assert.deepEqual(await fold(f.positive), f.positive.witnesses.map(hex));
+  await assert.rejects(fold(f.paid), { reason: 'AlreadyPaid' });
+});
 function calibrationRanges(maxAdvance = 1024): RecoveryCalibrationRange[] {
   const range = (entry: RecoveryCalibrationRange['max']['entry'], operations: number, gaps: number): RecoveryCalibrationRange => ({
     minReceiptBytes: entry === 'run' ? 0 : 1,

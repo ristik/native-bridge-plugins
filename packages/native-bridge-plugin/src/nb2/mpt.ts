@@ -28,8 +28,16 @@ function hexPrefix(it: RlpItem): { path: number[]; leaf: boolean } | null {
 
 /** The value stored at `key` under `root`; throws {@link MptError}. */
 export function mptVerify(root: Uint8Array, key: Uint8Array, nodes: Uint8Array[]): Uint8Array {
+  return mptLookup(root, key, nodes) ?? bad();
+}
+
+const emptyRoot = HE(rlpBytes(new Uint8Array()));
+
+/** Verify inclusion or exclusion. An absent key is distinct from an incomplete or invalid path. */
+export function mptLookup(root: Uint8Array, key: Uint8Array, nodes: Uint8Array[]): Uint8Array | null {
   let nib = nibbles(key);
-  if (nodes.length === 0 || !eq(HE(nodes[0]), root)) bad();
+  if (nodes.length === 0) return eq(root, emptyRoot) ? null : bad();
+  if (!eq(HE(nodes[0]), root)) bad();
   let cur: RlpItem;
   try {
     cur = rlpDecode(nodes[0]);
@@ -37,29 +45,27 @@ export function mptVerify(root: Uint8Array, key: Uint8Array, nodes: Uint8Array[]
     return bad();
   }
   let used = 1;
-  const finish = (v: Uint8Array): Uint8Array => (used !== nodes.length ? bad() : v);
+  const finish = (v: Uint8Array | null): Uint8Array | null => (used !== nodes.length ? bad() : v);
   for (;;) {
     if (!cur.list) bad();
     let child: RlpItem;
     if (cur.kids.length === 17) {
       if (nib.length === 0) {
         const v = cur.kids[16];
-        if (v.list || v.str.length === 0) bad();
-        return finish(v.str);
+        if (v.list) bad();
+        return finish(v.str.length === 0 ? null : v.str);
       }
       child = cur.kids[nib[0]];
       nib = nib.slice(1);
-      if (!child.list && child.str.length === 0) bad();
+      if (!child.list && child.str.length === 0) return finish(null);
     } else if (cur.kids.length === 2) {
       const hp = hexPrefix(cur.kids[0]);
-      if (hp === null || hp.path.length > nib.length || hp.path.some((x, i) => x !== nib[i])) bad();
-      nib = nib.slice(hp!.path.length);
       const v = cur.kids[1];
-      if (hp!.leaf) {
-        if (nib.length !== 0 || v.list || v.str.length === 0) bad();
-        return finish(v.str);
-      }
-      if (hp!.path.length === 0) bad();
+      if (hp === null) return bad();
+      if (hp.leaf ? v.list || v.str.length === 0 : hp.path.length === 0 || (v.list ? v.raw.length >= 32 : v.str.length !== 32)) bad();
+      if (hp.path.length > nib.length || hp.path.some((x, i) => x !== nib[i])) return finish(null);
+      nib = nib.slice(hp.path.length);
+      if (hp.leaf) return finish(nib.length === 0 ? v.str : null);
       child = v;
     } else {
       return bad();
@@ -100,7 +106,7 @@ const ref = (node: Uint8Array): Uint8Array => (node.length < 32 ? node : rlpByte
 type Entry = { k: number[]; v: Uint8Array };
 
 function build(entries: Entry[], depth: number, target: number[] | null, path: Uint8Array[]): Uint8Array {
-  const onPath = target !== null && entries.some((e) => e.k.length === target.length && e.k.every((x, i) => x === target[i]));
+  const onPath = target !== null;
   let node: Uint8Array;
   if (entries.length === 1 && entries[0].k.length >= depth) {
     node = rlpList([rlpBytes(compact(entries[0].k.slice(depth), true)), rlpBytes(entries[0].v)]);
@@ -114,13 +120,14 @@ function build(entries: Entry[], depth: number, target: number[] | null, path: U
       while (deeper.every((e) => e.k.length > depth + cp && e.k[depth + cp] === first[depth + cp])) cp++;
     }
     if (cp > 0) {
-      const child = build(entries, depth + cp, target, path);
-      node = rlpList([rlpBytes(compact(deeper[0].k.slice(depth, depth + cp), false)), ref(child)]);
+      const prefix = deeper[0].k.slice(depth, depth + cp);
+      const child = build(entries, depth + cp, target && prefix.every((n, i) => n === target[depth + i]) ? target : null, path);
+      node = rlpList([rlpBytes(compact(prefix, false)), ref(child)]);
     } else {
       const items: Uint8Array[] = [];
       for (let n = 0; n < 16; n++) {
         const group = deeper.filter((e) => e.k[depth] === n);
-        items.push(group.length === 0 ? rlpBytes(new Uint8Array()) : ref(build(group, depth + 1, target, path)));
+        items.push(group.length === 0 ? rlpBytes(new Uint8Array()) : ref(build(group, depth + 1, target?.[depth] === n ? target : null, path)));
       }
       items.push(rlpBytes(here.length === 1 ? here[0].v : new Uint8Array()));
       node = rlpList(items);
@@ -131,9 +138,9 @@ function build(entries: Entry[], depth: number, target: number[] | null, path: U
   return node;
 }
 
-/** Build the trie of `entries` (distinct keys): its root and the root-to-leaf path of `target` (empty if `target` is null). */
+/** Build the trie of `entries` (distinct keys) and the inclusion or exclusion path for `target` (none for null). */
 export function buildTrie(entries: [Uint8Array, Uint8Array][], target: Uint8Array | null): { root: Uint8Array; path: Uint8Array[] } {
-  if (entries.length === 0) return { root: HE(rlpBytes(new Uint8Array())), path: [] };
+  if (entries.length === 0) return { root: emptyRoot.slice(), path: [] };
   const es = entries.map(([k, v]) => ({ k: nibbles(k), v }));
   const path: Uint8Array[] = [];
   const root = build(es, 0, target === null ? null : nibbles(target), path);

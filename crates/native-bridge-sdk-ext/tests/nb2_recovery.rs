@@ -3,15 +3,18 @@
 use std::{fs, path::Path, process::Command};
 
 use native_bridge_sdk_ext::nb2::{
-    config::{decode_config, production_params},
+    config::{decode_config, production_params, test_params},
     deposit::{decode_deposit_proof, verify_receipt_log},
     errors::{fail, refuse},
+    journal::unhex,
     recovery::{
         GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoveryEvent,
         RecoverySession,
     },
+    segment::{next_head, segment_sealed_data, GapTree},
     trust::TrustInput,
     util::{arr, from_hex},
+    verify::verify_return,
     Rule, WalletReason,
 };
 use serde_json::Value;
@@ -99,6 +102,98 @@ fn op_count(calldata: &[u8]) -> usize {
         pos += 8 + (n - index * 4096).min(4096) + 32 * depth;
     }
     raw[pos] as usize
+}
+
+#[test]
+fn shared_archive_fold_authenticates_witness_and_membership_beyond_limit() {
+    let f: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/nb2-archive-fold.json"
+    ))
+    .unwrap();
+    let bytes = |v: &Value| unhex(v.as_str().unwrap()).unwrap();
+    let gamma = bytes(&f["gamma"]);
+    let params = test_params();
+    let cfg = decode_config(&gamma, &params).unwrap();
+    let trust = TrustInput::from_bundle(&bytes(&f["trustBundle"]), &cfg.root_genesis).unwrap();
+    let d = &f["deployment"];
+    let session = RecoverySession::create(
+        &gamma,
+        &bytes(&f["evidence"]),
+        RecoveryAuthority::new(trust.clone(), |_| Ok(())),
+        &params,
+        RecoveryDeployment {
+            salt: arr(&bytes(&d["salt"])),
+            recovery: arr(&bytes(&d["recovery"])),
+            runtime_hash: arr(&bytes(&d["runtimeHash"])),
+            pins: arr(&bytes(&d["pins"])),
+            vault_runtime_hash: Some(arr(&bytes(&d["vaultRuntimeHash"]))),
+        },
+    )
+    .unwrap();
+    let fold = |example: &Value| {
+        let rows: Vec<_> = example["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["index"].as_str().unwrap().parse::<u64>().unwrap(),
+                    bytes(&row["data"]),
+                )
+            })
+            .collect();
+        let logs: Vec<_> = rows
+            .iter()
+            .map(|(index, data)| (*index, data.as_slice()))
+            .collect();
+        session.archived_gaps(
+            &trust,
+            f["start"].as_str().unwrap().parse().unwrap(),
+            arr(&bytes(&f["head"])),
+            &logs,
+            &bytes(&example["terminalSeal"]),
+            f["limit"].as_u64().unwrap() as usize,
+        )
+    };
+    let expected: Vec<_> = f["positive"]["witnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(bytes)
+        .collect();
+    assert_eq!(fold(&f["positive"]).unwrap(), expected);
+    assert_eq!(
+        fold(&f["paid"]).unwrap_err().reason(),
+        Some(WalletReason::AlreadyPaid)
+    );
+}
+
+#[test]
+fn archived_gaps_check_the_suffix_beyond_the_first_packet() {
+    let path = "transcripts/root";
+    let (session, trust, gamma, _) = load(BASE, path);
+    let params = production_params();
+    let cfg = decode_config(&gamma, &params).unwrap();
+    let evidence = read(BASE, &format!("{path}/evidence.bin"));
+    let verdict = verify_return(&gamma, &evidence, &trust, &params).unwrap();
+    let start = verdict.min_segment;
+    let ids: Vec<[u8; 32]> = (0..cfg.k).map(|i| [i as u8; 32]).collect();
+    let root = GapTree::build(&ids).unwrap().root();
+    let head = [3; 32];
+    let middle = next_head(&verdict.domain, start, &head, &root);
+    let end = next_head(&verdict.domain, start + 1, &middle, &root);
+    let first = segment_sealed_data(&head, &middle, &ids);
+    let last = segment_sealed_data(&middle, &end, &ids);
+    let bad = [(start, first.as_slice()), (start + 2, last.as_slice())];
+    let err = session
+        .archived_gaps(&trust, start, head, &bad, &[], 1)
+        .unwrap_err();
+    assert_eq!(err.rule().unwrap().rule, Rule::SegmentLog);
+    let consecutive = [(start, first.as_slice()), (start + 1, last.as_slice())];
+    let err = session
+        .archived_gaps(&trust, start, head, &consecutive, &[], 1)
+        .unwrap_err();
+    assert_eq!(err.rule().unwrap().rule, Rule::SealReceipt);
 }
 
 #[test]
