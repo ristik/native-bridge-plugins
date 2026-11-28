@@ -436,7 +436,7 @@ test('ERC20 open rejects an unregistered foreign pending send on any chain', asy
   await assert.rejects(NativeBridgeV2.open({ ...x.options(), journal: store }), refused);
 });
 
-test('ERC20 open rereads a holder burn when Paid and a payer handoff follow the scan read', async () => {
+async function assertOpenDuringPayerHandoff(withSignedSend: boolean) {
   class PausingStore extends MemoryJournalStore {
     pauseKey?: string;
     private markRead!: () => void;
@@ -461,27 +461,64 @@ test('ERC20 open rereads a holder burn when Paid and a payer handoff follow the 
   const { chainId } = x.cfg;
   const admission = { erc20Recovery: admissionFor(x) };
   const first = await bridge.planReturn(firstHeld, recipient, payer, { admission });
-  const next = await bridge.planReturn(held, recipient, payer, { admission });
+  const nextPlan = await bridge.planReturn(held, recipient, payer, { admission });
   await bridge.burn(first.returnId, owner, admission);
   assert.equal((await bridge.journal.ret(hex(first.returnId)))?.status, 'burned');
 
   const writer = new Journal(store, bridge.domain);
+  const claimant = new Journal(store, key('next payer domain'));
+  const next = { ...nextPlan.record, ...claimant.base(), returnId: hex(key('next return in the other domain')) };
+  await claimant.registerPayerChain(chainId);
+  await claimant.putReturn(next);
   const firstKey = `${writer.prefix}return/${toHex(first.returnId)}`;
-  const nextKey = `${writer.prefix}return/${toHex(next.returnId)}`;
-  const slot = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
-  assert.equal(await store.get(slot), firstKey);
+  const nextKey = `${claimant.prefix}return/${next.returnId.slice(2)}`;
+  const scope = `${chainId}/${toHex(payer)}`;
+  const slot = `nb2/payer/v1/${scope}`;
+  const history = `${scope}/${toHex(bridge.domain)}/${toHex(first.returnId)}`;
+  const watermark = `nb2/payer-sends/v1/${history}`;
+  const fees = `nb2/payer-fees/v1/${history}/`;
+  if (withSignedSend) {
+    await writer.checkReturnPayer(chainId, payer, hex(first.returnId), true, { signingNonce: 0n });
+    const tx = await signTx(x.payer, { chainId, nonce: 0n, gas: 100_000n, maxFeePerGas: 10n,
+      maxPriorityFeePerGas: 1n, to: bytes(x.a.vault), value: 0n, data: new Uint8Array() });
+    const burned = (await writer.retForUpdate(hex(first.returnId)))!;
+    await writer.retainPayerSend(burned, tx.raw);
+    await writer.putReturn({ ...burned, status: 'submitted', executionPayer: hex(payer), sends: [bridge['sendRecord'](tx)] });
+    await writer.checkReturnPayer(chainId, payer, hex(first.returnId), true, { signingNonce: 1n });
+    assert.equal(await store.get(watermark), '0');
+  }
+  assert.equal(await store.get(slot), firstKey + (withSignedSend ? '#nonce:1' : ''));
   store.pauseKey = firstKey;
-  const opening = NativeBridgeV2.open({ ...x.options(), journal: store });
+  const reopen = () => NativeBridgeV2.open({ ...x.options(), journal: store });
+  const opening = reopen();
   try {
     await Promise.race([store.read, opening.then(() => assert.fail('open skipped the holder burn'))]);
     const saved = (await writer.retForUpdate(hex(first.returnId)))!;
     await writer.putReturn({ ...saved, status: 'paid', paid: { txHash: hex(key('concurrent Paid')), blockNumber: '21' } });
-    await writer.checkReturnPayer(chainId, payer, hex(next.returnId), true);
+    x.finalized(2n);
+    await claimant.checkReturnPayer(chainId, payer, next.returnId, true, { finalizedNonce: () => bridge.evm.nonce(payer, 'finalized') });
     assert.equal(await store.get(slot), nextKey);
+    if (withSignedSend) {
+      assert.equal(await store.get(watermark), '1');
+      assert.deepEqual(await store.list(fees), [fees + '0']);
+    }
   } finally {
     store.resume();
   }
   assert.equal((await (await opening).journal.ret(hex(first.returnId)))?.status, 'paid');
+  if (withSignedSend) {
+    const paid = (await writer.retForUpdate(hex(first.returnId)))!;
+    await writer.putReturn({ ...paid, status: 'submitted', paid: undefined });
+    await assert.rejects(reopen(), /unsupported pre-release ERC20 record: start a fresh wallet/);
+  }
+}
+
+test('ERC20 open rereads a holder burn when Paid and a payer handoff follow the scan read', async () => {
+  await assertOpenDuringPayerHandoff(false);
+});
+
+test('ERC20 open rereads a signed return when handoff advances its watermark past the last fee', async () => {
+  await assertOpenDuringPayerHandoff(true);
 });
 
 test('ERC20 slot validation bounds retries when the return keeps changing', async () => {

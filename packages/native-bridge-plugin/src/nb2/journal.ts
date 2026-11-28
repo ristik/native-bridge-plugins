@@ -209,7 +209,7 @@ export function undec(s: Dec): bigint {
   return BigInt(s);
 }
 
-const PAYER_SLOT_VALIDATION_RETRIES = 3;
+const ERC20_RETURN_VALIDATION_RETRIES = 3;
 const returnKey = /^nb2\/v1\/([0-9a-f]{64})\/return\/([0-9a-f]{64})$/;
 
 export interface PayerCheck {
@@ -511,43 +511,47 @@ export class Journal {
     if (!match || !await this.payerHistoryComplete(`${scope}/${match[1]}/${match[2]}`)) unsupportedErc20Return();
   }
 
-  /** Check ERC20 state, returning the current record if its payer slot changed during the read. */
+  /** Check ERC20 state, refreshing the return before refusing on a status-dependent mismatch. */
   public async requireErc20ReturnState(chainId: bigint, record: ReturnRecord): Promise<ReturnRecord> {
     const domain = record.domain.slice(2);
     const id = record.returnId.slice(2);
     if (await this.store.get(`nb2/domain-chain/v1/${domain}`) !== dec(chainId)) unsupportedErc20Return();
     const owner = `nb2/v1/${domain}/return/${id}`;
     for (let retries = 0; ; retries++) {
-      const payer = executionPayerOf(record);
-      if (payer) {
-        const path = this.payerSendPath(chainId, payer, record);
-        const highest = await this.store.get(`nb2/payer-sends/v1/${path}`);
-        if (!await this.payerHistoryComplete(path) || highest === null) unsupportedErc20Return();
-        const fees = `nb2/payer-fees/v1/${path}/`;
-        if (record.status === 'paid' ? !(await this.store.list(fees)).length : await this.store.get(fees + highest) === null) {
-          unsupportedErc20Return();
-        }
-        for (const { raw } of record.sends) {
-          await this.requireIndexedPayerSend(chainId, record, unhex(raw), undec(highest));
-        }
-        return record;
-      }
-      if (record.status === 'submitted') unsupportedErc20Return();
-      const holderBurn = record.status !== 'planned' && record.status !== 'paid' &&
-        record.payer !== undefined && record.burnRequest !== undefined;
-      if (record.erc20PayerState === 1 && !holderBurn) return record;
-      // An unpaid local burn keeps its slot before the first signed EVM packet.
-      const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
-      if (slot?.split('#')[0] === owner) return record;
+      if (await this.hasErc20ReturnState(chainId, owner, record)) return record;
 
-      // Paid is recorded before a different return can claim this payer slot.
+      // Handoff follows Paid and can change both the slot and the finalized nonce watermark.
       const latest = await this.readSharedReturn(owner, domain, id);
       if (JSON.stringify(latest) === JSON.stringify(record)) unsupportedErc20Return();
-      if (retries === PAYER_SLOT_VALIDATION_RETRIES) {
+      if (retries === ERC20_RETURN_VALIDATION_RETRIES) {
         refuse('JournalConflict', 'ERC20 return changed repeatedly during payer validation, retry');
       }
       record = latest;
     }
+  }
+
+  private async hasErc20ReturnState(chainId: bigint, owner: string, record: ReturnRecord): Promise<boolean> {
+    const payer = executionPayerOf(record);
+    if (payer) {
+      const path = this.payerSendPath(chainId, payer, record);
+      const highest = await this.store.get(`nb2/payer-sends/v1/${path}`);
+      if (!await this.payerHistoryComplete(path) || highest === null) return false;
+      const fees = `nb2/payer-fees/v1/${path}/`;
+      const hasFee = record.status === 'paid' ? (await this.store.list(fees)).length > 0 : (await this.store.get(fees + highest)) !== null;
+      if (!hasFee) return false;
+      // The exact fees for retained packets are required in every status.
+      for (const { raw } of record.sends) {
+        await this.requireIndexedPayerSend(chainId, record, unhex(raw), undec(highest));
+      }
+      return true;
+    }
+    if (record.status === 'submitted') return false;
+    const holderBurn = record.status !== 'planned' && record.status !== 'paid' &&
+      record.payer !== undefined && record.burnRequest !== undefined;
+    if (record.erc20PayerState === 1 && !holderBurn) return true;
+    // An unpaid local burn keeps its slot before the first signed EVM packet.
+    const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
+    return slot?.split('#')[0] === owner;
   }
 
   public async openErc20PayerJournal(chainId: bigint): Promise<void> {

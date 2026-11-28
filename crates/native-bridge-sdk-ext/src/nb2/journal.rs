@@ -29,7 +29,7 @@ use super::util::{from_hex, to_hex};
 
 pub const JOURNAL_FORMAT: &str = "unicity-nb2-journal";
 pub const JOURNAL_VERSION: u64 = 1;
-const PAYER_SLOT_VALIDATION_RETRIES: usize = 3;
+const ERC20_RETURN_VALIDATION_RETRIES: usize = 3;
 
 /// Durable key-value storage. `put_if` is a compare-and-swap: it writes `value` only when the stored value is exactly
 /// `expected` (None: absent) and reports whether it did; it must be atomic and must not return before the value survives a
@@ -934,7 +934,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Check ERC20 state. Returns the refreshed record if its payer slot changed during the read.
+    /// Check ERC20 state, refreshing the return before refusing on a status-dependent mismatch.
     pub(crate) fn require_erc20_return_state(
         &self,
         chain_id: u64,
@@ -955,66 +955,16 @@ impl Journal {
         let mut retries = 0;
         loop {
             let record = refreshed.as_ref().unwrap_or(record);
-            if let Some(payer) = record.execution_payer()? {
-                let path = payer_send_path(chain_id, &payer, record);
-                let highest = self
-                    .store
-                    .get(&format!("nb2/payer-sends/v1/{path}"))?
-                    .as_deref()
-                    .map(undec64)
-                    .transpose()?;
-                let Some(highest) = highest else {
-                    return unsupported_erc20_return();
-                };
-                if !self.payer_history_complete(&path)? {
-                    return unsupported_erc20_return();
-                }
-                let fees = format!("nb2/payer-fees/v1/{path}/");
-                let missing = if record.status == "paid" {
-                    self.store.list(&fees)?.is_empty()
-                } else {
-                    self.store.get(&format!("{fees}{highest}"))?.is_none()
-                };
-                if missing {
-                    return unsupported_erc20_return();
-                }
-                for send in &record.sends {
-                    self.require_indexed_payer_send(
-                        chain_id,
-                        record,
-                        &unhex(&send.raw)?,
-                        Some(highest),
-                    )?;
-                }
-                return Ok(refreshed);
-            }
-            if record.status == "submitted" {
-                return unsupported_erc20_return();
-            }
-            let holder_burn = record.status != "planned"
-                && record.status != "paid"
-                && record.payer.is_some()
-                && record.burn_request.is_some();
-            if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1)
-                && !holder_burn
-            {
-                return Ok(refreshed);
-            }
-            // An unpaid local burn keeps its slot before the first signed EVM packet.
-            let payer = unhex_n::<20>(record.payer.as_deref().unwrap_or(&record.recipient))?;
-            let slot = self
-                .store
-                .get(&format!("nb2/payer/v1/{chain_id}/{}", to_hex(&payer)))?;
-            if slot.as_deref().and_then(|value| value.split('#').next()) == Some(&owner) {
+            if self.has_erc20_return_state(chain_id, &owner, record)? {
                 return Ok(refreshed);
             }
 
-            // Paid is recorded before a different return can claim this payer slot.
+            // Handoff follows Paid and can change both the slot and the finalized nonce watermark.
             let latest = self.read_shared_return(&owner, domain, id)?;
             if latest == *record {
                 return unsupported_erc20_return();
             }
-            if retries == PAYER_SLOT_VALIDATION_RETRIES {
+            if retries == ERC20_RETURN_VALIDATION_RETRIES {
                 return refuse(
                     WalletReason::JournalConflict,
                     "ERC20 return changed repeatedly during payer validation, retry",
@@ -1023,6 +973,64 @@ impl Journal {
             refreshed = Some(latest);
             retries += 1;
         }
+    }
+
+    fn has_erc20_return_state(
+        &self,
+        chain_id: u64,
+        owner: &str,
+        record: &ReturnRecord,
+    ) -> Result<bool> {
+        if let Some(payer) = record.execution_payer()? {
+            let path = payer_send_path(chain_id, &payer, record);
+            let highest = self
+                .store
+                .get(&format!("nb2/payer-sends/v1/{path}"))?
+                .as_deref()
+                .map(undec64)
+                .transpose()?;
+            let Some(highest) = highest else {
+                return Ok(false);
+            };
+            if !self.payer_history_complete(&path)? {
+                return Ok(false);
+            }
+            let fees = format!("nb2/payer-fees/v1/{path}/");
+            let has_fee = if record.status == "paid" {
+                !self.store.list(&fees)?.is_empty()
+            } else {
+                self.store.get(&format!("{fees}{highest}"))?.is_some()
+            };
+            if !has_fee {
+                return Ok(false);
+            }
+            // The exact fees for retained packets are required in every status.
+            for send in &record.sends {
+                self.require_indexed_payer_send(
+                    chain_id,
+                    record,
+                    &unhex(&send.raw)?,
+                    Some(highest),
+                )?;
+            }
+            return Ok(true);
+        }
+        if record.status == "submitted" {
+            return Ok(false);
+        }
+        let holder_burn = record.status != "planned"
+            && record.status != "paid"
+            && record.payer.is_some()
+            && record.burn_request.is_some();
+        if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1) && !holder_burn {
+            return Ok(true);
+        }
+        // An unpaid local burn keeps its slot before the first signed EVM packet.
+        let payer = unhex_n::<20>(record.payer.as_deref().unwrap_or(&record.recipient))?;
+        let slot = self
+            .store
+            .get(&format!("nb2/payer/v1/{chain_id}/{}", to_hex(&payer)))?;
+        Ok(slot.as_deref().and_then(|value| value.split('#').next()) == Some(owner))
     }
 
     pub(crate) fn open_erc20_payer_journal(&self, chain_id: u64) -> Result<()> {

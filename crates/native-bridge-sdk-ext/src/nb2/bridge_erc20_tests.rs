@@ -1247,8 +1247,8 @@ fn erc20_open_refuses_an_unregistered_foreign_pending_send_on_any_chain() {
     );
 }
 
-#[test]
-fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
+fn assert_open_during_payer_handoff(with_signed_send: bool) {
+    use super::super::evm::LocalKeySigner;
     use std::sync::{mpsc, Mutex};
     use std::time::Duration;
 
@@ -1280,24 +1280,29 @@ fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
         }
     }
 
-    let (bridge, _, held) = return_bridge(
+    let (bridge, rpc, held) = return_bridge(
         6_000_000,
         1_000_000_000_000,
         1_000_000_000_000,
         Arc::new(NeverSign),
     );
-    let payer = [0xcd; 20];
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
     let chain = bridge.cfg.chain_id;
     let writer = &bridge.journal;
+    let next_domain = [0x39; 32];
+    let claimant = Journal::new(writer.store.clone(), next_domain);
     let mut first = bridge
         .plan_return(&held, &[0xab; 20], &payer, Some(0))
         .unwrap()
         .record;
     let next = ReturnRecord {
+        base: claimant.base("return"),
         return_id: hex(&[0x38; 32]),
         ..first.clone()
     };
-    writer.put_return(&next).unwrap();
+    claimant.register_payer_chain(chain).unwrap();
+    claimant.put_return(&next).unwrap();
     writer
         .check_return_payer(chain, &payer, &first.return_id, true)
         .unwrap();
@@ -1312,9 +1317,60 @@ fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
             &record.return_id[2..]
         )
     };
-    let slot = format!("nb2/payer/v1/{chain}/{}", to_hex(&payer));
+    let payer_scope = format!("{chain}/{}", to_hex(&payer));
+    let slot = format!("nb2/payer/v1/{payer_scope}");
+    let history = format!(
+        "{payer_scope}/{}/{}",
+        &first.base.domain[2..],
+        &first.return_id[2..]
+    );
+    let watermark = format!("nb2/payer-sends/v1/{history}");
+    let fees = format!("nb2/payer-fees/v1/{history}/");
+    if with_signed_send {
+        let fence = |nonce| {
+            writer.check_payer(
+                chain,
+                &payer,
+                &first.return_id,
+                true,
+                &PayerCheck {
+                    signing_nonce: Some(nonce),
+                    ..Default::default()
+                },
+            )
+        };
+        fence(0).unwrap();
+        let tx = sign_tx(
+            &signer,
+            &TxRequest {
+                chain_id: chain,
+                nonce: 0,
+                gas: 100_000,
+                max_fee_per_gas: 10u8.into(),
+                max_priority_fee_per_gas: 1u8.into(),
+                to: bridge.cfg.vault,
+                value: BigUint::default(),
+                data: vec![],
+            },
+        )
+        .unwrap();
+        writer.retain_payer_send(&first, &tx.raw).unwrap();
+        first.status = "submitted".into();
+        first
+            .extra
+            .insert("executionPayer".into(), json!(hex(&payer)));
+        first.sends = vec![bridge.send_record(&tx)];
+        writer.put_return(&first).unwrap();
+        fence(1).unwrap();
+        assert_eq!(writer.store.get(&watermark).unwrap().as_deref(), Some("0"));
+    }
     let first_key = record_key(&first);
-    assert_eq!(writer.store.get(&slot).unwrap(), Some(first_key.clone()));
+    let expected_slot = if with_signed_send {
+        format!("{first_key}#nonce:1")
+    } else {
+        first_key.clone()
+    };
+    assert_eq!(writer.store.get(&slot).unwrap(), Some(expected_slot));
     let (read, did_read) = mpsc::channel();
     let (resume, wait) = mpsc::channel();
     let reader = Journal::new(
@@ -1325,7 +1381,7 @@ fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
             read,
             resume: Mutex::new(wait),
         }),
-        [0x39; 32],
+        next_domain,
     );
 
     std::thread::scope(|scope| {
@@ -1338,13 +1394,49 @@ fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
             extra: Default::default(),
         });
         writer.put_return(&first).unwrap();
-        writer
-            .check_return_payer(chain, &payer, &next.return_id, true)
+        rpc.finalized_nonce.store(2, Ordering::SeqCst);
+        claimant
+            .check_payer(
+                chain,
+                &payer,
+                &next.return_id,
+                true,
+                &PayerCheck {
+                    finalized_nonce: Some(&|| bridge.evm.nonce(&payer, "finalized")),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(writer.store.get(&slot).unwrap(), Some(record_key(&next)));
+        if with_signed_send {
+            assert_eq!(writer.store.get(&watermark).unwrap().as_deref(), Some("1"));
+            assert_eq!(writer.store.list(&fees).unwrap(), [format!("{fees}0")]);
+        }
         resume.send(()).unwrap();
         opening.join().unwrap().unwrap();
     });
+    if with_signed_send {
+        first.status = "submitted".into();
+        first.paid = None;
+        writer.put_return(&first).unwrap();
+        let error = reader.open_erc20_payer_journal(chain).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported pre-release ERC20 record: start a fresh wallet"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
+    assert_open_during_payer_handoff(false);
+}
+
+#[test]
+fn erc20_open_rereads_a_signed_return_when_handoff_advances_its_watermark_past_the_last_fee() {
+    assert_open_during_payer_handoff(true);
 }
 
 #[test]
