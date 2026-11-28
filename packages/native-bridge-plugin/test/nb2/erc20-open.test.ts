@@ -570,6 +570,9 @@ test('ordinary takeover migrates local Run fees and preserves the higher replace
   await legacy.preparePayerBroadcast(unregistered, chainId, lower);
   assert.deepEqual(await legacy.payerFees(unregistered, chainId, payer, 0n), { prior: 0n, atNonce: 20n });
   await legacy.putReturn({ ...unregistered, status: 'paid' });
+  const second = new LocalKeySigner(key('other scoped execution payer'));
+  await assert.rejects(legacy.preparePayerSigning(unregistered, chainId, second.address), /bound to execution payer/);
+  await assert.rejects(legacy.preparePayerBroadcast(unregistered, chainId, await raw(second, 200n)), /bound to execution payer/);
   const oldOrdinary = { ...unregistered, returnId: hex(key('ordinary-only legacy return')), executionPayer: undefined,
     sends: [{ raw: hex(local), hash: hex(decodeSignedTx(local).hash), nonce: '0', gas: '2', at: '0' }] };
   await legacy.putReturn(oldOrdinary);

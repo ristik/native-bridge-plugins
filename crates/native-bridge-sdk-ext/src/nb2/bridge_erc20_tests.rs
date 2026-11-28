@@ -80,6 +80,8 @@ impl JsonRpc for Chain {
                 })
             }
             "eth_maxPriorityFeePerGas" => json!("0x1"),
+            "eth_blockNumber" => json!("0x14"),
+            "eth_getLogs" => json!([]),
             "eth_call" if params[0]["data"] == hex0x(&sel("state()")) => json!(hex0x(&[0; 192])),
             "eth_call" if params[0]["to"] == hex0x(&self.recovery) => {
                 let data = &params[0]["data"];
@@ -1971,6 +1973,103 @@ fn finalized_runs_keep_ordinary_retries_reserved_until_their_nonces_are_used() {
     rpc.finalized_nonce.store(2, Ordering::SeqCst);
     assert_eq!(commitments().calls, 8);
     assert_eq!(commitments().fees, 90u64.into());
+}
+
+#[test]
+fn a_second_ordinary_payer_cannot_sign_or_rebroadcast_an_already_bound_return() {
+    use super::super::evm::LocalKeySigner;
+    struct MustNotSign([u8; 20]);
+    impl EvmSigner for MustNotSign {
+        fn address(&self) -> [u8; 20] {
+            self.0
+        }
+        fn sign_transaction(&self, _: &TxRequest) -> core::result::Result<Vec<u8>, String> {
+            panic!("a second payer must never reach its signer");
+        }
+    }
+
+    let (bridge, rpc, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let first = LocalKeySigner::new(&[0x35; 32]);
+    let other = LocalKeySigner::new(&[0x36; 32]);
+    let signer = MustNotSign(other.address());
+    let chain = bridge.cfg.chain_id;
+    let mut record = bridge
+        .plan_return(&held, &[0xab; 20], &first.address(), Some(0))
+        .unwrap()
+        .record;
+    record.status = "burned".into();
+    record.eta = Some(hex(&[0x37; 32]));
+    record
+        .extra
+        .insert("executionPayer".into(), json!(hex(&first.address())));
+    let request = TxRequest {
+        chain_id: chain,
+        nonce: 0,
+        gas: 100_000,
+        max_fee_per_gas: 10u8.into(),
+        max_priority_fee_per_gas: 1u8.into(),
+        to: rpc.recovery,
+        value: BigUint::default(),
+        data: vec![0x11; 68],
+    };
+    let recovery = sign_tx(&first, &request).unwrap();
+    bridge
+        .journal
+        .index_payer_sends(&record, &[&recovery.raw])
+        .unwrap();
+    rpc.finalized_nonce.store(1, Ordering::SeqCst);
+    assert_eq!(
+        bridge
+            .journal
+            .payer_fees(&record, chain, &first.address(), 1)
+            .unwrap()
+            .prior,
+        1_000_000u64.into()
+    );
+    let second_packet = sign_tx(&other, &request).unwrap();
+    let return_id = unhex_n::<32>(&record.return_id).unwrap();
+    let next = TxRequest {
+        nonce: 1,
+        to: bridge.cfg.vault,
+        ..request.clone()
+    };
+
+    for recorded in [true, false] {
+        if !recorded {
+            record.extra.remove("executionPayer");
+            record
+                .sends
+                .push(bridge.send_record(&sign_tx(&first, &next).unwrap()));
+        }
+        bridge.journal.put_return(&record).unwrap();
+        for error in [
+            bridge.submit_redeem(&return_id, &signer).unwrap_err(),
+            bridge.sign_redeem_tx(&record, &signer, &next).unwrap_err(),
+            bridge
+                .journal
+                .prepare_payer_broadcast(&record, chain, &second_packet.raw)
+                .unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("bound to execution payer"),
+                "{error}"
+            );
+        }
+    }
+    assert!(bridge
+        .journal
+        .store
+        .get(&format!(
+            "nb2/payer/v1/{chain}/{}",
+            to_hex(&other.address())
+        ))
+        .unwrap()
+        .is_none());
 }
 
 #[test]

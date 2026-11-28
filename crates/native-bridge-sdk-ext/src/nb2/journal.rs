@@ -344,6 +344,48 @@ pub struct ReturnRecord {
     pub extra: Map<String, Value>,
 }
 
+impl ReturnRecord {
+    fn execution_payer(&self) -> Result<Option<[u8; 20]>> {
+        let first = self
+            .sends
+            .first()
+            .map(|send| {
+                Ok::<_, Error>(
+                    decode_signed_tx(&unhex(&send.raw)?)
+                        .map_err(Error::Other)?
+                        .from,
+                )
+            })
+            .transpose()?;
+        let Some(stored) = self.extra.get("executionPayer") else {
+            return Ok(first);
+        };
+        let Some(address) = stored.as_str() else {
+            return refuse(WalletReason::BadInput, "invalid execution payer");
+        };
+        let payer = unhex_n::<20>(address)?;
+        if first.is_some_and(|from| from != payer) {
+            return refuse(
+                WalletReason::BadInput,
+                "execution payer disagrees with the return journal",
+            );
+        }
+        Ok(Some(payer))
+    }
+
+    pub(crate) fn require_execution_payer(&self, payer: &[u8]) -> Result<()> {
+        if let Some(bound) = self.execution_payer()? {
+            if bound != payer {
+                return refuse(
+                    WalletReason::NotPending,
+                    format!("return is bound to execution payer {}", hex(&bound)),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A record kind with its `kind` string.
 pub trait Record: Serialize + DeserializeOwned {
     const KIND: &'static str;
@@ -703,6 +745,7 @@ impl Journal {
     /// Record the signed fee and highest nonce before offering an exact transaction to any RPC.
     pub fn retain_payer_send(&self, record: &ReturnRecord, raw: &[u8]) -> Result<()> {
         let tx = decode_signed_tx(raw).map_err(Error::Other)?;
+        record.require_execution_payer(&tx.from)?;
         let payer = payer_send_path(tx.request.chain_id, &tx.from, record);
         let fee = BigUint::from(tx.request.gas) * tx.request.max_fee_per_gas;
         self.retain_payer_maximum(
@@ -774,7 +817,8 @@ impl Journal {
             .iter()
             .map(|send| unhex(&send.raw))
             .collect::<Result<Vec<_>>>()?;
-        let executor = record.extra.get("executionPayer").and_then(Value::as_str);
+        let bound = record.execution_payer()?;
+        let executor = record.extra.contains_key("executionPayer");
         let mut covered = BTreeMap::<String, u64>::new();
         for (index, raw) in signed
             .iter()
@@ -783,13 +827,15 @@ impl Journal {
             .enumerate()
         {
             let tx = decode_signed_tx(raw).map_err(Error::Other)?;
-            if chain.as_deref() != Some(&dec(tx.request.chain_id)) {
+            if chain.as_deref() != Some(&dec(tx.request.chain_id))
+                || bound.is_some_and(|payer| payer != tx.from)
+            {
                 continue;
             }
             self.retain_payer_send(record, raw)?;
             let path = payer_send_path(tx.request.chain_id, &tx.from, record);
             // Ordinary records alone cannot prove the separate recovery history of a recorded executor.
-            if executor.is_some() && index >= signed.len() && !covered.contains_key(&path) {
+            if executor && index >= signed.len() && !covered.contains_key(&path) {
                 continue;
             }
             let highest = covered.entry(path).or_default();
@@ -832,20 +878,9 @@ impl Journal {
                 "payer fee history needs an authenticated chain association",
             );
         }
+        record.require_execution_payer(payer)?;
         let path = payer_send_path(chain_id, payer, record);
-        let executor = record.extra.get("executionPayer").and_then(Value::as_str);
-        if let Some(executor) = executor {
-            if !self.payer_history_complete(&payer_send_path(
-                chain_id,
-                &unhex_n::<20>(executor)?,
-                record,
-            ))? {
-                return fail_d(
-                    Rule::CapacityPreflight,
-                    "return needs its local signed fees indexed",
-                );
-            }
-        }
+        let executor = record.extra.contains_key("executionPayer");
         let ordinary = record
             .sends
             .iter()
@@ -854,12 +889,13 @@ impl Journal {
         let has_ordinary = ordinary
             .iter()
             .any(|tx| tx.request.chain_id == chain_id && tx.from.as_slice() == payer);
-        if executor.is_none() && has_ordinary && !self.payer_history_complete(&path)? {
+        if !executor && has_ordinary && !self.payer_history_complete(&path)? {
             self.index_payer_sends(record, &[])?;
         }
         let prefix = format!("nb2/payer-fees/v1/{path}/");
         let keys = self.store.list(&prefix)?;
-        if (has_ordinary
+        if (executor
+            || has_ordinary
             || !keys.is_empty()
             || self
                 .store
@@ -925,6 +961,9 @@ impl Journal {
                 WalletReason::BadInput,
                 "signed payer packet belongs to another chain",
             );
+        }
+        if let Some(current) = self.ret(&record.return_id)? {
+            current.require_execution_payer(&tx.from)?;
         }
         self.payer_fee_maxima(record, chain_id, &tx.from)?;
         if !self.payer_history_complete(&payer_send_path(chain_id, &tx.from, record))? {
@@ -1267,6 +1306,9 @@ impl Journal {
                         "return is no longer eligible for payer signing",
                     );
                 };
+                if check.signing_nonce.is_some() {
+                    current.require_execution_payer(payer)?;
+                }
                 let recovery = &current.extra["recovery"];
                 let cap = recovery["envelope"]["maxNonce"]
                     .as_str()

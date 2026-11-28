@@ -8,7 +8,7 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  CERTIFICATION_DEPTH, EvmReader, GapTree, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
+  CERTIFICATION_DEPTH, EvmReader, GapTree, NativeBridgeV2, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
   evidenceOf, firstOwnerOf, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryCalibration, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
@@ -18,7 +18,7 @@ import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/tok
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
 import { Wallet, burn, connectionOf, readRetrying, retry, transportRetry, hx, io, mint, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, transfer, unhex } from './core.js';
-import { importReturn, indexLocalRecoverySends, ordinaryPayout, publishReturnBackup, reconcileReturn, qualifyExistingRecovery, recoverStep, restoreReturn, walletAdmission, type PayerPolicy } from './recovery.js';
+import { importReturn, indexLocalRecoverySends, ordinaryPayout, publishReturnBackup, reconcileReturn, qualifyExistingRecovery, recoverStep, restoreReturn, retainTerminal, walletAdmission, type PayerPolicy } from './recovery.js';
 
 const caps: PayerPolicy = { signedBytes: 524_288, calldataBytes: 524_288, gas: 24_000_000n, maxNonce: 10_000n,
   maxFeePerGas: 30n, maxPriorityFeePerGas: 2n, maxTransactionFee: 10n ** 9n, feeBudget: 10n ** 12n, archives: [] };
@@ -290,6 +290,86 @@ test('a contested ordinary handoff reserves the old fee and the entire fallback 
   assert.deepEqual(await journal.store.list('nb2/payer/v1/'), []);
   await assert.rejects(recoverStep(w, rec, { ...caps, feeBudget: fallback + largestFee }), /payer signer reached/);
   assert.equal(sign.mock.callCount(), 1);
+});
+
+test('wallet startup migrates an already-bound ordinary return for exact resend and reuse after Paid', async (t) => {
+  const { w, open, chain, cfg, deployment, rpc } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const id = (await w.returnRecord('coin')).returnId;
+  const sidecar = join(w.dir, `recovery-${id.slice(2)}.json`);
+  const empty = readFileSync(sidecar, 'utf8');
+  assert.deepEqual(JSON.parse(empty).cuts, []);
+  const send = t.mock.method(w.bridge.evm, 'sendRaw', async () => { throw new Error('old SDK send lost'); });
+  await assert.rejects(w.bridge.submitRedeem(unhex(id), w.signer), /old SDK send lost/);
+  assert.equal(send.mock.callCount(), 1);
+  const bound = (await w.bridge.journal.ret(id))!;
+  assert.equal(bound.executionPayer, hx(w.signer.address));
+  const [ordinary] = bound.sends;
+  const scope = `${cfg.chainId}/${bound.executionPayer!.slice(2)}/${bound.domain.slice(2)}/${id.slice(2)}`;
+  const feeIndex = `nb2/payer-fee-index/v2/${scope}`;
+  const openSdk = NativeBridgeV2.open.bind(NativeBridgeV2);
+  t.mock.method(NativeBridgeV2, 'open', async (...args: Parameters<typeof openSdk>) => {
+    const bridge = await openSdk(...args);
+    const erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+    // The fixture lineage is UCT. Use that config during receipt preflight and exercise the ERC20 journal gates around it.
+    const check = bridge['checkOrdinaryImport'].bind(bridge);
+    bridge['checkOrdinaryImport'] = async (...args) => {
+      bridge.cfg.erc20 = undefined;
+      try { await check(...args); }
+      finally { bridge.cfg.erc20 = erc20; }
+    };
+    bridge.cfg.erc20 = erc20;
+    return bridge;
+  });
+  const offered: string[] = [];
+  const recordingRpc: JsonRpc = { call: async <T>(method: string, args: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') offered.push(args[0] as string);
+    return rpc.call<T>(method, args);
+  } };
+  rmSync(sidecar);
+  const missing = await open('holder', recordingRpc);
+  await assert.rejects(reconcileReturn(missing, bound), /local signed fees indexed/);
+  assert.deepEqual(offered, []);
+  await retainTerminal(missing, bound);
+  assert.equal(existsSync(sidecar), false, 'an already-bound return cannot manufacture a new empty history');
+  writeFileSync(sidecar, empty);
+
+  const fee = decodeSignedTx(unhex(ordinary.raw)).request;
+  const additionalFee = `nb2/payer-fees/v1/${scope}/${fee.nonce}`;
+  const storePath = join(w.dir, 'journal.json');
+  const prior = await missing.bridge.journal.store.get(additionalFee);
+  assert.ok(await missing.bridge.journal.store.putIf(additionalFee, prior, String(fee.gas * fee.maxFeePerGas + 1n)));
+  const inconsistent = await open('holder', recordingRpc);
+  assert.equal(await inconsistent.bridge.journal.store.get(feeIndex), null, 'an empty sidecar cannot hide known higher signed exposure');
+  const removeKey = (key: string) => {
+    const stored = JSON.parse(readFileSync(storePath, 'utf8'));
+    delete stored[key];
+    writeFileSync(storePath, JSON.stringify(stored));
+  };
+  removeKey(additionalFee);
+
+  const slot = `nb2/payer/v1/${cfg.chainId}/${bound.executionPayer!.slice(2)}`;
+  const owner = `nb2/v1/${bound.domain.slice(2)}/return/${id.slice(2)}`;
+  assert.ok(await missing.bridge.journal.store.putIf(slot, null, `${owner}#nonce:${fee.nonce + 1n}`));
+  const unfinished = await open('holder', recordingRpc);
+  assert.equal(await unfinished.bridge.journal.store.get(feeIndex), null, 'an empty sidecar cannot clear an uncovered signing fence');
+  removeKey(slot);
+
+  const active = await open('holder', recordingRpc);
+  assert.equal(await active.bridge.journal.store.get(feeIndex), '1');
+  assert.deepEqual(await active.bridge.journal.payerFees(bound, cfg.chainId, w.signer.address, fee.nonce),
+    { prior: 0n, atNonce: fee.gas * fee.maxFeePerGas });
+  const first = await reconcileReturn(active, bound);
+  assert.deepEqual(offered, [ordinary.raw]);
+  await chain.mine([]);
+  const finalized = first.result.state === 'paid' ? first : await reconcileReturn(active, bound);
+  assert.equal(finalized.result.state, 'paid');
+  const next = { ...bound, returnId: hx(key('payer reused after ordinary Paid')), status: 'planned' as const };
+  removeKey(feeIndex);
+  await assert.rejects(active.bridge.checkErc20Payer(next, w.signer.address), /local signed sends indexed/);
+  const paid = await open('holder', recordingRpc);
+  assert.equal(await paid.bridge.journal.store.get(feeIndex), '1');
+  assert.equal((await paid.bridge.checkErc20Payer(next, w.signer.address)).finalizedNonce, fee.nonce + 1n);
 });
 
 test('a peer payout keeps the legacy wallet packet reserved after it drops out of the mempool', async (t) => {

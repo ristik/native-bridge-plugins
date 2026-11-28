@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   AmbiguousBroadcast, CERTIFICATION_DEPTH, FAILURE_PROOF_READS, VANISHED_CLAIM_HORIZON, ProofUnavailable, EvmReader, HttpJsonRpc, Nb2Error, RpcError, RecoveryAuthority, RecoverySession, TOPIC, WalletError,
-  buildParams, checkRemainingRecoveryRuns, continuationReserve, decodeSignedTx, evidenceOf, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch,
+  buildParams, checkRemainingRecoveryRuns, continuationReserve, decodeSignedTx, evidenceOf, executionPayerOf, preflightRecovery, quoteRecovery, quoteRecoveryGapBatch,
   quoteScheduledRecoveryRuns, recoveryCatchUpCalls, recoveryGeneration, remainingOrdinaryAttempts,
   payerNonceLimit, quoteErc20Call, quoteOrdinaryExecution, recoveryRpcSource, replacementBid, signTx, verifyRecoveryDependencies, type PayerCommitments, type Erc20ReturnRecovery, type Erc20SigningBounds,
   type OrdinaryCalibrationRange, type GapPrior, type RecoveryBacklog, type RecoveryCalibration,
@@ -589,7 +589,16 @@ export async function indexLocalRecoverySends(w: Wallet): Promise<void> {
   await w.bridge.journal.registerPayerChain(w.bridge.cfg.chainId);
   for (const { record } of await w.bridge.journal.allReturns()) {
     const saved = record.domain === hx(w.bridge.domain) ? loadRecovery(w, record) : undefined;
-    await w.bridge.journal.indexPayerSends(record, recoveryPackets(saved).map((signed) => bytes(signed)));
+    const signed = recoveryPackets(saved).map((packet) => bytes(packet));
+    if (saved && !signed.length && record.executionPayer && record.sends.length && record.recovery && record.burned &&
+        saved.version === 1 && !saved.complete && !saved.cuts.length && uint(saved.fees ?? '0') === 0n &&
+        !saved.ordinaryHandoff && !Object.keys(saved.signerEpochs ?? {}).length) {
+      const evidence = evidenceOf(bytes(record.burned));
+      if (saved.evidence === hx(evidence) && saved.evidenceBytes === evidence.length && saved.generation === record.recovery.generation) {
+        await w.bridge.journal.indexOrdinaryPayerSends(record, w.bridge.cfg.chainId);
+      }
+    }
+    await w.bridge.journal.indexPayerSends(record, signed);
     if (record.status !== 'paid' && record.recovery && saved && (saved.cuts.length || saved.complete)) {
       const release = recoveryRelease(w);
       await checkGraph(w, release);
@@ -615,7 +624,7 @@ function initialJournal(s: RecoverySession, rec: ReturnRecord, release: ReleaseR
 
 /** Commit the terminal continuation identity as soon as burn certification succeeds. */
 export async function retainTerminal(w: Wallet, rec: ReturnRecord): Promise<void> {
-  if (!rec.recovery || loadRecovery(w, rec)) return;
+  if (!rec.recovery || loadRecovery(w, rec) || (w.bridge.cfg.erc20 && executionPayerOf(rec))) return;
   const release = recoveryRelease(w);
   const session = await openSession(w, release, rec);
   saveRecovery(w, rec, initialJournal(session, rec, release));
@@ -787,11 +796,13 @@ function retainPayment(w: Wallet, rec: ReturnRecord, txHash: string): void {
 type RouteBlocked = Extract<ReconcileResult, { state: 'route-blocked' }>;
 
 function boundPayer(rec: ReturnRecord, journal?: RecoveryJournal) {
-  const cold = journal?.attempts?.[0] ?? journal?.superseded?.[0] ?? journal?.pending?.raw ?? journal?.settled?.submitted?.raw;
+  const cold = recoveryPackets(journal)[0];
   const raw = rec.sends[0]?.raw ?? cold;
   const first = raw && decodeSignedTx(bytes(raw));
-  const address = rec.executionPayer ? bytes(rec.executionPayer, 20) : first ? first.from : undefined;
-  if (address && first && !eq(address, first.from)) throw new WalletError('BadInput', 'execution payer disagrees with the first signed payout');
+  const address = executionPayerOf(rec) ?? (first ? first.from : undefined);
+  if (address && cold && !eq(address, decodeSignedTx(bytes(cold)).from)) {
+    throw new WalletError('BadInput', 'execution payer disagrees with the first signed recovery packet');
+  }
   if (address) return { address, txHash: first ? first.hash : bytes(rec.returnId, 32), route: cold ? 'recovery' as const : 'ordinary' as const };
 }
 

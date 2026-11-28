@@ -27,7 +27,7 @@ import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, 
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
-  Journal, continuationReserve, dec, hex, undec, unhex, payerNonceLimit, remainingOrdinaryAttempts, remainingRecoveryCalls,
+  Journal, continuationReserve, dec, executionPayerOf, hex, undec, unhex, payerNonceLimit, remainingOrdinaryAttempts, remainingRecoveryCalls,
   type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
 import { recoveredSettlementEta, recoveryGeneration, type RecoveryDeployment } from './recovery.js';
@@ -1663,7 +1663,7 @@ export class NativeBridgeV2 {
     // Reconciliation, construction and the journal CAS share this snapshot.
     const fresh = await this.returnRecord(returnId);
     const first = fresh.sends[0] && decodeSignedTx(unhex(fresh.sends[0].raw));
-    const payer = fresh.executionPayer ? unhex(fresh.executionPayer) : first?.from;
+    const payer = executionPayerOf(fresh);
     const different = payer && !eq(payer, signer.address);
     const pending = { recovery: options.recovery };
     let expired: TxRequest | undefined;

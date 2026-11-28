@@ -2651,7 +2651,8 @@ impl NativeBridgeV2 {
         signer: &dyn EvmSigner,
     ) -> Result<ReconcileResult> {
         let mut expired = None;
-        let prior = self.reconcile_inner_with_expiry(return_id, &mut expired)?;
+        let prior =
+            self.reconcile_inner_with_expiry(return_id, &mut expired, Some(&signer.address()))?;
         if !matches!(prior, ReconcileResult::NotPaid { .. })
             && !expired
                 .as_ref()
@@ -2788,13 +2789,14 @@ impl NativeBridgeV2 {
     }
 
     fn reconcile_inner(&self, return_id: &[u8; 32]) -> Result<ReconcileResult> {
-        self.reconcile_inner_with_expiry(return_id, &mut None)
+        self.reconcile_inner_with_expiry(return_id, &mut None, None)
     }
 
     fn reconcile_inner_with_expiry(
         &self,
         return_id: &[u8; 32],
         expired: &mut Option<(DecodedTx, bool)>,
+        payer: Option<&[u8; 20]>,
     ) -> Result<ReconcileResult> {
         let mut rec = self.return_record(return_id)?;
         if rec.status == "paid" {
@@ -2805,6 +2807,9 @@ impl NativeBridgeV2 {
             });
         }
         let Some(eta_hex) = rec.eta.clone() else {
+            if let Some(payer) = payer {
+                rec.require_execution_payer(payer)?;
+            }
             return Ok(ReconcileResult::NotPaid { last_failure: None });
         };
         let eta = unhex(&eta_hex)?;
@@ -2819,6 +2824,9 @@ impl NativeBridgeV2 {
             if let Some(v) = self.verified_paid(rec.clone(), &l.transaction_hash)? {
                 return Ok(v);
             }
+        }
+        if let Some(payer) = payer {
+            rec.require_execution_payer(payer)?;
         }
         let mut sends = rec.sends.clone();
         let landed = self.landed_send(&mut sends, Some(&rec))?;
@@ -3136,13 +3144,14 @@ impl NativeBridgeV2 {
         signer: &dyn EvmSigner,
         request: &TxRequest,
     ) -> Result<SignedTx> {
+        let payer = signer.address();
+        record.require_execution_payer(&payer)?;
         if self.cfg.erc20.is_none() {
             return sign_tx(signer, request);
         }
         let Some(policy) = &self.erc20_return_recovery else {
             return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
         };
-        let payer = signer.address();
         let mut used = std::collections::BTreeSet::new();
         if !record.sends.is_empty() {
             let finalized = self.evm.nonce(&payer, "finalized")?;
