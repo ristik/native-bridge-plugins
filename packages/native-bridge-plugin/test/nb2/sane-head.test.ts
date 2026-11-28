@@ -1,13 +1,14 @@
 /**
  * A reader whose eth_blockNumber lies (0xffffffff) must not make the wallet page eth_getLogs through the claimed range (about 429,000
  * windows of LOG_BLOCK_RANGE): every height-driven loop runs to EvmReader.saneHead(), the highest block the reader actually serves.
- * The lie costs O(log) header reads and O(1) extra log windows.
+ * The lie costs logarithmic header reads in the distance to the served head and O(1) extra log windows.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { NativeBridgeV2 } from '../../src/nb2/bridge.js';
 import { HE } from '../../src/nb2/crypto.js';
+import { WalletError } from '../../src/nb2/errors.js';
 import { MemoryJournalStore } from '../../src/nb2/journal.js';
 import { EvmReader, type JsonRpc } from '../../src/nb2/rpc.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
@@ -25,22 +26,32 @@ const counting = (inner: JsonRpc, head?: string) => {
   return { rpc, calls };
 };
 
-test('saneHead: an honest head costs one header read; a lying 0xffffffff head is bounded to the served head in O(log) reads', async () => {
+test('saneHead: an honest head costs one header read and a lying head costs reads based on the served distance', async () => {
   const { chain } = await setup();
   for (let i = 0; i < 40; i++) await chain.mine([]);
   const real = BigInt(chain.blocks.length - 1);
   const honest = counting(chain);
   assert.equal(await new EvmReader(honest.rpc).saneHead(), real);
   assert.equal(honest.calls.get('eth_getBlockByNumber'), 1);
-  const lying = counting(chain, '0xffffffff');
+  const lying = counting(chain, `0x${'f'.repeat(64)}`);
   const reader = new EvmReader(lying.rpc);
   assert.equal(await reader.saneHead(), real);
-  assert.ok((lying.calls.get('eth_getBlockByNumber') ?? 0) <= 34, `${lying.calls.get('eth_getBlockByNumber')} header reads`);
+  assert.ok((lying.calls.get('eth_getBlockByNumber') ?? Infinity) <= 16, `${lying.calls.get('eth_getBlockByNumber')} header reads`);
   // later reads start from the confirmed head
   await chain.mine([]);
   lying.calls.clear();
   assert.equal(await reader.saneHead(), real + 1n);
-  assert.ok((lying.calls.get('eth_getBlockByNumber') ?? 0) <= 34);
+  assert.equal(lying.calls.get('eth_getBlockByNumber'), 3);
+});
+
+test('headerByNumber and saneHead refuse a header served at the wrong height', async () => {
+  const { chain } = await setup();
+  const reader = new EvmReader({ call: <T>(method: string, params: unknown[]) =>
+    method === 'eth_blockNumber' ? Promise.resolve('0x8' as T)
+      : chain.call<T>(method, method === 'eth_getBlockByNumber' ? ['0x0', false] : params) });
+  const mismatch = (e: unknown) => e instanceof WalletError && e.reason === 'ProviderFault' && /requested block 8, received block 0/.test(e.message);
+  await assert.rejects(reader.headerByNumber(8n), mismatch);
+  await assert.rejects(reader.saneHead(), mismatch);
 });
 
 test('a reconcile through a reader whose head lies costs O(1) extra eth_getLogs windows, and still finds the payout', async () => {

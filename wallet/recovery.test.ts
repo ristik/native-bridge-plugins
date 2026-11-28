@@ -2673,7 +2673,7 @@ test('a missing payer policy is PolicyRequired, distinct from exceeded limits', 
   await assert.rejects(burn(w, 'coin', undefined, undefined, { ...caps, gas: 1n }), { rule: 'CapacityPreflight' });
 });
 
-test('readRetrying waits out 429/503 on reads and never repeats a send', async () => {
+test('readRetrying waits out 429/503 only on known reads', async () => {
   const calls: string[] = [];
   let busy = 2;
   const inner: JsonRpc = { call: async <T>(method: string): Promise<T> => {
@@ -2681,6 +2681,7 @@ test('readRetrying waits out 429/503 on reads and never repeats a send', async (
     if (method === 'eth_estimateGas' && busy-- > 0) throw new RpcError(429, 0, 'rate limit');
     if (method === 'eth_getTransactionReceipt' && calls.filter((m) => m === method).length === 1) throw new RpcError(503, 0, 'RPC unavailable');
     if (method === 'eth_sendRawTransaction') throw new RpcError(503, 0, 'No transaction acknowledgement');
+    if (method === 'custom_getOrSubmit') throw new RpcError(429, 0, 'rate limit');
     if (method === 'eth_call') throw new RpcError(200, 3, 'execution reverted');
     return '0x1' as T;
   } };
@@ -2689,9 +2690,10 @@ test('readRetrying waits out 429/503 on reads and never repeats a send', async (
   assert.equal(await rpc.call('eth_estimateGas', [{}]), '0x1');
   assert.equal(await rpc.call('eth_getTransactionReceipt', ['0x00']), '0x1');
   await assert.rejects(rpc.call('eth_sendRawTransaction', ['0x00']), (e: unknown) => e instanceof RpcError && e.status === 503);
+  await assert.rejects(rpc.call('custom_getOrSubmit', []), (e: unknown) => e instanceof RpcError && e.status === 429);
   await assert.rejects(rpc.call('eth_call', [{}, 'latest']), (e: unknown) => e instanceof RpcError && e.code === 3);
   assert.deepEqual(calls, ['eth_estimateGas', 'eth_estimateGas', 'eth_estimateGas', 'eth_getTransactionReceipt', 'eth_getTransactionReceipt',
-    'eth_sendRawTransaction', 'eth_call'], 'reads repeat until answered; a send and a refusal are tried once');
+    'eth_sendRawTransaction', 'custom_getOrSubmit', 'eth_call']);
   assert.equal(sleeps.length, 3);
 });
 

@@ -4,8 +4,8 @@
  * Receipt, quorum and lineage checks independently authenticate the evidence.
  *
  * Gateway rules honoured here: `eth_getLogs` names one address and an explicit window of at most 10,000 blocks (a result-count error
- * or the 8 MiB answer cap, HTTP 413, halves the window); every read takes exactly its accepted parameter shape; 429 and a busy 503 are waited out; an HTTP 503 from `eth_sendRawTransaction` is ambiguous (the transaction may
- * still land, #1121), so it is reported as such and the caller polls for the receipt of the locally computed hash.
+ * or the 8 MiB answer cap, HTTP 413, halves the window); known reads can wait out 429 and a busy 503.
+ * An ambiguous send goes to receipt polling by the locally computed hash.
  */
 import { concat, eq, fromHex, toHex } from '../bytes.js';
 import { decodeRevert, decodeBytesReturn, decodeStateReturn, SELECTOR, type RawLog, type VaultState } from './abi.js';
@@ -35,6 +35,19 @@ export interface JsonRpc {
   call<T = unknown>(method: string, params: unknown[]): Promise<T>;
 }
 
+const READ_METHODS = new Set([
+  'eth_blockNumber', 'eth_call', 'eth_chainId', 'eth_estimateGas', 'eth_gasPrice', 'eth_getBalance',
+  'eth_getBlockByHash', 'eth_getBlockByNumber', 'eth_getBlockReceipts', 'eth_getCode', 'eth_getLogs',
+  'eth_getRawTransactionByBlockHashAndIndex', 'eth_getStorageAt', 'eth_getTransactionByHash',
+  'eth_getTransactionCount', 'eth_getTransactionReceipt', 'eth_maxPriorityFeePerGas', 'eth_syncing',
+  'net_version', 'unicity_getSealCompanionV1', 'unicity_sealCompanionHorizonV1', 'web3_clientVersion',
+]);
+
+/** Methods the wallet can safely repeat on a transport error. */
+export function isReadRpcMethod(method: string): boolean {
+  return READ_METHODS.has(method);
+}
+
 /** A JSON-RPC error object, or a gateway refusal (HTTP status and its error text). */
 export class RpcError extends Error {
   /** Milliseconds the gateway asked us to wait (`Retry-After`), when it did. */
@@ -55,7 +68,7 @@ export class RpcError extends Error {
 
   /** The node does not implement the method (JSON-RPC -32601), as opposed to a transport failure. */
   public get methodNotFound(): boolean {
-    return this.code === -32601;
+    return this.status === 200 && this.code === -32601;
   }
 }
 
@@ -94,7 +107,7 @@ async function proofFrom<T>(readers: readonly EvmReader[], component: string, re
   throw new ProofUnavailable(component, pruned, missing);
 }
 
-/** An `eth_sendRawTransaction` answered with HTTP 503 ("broadcast may be partial"): the transaction may still be included. */
+/** The transport could not confirm a send. The transaction may still be included. */
 export class AmbiguousBroadcast extends Error {
   public constructor(public readonly txHash: Uint8Array, detail: string) {
     super(`broadcast of 0x${toHex(txHash)} is ambiguous (${detail}): poll its receipt before any resubmission`);
@@ -104,7 +117,7 @@ export class AmbiguousBroadcast extends Error {
 
 export interface HttpRpcOptions {
   fetch?: typeof fetch;
-  /** Retries of a 429 or busy 503 (not of a send); default 2 (three attempts). Outer loops must not multiply this. */
+  /** Retries of a known read on 429 or 503. Default 2 (three attempts). */
   retries?: number;
   /** Total time spent waiting between attempts of one call; default 5,000 ms. A longer `Retry-After` is not waited out. */
   maxWaitMs?: number;
@@ -116,6 +129,7 @@ export interface HttpRpcOptions {
 
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_STEP_CAP_MS = 2_000;
+const MAX_CONCURRENT_READS = 4;
 
 /** `Retry-After` as milliseconds: delta-seconds or an HTTP date. */
 function retryAfterOf(value: string | null | undefined): number | undefined {
@@ -131,26 +145,40 @@ const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r
 /** The gateway client. */
 export class HttpJsonRpc implements JsonRpc {
   private id = 0;
+  private activeReads = 0;
+  private readonly readWaiters: (() => void)[] = [];
   public constructor(private readonly url: string, private readonly opts: HttpRpcOptions = {}) {}
 
   public async call<T>(method: string, params: unknown[]): Promise<T> {
+    const read = isReadRpcMethod(method);
     const sleep = this.opts.sleep ?? realSleep;
     const random = this.opts.random ?? Math.random;
     const budget = this.opts.maxWaitMs ?? 5_000;
     let waited = 0;
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.once<T>(method, params);
+        return await (read ? this.readOnce<T>(method, params) : this.once<T>(method, params));
       } catch (e) {
-        const wait = e instanceof RpcError && (e.status === 429 || (e.status === 503 && method !== 'eth_sendRawTransaction'));
-        if (!wait || attempt >= (this.opts.retries ?? 2)) throw e;
+        if (!read || !(e instanceof RpcError) || (e.status !== 429 && e.status !== 503) || attempt >= (this.opts.retries ?? 2)) throw e;
         // exponential backoff with full jitter; a `Retry-After` replaces it, and one that does not fit the budget is surfaced
-        const ask = (e as RpcError).retryAfterMs;
+        const ask = e.retryAfterMs;
         const delay = ask ?? Math.floor(random() * Math.min(BACKOFF_STEP_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt));
         if (waited + delay > budget) throw e;
         waited += delay;
         await sleep(delay);
       }
+    }
+  }
+
+  private async readOnce<T>(method: string, params: unknown[]): Promise<T> {
+    if (this.activeReads < MAX_CONCURRENT_READS) this.activeReads++;
+    else await new Promise<void>((resolve) => this.readWaiters.push(resolve));
+    try {
+      return await this.once<T>(method, params);
+    } finally {
+      const next = this.readWaiters.shift();
+      if (next) next(); // hand the slot directly to the oldest waiting read
+      else this.activeReads--;
     }
   }
 
@@ -171,22 +199,30 @@ export class HttpJsonRpc implements JsonRpc {
         if (e instanceof RpcError) throw e;
         throw new RpcError(0, 0, e instanceof Error ? e.message : String(e)); // network failure or timeout: retryable, not a verdict
       }
+      let env: { result?: T; error?: string | { code?: number; message?: string; data?: unknown } } | null = null;
+      try { env = JSON.parse(text); } catch { /* gateway text or an invalid JSON-RPC answer */ }
+      const error = env?.error;
       if (resp.status !== 200) {
-        let msg = text.slice(0, 200);
-        try {
-          msg = (JSON.parse(text) as { error?: string }).error ?? msg;
-        } catch { /* not JSON */ }
+        const msg = typeof error === 'string' ? error : typeof error?.message === 'string' ? error.message : text.slice(0, 200);
         const err = new RpcError(resp.status, 0, msg);
         err.retryAfterMs = retryAfterOf(resp.headers?.get?.('retry-after'));
         throw err;
       }
-      const env = JSON.parse(text) as { result?: T; error?: { code: number; message: string; data?: unknown } };
-      if (env.error) throw new RpcError(200, env.error.code, env.error.message, env.error.data);
-      return env.result as T;
+      if (typeof error === 'object' && error !== null && typeof error.code === 'number' && typeof error.message === 'string') {
+        throw new RpcError(200, error.code, error.message, error.data);
+      }
+      if (env?.result !== undefined) return env.result;
+      throw new RpcError(0, 0, 'missing or invalid JSON-RPC response');
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+function logPageLimit(error: RpcError): boolean {
+  if (error.status === 413) return true;
+  if ((error.status !== 200 && error.status !== 400) || /too many requests|rate limit/i.test(error.message)) return false;
+  return /too many (?:logs|results|blocks)|max(?:imum)? (?:results|block range)|query returned more than [\d,]+ results|(?:block range|response size|result count).*(?:limit|exceed|too (?:large|wide))/i.test(error.message);
 }
 
 // ---- typed reads --------------------------------------------------------------------------------
@@ -293,16 +329,27 @@ export class EvmReader {
   /**
    * The head every height-driven loop runs to (log scans, depth and horizon checks): this reader's `eth_blockNumber`, trusted only as
    * far as the reader serves the block at that height. A claimed head it does not serve (a lying or broken answer such as 0xffffffff)
-   * is replaced by the highest block it does serve, found by a binary search from the last confirmed one: O(log) header reads, never
-   * a scan of the claimed range. An honest reader costs one header read more. The gateway refuses a log window above its head, so
-   * there is no margin above the confirmed block.
+   * is replaced by the highest block it serves. Expand from the last confirmed block, then bisect the bracket. The number of reads
+   * grows with the distance to the served head. An honest reader costs one header read more.
    */
   public async saneHead(): Promise<bigint> {
     const claimed = await this.blockNumber();
     if (claimed <= this.confirmedHead) return claimed; // a lower answer (a lagging backend) only shortens a scan
-    if (await this.headerByNumber(claimed) !== null) return this.confirmedHead = claimed;
-    let lo = this.confirmedHead < 0n ? 0n : this.confirmedHead;
+    const base = this.confirmedHead < 0n ? 0n : this.confirmedHead;
+    if (await this.headerByNumber(claimed) !== null) {
+      if (claimed > this.confirmedHead) this.confirmedHead = claimed;
+      return claimed;
+    }
+    let lo = base;
     let hi = claimed;
+    for (let step = 1n; base + step < hi; step *= 2n) {
+      const probe = base + step;
+      if (await this.headerByNumber(probe) === null) {
+        hi = probe;
+        break;
+      }
+      lo = probe;
+    }
     while (hi - lo > 1n) {
       const mid = lo + (hi - lo) / 2n;
       if (await this.headerByNumber(mid) !== null) lo = mid;
@@ -335,6 +382,7 @@ export class EvmReader {
     const j = await this.rpc.call<Record<string, unknown> | null>('eth_getBlockByNumber', [qty(n), false]);
     if (j === null) return null;
     const header = headerOfJson(j);
+    if (header.number !== n) refuse('ProviderFault', `requested block ${n}, received block ${header.number}`);
     return { header, hash: HE(encodeHeader(header)) };
   }
 
@@ -527,8 +575,8 @@ export class EvmReader {
           for (const l of page) if (l.removed !== true) out.push(rawLogOf(l));
           break;
         } catch (e) {
-          // the node's result-count error, or the gateway's 8 MiB answer cap (HTTP 413): ask for less
-          if (e instanceof RpcError && (e.status === 413 || /max results|too many|exceed/i.test(e.message)) && hi > lo) {
+          // Result, range or response-size limit: ask for less.
+          if (e instanceof RpcError && logPageLimit(e) && hi > lo) {
             hi = lo + (hi - lo) / 2n;
             continue;
           }
@@ -688,13 +736,13 @@ export class EvmReader {
     }
   }
 
-  /** Submit a signed raw transaction; an HTTP 503 is {@link AmbiguousBroadcast}. */
+  /** Submit a signed raw transaction and report missing or ambiguous transport answers. */
   public async sendRaw(raw: Uint8Array): Promise<Uint8Array> {
     const hash = HE(raw);
     try {
       await this.rpc.call('eth_sendRawTransaction', [hexOf(raw)]);
     } catch (e) {
-      if (e instanceof RpcError && e.status === 503) throw new AmbiguousBroadcast(hash, e.message);
+      if (e instanceof RpcError && e.code === 0 && [0, 502, 503, 504].includes(e.status)) throw new AmbiguousBroadcast(hash, e.message);
       if (e instanceof RpcError && /already known|nonce too low/i.test(e.message)) return hash;
       throw e;
     }
