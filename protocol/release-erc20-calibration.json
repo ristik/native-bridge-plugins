@@ -21,6 +21,7 @@
     "inclusionAndFunding": null
   },
   "evidence": {
-    "protocol/calibration/erc20-1349-native.json": "99716069d08da64166b4006ac657f8d6b4499df4826d5ceaab4d4ae981feb9f7"
+    "protocol/calibration/erc20-1349-native.json": "e88029a9f0772cd8dba6a370483d261d2b6c46d1c58c1ad130e515cc1088a826",
+    "protocol/calibration/erc20-1349-live.json": "43ebc8c2e4f1a8d1ff598285e5839a8be5835f69f28956606ad7feac177d6d82"
   }
 }

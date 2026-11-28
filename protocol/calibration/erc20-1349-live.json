@@ -1,0 +1,315 @@
+{
+  "scope": "Private lane observations and candidate reserve arithmetic",
+  "chainId": "31337",
+  "executionGenesis": "0x60385c0f4544dc4a7f7c0c88e98dd979ef0562f49757b3b408448a419e28ca3e",
+  "rootPin": "0xbe02f8d01a766f45d070294c182ec76e80e60d712f812e7b5658298d7ccb0c3e",
+  "erc20Deployment": {
+    "token": "0x3aa5ebb10dc797cac828524e59a333d0a371443c",
+    "vault": "0xa12d05c654294b206804e3dcd4f10114722dd4d2",
+    "recovery": "0x2b1bf0fed5abcf70eceaeaf7d77d2ab2ad0a0a99",
+    "factory": "0x959922be3caee4b8cd9a407cc3ac1c251c2007b1",
+    "lineage": "0x9a676e781a523b5d0c0e43731313a708cb607508",
+    "ordinary": "0x0b306bf915c4d645ff596e518faf3f9669b97016",
+    "receipts": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9",
+    "salt": "0x25cde69f9fa21a3fd9a2758bb6c2a8447581162b2ffa532cbe61b1cf242e54ea",
+    "pins": "0x2ef18a52c66ceb0b19031f92b8a6b9a5c2243e111c8f15fc25bf27c922317b2d",
+    "domain": "0x93135d4fe289abac72c591aa277d55e4307bcb0f775d0f525d90a9b7ac8f3347",
+    "asset": "0x3d07923a2c6622d80d9f0b7e7b043e25e91b055d39fbfe4bf844b96af1fa46cc",
+    "runtimeHashes": {
+      "vault": "0x55755866dd020677c5de65dac7522d42f3d191287967d75608d3a39bf43a0216",
+      "recovery": "0x35a391f65cb3941f0e2cc528aa15e7d180a791175508969c1d9180252dc9d2c0",
+      "token": "0x2f87d278732de7015cb46b535838dfd40a1ec3c57f68e642fdaffc6550978d25",
+      "factory": "0x941c79e21f2b622b762599593f97d4f9982806a91371a9a49e0fb4e674be117b",
+      "ordinary": "0x04be818ad136715c300de18bac004fc3cfe8dbe10bab80e5118673059ebe4742",
+      "lineage": "0xa6d59314f3470ad46e541c63d8b3761f6e64cab56150ce4b03b800c3efd76c3b",
+      "receipts": "0x324e6192e4440cf2b26831019d130043cea5b2a7afc5a652655092429a3669a6",
+      "registry": "0x93dae8b0e730c861e66468a0ff109395190b7f5292da4a19a6f9515fd15c1841"
+    }
+  },
+  "build": {
+    "contracts": "de62921f10be506f3cd7a559ae8541bcb644d0f4",
+    "plugin": "f38ef9b2f7e4042ba742198f989764d7cc0c69b0",
+    "oracle": "59bf2c203c693d37fc4ac74986e681309c29ec8c",
+    "walletIndexSha256": "0427a0088754c7d42ad2b7f51bf69e10eb885cc9f5075055453cec7954752fa4",
+    "lockSha256": "42e66e81b291e320cb2fb4b858e6adda4911c5bc887d06e575952805afec2537",
+    "profileSha256": "f05dd5c3563165d73c1cf91a5af79ec7afcaa77edc90061c6e7666bf53a8b0b6",
+    "testTokenSourceSha256": "576a9b63f54357b7f81ba51030910820bd7228a11cf9553e1e6dcd7d61ebf213",
+    "harness": "18e892ea280159614369a0bcd0aade381558cce1",
+    "ureth": "c91535bf306738655d06db0389e44ab0df57014e",
+    "aggregator": "4c54c8f440e7e33bc53a795556d1391102dc75fb"
+  },
+  "slot": 3,
+  "samples": {
+    "run": [
+      {
+        "kind": "Start",
+        "txHash": "0x6e243538720001df9da6c85990ed6c99912fff5eb50506e121b2bbc0246caebf",
+        "block": 277,
+        "submittedGas": 21648712,
+        "gasUsed": 9074557,
+        "calldataBytes": 33796,
+        "signedBytes": 33907,
+        "shape": {
+          "entry": "run",
+          "calldataBytes": 33796,
+          "operations": 16,
+          "pages": 7,
+          "gaps": 0,
+          "receiptBytes": 0,
+          "openingBytes": 4034
+        }
+      },
+      {
+        "kind": "Resume",
+        "txHash": "0x4340d3d74a89cf500abb28375f2199ccb8992bf4ef1ca2ffad84148c327652dd",
+        "block": 370,
+        "submittedGas": 20257096,
+        "gasUsed": 4972995,
+        "calldataBytes": 22340,
+        "signedBytes": 22451,
+        "shape": {
+          "entry": "run",
+          "calldataBytes": 22340,
+          "operations": 8,
+          "pages": 4,
+          "gaps": 0,
+          "receiptBytes": 1914,
+          "openingBytes": 3056
+        }
+      },
+      {
+        "kind": "Resume",
+        "txHash": "0x84ec257f966b7aab7a0ec0390221b00ca0d967c74ac825bb7351a60f6eaab3f5",
+        "block": 373,
+        "submittedGas": 20257096,
+        "gasUsed": 4981952,
+        "calldataBytes": 22724,
+        "signedBytes": 22835,
+        "shape": {
+          "entry": "run",
+          "calldataBytes": 22724,
+          "operations": 8,
+          "pages": 4,
+          "gaps": 0,
+          "receiptBytes": 1914,
+          "openingBytes": 3440
+        }
+      },
+      {
+        "kind": "Resume",
+        "txHash": "0xfa64a247001b8827b577dc36837c26f1c0d81f9bf381de40aea956af72e792ef",
+        "block": 376,
+        "submittedGas": 19609416,
+        "gasUsed": 3903147,
+        "calldataBytes": 14212,
+        "signedBytes": 14323,
+        "shape": {
+          "entry": "run",
+          "calldataBytes": 14212,
+          "operations": 6,
+          "pages": 3,
+          "gaps": 0,
+          "receiptBytes": 1914,
+          "openingBytes": 2444
+        }
+      }
+    ],
+    "advanceGasMaximum": {
+      "kind": "AdvanceGaps",
+      "txHash": "0xfc1d135dfefc859e96440f778d513ce6fa833b1784a3eaf62b76f056247c4921",
+      "block": 1791,
+      "submittedGas": 24000000,
+      "gasUsed": 435253,
+      "calldataBytes": 3652,
+      "signedBytes": 3763,
+      "shape": {
+        "entry": "advanceGaps",
+        "calldataBytes": 3652,
+        "operations": 0,
+        "pages": 0,
+        "gaps": 3,
+        "receiptBytes": 2760,
+        "openingBytes": 0
+      }
+    },
+    "advanceCalldataMaximum": {
+      "kind": "AdvanceGaps",
+      "txHash": "0xa35ac94f30fe849d707ff7dc4db9011db727221a5865af10e68047f5189dc6a9",
+      "block": 1331,
+      "submittedGas": 24000000,
+      "gasUsed": 435241,
+      "calldataBytes": 3652,
+      "signedBytes": 3763,
+      "shape": {
+        "entry": "advanceGaps",
+        "calldataBytes": 3652,
+        "operations": 0,
+        "pages": 0,
+        "gaps": 3,
+        "receiptBytes": 2760,
+        "openingBytes": 0
+      }
+    },
+    "recovered": {
+      "kind": "recovered settlement",
+      "txHash": "0x16d3245bf190fcf90f91bcccc2d29c9ef8fa56a6910b79d3c0d80dad601f1079",
+      "block": 1854,
+      "submittedGas": 24000000,
+      "gasUsed": 613879,
+      "calldataBytes": 2276,
+      "signedBytes": 2387
+    },
+    "ordinary": {
+      "kind": "ordinary settlement",
+      "txHash": "0xf4f1e7702dc70647377f04f0f8d25d771cd1c8eca71df89cdad830b1c327b9e4",
+      "block": 1860,
+      "submittedGas": 24000000,
+      "gasUsed": 2201859,
+      "calldataBytes": 27588,
+      "signedBytes": 27699
+    },
+    "retry": {
+      "kind": "independent ordinary retry",
+      "txHash": "0xd3f7047d97346095b392914dcd0949dc0ca8cf5275e49abc0515758039d110eb",
+      "block": 1873,
+      "submittedGas": 24000000,
+      "gasUsed": 2667809,
+      "calldataBytes": 30788,
+      "signedBytes": 30899
+    },
+    "minedFailure": {
+      "payer": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "gasUsed": 2490538,
+      "signedBytes": 30899,
+      "calldataBytes": 30788,
+      "submittedGas": 24000000,
+      "separatePayer": true
+    }
+  },
+  "observedArrivals": {
+    "seals": 72,
+    "elapsedBetweenFirstAndLastSealSeconds": 2290,
+    "initialBacklog": 3,
+    "q": 3,
+    "b": 1,
+    "tauP99Ms": 5652,
+    "sampleCount": 25,
+    "peakSeals30s": 2,
+    "peakSealsPerSecond": 0.06666666666666667,
+    "duringProgress": 3,
+    "finalEndpointToInclusionSeconds": 9,
+    "mostSealsInSampledFinalWindow": 1,
+    "final": {
+      "startMs": 1795873016674,
+      "startSegment": "72",
+      "endMs": 1795873021747,
+      "endSegment": "72",
+      "elapsedMs": 5073,
+      "arrivals": 0
+    },
+    "observedCatchUp": true,
+    "exercisedReserve": true,
+    "allAdvancesShrankBacklog": true,
+    "backlogAtProgressStart": 0,
+    "run": [
+      {
+        "startMs": 1795870621154,
+        "startSegment": "0",
+        "endMs": 1795870625380,
+        "endSegment": "0",
+        "elapsedMs": 4226,
+        "arrivals": 0
+      },
+      {
+        "startMs": 1795870762815,
+        "startSegment": "3",
+        "endMs": 1795870767457,
+        "endSegment": "3",
+        "elapsedMs": 4642,
+        "arrivals": 0
+      },
+      {
+        "startMs": 1795870767457,
+        "startSegment": "3",
+        "endMs": 1795870772108,
+        "endSegment": "3",
+        "elapsedMs": 4651,
+        "arrivals": 0
+      },
+      {
+        "startMs": 1795870772109,
+        "startSegment": "3",
+        "endMs": 1795870776755,
+        "endSegment": "3",
+        "elapsedMs": 4646,
+        "arrivals": 0
+      }
+    ],
+    "restore": {
+      "startMs": 1795870762776,
+      "startSegment": "3",
+      "endMs": 1795870762815,
+      "endSegment": "3",
+      "elapsedMs": 39,
+      "arrivals": 0
+    },
+    "checkpoint": {
+      "startMs": 1795870615245,
+      "startSegment": "0",
+      "endMs": 1795870625381,
+      "endSegment": "0",
+      "elapsedMs": 10136,
+      "arrivals": 0
+    },
+    "resumed": {
+      "startMs": 1795870626000,
+      "startSegment": "0",
+      "endMs": 1795870776756,
+      "endSegment": "3",
+      "elapsedMs": 150756,
+      "arrivals": 3
+    },
+    "ordinaryBeforeFallbackExercised": false
+  },
+  "observedFundingAndCandidateReserve": {
+    "payer": "0xcac87d253ac345abad6c8c8c85f2e3994c470374",
+    "observedMaximumSignedExposureWei": "1415015904000000",
+    "candidateFeeWei": "2014352",
+    "everySignatureFundedObservedPath": true,
+    "observedPaidFeesWei": "33144573275124",
+    "maxInclusionBlocks": 2,
+    "coversSampledInclusion": true,
+    "tipWei": "0",
+    "sampledInclusionFloorWei": "1274707",
+    "highestSignedBidWei": "2014352",
+    "d": 67,
+    "n": 34,
+    "ordinaryAttempts": 2,
+    "nonceCount": 41,
+    "candidateMaxNonce": 255,
+    "observedPathBlocks": 1579,
+    "fullPathFeeAtFullBlocksWei": "588615497344281917575402254629617562895115594611212643596958938655724967906197636231423",
+    "candidateBudgetWei": "1000000000000000000",
+    "signingState": {
+      "finalizedBlock": "0x8f7ae5fc79b101b99e59099d8ce97a3a635a64d8056141e60b52f96677523f53",
+      "finalizedBlockNumber": "275",
+      "finalizedBaseFee": "1000000",
+      "finalizedBalance": "1000000000000000000",
+      "finalizedNonce": "0",
+      "pendingBalance": "1000000000000000000",
+      "pendingNonce": "0",
+      "quotedBaseFee": "1000000",
+      "submittedAtMs": 1795870621256
+    },
+    "recoveryCeilingWei": "1885433472000000",
+    "ordinaryCeilingWei": "145033344000000",
+    "reserveCeilingWei": "1982122368000000",
+    "replacementCeilingPerNonceWei": "48344448000000",
+    "passesCandidate": true,
+    "candidateSdkReproduced": true
+  },
+  "sourceSha256": {
+    "proofAudit": "4e0727b0b0eb08e137554efa619d39e4fa2c52196e2244adb3f8a8f5fe1f4f0f",
+    "archiveIndex": "cf958daca6c0b77c6820246c35aa527e93c4adc3ab409246934f6a0b4cdc3873"
+  }
+}
