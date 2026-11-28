@@ -111,7 +111,8 @@ function quoteRange(shape: RecoveryShape, minReceiptBytes: number, calibration: 
 
 /** Bound a zero-value Type 2 call with an empty access list and full-width signature. */
 export function quoteErc20Call(n: number, gas: bigint, limits: RecoveryLimits): { signedBytes: number; fee: bigint } | null {
-  if (!validLimits(limits) || !Number.isSafeInteger(n) || n < 68 || n > Math.min(CALLDATA_BYTES, limits.calldataBytes) || gas <= 0n) return null;
+  if (!validLimits(limits) || !Number.isSafeInteger(n) || n < 68 || n > Math.min(CALLDATA_BYTES, limits.calldataBytes)
+    || typeof gas !== 'bigint' || gas <= 0n) return null;
   if (gas > GAS_LIMIT || gas > limits.gas || limits.chainId <= 0n || limits.chainId > U64_MAX || limits.maxNonce < 0n || limits.maxNonce > U64_MAX
     || limits.maxFeePerGas <= 0n || limits.maxFeePerGas > U256_MAX || limits.maxPriorityFeePerGas < 0n
     || limits.maxPriorityFeePerGas > limits.maxFeePerGas) return null;
@@ -225,6 +226,9 @@ function recoveryGapNeed(backlog: RecoveryBacklog): bigint {
 /** Reserve the greater route at the fee ceiling, plus each allowed pre-fallback charge. */
 export function erc20SigningReserve(recoveryFee: bigint, calls: bigint, backlog: RecoveryBacklog,
   limits: RecoveryLimits, bounds?: Erc20SigningBounds): { totalFee: bigint; priorAttempts: bigint } {
+  checkBacklogMeasurements(backlog);
+  if (!validLimits(limits) || limits.maxFeePerGas <= 0n || limits.maxFeePerGas > U256_MAX
+    || limits.maxPriorityFeePerGas > limits.maxFeePerGas) fail('CapacityPreflight', 'invalid ERC20 fee limits');
   if (!bounds || [bounds.feeWindowMs, bounds.progressWindowMs, bounds.advanceWindowMs]
     .some((v) => typeof v !== 'bigint' || v <= 0n) || bounds.advanceWindowMs < backlog.receiptP99Ms) {
     fail('CapacityPreflight', 'unqualified ERC20 fee or inclusion windows');
@@ -294,6 +298,7 @@ function prospectiveRunQuotes(evidence: Uint8Array, calibration: RecoveryCalibra
 
 export function quoteRunCut(spans: readonly RecoveryRunSpan[], from: number, end: number, evidenceBytes: number,
   calibration: RecoveryCalibration, limits: RecoveryLimits, erc20: boolean): RecoveryQuote | null {
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(end) || from < 0 || end > spans.length || end <= from || end - from > 16) return null;
   const opening = spans.slice(from, end).reduce((sum, op) => sum + SPARSE + op.claims * (34 + SPARSE), 0);
   const shape = runShape(spans, from, end, evidenceBytes, from === 0 ? 0 : RECEIPT_BYTES, opening);
   return shape === null ? null : quoteRange(shape, from === 0 ? 0 : 1, calibration, limits, erc20);

@@ -2095,7 +2095,7 @@ impl NativeBridgeV2 {
             .signed_bytes
             .min(self.pins.max_encoded_tx_bytes as usize);
         limits.gas = limits.gas.min(self.pins.user_gas_limit);
-        limits.balance = limits.balance.min(self.evm.balance(payer)?);
+        limits.balance = limits.balance.min(self.erc20_free_balance(record, payer)?);
         let ordinary = ordinary
             .map(|pf| {
                 let return_data = encode_return_data(&ReturnData {
@@ -2205,12 +2205,25 @@ impl NativeBridgeV2 {
     /// makes another.
     pub fn burn(&self, return_id: &[u8; 32], owner: &dyn OwnerSigner) -> Result<Burned> {
         self.locked(&format!("return/{}", hex(return_id)), || {
-            self.burn_inner(return_id, owner)
+            let rec = self.return_record(return_id)?;
+            if self.cfg.erc20.is_some() && rec.status == "planned" {
+                let payer_lock = format!(
+                    "return-payer/{}",
+                    rec.payer.as_deref().unwrap_or(&rec.recipient)
+                );
+                self.locked(&payer_lock, || self.burn_inner(return_id, owner, rec))
+            } else {
+                self.burn_inner(return_id, owner, rec)
+            }
         })
     }
 
-    fn burn_inner(&self, return_id: &[u8; 32], owner: &dyn OwnerSigner) -> Result<Burned> {
-        let mut rec = self.return_record(return_id)?;
+    fn burn_inner(
+        &self,
+        return_id: &[u8; 32],
+        owner: &dyn OwnerSigner,
+        mut rec: ReturnRecord,
+    ) -> Result<Burned> {
         let recipient: [u8; 20] = unhex_n(&rec.recipient)?;
         let amount = undec(&rec.amount)?;
         let a = undec64(&rec.a)?;
@@ -2834,7 +2847,7 @@ impl NativeBridgeV2 {
             || request.max_priority_fee_per_gas > limits.max_priority_fee_per_gas
             || fee > limits.fee_budget
             || fee > limits.balance
-            || fee > self.evm.balance(payer)?
+            || fee > self.erc20_free_balance(record, payer)?
         {
             return fail_d(
                 Rule::CapacityPreflight,
@@ -2842,6 +2855,35 @@ impl NativeBridgeV2 {
             );
         }
         Ok(())
+    }
+
+    fn erc20_free_balance(&self, record: &ReturnRecord, payer: &[u8]) -> Result<BigUint> {
+        let balance = self
+            .evm
+            .balance(payer)?
+            .min(self.evm.balance_at(payer, "pending")?);
+        let address = hex(payer);
+        let mut reserved = BigUint::default();
+        for other in self.journal.returns()? {
+            if other.return_id != record.return_id
+                && other.status != "planned"
+                && other.status != "paid"
+                && other.payer.as_deref().unwrap_or(&other.recipient) == address
+            {
+                if let Some(total) = other
+                    .extra
+                    .get("recovery")
+                    .and_then(|plan| plan["totalFee"].as_str())
+                {
+                    reserved += undec(total)?;
+                }
+            }
+        }
+        Ok(if balance > reserved {
+            balance - reserved
+        } else {
+            BigUint::default()
+        })
     }
 
     fn transaction_request(

@@ -628,7 +628,7 @@ export class EvmReader {
     return bytesOf(await this.rpc.call('eth_getCode', [hexOf(address), 'latest']), 'eth_getCode');
   }
 
-  public async balance(address: Uint8Array, tag: 'latest' | bigint = 'latest'): Promise<bigint> {
+  public async balance(address: Uint8Array, tag: 'latest' | 'pending' | bigint = 'latest'): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_getBalance', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getBalance');
   }
 

@@ -1350,12 +1350,15 @@ export class NativeBridgeV2 {
     returnId = Uint8Array.from(returnId);
     const recipient = expectedRecipient && Uint8Array.from(expectedRecipient);
     const recoverProof = options?.recoverProof;
-    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner, admission, recipient, recoverProof));
+    return this.locked(`return/${toHex(returnId)}`, async () => {
+      const record = await this.returnRecord(returnId);
+      const burn = () => this.burnInner(returnId, record, owner, admission, recipient, recoverProof);
+      return this.cfg.erc20 && record.status === 'planned' ? this.locked(`return-payer/${record.payer ?? record.recipient}`, burn) : burn();
+    });
   }
 
-  private async burnInner(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array,
+  private async burnInner(returnId: Uint8Array, rec: ReturnRecord, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array,
     recoverProof?: boolean): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
-    const rec = await this.returnRecord(returnId);
     if (rec.status === 'planned') {
       // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
       if (owner === undefined) return refuse('BadInput', 'only the holder can sign a new burn');

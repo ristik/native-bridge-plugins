@@ -1,4 +1,5 @@
 use super::*;
+use crate::nb2::recovery_cost::{erc20_signing_reserve, preflight_recovery, quote_erc20_recovery};
 use crate::nb2::{
     recovery::{RecoveryAuthority, RecoverySession},
     recovery_cost::{RecoveryCalibrationRange, RecoveryEntry, RecoveryShape},
@@ -249,7 +250,8 @@ fn return_requires_affordable_continuation_and_reprobes_before_signing() {
         .unwrap();
     assert_eq!(err.rule().unwrap().rule, Rule::CapacityPreflight);
     assert!(
-        err.to_string().contains("insufficient recovery fee budget"),
+        err.to_string()
+            .contains("insufficient authorized fee budget"),
         "{err}"
     );
 
@@ -288,7 +290,7 @@ fn continuation_only_admits_planning_and_signing_after_capacity_or_funds_refusal
     let payer = [0xcd; 20];
     for (gas, balance, ordinary_refusal) in [
         (24_000_001, 1_000_000_000_000, "CapacityPreflight"),
-        (24_000_000, 150_000_000, "InsufficientFunds"),
+        (24_000_000, 167_000_000, "InsufficientFunds"),
     ] {
         let (bridge, rpc, held) = return_bridge(
             gas,
@@ -312,7 +314,7 @@ fn continuation_only_admits_planning_and_signing_after_capacity_or_funds_refusal
         assert!(
             error
                 .to_string()
-                .contains("insufficient recovery fee budget"),
+                .contains("insufficient free payer balance"),
             "{error}"
         );
         assert_eq!(
@@ -354,7 +356,7 @@ fn continuation_only_refuses_an_unaffordable_or_unqualified_plan() {
     assert!(
         error
             .to_string()
-            .contains("insufficient recovery fee budget"),
+            .contains("insufficient authorized fee budget"),
         "{error}"
     );
     assert!(bridge
@@ -425,4 +427,100 @@ fn recovery_session_and_quote_reject_one_mismatched_config_field() {
         );
     }
 }
-use crate::nb2::recovery_cost::preflight_recovery;
+
+#[test]
+fn erc20_caps_and_funding_limits_are_inclusive() {
+    let (_, gamma, _) = vector();
+    let cfg = decode_config(&gamma, &build_params(Build::Production)).unwrap();
+    let model = continuation(&cfg, [0x22; 20], 100_000_000);
+    let limits = &model.limits;
+    let resume = RecoveryShape {
+        entry: RecoveryEntry::Run,
+        operations: 8,
+        pages: 32,
+        gaps: 0,
+        receipt_bytes: 65_536,
+        calldata_bytes: 333_060,
+        opening_bytes: 131_856,
+    };
+    let quoted = quote_erc20_recovery(resume, &*model.calibration, limits).unwrap();
+    let mut boundary = limits.clone();
+    boundary.gas = quoted.gas;
+    boundary.signed_bytes = quoted.signed_bytes;
+    boundary.calldata_bytes = resume.calldata_bytes;
+    assert!(quote_erc20_recovery(resume, &*model.calibration, &boundary).is_some());
+    for larger in [
+        RecoveryShape {
+            operations: 9,
+            ..resume
+        },
+        RecoveryShape {
+            pages: 33,
+            ..resume
+        },
+        RecoveryShape {
+            receipt_bytes: 65_537,
+            ..resume
+        },
+        RecoveryShape {
+            calldata_bytes: 333_092,
+            ..resume
+        },
+    ] {
+        assert!(quote_erc20_recovery(larger, &*model.calibration, &boundary).is_none());
+    }
+    boundary.signed_bytes -= 1;
+    assert!(quote_erc20_recovery(resume, &*model.calibration, &boundary).is_none());
+
+    let ordinary = Erc20OrdinaryBound {
+        gas: 1_500_000,
+        calldata_bytes: 120_004,
+        attempts_before_fallback: 2,
+        inclusion_ms: 2_000,
+    };
+    let reserve = |limits: &RecoveryLimits,
+                   bounds: &Erc20SigningBounds,
+                   ordinary: Option<&Erc20OrdinaryBound>| {
+        erc20_signing_reserve(
+            12_000_000u64.into(),
+            2,
+            &model.backlog,
+            limits,
+            bounds,
+            ordinary,
+        )
+    };
+    let mut bounds = Erc20SigningBounds {
+        fee_window_ms: 14_025,
+        progress_window_ms: 10_000,
+        advance_window_ms: 2_000,
+    };
+    let mut payer = limits.clone();
+    payer.balance = 45_000_000u64.into();
+    payer.fee_budget = payer.balance.clone();
+    assert_eq!(
+        reserve(&payer, &bounds, Some(&ordinary)).unwrap(),
+        (45_000_000u64.into(), 2)
+    );
+    payer.balance -= 1u8;
+    assert!(reserve(&payer, &bounds, Some(&ordinary))
+        .unwrap_err()
+        .to_string()
+        .contains("free payer balance"));
+    payer.balance += 1u8;
+    payer.fee_budget -= 1u8;
+    assert!(reserve(&payer, &bounds, Some(&ordinary))
+        .unwrap_err()
+        .to_string()
+        .contains("authorized fee budget"));
+    bounds.fee_window_ms -= 1;
+    assert!(reserve(&payer, &bounds, None)
+        .unwrap_err()
+        .to_string()
+        .contains("signing horizon"));
+    bounds.advance_window_ms = 999;
+    assert!(reserve(&payer, &bounds, None)
+        .unwrap_err()
+        .to_string()
+        .contains("fee or inclusion windows"));
+}

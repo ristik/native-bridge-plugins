@@ -1063,12 +1063,12 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
     }
 
     pub fn balance(&self, address: &[u8]) -> Result<BigUint> {
+        self.balance_at(address, "latest")
+    }
+
+    pub fn balance_at(&self, address: &[u8], tag: &str) -> Result<BigUint> {
         qty_of(
-            &call(
-                &*self.rpc,
-                "eth_getBalance",
-                json!([hex0x(address), "latest"]),
-            )?,
+            &call(&*self.rpc, "eth_getBalance", json!([hex0x(address), tag]))?,
             "eth_getBalance",
         )
     }

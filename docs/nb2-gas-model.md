@@ -340,3 +340,13 @@ The margin has four parts:
 When the deployment is outside the measured artifacts, deposit estimates the actual sender, vault, calldata and
 value with `eth_estimateGas`. It adds a 20% margin and checks the wallet gas limit before signing. A wallet-supplied
 model can provide a deposit bound for its active deployment.
+
+## ERC20 continuation admission
+
+For the ERC20 release, the signing policy admits at most 16 operations in Start and eight in Resume. It retains 32 pages per Run, the 65,536-byte predecessor receipt cap, and at most 1,024 gaps per call. The 393,216-byte calldata ceiling, 524,288-byte signed Type 2 envelope ceiling, and 24,000,000 submitted gas ceiling apply alongside tighter chain, node and payer limits. The eight-operation cap is an admission policy. The continuation wire still allows 16 operations in Resume.
+
+The SDK schedules all cuts before signing. Future predecessor receipts are priced up to the full receipt cap and sparse openings at their maximum width, including the hypothetical terminal burn pair at its decoder cap. The deployment's calibrated execution ranges must cover those shapes, including the ERC20 call caps and worst combination of scan and seal at settlement. The conservative gas quote retains 16 gas per calldata byte, the 20% execution margin, and the recovered settlement seal reserve.
+
+The reserve uses `D = max(0, observed - signedStart) + 64 + duringProgress` and `N = ceil(D / (q - advancePeakSeals))`. The batch must clear more gaps than can arrive before its next usable proof, sustain twice peak seal throughput at the measured p99, and leave at most one arrival during final inclusion. The fee ceiling covers the Run window, `N` upper-bound advance windows, and final inclusion. `duringProgress` covers burn and Run certification, any qualified restore delay and any allowed ordinary attempts before fallback.
+
+The reference wallet reads `signingWindows.progressWindowMs`, `signingWindows.advanceWindowMs`, and, when offering ordinary settlement, `signingWindows.ordinaryInclusionMs` from the release's recovery section. The payer policy supplies `feeWindowMs` over which `maxFeePerGas` covers base fee and tip. It also supplies `ordinaryAttemptsBeforeFallback` when offering ordinary settlement. The wallet reserves the greater route plus the capped fees for those attempts, and checks the spendable payer balance and authorized budget separately.
