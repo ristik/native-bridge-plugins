@@ -1,12 +1,12 @@
 {
   "repo": "https://github.com/ristik/bft-core.git",
-  "commit": "59bf2c203c693d37fc4ac74986e681309c29ec8c",
+  "commit": "5bf749649d1f61c8ac81c1fc9983019833462115",
   "command": "go test ./nb2ref -run ^TestERC20FlatReturnVectors$ -count=1",
   "outputEnv": "NB2_ERC20_VECTORS",
   "sha256": "50fdfe019a2cf6802e05c1f032164443108ac5d1e581a081392256c3da0ecaa6",
   "contracts": {
     "repo": "https://github.com/ristik/unicity-pos-contracts.git",
-    "commit": "821c2501981aff09aa04bdb1daa00150ddac4c6a",
+    "commit": "de62921f10be506f3cd7a559ae8541bcb644d0f4",
     "sdkFixture": {
       "file": "sdk-deployment.json.gz",
       "sha256": "94695194703e52c2ec90e09f7b18706e11f5e174a5747d159b34cd63c71cc763",
