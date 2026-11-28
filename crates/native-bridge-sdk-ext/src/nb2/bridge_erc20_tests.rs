@@ -29,6 +29,17 @@ const RECEIPT_HELPER: [u8; 20] = [0x76; 20];
 const LINEAGE_HELPER: [u8; 20] = [0x77; 20];
 const REGISTRY_HELPER: [u8; 20] = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
+fn finalized_header() -> Value {
+    let zero = hex0x(&[0; 32]);
+    json!({
+        "number": "0x14", "parentHash": zero, "sha3Uncles": zero, "miner": hex0x(&[0; 20]),
+        "stateRoot": zero, "transactionsRoot": zero, "receiptsRoot": zero, "logsBloom": hex0x(&[0; 256]),
+        "difficulty": "0x0", "gasLimit": "0x2000000", "gasUsed": "0x0", "timestamp": "0x1",
+        "extraData": "0x", "mixHash": zero, "nonce": hex0x(&[0; 8]), "baseFeePerGas": "0x3",
+        "withdrawalsRoot": zero, "blobGasUsed": "0x0", "excessBlobGas": "0x0", "parentBeaconBlockRoot": zero,
+    })
+}
+
 impl JsonRpc for Chain {
     fn call(&self, method: &str, params: Value) -> core::result::Result<Value, RpcError> {
         Ok(match method {
@@ -50,6 +61,9 @@ impl JsonRpc for Chain {
                     }
                     None => json!("0x"),
                 }
+            }
+            "eth_getBlockByNumber" if params[0] == "finalized" || params[0] == "0x14" => {
+                finalized_header()
             }
             "eth_getBlockByNumber" => json!({"baseFeePerGas": "0x3"}),
             "eth_getBalance" => json!(format!("0x{:x}", self.balance.load(Ordering::SeqCst))),
@@ -133,16 +147,16 @@ impl GasModel for OrdinaryGas {
     }
 }
 
-struct Calibration([u8; 32], Vec<RecoveryCalibrationRange>);
+struct Calibration([u8; 32], Vec<RecoveryCalibrationRange>, [u8; 32], [u8; 32]);
 impl RecoveryCalibration for Calibration {
     fn pins(&self) -> [u8; 32] {
         self.0
     }
     fn runtime_hash(&self) -> [u8; 32] {
-        he(&[&[0x60, 0]])
+        self.2
     }
     fn vault_runtime_hash(&self) -> Option<[u8; 32]> {
-        Some([1; 32])
+        Some(self.3)
     }
     fn ranges(&self) -> &[RecoveryCalibrationRange] {
         &self.1
@@ -187,7 +201,7 @@ fn continuation(cfg: &Config, recovery: [u8; 20], fee_budget: u64) -> Erc20Retur
         .chain((1..=128).map(|n| range(RecoveryEntry::AdvanceGaps, 0, n)))
         .chain((0..128).map(|n| range(RecoveryEntry::RedeemRecovered, 0, n)))
         .collect();
-    let calibration = Box::new(Calibration(erc20.pins, ranges));
+    let calibration = Box::new(Calibration(erc20.pins, ranges, he(&[&[0x60, 0]]), [1; 32]));
     Erc20ReturnRecovery {
         deployment: RecoveryDeployment {
             salt: erc20.generation,
@@ -446,7 +460,12 @@ fn recovery_session_and_quote_reject_one_mismatched_config_field() {
             quote.deployment.salt[0] ^= 1;
         } else {
             quote.deployment.pins[0] ^= 1;
-            quote.calibration = Box::new(Calibration(quote.deployment.pins, vec![]));
+            quote.calibration = Box::new(Calibration(
+                quote.deployment.pins,
+                vec![],
+                he(&[&[0x60, 0]]),
+                [1; 32],
+            ));
         }
         let err = preflight_recovery(
             &AdmissionContext {
@@ -1330,7 +1349,7 @@ fn the_sdk_publishes_only_authenticated_recovery_checkpoints() {
     let receipt_start = 68 + 42 + 1 + 4;
     let width = u32::from_be_bytes(arr(&calldata[receipt_start - 4..receipt_start])) as usize;
     let receipt = &calldata[receipt_start..receipt_start + width];
-    let publish = |proof| {
+    let publish = |bridge: &NativeBridgeV2, proof| {
         bridge.index_erc20_recovery_progress(
             &plan.return_id,
             &[Erc20RecoveryCheckpoint {
@@ -1339,14 +1358,47 @@ fn the_sdk_publishes_only_authenticated_recovery_checkpoints() {
             }],
         )
     };
-    assert!(publish(&receipt[..receipt.len() - 1]).is_err());
+    let error = publish(&bridge, receipt).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unqualified recovery deployment"),
+        "{error}"
+    );
+    let policy = bridge.erc20_return_recovery.as_mut().unwrap();
+    let deployed = &policy.deployment;
+    let vault_hash = deployed.vault_runtime_hash.unwrap();
+    let ranges = policy.calibration.ranges().to_vec();
+    for (pins, vault) in [([0xff; 32], vault_hash), (deployed.pins, [0xff; 32])] {
+        bridge.erc20_return_recovery.as_mut().unwrap().calibration = Box::new(Calibration(
+            pins,
+            ranges.clone(),
+            he(&[b"erc20-recovery-runtime"]),
+            vault,
+        ));
+        let error = publish(&bridge, receipt).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unqualified recovery deployment"),
+            "{error}"
+        );
+    }
+    let policy = bridge.erc20_return_recovery.as_mut().unwrap();
+    policy.calibration = Box::new(Calibration(
+        policy.deployment.pins,
+        ranges,
+        policy.deployment.runtime_hash,
+        vault_hash,
+    ));
+    assert!(publish(&bridge, &receipt[..receipt.len() - 1]).is_err());
     assert!(bridge
         .journal
         .store
         .list("nb2/payer-progress/v2/")
         .unwrap()
         .is_empty());
-    publish(receipt).unwrap();
+    publish(&bridge, receipt).unwrap();
     let keys = bridge.journal.store.list("nb2/payer-progress/v2/").unwrap();
     assert_eq!(keys.len(), 1);
     let progress: Value =
@@ -1438,6 +1490,251 @@ fn contested_ordinary_signing_requires_the_remaining_fee_budget_and_free_balance
         .unwrap()
         .to_string()
         .contains("outstanding ERC20 return"));
+}
+
+#[test]
+fn contested_ordinary_signing_checks_fallback_signed_bytes_and_per_packet_fee() {
+    use super::super::evm::LocalKeySigner;
+    let (mut bridge, _, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
+    let mut first = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    first.status = "burned".into();
+    let mut second = first.clone();
+    second.return_id = hex(&[0x34; 32]);
+    bridge.journal.put_return(&first).unwrap();
+    bridge.journal.put_return(&second).unwrap();
+    let plan = &first.extra["recovery"];
+    let cuts = recovery_run_cuts(plan).unwrap();
+    let batch = plan["advanceGaps"].as_u64().unwrap() as usize;
+    let advances = recovery_advance_calls(plan, cuts.len(), 1).unwrap();
+    let saved = bridge.erc20_return_recovery.as_ref().unwrap();
+    let mut limits = saved.limits.clone();
+    limits.max_fee_per_gas = 127u8.into();
+    let fits = |signed_bytes| {
+        admitted_recovery_gas(
+            &held,
+            RecoverySuffix {
+                cuts: &cuts,
+                completed_runs: 0,
+                batch,
+                advances,
+            },
+            bridge.cfg.k,
+            &*saved.calibration,
+            &RecoveryLimits {
+                signed_bytes,
+                ..limits.clone()
+            },
+        )
+        .is_ok()
+    };
+    let (mut low, mut high) = (0, limits.signed_bytes);
+    assert!(fits(high));
+    while high - low > 1 {
+        let mid = (low + high) / 2;
+        if fits(mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let tx = TxRequest {
+        chain_id: bridge.cfg.chain_id,
+        nonce: 1,
+        gas: 100_000,
+        max_fee_per_gas: 10u8.into(),
+        max_priority_fee_per_gas: 1u8.into(),
+        to: bridge.cfg.vault,
+        value: BigUint::default(),
+        data: vec![0x11; 68],
+    };
+    limits.max_transaction_fee = Some(2_000_000u64.into());
+    limits.max_fee_per_gas = tx.max_fee_per_gas.clone();
+    assert!(quote_erc20_call(tx.data.len(), tx.gas, &limits).is_some());
+    bridge.erc20_return_recovery.as_mut().unwrap().limits = limits.clone();
+    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
+    assert!(
+        error.to_string().contains("outside the release limits"),
+        "{error}"
+    );
+    limits.max_transaction_fee = None;
+    limits.max_fee_per_gas = 254u8.into();
+    limits.signed_bytes = high;
+    bridge.erc20_return_recovery.as_mut().unwrap().limits = limits.clone();
+    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
+    assert!(
+        error.to_string().contains("outside the release limits"),
+        "{error}"
+    );
+    limits.signed_bytes += 1;
+    bridge.erc20_return_recovery.as_mut().unwrap().limits = limits;
+    bridge.sign_redeem_tx(&second, &signer, &tx).unwrap();
+}
+
+#[test]
+fn ordinary_takeover_includes_finalized_local_run_fees_once_per_nonce() {
+    use super::super::evm::LocalKeySigner;
+    use super::super::recovery::RecoveryReceipt;
+    let (mut bridge, rpc, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
+    let chain = bridge.cfg.chain_id;
+    let mut first = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    first.status = "burned".into();
+    let mut other = first.clone();
+    other.return_id = hex(&[0x33; 32]);
+    bridge.journal.put_return(&first).unwrap();
+    bridge.journal.put_return(&other).unwrap();
+    let tx = TxRequest {
+        chain_id: chain,
+        nonce: 1,
+        gas: 100_000,
+        max_fee_per_gas: 10u8.into(),
+        max_priority_fee_per_gas: 1u8.into(),
+        to: bridge.cfg.vault,
+        value: BigUint::default(),
+        data: vec![0x11; 68],
+    };
+    let raw = |signer: &LocalKeySigner, gas, chain_id, nonce| {
+        sign_tx(
+            signer,
+            &TxRequest {
+                gas,
+                chain_id,
+                nonce,
+                to: rpc.recovery,
+                ..tx.clone()
+            },
+        )
+        .unwrap()
+        .raw
+    };
+    let run = raw(&signer, 2, chain, 0);
+    let id = format!("{}/{}", &first.base.domain[2..], &first.return_id[2..]);
+    bridge
+        .journal
+        .store
+        .put_if(
+            &format!("nb2/payer-sends/v1/{chain}/{}/{id}", to_hex(&payer)),
+            None,
+            "0",
+        )
+        .unwrap();
+    bridge.journal.index_payer_sends(&first, &[]).unwrap();
+    assert!(bridge
+        .journal
+        .store
+        .get(&format!("nb2/payer-fee-index/v1/{id}"))
+        .unwrap()
+        .is_none());
+    bridge.journal.retain_payer_send(&first, &run).unwrap();
+    let hash = he(&[&super::super::header::encode_header(
+        &super::super::rpc::header_of_json(&finalized_header()).unwrap(),
+    )]);
+    bridge
+        .journal
+        .index_recovery_progress(
+            chain,
+            &first,
+            1,
+            &RecoveryReceipt {
+                encoded: vec![],
+                block_number: 20,
+                block_hash: hash,
+                tx_index: 0,
+                log_index: 0,
+            },
+            None,
+        )
+        .unwrap();
+    let plan = &first.extra["recovery"];
+    let ordinary = &plan["ordinary"];
+    let attempts = undec64(ordinary["attemptsBeforeFallback"].as_str().unwrap()).unwrap();
+    let ordinary_gas = undec(ordinary["gas"].as_str().unwrap()).unwrap();
+    let cuts = recovery_run_cuts(plan).unwrap();
+    let advances = recovery_advance_calls(plan, cuts.len(), attempts).unwrap();
+    let batch = plan["advanceGaps"].as_u64().unwrap() as usize;
+    let saved = bridge.erc20_return_recovery.as_ref().unwrap();
+    let suffix = admitted_recovery_gas(
+        &held,
+        RecoverySuffix {
+            cuts: &cuts,
+            completed_runs: 1,
+            batch,
+            advances,
+        },
+        bridge.cfg.k,
+        &*saved.calibration,
+        &saved.limits,
+    )
+    .unwrap();
+    let gas: BigUint = suffix.run.into_iter().fold(
+        BigUint::from(advances) * suffix.advance + suffix.settle,
+        |sum, gas| sum + gas,
+    );
+    let needed =
+        (gas.max(ordinary_gas.clone()) + ordinary_gas * attempts) * &saved.limits.max_fee_per_gas;
+    rpc.finalized_nonce.store(1, Ordering::SeqCst);
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = &needed + 20u8;
+    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
+    assert!(
+        error.to_string().contains("local signed fees indexed"),
+        "{error}"
+    );
+    let peer = LocalKeySigner::new(&[0x36; 32]);
+    bridge
+        .journal
+        .index_payer_sends(
+            &first,
+            &[
+                &run,
+                &raw(&signer, 1, chain, 0),
+                &raw(&peer, 200, chain, 0),
+                &raw(&signer, 200, chain + 1, 0),
+                &raw(&signer, 200, chain, tx.nonce),
+            ],
+        )
+        .unwrap();
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = &needed + 19u8;
+    let error = bridge.sign_redeem_tx(&first, &signer, &tx).unwrap_err();
+    assert!(
+        error.to_string().contains("authorized payer fee budget"),
+        "{error}"
+    );
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = needed + 20u8;
+    bridge.sign_redeem_tx(&first, &signer, &tx).unwrap();
 }
 
 #[test]

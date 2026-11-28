@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use num_bigint::BigUint;
 
-use super::config::{decode_config, domain_of, Params, MAX_SEGMENT};
+use super::config::{decode_config, domain_of, Config, Params, MAX_SEGMENT};
 use super::errors::{fail_d, Result, Rule};
 use super::recovery::RecoveryDeployment;
 use super::rlp::{rlp_bytes, rlp_list, rlp_u64_enc, rlp_uint_enc};
@@ -293,32 +293,47 @@ pub(crate) struct AdmittedRecoveryGas {
     pub settle: u64,
 }
 
+#[cfg(feature = "host")]
+pub(crate) struct RecoverySuffix<'a> {
+    pub cuts: &'a [usize],
+    pub completed_runs: usize,
+    pub batch: usize,
+    pub advances: u64,
+}
+
 /// Reconstruct the exact admission quote for a saved schedule without choosing different cut sizes.
 #[cfg(feature = "host")]
 pub(crate) fn admitted_recovery_gas(
     held: &[u8],
-    cuts: &[usize],
+    suffix: RecoverySuffix<'_>,
     k: u64,
-    batch: usize,
     calibration: &dyn RecoveryCalibration,
     limits: &RecoveryLimits,
 ) -> Result<AdmittedRecoveryGas> {
+    let RecoverySuffix {
+        cuts,
+        completed_runs,
+        batch,
+        advances,
+    } = suffix;
     let token = decode_token(held)?;
     let (spans, n) = prospective_run_spans(held, &token);
     let mut from = 0;
     let mut run = Vec::new();
-    for &count in cuts {
+    for (index, &count) in cuts.iter().enumerate() {
         let end = from + count;
         if !(1..=16).contains(&count) || end > spans.len() {
             return fail_d(Rule::CapacityPreflight, "invalid admitted Run schedule");
         }
-        let Some(quote) = quote_run_cut(&spans, n, from, end, calibration, limits, true) else {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "admitted Run cut is outside the release limits",
-            );
-        };
-        run.push(quote.gas);
+        if index >= completed_runs {
+            let Some(quote) = quote_run_cut(&spans, n, from, end, calibration, limits, true) else {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "admitted Run cut is outside the release limits",
+                );
+            };
+            run.push(quote.gas);
+        }
         from = end;
     }
     if from != spans.len() || !(1..=1024).contains(&batch) {
@@ -328,26 +343,52 @@ pub(crate) fn admitted_recovery_gas(
         );
     }
     let width = gap_proof_len(k);
-    let (Some(advance), Some(settle)) = (
-        quote_range(
+    let advance = if advances == 0 {
+        0
+    } else {
+        let Some(quote) = quote_range(
             gap_shape(RecoveryEntry::AdvanceGaps, batch, width),
             1,
             calibration,
             limits,
             true,
-        ),
-        quote_settlement_suffixes(batch, width, calibration, limits, true),
-    ) else {
+        ) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "admitted gap batch is outside the release limits",
+            );
+        };
+        quote.gas
+    };
+    let Some(settle) = quote_settlement_suffixes(batch, width, calibration, limits, true) else {
         return fail_d(
             Rule::CapacityPreflight,
-            "admitted gap batch or settlement suffix is outside the release limits",
+            "admitted settlement suffix is outside the release limits",
         );
     };
     Ok(AdmittedRecoveryGas {
         run,
-        advance: advance.gas,
+        advance,
         settle: settle.gas,
     })
+}
+
+pub(crate) fn check_recovery_calibration(
+    cfg: &Config,
+    deployment: &RecoveryDeployment,
+    calibration: &dyn RecoveryCalibration,
+    chain_id: u64,
+) -> Result<()> {
+    if !deployment.matches_config(cfg)
+        || deployment.pins != calibration.pins()
+        || deployment.runtime_hash != calibration.runtime_hash()
+        || deployment.vault_runtime_hash.is_none()
+        || deployment.vault_runtime_hash != calibration.vault_runtime_hash()
+        || cfg.chain_id != chain_id
+    {
+        return fail_d(Rule::CapacityPreflight, "unqualified recovery deployment");
+    }
+    Ok(())
 }
 
 fn calldata_size(payload: usize) -> usize {
@@ -555,15 +596,7 @@ pub fn preflight_recovery_with_signing_bounds(
 ) -> Result<RecoveryAdmission> {
     let cfg = decode_config(ctx.gamma, ctx.params)?;
     let erc20 = cfg.erc20.is_some();
-    if !ctx.deployment.matches_config(&cfg)
-        || ctx.deployment.pins != ctx.calibration.pins()
-        || ctx.deployment.runtime_hash != ctx.calibration.runtime_hash()
-        || ctx.deployment.vault_runtime_hash.is_none()
-        || ctx.deployment.vault_runtime_hash != ctx.calibration.vault_runtime_hash()
-        || cfg.chain_id != ctx.limits.chain_id
-    {
-        return fail_d(Rule::CapacityPreflight, "unqualified recovery deployment");
-    }
+    check_recovery_calibration(&cfg, ctx.deployment, ctx.calibration, ctx.limits.chain_id)?;
     let domain = domain_of(ctx.gamma);
     let token = decode_token(held)?;
     verify_held(&cfg, &domain, ctx.trust, &token)?;

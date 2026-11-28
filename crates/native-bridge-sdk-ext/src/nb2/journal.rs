@@ -450,11 +450,10 @@ impl RecoveryProgress {
     }
 }
 
-pub(crate) fn remaining_recovery_fee(
+fn remaining_recovery_fee(
     plan: &Value,
     progress: Option<&RecoveryProgress>,
     ordinary_used: u64,
-    ceiling: Option<&BigUint>,
 ) -> Result<BigUint> {
     let total = undec(plan["totalFee"].as_str().unwrap_or(""))?;
     let ordinary = &plan["ordinary"];
@@ -465,8 +464,7 @@ pub(crate) fn remaining_recovery_fee(
         return Ok(total);
     };
     let admitted = undec(bid)?;
-    let price = ceiling.unwrap_or(&admitted);
-    if admitted == BigUint::default() || *price == BigUint::default() {
+    if admitted == BigUint::default() {
         return fail_d(Rule::CapacityPreflight, "invalid continuation fee ceiling");
     }
     let ordinary_gas = undec(ordinary["gas"].as_str().unwrap_or("0"))?;
@@ -479,13 +477,13 @@ pub(crate) fn remaining_recovery_fee(
         } else {
             gas
         };
-        return Ok((route + BigUint::from(attempts) * &ordinary_gas) * price);
+        return Ok((route + BigUint::from(attempts) * &ordinary_gas) * admitted);
     }
     let consumed = BigUint::from(spent) * ordinary_gas * &admitted;
     if total <= consumed {
         return Ok(BigUint::default());
     }
-    Ok(((total - consumed) * price + &admitted - 1u8) / admitted)
+    Ok(total - consumed)
 }
 
 impl PayerCommitments {
@@ -522,6 +520,15 @@ fn return_path(key: &str) -> Option<(&str, &str)> {
                     .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
         })
         .then_some((domain, id))
+}
+
+fn payer_send_path(chain_id: u64, payer: &[u8], record: &ReturnRecord) -> String {
+    format!(
+        "{chain_id}/{}/{}/{}",
+        to_hex(payer),
+        &record.base.domain[2..],
+        &record.return_id[2..]
+    )
 }
 
 impl Journal {
@@ -688,49 +695,131 @@ impl Journal {
         Ok(out)
     }
 
-    /// Record the highest signed nonce before offering an exact transaction to any RPC.
+    /// Record the signed fee and highest nonce before offering an exact transaction to any RPC.
     pub fn retain_payer_send(&self, record: &ReturnRecord, raw: &[u8]) -> Result<()> {
         let tx = decode_signed_tx(raw).map_err(Error::Other)?;
-        let key = format!(
-            "nb2/payer-sends/v1/{}/{}/{}/{}",
-            tx.request.chain_id,
-            to_hex(&tx.from),
-            &record.base.domain[2..],
-            &record.return_id[2..]
-        );
-        self.retain_payer_nonce(&key, tx.request.nonce)
+        let payer = payer_send_path(tx.request.chain_id, &tx.from, record);
+        let fee = BigUint::from(tx.request.gas) * tx.request.max_fee_per_gas;
+        self.retain_payer_maximum(
+            &format!("nb2/payer-fees/v1/{payer}/{}", tx.request.nonce),
+            &fee,
+        )?;
+        self.retain_payer_nonce(&format!("nb2/payer-sends/v1/{payer}"), tx.request.nonce)
     }
 
     fn retain_payer_nonce(&self, key: &str, nonce: u64) -> Result<()> {
+        self.retain_payer_maximum(key, &nonce.into())
+    }
+
+    fn retain_payer_maximum(&self, key: &str, value: &BigUint) -> Result<()> {
         loop {
             let previous = self.store.get(key)?;
             if previous
                 .as_deref()
-                .map(undec64)
+                .map(undec)
                 .transpose()?
-                .is_some_and(|n| n >= nonce)
-                || self.store.put_if(key, previous.as_deref(), &dec(nonce))?
+                .is_some_and(|n| &n >= value)
+                || self.store.put_if(key, previous.as_deref(), &dec(value))?
             {
                 return Ok(());
             }
         }
     }
 
-    /// Register separately retained signed packets before an upgraded wallet can reuse a payer.
+    /// Register all separately retained signed packets before an upgraded wallet can reuse a payer.
     pub fn index_payer_sends(&self, record: &ReturnRecord, signed: &[&[u8]]) -> Result<()> {
         for raw in signed {
             self.retain_payer_send(record, raw)?;
         }
-        self.store.put_if(
-            &format!(
-                "nb2/payer-index/v1/{}/{}",
-                &record.base.domain[2..],
-                &record.return_id[2..]
-            ),
-            None,
-            "1",
-        )?;
+        let id = format!("{}/{}", &record.base.domain[2..], &record.return_id[2..]);
+        self.store
+            .put_if(&format!("nb2/payer-index/v1/{id}"), None, "1")?;
+        let fee_index = format!("nb2/payer-fee-index/v1/{id}");
+        if self.store.get(&fee_index)?.as_deref() == Some("1") {
+            return Ok(());
+        }
+        for send in &record.sends {
+            self.retain_payer_send(record, &unhex(&send.raw)?)?;
+        }
+        let prefix = "nb2/payer-sends/v1/";
+        let suffix = format!("/{id}");
+        for key in self.store.list(prefix)? {
+            if !key.ends_with(&suffix) {
+                continue;
+            }
+            let Some(highest) = self.store.get(&key)? else {
+                return Ok(());
+            };
+            let fee = format!(
+                "nb2/payer-fees/v1/{}/{}",
+                &key[prefix.len()..],
+                undec64(&highest)?
+            );
+            if self.store.get(&fee)?.is_none() {
+                return Ok(());
+            }
+        }
+        self.store.put_if(&fee_index, None, "1")?;
         Ok(())
+    }
+
+    /// Count the greatest locally authorized fee per nonce across both routes for this payer and return.
+    pub(crate) fn prior_payer_fees(
+        &self,
+        record: &ReturnRecord,
+        chain_id: u64,
+        payer: &[u8],
+        replacing: u64,
+    ) -> Result<BigUint> {
+        let path = payer_send_path(chain_id, payer, record);
+        if self
+            .store
+            .get(&format!("nb2/payer-sends/v1/{path}"))?
+            .is_some()
+            && self
+                .store
+                .get(&format!(
+                    "nb2/payer-fee-index/v1/{}/{}",
+                    &record.base.domain[2..],
+                    &record.return_id[2..]
+                ))?
+                .as_deref()
+                != Some("1")
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "return needs its local signed fees indexed",
+            );
+        }
+        let mut fees = std::collections::BTreeMap::<u64, BigUint>::new();
+        let mut record_fee = |nonce, fee| {
+            if nonce != replacing {
+                let saved = fees.entry(nonce).or_default();
+                if *saved < fee {
+                    *saved = fee;
+                }
+            }
+        };
+        let prefix = format!("nb2/payer-fees/v1/{path}/");
+        for key in self.store.list(&prefix)? {
+            let Some(value) = self.store.get(&key)? else {
+                return refuse(
+                    WalletReason::JournalNotPersisted,
+                    "signed fee disappeared during payer reconciliation",
+                );
+            };
+            record_fee(undec64(&key[prefix.len()..])?, undec(&value)?);
+        }
+        for send in &record.sends {
+            let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
+            if tx.request.chain_id == chain_id && tx.from.as_slice() == payer {
+                record_fee(
+                    tx.request.nonce,
+                    BigUint::from(tx.request.gas) * tx.request.max_fee_per_gas,
+                );
+            }
+        }
+        Ok(fees.values().sum())
     }
 
     /// Publish a replayed checkpoint. Readers check the exact block's execution finality before crediting it.
@@ -914,7 +1003,7 @@ impl Journal {
                 let progress =
                     self.finalized_recovery_progress(chain_id, &rec, check.finalized_block)?;
                 let used = ordinary.len() as u64;
-                out.fees += remaining_recovery_fee(recovery, progress.as_ref(), used, None)?;
+                out.fees += remaining_recovery_fee(recovery, progress.as_ref(), used)?;
                 // The signed-nonce check below must pass before ordinary nonces count as used.
                 let calls =
                     remaining_recovery_calls(recovery, progress.map_or(0, |p| p.completed), used)?;

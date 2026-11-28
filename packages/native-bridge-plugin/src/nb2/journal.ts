@@ -256,21 +256,20 @@ function recoveryProgressOf(value: string): RecoveryProgress {
   return { completed: undec(completed), continuationGas: continuationGas === undefined ? undefined : undec(continuationGas) };
 }
 
-/** Reprice the admitted gas exposure. Older records retain the original gas bound until their checkpoints are replayed. */
-export function remainingRecoveryFee(plan: NonNullable<ReturnRecord['recovery']>, progress: RecoveryProgress | undefined,
-  ordinaryUsed: bigint, ceiling?: bigint): bigint {
+/** Price other returns at their admitted ceiling. A verified checkpoint can supply the remaining gas. */
+function remainingRecoveryFee(plan: NonNullable<ReturnRecord['recovery']>, progress: RecoveryProgress | undefined,
+  ordinaryUsed: bigint): bigint {
   const total = undec(plan.totalFee);
   const savedBid = plan.envelope?.maxFeePerGas ?? plan.ordinary?.maxFeePerGas;
   if (savedBid === undefined) return total;
   const admitted = undec(savedBid);
-  if (admitted === 0n || (ceiling !== undefined && ceiling <= 0n)) fail('CapacityPreflight', 'invalid continuation fee ceiling');
-  const price = ceiling ?? admitted;
+  if (admitted === 0n) fail('CapacityPreflight', 'invalid continuation fee ceiling');
   const ordinary = undec(plan.ordinary?.gas ?? '0');
   const attempts = remainingOrdinaryAttempts(plan, ordinaryUsed);
-  if (progress?.continuationGas !== undefined) return continuationReserve(progress.continuationGas, ordinary, attempts) * price;
+  if (progress?.continuationGas !== undefined) return continuationReserve(progress.continuationGas, ordinary, attempts) * admitted;
   const spent = remainingOrdinaryAttempts(plan) - attempts;
   const left = total - spent * ordinary * admitted;
-  return left > 0n ? (left * price + admitted - 1n) / admitted : 0n;
+  return left > 0n ? left : 0n;
 }
 /** Last nonce this return may use while leaving feasible nonce windows for the older returns. */
 export function payerNonceLimit(maxNonce: bigint, other: PayerCommitments): bigint {
@@ -411,22 +410,64 @@ export class Journal {
   /** Record the highest signed nonce before offering an exact transaction to any RPC. */
   public async retainPayerSend(record: ReturnRecord, raw: Uint8Array): Promise<void> {
     const { from, request } = decodeSignedTx(raw);
-    const key = `nb2/payer-sends/v1/${request.chainId}/${toHex(from)}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
-    await this.retainPayerNonce(key, request.nonce);
+    const payer = this.payerSendPath(request.chainId, from, record);
+    await this.retainPayerMaximum(`nb2/payer-fees/v1/${payer}/${request.nonce}`, request.gas * request.maxFeePerGas);
+    await this.retainPayerMaximum(`nb2/payer-sends/v1/${payer}`, request.nonce);
   }
 
-  private async retainPayerNonce(key: string, nonce: bigint): Promise<void> {
+  private payerSendPath(chainId: bigint, payer: Uint8Array, record: ReturnRecord): string {
+    return `${chainId}/${toHex(payer)}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+  }
+
+  private async retainPayerMaximum(key: string, value: bigint): Promise<void> {
     for (;;) {
       const previous = await this.store.get(key);
-      if ((previous !== null && undec(previous) >= nonce) || await this.store.putIf(key, previous, dec(nonce))) return;
+      if ((previous !== null && undec(previous) >= value) || await this.store.putIf(key, previous, dec(value))) return;
     }
   }
 
-  /** Mark a return only after indexing every separately journaled signed recovery packet. */
+  /** Mark a return only after indexing every separately journaled signed recovery packet and its fee. */
   public async indexPayerSends(record: ReturnRecord, raw: readonly Uint8Array[]): Promise<void> {
     for (const signed of raw) await this.retainPayerSend(record, signed);
-    const key = `nb2/payer-index/v1/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+    const id = `${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+    const key = `nb2/payer-index/v1/${id}`;
     await this.store.putIf(key, null, '1');
+    const feeIndex = `nb2/payer-fee-index/v1/${id}`;
+    if (await this.store.get(feeIndex) === '1') return;
+    for (const send of record.sends) await this.retainPayerSend(record, unhex(send.raw));
+    const prefix = 'nb2/payer-sends/v1/';
+    for (const key of await this.store.list(prefix)) {
+      if (!key.endsWith('/' + id)) continue;
+      const highest = await this.store.get(key);
+      if (highest === null || await this.store.get(`nb2/payer-fees/v1/${key.slice(prefix.length)}/${undec(highest)}`) === null) return;
+    }
+    await this.store.putIf(feeIndex, null, '1');
+  }
+
+  /** Count the greatest locally authorized fee per nonce across both routes for this payer and return. */
+  public async priorPayerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, replacing: bigint): Promise<bigint> {
+    const path = this.payerSendPath(chainId, payer, record);
+    if (await this.store.get(`nb2/payer-sends/v1/${path}`) !== null &&
+      await this.store.get(`nb2/payer-fee-index/v1/${record.domain.slice(2)}/${record.returnId.slice(2)}`) !== '1') {
+      fail('CapacityPreflight', 'return needs its local signed fees indexed');
+    }
+    const fees = new Map<bigint, bigint>();
+    const recordFee = (nonce: bigint, fee: bigint) => {
+      if (nonce !== replacing && fee > (fees.get(nonce) ?? 0n)) fees.set(nonce, fee);
+    };
+    const prefix = `nb2/payer-fees/v1/${path}/`;
+    for (const key of await this.store.list(prefix)) {
+      const value = await this.store.get(key);
+      if (value === null) refuse('JournalNotPersisted', 'signed fee disappeared during payer reconciliation');
+      recordFee(undec(key.slice(prefix.length)), undec(value));
+    }
+    for (const send of record.sends) {
+      const { from, request } = decodeSignedTx(unhex(send.raw));
+      if (request.chainId === chainId && eqBytes(from, payer)) recordFee(request.nonce, request.gas * request.maxFeePerGas);
+    }
+    let total = 0n;
+    for (const fee of fees.values()) total += fee;
+    return total;
   }
 
   /** Publish a replayed checkpoint. Readers independently check execution finality before giving credit. */
@@ -554,7 +595,7 @@ export class Journal {
         commitment.finalizedNonce = finalized;
         if (reserve) {
           const [, domain, returned] = returnKey.exec(owner)!;
-          await this.retainPayerNonce(`nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${domain}/${returned}`, heldNonce);
+          await this.retainPayerMaximum(`nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${domain}/${returned}`, heldNonce);
         }
       }
       if (!reserve) return commitment;

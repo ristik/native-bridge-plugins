@@ -35,6 +35,14 @@ export interface RecoveryCalibration {
   ranges: readonly RecoveryCalibrationRange[];
 }
 
+export function checkRecoveryCalibration(cfg: Config, deployment: RecoveryDeployment, calibration: RecoveryCalibration, chainId: bigint): void {
+  if (!validRecoveryDeployment(deployment, cfg) || !eq(deployment.pins, calibration.pins) ||
+    !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 ||
+    calibration.vaultRuntimeHash?.length !== 32 || !eq(deployment.vaultRuntimeHash, calibration.vaultRuntimeHash) || cfg.chainId !== chainId) {
+    fail('CapacityPreflight', 'unqualified recovery deployment');
+  }
+}
+
 /** A qualified envelope for the same entry, operation count and gap count.
  * It covers the inclusive receipt interval and all smaller calldata, page and opening sizes for that class.
  */
@@ -338,6 +346,23 @@ export function checkRemainingRecoveryRuns(held: Uint8Array, cuts: readonly numb
   return quoteScheduledRecoveryRuns(held, cuts, confirmedCuts, calibration, limits, erc20).reduce((fee, quote) => fee + quote.fee, 0n);
 }
 
+/** Reprice the saved fallback, including every possible settlement suffix, at the live signing limits. */
+export function quoteScheduledRecoveryFee(held: Uint8Array, K: bigint,
+  schedule: { cuts: readonly number[]; completedRuns: number; batch: number; advances: bigint },
+  calibration: RecoveryCalibration, limits: RecoveryLimits): bigint {
+  const { cuts, completedRuns, batch, advances } = schedule;
+  if (!Number.isSafeInteger(batch) || batch < 1 || batch > 1024 || advances < 0n || !validLimits(limits)) {
+    fail('CapacityPreflight', 'invalid admitted recovery schedule');
+  }
+  const runs = checkRemainingRecoveryRuns(held, cuts, completedRuns, calibration, limits, true);
+  const width = gapProofLen(K);
+  const settle = quoteSettlementSuffixes(batch, width, calibration, limits);
+  if (!settle) fail('CapacityPreflight', 'admitted settlement suffix is outside the release limits');
+  if (advances === 0n) return runs + settle.fee;
+  const advance = quoteRange(gapShape('advanceGaps', batch, width), 1, calibration, limits, true);
+  if (!advance) fail('CapacityPreflight', 'admitted gap batch is outside the release limits');
+  return runs + advances * advance.fee + settle.fee;
+}
 export function scheduleRecoveryRuns(operations: number, quote: (from: number, end: number) => RecoveryQuote | null): RecoveryQuote[] {
   const run: RecoveryQuote[] = [];
   // Check even operations that normally share a cut with their neighbours.
@@ -365,10 +390,7 @@ export async function preflightRecovery(gamma: Uint8Array, held: Uint8Array, tru
   checkBacklogMeasurements(backlog);
   const config = Uint8Array.from(gamma);
   const cfg = decodeConfig(config, params);
-  if (!validRecoveryDeployment(deployment, cfg) || !eq(deployment.pins, calibration.pins) || !eq(deployment.runtimeHash, calibration.runtimeHash) || deployment.vaultRuntimeHash?.length !== 32 || calibration.vaultRuntimeHash?.length !== 32
-    || !eq(deployment.vaultRuntimeHash, calibration.vaultRuntimeHash) || cfg.chainId !== limits.chainId) {
-    fail('CapacityPreflight', 'unqualified recovery deployment');
-  }
+  checkRecoveryCalibration(cfg, deployment, calibration, limits.chainId);
   const evidence = Uint8Array.from(held);
   const token = decodeToken(evidence);
   const domain = domainOf(config);

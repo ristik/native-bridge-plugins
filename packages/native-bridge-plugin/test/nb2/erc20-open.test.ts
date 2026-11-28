@@ -4,15 +4,16 @@ import { test } from 'node:test';
 import { gunzipSync } from 'node:zlib';
 import { toHex } from '../../src/bytes.js';
 import { addressWord, decodeBytesReturn } from '../../src/nb2/abi.js';
-import { ERC20_PROFILE_HASH, IMPORTED_TIP_PROFILE_HASH, NativeBridgeV2, type ReturnAdmission } from '../../src/nb2/bridge.js';
+import { ERC20_PROFILE_HASH, IMPORTED_TIP_PROFILE_HASH, NativeBridgeV2, type RedeemOptions, type ReturnAdmission } from '../../src/nb2/bridge.js';
 import { ascii, u256 } from '../../src/nb2/cbor.js';
 import { decodeConfig, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { decodeReceiptBacking, depositedData, TOPIC } from '../../src/nb2/deposit.js';
-import { signTx } from '../../src/nb2/evm.js';
-import { Journal, MemoryJournalStore, payerNonceLimit } from '../../src/nb2/journal.js';
+import { LocalKeySigner, signTx } from '../../src/nb2/evm.js';
+import { Journal, MemoryJournalStore, continuationReserve, payerNonceLimit } from '../../src/nb2/journal.js';
 import { WalletError } from '../../src/nb2/errors.js';
-import { type RecoveryCalibrationRange, type RecoveryShape } from '../../src/nb2/recovery-cost.js';
+import { quoteErc20Call, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, quoteScheduledRecoveryRuns,
+  type RecoveryCalibrationRange, type RecoveryShape } from '../../src/nb2/recovery-cost.js';
 import { RpcError, type JsonRpc } from '../../src/nb2/rpc.js';
 import { localOwner } from '../../src/nb2/tokenops.js';
 import { decodeUc } from '../../src/nb2/trust.js';
@@ -460,7 +461,8 @@ test('finalized Runs let both legacy returns drain at the exact 15/8 nonce and b
 test('an ordinary claimant must authorize the full legacy suffix before reserving the payer', async () => {
   const { x, bridge, held } = await heldPair();
   const payer = x.payer.address;
-  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const erc20Recovery = admissionFor(x);
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery } });
   const a = { ...record, status: 'burned' as const };
   const b = { ...a, returnId: hex(key('second ordinary legacy return')) };
   await bridge.journal.putReturn(a);
@@ -470,19 +472,107 @@ test('an ordinary claimant must authorize the full legacy suffix before reservin
   let admitted = 0;
   const admit = async () => { admitted++; };
   const feeBudget = BigInt(a.recovery!.totalFee);
+  const policy = erc20Recovery.limits;
   await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
-    admit, erc20Policy: { maxNonce: 255n, maxFeePerGas: 30n, feeBudget: request.gas * request.maxFeePerGas },
+    admit, erc20Recovery, erc20Policy: { maxNonce: 255n, feeBudget } as RedeemOptions['erc20Policy'],
+  }), /authorized payer fee ceiling/);
+  for (const maxFeePerGas of [undefined, 0n, '30', 30]) {
+    await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
+      admit, erc20Recovery, erc20Policy: { ...policy, maxFeePerGas, feeBudget } as RedeemOptions['erc20Policy'],
+    }), /authorized payer fee ceiling/);
+  }
+  await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
+    admit, erc20Recovery, erc20Policy: { ...policy, feeBudget: request.gas * request.maxFeePerGas },
   }), /authorized payer fee budget/);
   await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
-    admit, erc20Policy: { maxNonce: request.nonce, maxFeePerGas: 30n, feeBudget },
+    admit, erc20Recovery, erc20Policy: { ...policy, maxNonce: request.nonce, feeBudget },
   }), /remaining continuation schedule/);
   await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
-    admit, erc20Policy: { maxNonce: 255n, maxFeePerGas: 60n, feeBudget },
+    admit, erc20Recovery, erc20Policy: { ...policy, maxFeePerGas: 60n, feeBudget },
   }), /authorized payer fee budget/);
   assert.equal(admitted, 0);
-  await bridge['reserveOrdinaryPayer'](b, payer, request, { admit, erc20Policy: { maxNonce: 255n, maxFeePerGas: 60n, feeBudget: 2n * feeBudget } });
+  await bridge['reserveOrdinaryPayer'](b, payer, request, { admit, erc20Recovery, erc20Policy: { ...policy, maxFeePerGas: 60n, feeBudget: 2n * feeBudget } });
   assert.equal(admitted, 1);
   await assert.rejects(bridge.checkErc20Payer(a, payer), /outstanding ERC20 return/);
+});
+
+test('contested ordinary signing checks fallback signed bytes and per-packet fee limits', async () => {
+  const { x, bridge, held } = await heldPair();
+  const payer = x.payer.address;
+  const { chainId, K } = x.cfg;
+  const erc20Recovery = admissionFor(x);
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery } });
+  const first = { ...record, status: 'burned' as const };
+  const second = { ...first, returnId: hex(key('other legacy signing envelope')) };
+  await bridge.journal.putReturn(first);
+  await bridge.journal.putReturn(second);
+  const plan = first.recovery!;
+  const policy = { ...erc20Recovery.limits, chainId, maxFeePerGas: 127n };
+  const { calibration } = erc20Recovery;
+  const { advance, settle } = quoteRecoveryGapBatch(K, plan.advanceGaps, calibration, policy)!;
+  const run = quoteScheduledRecoveryRuns(held, plan.runCuts, 0, calibration, policy, true);
+  const signedBytes = Math.max(advance.signedBytes, settle.signedBytes, ...run.map((quote) => quote.signedBytes));
+  const request = { chainId, nonce: 1n, gas: 100_000n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n,
+    to: x.cfg.vault, value: 0n, data: new Uint8Array(68) };
+  const maxTransactionFee = 2_000_000n;
+  assert.ok(quoteErc20Call(request.data.length, request.gas, { ...policy, maxFeePerGas: request.maxFeePerGas, maxTransactionFee }));
+  const blocked = { erc20Recovery, admit: async () => assert.fail('fallback refusal must precede admission') };
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...blocked, erc20Policy: { ...policy, maxFeePerGas: 254n, signedBytes },
+  }), /outside the release limits/);
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...blocked, erc20Policy: { ...policy, maxFeePerGas: request.maxFeePerGas, maxTransactionFee },
+  }), /outside the release limits/);
+  await bridge['reserveOrdinaryPayer'](second, payer, request, {
+    erc20Recovery, admit: async () => {}, erc20Policy: { ...policy, maxFeePerGas: 254n, signedBytes: signedBytes + 1 },
+  });
+});
+
+test('ordinary takeover includes finalized local Run fees once per nonce', async () => {
+  const { x, bridge, held } = await heldPair();
+  const payer = x.payer.address;
+  const { chainId, K } = x.cfg;
+  const erc20Recovery = admissionFor(x);
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery } });
+  const first = { ...record, status: 'burned' as const };
+  const other = { ...first, returnId: hex(key('other legacy return waits during fee reconciliation')) };
+  const journal = bridge.journal;
+  await journal.putReturn(first);
+  await journal.putReturn(other);
+  const request = { chainId, nonce: 1n, gas: 100_000n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n,
+    to: x.cfg.vault, value: 0n, data: new Uint8Array(68) };
+  const raw = (signer: typeof x.payer, gas: bigint, chain = chainId, nonce = 0n) =>
+    signTx(signer, { ...request, gas, chainId: chain, nonce, to: bytes(x.a.recovery) }).then((signed) => signed.raw);
+  const id = `${first.domain.slice(2)}/${first.returnId.slice(2)}`;
+  await journal.store.putIf(`nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${id}`, null, '0');
+  await journal.indexPayerSends(first, []);
+  assert.equal(await journal.store.get(`nb2/payer-fee-index/v1/${id}`), null);
+  await journal.retainPayerSend(first, await raw(x.payer, 2n));
+  const plan = first.recovery!;
+  const policy = { ...erc20Recovery.limits, chainId };
+  const attempts = BigInt(plan.ordinary!.attemptsBeforeFallback);
+  const fallback = quoteScheduledRecoveryFee(held, K, {
+    cuts: plan.runCuts, completedRuns: 1, batch: plan.advanceGaps,
+    advances: BigInt(plan.calls) - BigInt(plan.runCuts.length) - attempts - 1n,
+  }, erc20Recovery.calibration, policy);
+  const suffix = continuationReserve(fallback, BigInt(plan.ordinary!.gas) * policy.maxFeePerGas, attempts);
+  await journal.indexRecoveryProgress(chainId, first, 1n, { blockNumber: 20n, blockHash: key('finalized local Run') });
+  bridge.evm.isFinalizedBlock = async () => true;
+  x.finalized(1n);
+  const opts = { erc20Recovery, admit: async () => assert.fail('budget refusal must precede admission') };
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...opts, erc20Policy: { ...policy, feeBudget: suffix + 20n },
+  }), /local signed fees indexed/);
+  await journal.indexPayerSends(first, await Promise.all([
+    raw(x.payer, 2n), raw(x.payer, 1n), raw(new LocalKeySigner(key('peer Run signer')), 200n),
+    raw(x.payer, 200n, chainId + 1n), raw(x.payer, 200n, chainId, request.nonce),
+  ]));
+  await assert.rejects(bridge['reserveOrdinaryPayer'](first, payer, request, {
+    ...opts, erc20Policy: { ...policy, feeBudget: suffix + 19n },
+  }), /authorized payer fee budget/);
+  await bridge['reserveOrdinaryPayer'](first, payer, request, {
+    erc20Recovery, admit: async () => {}, erc20Policy: { ...policy, feeBudget: suffix + 20n },
+  });
 });
 
 test('a finalized Run retains unused ordinary retry nonces and fees', async () => {
@@ -514,7 +604,8 @@ test('a finalized Run retains unused ordinary retry nonces and fees', async () =
 test('ordinary admission cannot mutate the request that the payer journal fences and signs', async () => {
   const { x, bridge, held, store } = await heldPair();
   const payer = x.payer.address;
-  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const erc20Recovery = admissionFor(x);
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery } });
   const a = { ...record, status: 'burned' as const };
   const b = { ...a, returnId: hex(key('contested ordinary request')) };
   await bridge.journal.putReturn(a);
@@ -535,7 +626,7 @@ test('ordinary admission cannot mutate the request that the payer journal fences
   } };
   const tx = await bridge['signed'](signer, x.cfg.vault, data, 0n, 100_000n, (request) =>
     bridge['reserveOrdinaryPayer'](a, payer, request, {
-      erc20Policy: { maxNonce: 255n, maxFeePerGas: 30n, feeBudget: BigInt(a.recovery!.totalFee) },
+      erc20Recovery, erc20Policy: { ...erc20Recovery.limits, feeBudget: BigInt(a.recovery!.totalFee) },
       admit: async (copy) => {
         admitted++;
         copy.nonce += 1n;

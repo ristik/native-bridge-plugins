@@ -159,7 +159,7 @@ function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary:
   const legacy = uint(recovery?.fees ?? '0');
   for (const signed of raw) {
     const { request, from } = decodeSignedTx(bytes(signed));
-    if (!eq(from, payer) || request.nonce === replacing) continue;
+    if (!eq(from, payer) || request.chainId !== w.bridge.cfg.chainId || request.nonce === replacing) continue;
     const fee = request.gas * request.maxFeePerGas;
     if (fee > (byNonce.get(request.nonce) ?? 0n)) byNonce.set(request.nonce, fee);
   }
@@ -176,7 +176,8 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
   if (!policy) return { recovery };
   return {
     envelope: ordinaryEnvelope(w, policy),
-    erc20Policy: { maxNonce: policy.maxNonce, maxFeePerGas: policy.maxFeePerGas, feeBudget: policy.feeBudget },
+    erc20Policy: policy,
+    erc20Recovery: w.bridge.cfg.erc20 && w.release.recovery !== undefined ? recoveryRelease(w) : undefined,
     archives: readers(w, policy),
     recovery,
     admit: async (req, prior, remainingFee) => {
@@ -1027,7 +1028,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
     }
     const tx = await signTx(w.signer, { chainId: limits.chainId, nonce, maxFeePerGas: limits.maxFeePerGas,
       maxPriorityFeePerGas: limits.maxPriorityFeePerGas, gas: quote.gas, to, value: 0n, data: calldata });
-    if (w.bridge.cfg.erc20) await w.bridge.journal.indexPayerSends(current, [tx.raw]);
+    if (w.bridge.cfg.erc20) await w.bridge.journal.retainPayerSend(current, tx.raw);
     if (tx.raw.length > quote.signedBytes) throw new Nb2Error('CapacityPreflight', 'signed recovery packet exceeds its bound');
     await w.bridge.evm.checkReturnImport(w.bridge.cfg, requiredSignerEpoch, { ...tx.request, from: w.signer.address });
     if (handoff) {
