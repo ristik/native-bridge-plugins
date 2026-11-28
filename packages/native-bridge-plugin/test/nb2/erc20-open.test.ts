@@ -436,6 +436,76 @@ test('ERC20 open rejects an unregistered foreign pending send on any chain', asy
   await assert.rejects(NativeBridgeV2.open({ ...x.options(), journal: store }), refused);
 });
 
+test('ERC20 open rereads a holder burn when Paid and a payer handoff follow the scan read', async () => {
+  class PausingStore extends MemoryJournalStore {
+    pauseKey?: string;
+    private markRead!: () => void;
+    private resumeRead!: () => void;
+    readonly read = new Promise<void>((resolve) => { this.markRead = resolve; });
+    private readonly resumed = new Promise<void>((resolve) => { this.resumeRead = resolve; });
+    resume() { this.resumeRead(); }
+
+    override async get(key: string): Promise<string | null> {
+      const value = await super.get(key);
+      if (this.pauseKey === key) {
+        this.pauseKey = undefined;
+        this.markRead();
+        await this.resumed;
+      }
+      return value;
+    }
+  }
+  const store = new PausingStore();
+  const { x, bridge, owner, firstHeld, held } = await heldPair(store);
+  const payer = x.payer.address;
+  const { chainId } = x.cfg;
+  const admission = { erc20Recovery: admissionFor(x) };
+  const first = await bridge.planReturn(firstHeld, recipient, payer, { admission });
+  const next = await bridge.planReturn(held, recipient, payer, { admission });
+  await bridge.burn(first.returnId, owner, admission);
+  assert.equal((await bridge.journal.ret(hex(first.returnId)))?.status, 'burned');
+
+  const writer = new Journal(store, bridge.domain);
+  const firstKey = `${writer.prefix}return/${toHex(first.returnId)}`;
+  const nextKey = `${writer.prefix}return/${toHex(next.returnId)}`;
+  const slot = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
+  assert.equal(await store.get(slot), firstKey);
+  store.pauseKey = firstKey;
+  const opening = NativeBridgeV2.open({ ...x.options(), journal: store });
+  try {
+    await Promise.race([store.read, opening.then(() => assert.fail('open skipped the holder burn'))]);
+    const saved = (await writer.retForUpdate(hex(first.returnId)))!;
+    await writer.putReturn({ ...saved, status: 'paid', paid: { txHash: hex(key('concurrent Paid')), blockNumber: '21' } });
+    await writer.checkReturnPayer(chainId, payer, hex(next.returnId), true);
+    assert.equal(await store.get(slot), nextKey);
+  } finally {
+    store.resume();
+  }
+  assert.equal((await (await opening).journal.ret(hex(first.returnId)))?.status, 'paid');
+});
+
+test('ERC20 slot validation bounds retries when the return keeps changing', async () => {
+  class ChangingStore extends MemoryJournalStore {
+    changingKey?: string;
+    reads = 0;
+    override async get(key: string): Promise<string | null> {
+      const value = await super.get(key);
+      if (key !== this.changingKey || value === null) return value;
+      return JSON.stringify({ ...JSON.parse(value), peerClaimSince: String(++this.reads) });
+    }
+  }
+  const store = new ChangingStore();
+  const { x, bridge, held } = await heldPair(store);
+  const { chainId } = x.cfg;
+  const { record } = await bridge.planReturn(held, recipient, x.payer.address, { admission: { erc20Recovery: admissionFor(x) } });
+  await bridge.journal.putReturn({ ...record, status: 'burned', burnRequest: hex(key('holder burn without slot')) });
+  store.changingKey = `${bridge.journal.prefix}return/${record.returnId.slice(2)}`;
+  await assert.rejects(bridge.journal.openErc20PayerJournal(chainId), { reason: 'JournalConflict' });
+  assert.equal(store.reads, 5, 'one initial read, three retries and one final mismatch check');
+  store.changingKey = undefined;
+  await assert.rejects(bridge.journal.openErc20PayerJournal(chainId), /unsupported pre-release ERC20 record: start a fresh wallet/);
+});
+
 test('an EVM nonce fence requires its existing scoped fee index', async () => {
   const { x, bridge, held, store } = await heldPair();
   const payer = x.payer.address;

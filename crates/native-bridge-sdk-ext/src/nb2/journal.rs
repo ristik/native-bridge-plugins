@@ -29,6 +29,7 @@ use super::util::{from_hex, to_hex};
 
 pub const JOURNAL_FORMAT: &str = "unicity-nb2-journal";
 pub const JOURNAL_VERSION: u64 = 1;
+const PAYER_SLOT_VALIDATION_RETRIES: usize = 3;
 
 /// Durable key-value storage. `put_if` is a compare-and-swap: it writes `value` only when the stored value is exactly
 /// `expected` (None: absent) and reports whether it did; it must be atomic and must not return before the value survives a
@@ -764,29 +765,33 @@ impl Journal {
         Ok(out)
     }
 
+    fn read_shared_return(&self, key: &str, domain: &str, id: &str) -> Result<ReturnRecord> {
+        let Some(raw) = self.store.get(key)? else {
+            return refuse(
+                WalletReason::JournalNotPersisted,
+                "return disappeared during payer reconciliation",
+            );
+        };
+        let record: ReturnRecord =
+            serde_json::from_str(&raw).map_err(|err| Error::Other(err.to_string()))?;
+        if record.base.domain != format!("0x{domain}")
+            || record.return_id != format!("0x{id}")
+            || record.base.kind != "return"
+            || record.base.version != JOURNAL_VERSION
+            || record.base.format != JOURNAL_FORMAT
+        {
+            return refuse(WalletReason::BadInput, "invalid return in shared journal");
+        }
+        Ok(record)
+    }
+
     fn all_returns(&self) -> Result<Vec<(String, ReturnRecord)>> {
         let mut records = Vec::new();
         for key in self.store.list("nb2/v1/")? {
-            let Some((domain, id)) = return_path(&key) else {
-                continue;
-            };
-            let Some(raw) = self.store.get(&key)? else {
-                return refuse(
-                    WalletReason::JournalNotPersisted,
-                    "return disappeared during payer reconciliation",
-                );
-            };
-            let rec: ReturnRecord =
-                serde_json::from_str(&raw).map_err(|err| Error::Other(err.to_string()))?;
-            if rec.base.domain != format!("0x{domain}")
-                || rec.return_id != format!("0x{id}")
-                || rec.base.kind != "return"
-                || rec.base.version != JOURNAL_VERSION
-                || rec.base.format != JOURNAL_FORMAT
-            {
-                return refuse(WalletReason::BadInput, "invalid return in shared journal");
+            if let Some((domain, id)) = return_path(&key) {
+                let record = self.read_shared_return(&key, domain, id)?;
+                records.push((key, record));
             }
-            records.push((key, rec));
         }
         Ok(records)
     }
@@ -840,8 +845,10 @@ impl Journal {
             let Some(chain) = chain else {
                 return unsupported_erc20_return();
             };
-            self.require_erc20_return_state(chain, &record)?;
-            records.push((key, record, chain));
+            let validated = self
+                .require_erc20_return_state(chain, &record)?
+                .unwrap_or(record);
+            records.push((key, validated, chain));
         }
         Ok(records)
     }
@@ -927,12 +934,12 @@ impl Journal {
         Ok(())
     }
 
-    /// Check stored ERC20 state before opening the domain or acting on a return.
+    /// Check ERC20 state. Returns the refreshed record if its payer slot changed during the read.
     pub(crate) fn require_erc20_return_state(
         &self,
         chain_id: u64,
         record: &ReturnRecord,
-    ) -> Result<()> {
+    ) -> Result<Option<ReturnRecord>> {
         let domain = &record.base.domain[2..];
         if self
             .store
@@ -942,59 +949,80 @@ impl Journal {
         {
             return unsupported_erc20_return();
         }
-        if let Some(payer) = record.execution_payer()? {
-            let path = payer_send_path(chain_id, &payer, record);
-            let highest = self
+        let id = &record.return_id[2..];
+        let owner = format!("nb2/v1/{domain}/return/{id}");
+        let mut refreshed = None;
+        let mut retries = 0;
+        loop {
+            let record = refreshed.as_ref().unwrap_or(record);
+            if let Some(payer) = record.execution_payer()? {
+                let path = payer_send_path(chain_id, &payer, record);
+                let highest = self
+                    .store
+                    .get(&format!("nb2/payer-sends/v1/{path}"))?
+                    .as_deref()
+                    .map(undec64)
+                    .transpose()?;
+                let Some(highest) = highest else {
+                    return unsupported_erc20_return();
+                };
+                if !self.payer_history_complete(&path)? {
+                    return unsupported_erc20_return();
+                }
+                let fees = format!("nb2/payer-fees/v1/{path}/");
+                let missing = if record.status == "paid" {
+                    self.store.list(&fees)?.is_empty()
+                } else {
+                    self.store.get(&format!("{fees}{highest}"))?.is_none()
+                };
+                if missing {
+                    return unsupported_erc20_return();
+                }
+                for send in &record.sends {
+                    self.require_indexed_payer_send(
+                        chain_id,
+                        record,
+                        &unhex(&send.raw)?,
+                        Some(highest),
+                    )?;
+                }
+                return Ok(refreshed);
+            }
+            if record.status == "submitted" {
+                return unsupported_erc20_return();
+            }
+            let holder_burn = record.status != "planned"
+                && record.status != "paid"
+                && record.payer.is_some()
+                && record.burn_request.is_some();
+            if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1)
+                && !holder_burn
+            {
+                return Ok(refreshed);
+            }
+            // An unpaid local burn keeps its slot before the first signed EVM packet.
+            let payer = unhex_n::<20>(record.payer.as_deref().unwrap_or(&record.recipient))?;
+            let slot = self
                 .store
-                .get(&format!("nb2/payer-sends/v1/{path}"))?
-                .as_deref()
-                .map(undec64)
-                .transpose()?;
-            let Some(highest) = highest else {
-                return unsupported_erc20_return();
-            };
-            if !self.payer_history_complete(&path)? {
-                return unsupported_erc20_return();
+                .get(&format!("nb2/payer/v1/{chain_id}/{}", to_hex(&payer)))?;
+            if slot.as_deref().and_then(|value| value.split('#').next()) == Some(&owner) {
+                return Ok(refreshed);
             }
-            let fees = format!("nb2/payer-fees/v1/{path}/");
-            let missing = if record.status == "paid" {
-                self.store.list(&fees)?.is_empty()
-            } else {
-                self.store.get(&format!("{fees}{highest}"))?.is_none()
-            };
-            if missing {
+
+            // Paid is recorded before a different return can claim this payer slot.
+            let latest = self.read_shared_return(&owner, domain, id)?;
+            if latest == *record {
                 return unsupported_erc20_return();
             }
-            for send in &record.sends {
-                self.require_indexed_payer_send(
-                    chain_id,
-                    record,
-                    &unhex(&send.raw)?,
-                    Some(highest),
-                )?;
+            if retries == PAYER_SLOT_VALIDATION_RETRIES {
+                return refuse(
+                    WalletReason::JournalConflict,
+                    "ERC20 return changed repeatedly during payer validation, retry",
+                );
             }
-            return Ok(());
+            refreshed = Some(latest);
+            retries += 1;
         }
-        if record.status == "submitted" {
-            return unsupported_erc20_return();
-        }
-        let holder_burn = record.status != "planned"
-            && record.status != "paid"
-            && record.payer.is_some()
-            && record.burn_request.is_some();
-        if record.extra.get("erc20PayerState").and_then(Value::as_u64) == Some(1) && !holder_burn {
-            return Ok(());
-        }
-        // An unpaid local burn keeps its slot before the first signed EVM packet.
-        let payer = unhex_n::<20>(record.payer.as_deref().unwrap_or(&record.recipient))?;
-        let slot = self
-            .store
-            .get(&format!("nb2/payer/v1/{chain_id}/{}", to_hex(&payer)))?;
-        let owner = format!("nb2/v1/{domain}/return/{}", &record.return_id[2..]);
-        if slot.as_deref().and_then(|value| value.split('#').next()) != Some(&owner) {
-            return unsupported_erc20_return();
-        }
-        Ok(())
     }
 
     pub(crate) fn open_erc20_payer_journal(&self, chain_id: u64) -> Result<()> {
@@ -1059,9 +1087,10 @@ impl Journal {
         record.require_execution_payer(payer)?;
         let stored = self.ret(&record.return_id)?;
         let record = stored.as_ref().unwrap_or(record);
+        let refreshed = self.require_erc20_return_state(chain_id, record)?;
+        let record = refreshed.as_ref().unwrap_or(record);
         record.require_execution_payer(payer)?;
         let path = payer_send_path(chain_id, payer, record);
-        self.require_erc20_return_state(chain_id, record)?;
         let scope = format!("{chain_id}/{}", to_hex(payer));
         self.require_nonce_fence_fee_index(
             &scope,
@@ -1419,16 +1448,20 @@ impl Journal {
             let contested_drain = !owns_slot && check.drain && out.calls > 0;
             out.contested_drain = contested_drain;
             if check.signing_nonce.is_some() || contested_drain {
-                let Some(current) = self
-                    .ret(id)?
-                    .filter(|r| r.status != "paid" && r.status != "planned")
+                let current = match self.ret(id)? {
+                    Some(saved) => Some(
+                        self.require_erc20_return_state(chain_id, &saved)?
+                            .unwrap_or(saved),
+                    ),
+                    None => None,
+                };
+                let Some(current) = current.filter(|r| r.status != "paid" && r.status != "planned")
                 else {
                     return fail_d(
                         Rule::CapacityPreflight,
                         "return is no longer eligible for payer signing",
                     );
                 };
-                self.require_erc20_return_state(chain_id, &current)?;
                 if check.signing_nonce.is_some() {
                     current.require_execution_payer(payer)?;
                 }

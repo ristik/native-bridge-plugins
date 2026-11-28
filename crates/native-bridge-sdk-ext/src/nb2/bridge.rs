@@ -1886,9 +1886,11 @@ impl NativeBridgeV2 {
             }
             let (c_obs, ordinary) = self.admit_return(&mut record, token, &held.amount, &recipient, a, payer)?;
             if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
-                if self.cfg.erc20.is_some() {
-                    self.journal.require_erc20_return_state(self.cfg.chain_id, &existing)?;
-                }
+                let existing = if self.cfg.erc20.is_some() {
+                    self.journal.require_erc20_return_state(self.cfg.chain_id, &existing)?.unwrap_or(existing)
+                } else {
+                    existing
+                };
                 if existing.status != "planned" {
                     return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
                 }
@@ -2086,8 +2088,10 @@ impl NativeBridgeV2 {
         match self.journal.ret_for_update(&hex(id))? {
             Some(r) => {
                 if self.cfg.erc20.is_some() {
-                    self.journal
-                        .require_erc20_return_state(self.cfg.chain_id, &r)?;
+                    return Ok(self
+                        .journal
+                        .require_erc20_return_state(self.cfg.chain_id, &r)?
+                        .unwrap_or(r));
                 }
                 Ok(r)
             }

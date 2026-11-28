@@ -1156,8 +1156,8 @@ export class NativeBridgeV2 {
           if (age > (this.opts.maxSealAgeBlocks ?? 7_200n)) warnings.push(`the newest seal receipt served is ${age} blocks old: the provider may be hiding newer seals; the burn then owes more history`);
         }
       }
-      const existing = await this.journal.retForUpdate(hex(returnId));
-      if (existing && this.cfg.erc20) await this.journal.requireErc20ReturnState(this.cfg.chainId, existing);
+      const saved = await this.journal.retForUpdate(hex(returnId));
+      const existing = saved && this.cfg.erc20 ? await this.journal.requireErc20ReturnState(this.cfg.chainId, saved) : saved;
       if (existing !== null && existing.status !== 'planned') refuse('NotPending', `this part's return is already ${existing.status}`);
       const record: ReturnRecord = {
         ...this.journal.base(), kind: 'return', returnId: hex(returnId), source: hex(token), amount: dec(held.amount), recipient: hex(recipient), a: dec(a),
@@ -1430,8 +1430,8 @@ export class NativeBridgeV2 {
       verified.eta = eta;
     }
     return this.locked(`return/${returnId.slice(2)}`, async () => {
-      const existing = await this.journal.retForUpdate(returnId);
-      if (existing && this.cfg.erc20) await this.journal.requireErc20ReturnState(this.cfg.chainId, existing);
+      const saved = await this.journal.retForUpdate(returnId);
+      const existing = saved && this.cfg.erc20 ? await this.journal.requireErc20ReturnState(this.cfg.chainId, saved) : saved;
       if (existing?.burnRequest !== undefined &&
         (existing.burnRequest !== burnRequest || existing.burnTx !== burnTx || existing.returnId !== returnId ||
           existing.source !== source || existing.amount !== amount || existing.recipient !== recipient || existing.a !== a ||
@@ -1481,8 +1481,7 @@ export class NativeBridgeV2 {
 
   private async returnRecord(id: Uint8Array): Promise<ReturnRecord> {
     const record = (await this.journal.retForUpdate(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
-    if (this.cfg.erc20) await this.journal.requireErc20ReturnState(this.cfg.chainId, record);
-    return record;
+    return this.cfg.erc20 ? this.journal.requireErc20ReturnState(this.cfg.chainId, record) : record;
   }
 
   /**

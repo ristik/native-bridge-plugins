@@ -1248,6 +1248,106 @@ fn erc20_open_refuses_an_unregistered_foreign_pending_send_on_any_chain() {
 }
 
 #[test]
+fn erc20_open_rereads_a_holder_burn_after_concurrent_paid_and_payer_handoff() {
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+
+    struct PausingStore {
+        inner: Arc<dyn JournalStore>,
+        key: String,
+        paused: AtomicBool,
+        read: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl JournalStore for PausingStore {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            let value = self.inner.get(key)?;
+            if key == self.key && !self.paused.swap(true, Ordering::SeqCst) {
+                self.read.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Ok(value)
+        }
+        fn put_if(&self, key: &str, expected: Option<&str>, value: &str) -> Result<bool> {
+            self.inner.put_if(key, expected, value)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    let (bridge, _, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let payer = [0xcd; 20];
+    let chain = bridge.cfg.chain_id;
+    let writer = &bridge.journal;
+    let mut first = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    let next = ReturnRecord {
+        return_id: hex(&[0x38; 32]),
+        ..first.clone()
+    };
+    writer.put_return(&next).unwrap();
+    writer
+        .check_return_payer(chain, &payer, &first.return_id, true)
+        .unwrap();
+    first.status = "burned".into();
+    first.burn_request = Some(hex(&[0x37; 32]));
+    writer.put_return(&first).unwrap();
+
+    let record_key = |record: &ReturnRecord| {
+        format!(
+            "nb2/v1/{}/return/{}",
+            &record.base.domain[2..],
+            &record.return_id[2..]
+        )
+    };
+    let slot = format!("nb2/payer/v1/{chain}/{}", to_hex(&payer));
+    let first_key = record_key(&first);
+    assert_eq!(writer.store.get(&slot).unwrap(), Some(first_key.clone()));
+    let (read, did_read) = mpsc::channel();
+    let (resume, wait) = mpsc::channel();
+    let reader = Journal::new(
+        Arc::new(PausingStore {
+            inner: writer.store.clone(),
+            key: first_key,
+            paused: AtomicBool::new(false),
+            read,
+            resume: Mutex::new(wait),
+        }),
+        [0x39; 32],
+    );
+
+    std::thread::scope(|scope| {
+        let opening = scope.spawn(|| reader.open_erc20_payer_journal(chain));
+        did_read.recv_timeout(Duration::from_secs(5)).unwrap();
+        first.status = "paid".into();
+        first.paid = Some(PaidRecord {
+            tx_hash: hex(&[0x40; 32]),
+            block_number: "21".into(),
+            extra: Default::default(),
+        });
+        writer.put_return(&first).unwrap();
+        writer
+            .check_return_payer(chain, &payer, &next.return_id, true)
+            .unwrap();
+        assert_eq!(writer.store.get(&slot).unwrap(), Some(record_key(&next)));
+        resume.send(()).unwrap();
+        opening.join().unwrap().unwrap();
+    });
+}
+
+#[test]
 fn an_evm_nonce_fence_requires_its_existing_scoped_fee_index() {
     let (bridge, _, held) = return_bridge(
         6_000_000,

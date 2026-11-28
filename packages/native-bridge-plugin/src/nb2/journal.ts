@@ -209,6 +209,7 @@ export function undec(s: Dec): bigint {
   return BigInt(s);
 }
 
+const PAYER_SLOT_VALIDATION_RETRIES = 3;
 const returnKey = /^nb2\/v1\/([0-9a-f]{64})\/return\/([0-9a-f]{64})$/;
 
 export interface PayerCheck {
@@ -428,17 +429,20 @@ export class Journal {
     return out;
   }
 
+  private async readSharedReturn(key: string, domain: string, id: string): Promise<ReturnRecord> {
+    const raw = await this.store.get(key);
+    if (raw === null) refuse('JournalNotPersisted', 'return disappeared during payer reconciliation');
+    const record = JSON.parse(raw) as ReturnRecord;
+    if (record.domain !== '0x' + domain || record.returnId !== '0x' + id || record.kind !== 'return'
+      || record.format !== JOURNAL_FORMAT || record.version !== JOURNAL_VERSION) refuse('BadInput', 'invalid return in shared journal');
+    return record;
+  }
+
   public async allReturns(): Promise<{ key: string; record: ReturnRecord }[]> {
     const records: { key: string; record: ReturnRecord }[] = [];
     for (const key of await this.store.list('nb2/v1/')) {
       const match = returnKey.exec(key);
-      if (!match) continue;
-      const raw = await this.store.get(key);
-      if (raw === null) refuse('JournalNotPersisted', 'return disappeared during payer reconciliation');
-      const record = JSON.parse(raw) as ReturnRecord;
-      if (record.domain !== '0x' + match[1] || record.returnId !== '0x' + match[2] || record.kind !== 'return'
-        || record.format !== JOURNAL_FORMAT || record.version !== JOURNAL_VERSION) refuse('BadInput', 'invalid return in shared journal');
-      records.push({ key, record });
+      if (match) records.push({ key, record: await this.readSharedReturn(key, match[1], match[2]) });
     }
     return records;
   }
@@ -459,8 +463,7 @@ export class Journal {
       const signedChain = first && decodeSignedTx(unhex(first.raw)).request.chainId;
       const chain = own ? chainId : registered === null ? signedChain : undec(registered);
       if (chain === undefined) unsupportedErc20Return();
-      await this.requireErc20ReturnState(chain, record);
-      records.push({ key, record, chainId: chain });
+      records.push({ key, record: await this.requireErc20ReturnState(chain, record), chainId: chain });
     }
     return records;
   }
@@ -508,32 +511,43 @@ export class Journal {
     if (!match || !await this.payerHistoryComplete(`${scope}/${match[1]}/${match[2]}`)) unsupportedErc20Return();
   }
 
-  /** Check stored ERC20 state before opening the domain or acting on a return. */
-  public async requireErc20ReturnState(chainId: bigint, record: ReturnRecord): Promise<void> {
-    const chain = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
-    if (chain !== dec(chainId)) unsupportedErc20Return();
-    const payer = executionPayerOf(record);
-    if (payer) {
-      const path = this.payerSendPath(chainId, payer, record);
-      const highest = await this.store.get(`nb2/payer-sends/v1/${path}`);
-      if (!await this.payerHistoryComplete(path) || highest === null) unsupportedErc20Return();
-      const fees = `nb2/payer-fees/v1/${path}/`;
-      if (record.status === 'paid' ? !(await this.store.list(fees)).length : await this.store.get(fees + highest) === null) {
-        unsupportedErc20Return();
+  /** Check ERC20 state, returning the current record if its payer slot changed during the read. */
+  public async requireErc20ReturnState(chainId: bigint, record: ReturnRecord): Promise<ReturnRecord> {
+    const domain = record.domain.slice(2);
+    const id = record.returnId.slice(2);
+    if (await this.store.get(`nb2/domain-chain/v1/${domain}`) !== dec(chainId)) unsupportedErc20Return();
+    const owner = `nb2/v1/${domain}/return/${id}`;
+    for (let retries = 0; ; retries++) {
+      const payer = executionPayerOf(record);
+      if (payer) {
+        const path = this.payerSendPath(chainId, payer, record);
+        const highest = await this.store.get(`nb2/payer-sends/v1/${path}`);
+        if (!await this.payerHistoryComplete(path) || highest === null) unsupportedErc20Return();
+        const fees = `nb2/payer-fees/v1/${path}/`;
+        if (record.status === 'paid' ? !(await this.store.list(fees)).length : await this.store.get(fees + highest) === null) {
+          unsupportedErc20Return();
+        }
+        for (const { raw } of record.sends) {
+          await this.requireIndexedPayerSend(chainId, record, unhex(raw), undec(highest));
+        }
+        return record;
       }
-      for (const { raw } of record.sends) {
-        await this.requireIndexedPayerSend(chainId, record, unhex(raw), undec(highest));
+      if (record.status === 'submitted') unsupportedErc20Return();
+      const holderBurn = record.status !== 'planned' && record.status !== 'paid' &&
+        record.payer !== undefined && record.burnRequest !== undefined;
+      if (record.erc20PayerState === 1 && !holderBurn) return record;
+      // An unpaid local burn keeps its slot before the first signed EVM packet.
+      const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
+      if (slot?.split('#')[0] === owner) return record;
+
+      // Paid is recorded before a different return can claim this payer slot.
+      const latest = await this.readSharedReturn(owner, domain, id);
+      if (JSON.stringify(latest) === JSON.stringify(record)) unsupportedErc20Return();
+      if (retries === PAYER_SLOT_VALIDATION_RETRIES) {
+        refuse('JournalConflict', 'ERC20 return changed repeatedly during payer validation, retry');
       }
-      return;
+      record = latest;
     }
-    if (record.status === 'submitted') unsupportedErc20Return();
-    const holderBurn = record.status !== 'planned' && record.status !== 'paid' &&
-      record.payer !== undefined && record.burnRequest !== undefined;
-    if (record.erc20PayerState === 1 && !holderBurn) return;
-    // An unpaid local burn keeps its slot before the first signed EVM packet.
-    const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
-    const owner = `nb2/v1/${record.domain.slice(2)}/return/${record.returnId.slice(2)}`;
-    if (slot?.split('#')[0] !== owner) unsupportedErc20Return();
   }
 
   public async openErc20PayerJournal(chainId: bigint): Promise<void> {
@@ -558,10 +572,9 @@ export class Journal {
   public async payerFeeMaxima(record: ReturnRecord, chainId: bigint, payer: Uint8Array): Promise<Map<bigint, bigint>> {
     if (record.domain !== hex(this.domain)) refuse('BadInput', 'return belongs to another payer journal domain');
     requireExecutionPayer(record, payer);
-    const history = await this.ret(record.returnId) ?? record;
+    const history = await this.requireErc20ReturnState(chainId, await this.ret(record.returnId) ?? record);
     requireExecutionPayer(history, payer);
     const path = this.payerSendPath(chainId, payer, history);
-    await this.requireErc20ReturnState(chainId, history);
     const scope = `${chainId}/${toHex(payer)}`;
     await this.requireNonceFenceFeeIndex(scope, await this.store.get(`nb2/payer/v1/${scope}`));
     const prefix = `nb2/payer-fees/v1/${path}/`;
@@ -732,11 +745,11 @@ export class Journal {
       let claimed = owner === target ? held! : target;
       commitment.contestedDrain = owner !== target && options.mode === 'drain' && commitment.calls > 0n;
       if (nonce !== undefined || commitment.contestedDrain) {
-        const current = await this.ret(id);
+        const saved = await this.ret(id);
+        const current = saved && await this.requireErc20ReturnState(chainId, saved);
         if (!current || current.status === 'paid' || current.status === 'planned') {
           fail('CapacityPreflight', 'return is no longer eligible for payer signing');
         }
-        await this.requireErc20ReturnState(chainId, current);
         if (nonce !== undefined) requireExecutionPayer(current, payer);
         const admitted = current.recovery?.envelope?.maxNonce;
         const cap = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
