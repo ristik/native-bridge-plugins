@@ -184,10 +184,10 @@ def check_erc20_wallet_manifest(manifest, deployment, digest, bounds, caps):
         minimum = max(row[field] for rows in envelopes.values() for row in rows)
         decimal(manifest[name], minimum, caps[field], f'manifest {name}')
     assert manifest['returnReserveSegments'] == str(caps['reserveSegments']), 'ERC20 wallet manifest segment reserve mismatch'
-    check_erc20_manifest_ranges(manifest, envelopes, caps)
+    check_erc20_manifest_ranges(manifest, envelopes, caps, arrivals['maxObservedBacklog'] + caps['reserveSegments'])
 
 
-def check_erc20_manifest_ranges(manifest, envelopes, caps):
+def check_erc20_manifest_ranges(manifest, envelopes, caps, ordinary_need):
     expected = {(entry, i): row for entry, rows in envelopes.items() if entry != 'ordinary' for i, row in enumerate(rows)}
     covered = set()
     for entry in manifest['ranges']:
@@ -220,9 +220,13 @@ def check_erc20_manifest_ranges(manifest, envelopes, caps):
     assert covered == expected.keys(), 'incomplete ERC20 wallet manifest recovery ranges'
     ordinary = envelopes['ordinary']
     assert bool(manifest['ordinary']) == bool(ordinary), 'ERC20 wallet manifest ordinary ranges mismatch'
-    for quote in manifest['ordinary']:
-        assert any(quote['calldataBytes'] <= row['calldataBytes'] and int(quote['executionGas']) <= row['executionGas']
-                   and int(quote['submittedGas']) <= row['submittedGas'] for row in ordinary), 'ERC20 wallet manifest ordinary range exceeds reviewed envelope'
+    if ordinary:
+        assert any(int(quote['maxGaps']) >= ordinary_need for quote in manifest['ordinary']), 'ERC20 wallet manifest ordinary ranges cannot cover preflight history'
+    # A small recovered suffix does not reduce the work of an ordinary call.
+    for suffix, row in enumerate(ordinary):
+        assert all(int(quote[field]) <= row[field] for quote in manifest['ordinary']
+                   for field in ('calldataBytes', 'executionGas', 'submittedGas', 'signedBytes')), (
+            f'ERC20 wallet manifest ordinary range exceeds reviewed envelope for suffix {suffix}')
 
 
 def erc20_envelope_bytes(chain_id, calldata, gas):

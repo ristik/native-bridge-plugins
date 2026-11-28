@@ -60,10 +60,11 @@ class Erc20ReleaseTests(unittest.TestCase):
             'authorityProfileSha256': 'cd' * 32,
         }
         call = {'calldataBytes': 100_000, 'signedBytes': 100_220, 'executionGas': 900_000, 'submittedGas': 3_500_000}
+        run = {**call, 'calldataBytes': 230_000, 'signedBytes': 230_220, 'submittedGas': 5_000_000}
         self.release['qualifiedBounds'] = {
             'calls': {
                 'maxStartOperations': 1, 'maxResumeOperations': 1, 'advanceBatch': 3,
-                'envelopes': {name: [deepcopy(call) for _ in range(count)] for name, count in {
+                'envelopes': {name: [deepcopy(run if name in {'start', 'resume'} else call) for _ in range(count)] for name, count in {
                     'start': 1, 'resume': 1, 'advanceGaps': 3, 'redeemRecovered': 3, 'ordinary': 0,
                 }.items()},
             },
@@ -89,11 +90,12 @@ class Erc20ReleaseTests(unittest.TestCase):
             if entry == 'ordinary':
                 continue
             run = entry in {'start', 'resume'}
+            opening = {'start': 24_740, 'resume': 16_482}.get(entry, 0)
             for i, row in enumerate(rows):
                 ranges.append({'minReceiptBytes': 0 if entry == 'start' else 1, 'execution': str(row['executionGas']),
                                'max': {'entry': 'run' if run else entry, 'operations': i + 1 if run else 0,
                                        'gaps': 0 if run else i + int(entry == 'advanceGaps'),
-                                       'pages': 32 if run else 0, 'openingBytes': 18_000 if run else 0,
+                                       'pages': 32 if run else 0, 'openingBytes': opening,
                                        'receiptBytes': 0 if entry == 'start' else 65_536,
                                        'calldataBytes': row['calldataBytes']}})
         return {
@@ -239,29 +241,101 @@ class Erc20ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'gammaSha256 mismatch'):
             self.check()
 
+    def test_promotion_refuses_unquotable_run_shapes(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        cases = [
+            (0, 'openingBytes', 18_000, 'cannot quote Start'),
+            (1, 'openingBytes', 16_481, 'cannot quote Resume'),
+            (1, 'pages', 11, 'cannot quote the terminal Resume'),
+        ]
+        for minimum, field, value, reason in cases:
+            with self.subTest(field=field, minimum=minimum):
+                manifest = self.make_manifest()
+                run = next(r for r in manifest['recovery']['ranges']
+                           if r['max']['entry'] == 'run' and r['minReceiptBytes'] == minimum)
+                run['max'][field] = value
+                self.pin_qualification(manifest=manifest)
+                with self.assertRaisesRegex(AssertionError, reason):
+                    self.check()
+
+        self.release['qualifiedBounds']['calls']['envelopes']['start'][0].update(
+            calldataBytes=32_000, signedBytes=32_220)
+        self.pin_qualification()
+        with self.assertRaisesRegex(AssertionError, 'cannot quote Start'):
+            self.check()
+
+    def test_promotion_refuses_test_only_or_nonstandard_pins(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        for field, value in [('stateReadOnly', True), ('maxEncodedTxBytes', 400_000)]:
+            with self.subTest(pin=field):
+                manifest = self.make_manifest()
+                manifest['pins'][field] = value
+                self.pin_qualification(manifest=manifest)
+                with self.assertRaisesRegex(AssertionError, field):
+                    self.check()
+
+    def enable_ordinary(self, *, reserve=500_000, gaps=70, execution=900_001):
+        bounds = self.release['qualifiedBounds']
+        bounds['inclusionAndFunding'].update(ordinaryAttempts=1, ordinaryInclusionMs=9_000)
+        evidence = 100_000
+        history = 32 + 257 * gaps
+        calldata = 196 + evidence + 32 * ((history + 31) // 32)
+        minimum = 21_000 + 16 * calldata + (6 * execution + 4) // 5 + max(500_000, reserve)
+        row = {'calldataBytes': calldata, 'signedBytes': calldata + 200, 'executionGas': execution, 'submittedGas': minimum}
+        bounds['calls']['envelopes']['ordinary'][:] = [row.copy() for _ in range(3)]
+        manifest = self.make_manifest(reserve=reserve)
+        manifest['recovery']['ordinaryRanges'] = [
+            {'maxEvidenceBytes': evidence, 'maxOperations': 16, 'maxGaps': str(gaps), 'execution': str(execution)},
+        ]
+        return manifest
+
     def test_minimum_ordinary_gas_uses_the_manifest_reserve_with_a_floor(self):
         self.complete()
         self.release['fundingQualified'] = True
-        bounds = self.release['qualifiedBounds']
-        bounds['inclusionAndFunding'].update(ordinaryAttempts=1, ordinaryInclusionMs=9_000)
-        ordinary = bounds['calls']['envelopes']['ordinary']
-        calldata, execution = 4_868, 900_001  # ABI for 4096 evidence bytes and two K64 gap proofs.
-        for reserve, allowance in [(250_000, 500_000), (700_000, 700_000)]:
+        ordinary = self.release['qualifiedBounds']['calls']['envelopes']['ordinary']
+        for reserve in [250_000, 700_000]:
             with self.subTest(reserve=reserve):
-                minimum = 21_000 + 16 * calldata + 1_080_002 + allowance
-                row = {'calldataBytes': calldata, 'signedBytes': calldata + 200,
-                       'executionGas': execution, 'submittedGas': minimum}
-                ordinary[:] = [row.copy() for _ in range(3)]
-                manifest = self.make_manifest(reserve=reserve)
-                manifest['recovery']['ordinaryRanges'] = [
-                    {'maxEvidenceBytes': 4096, 'maxOperations': 4, 'maxGaps': '2', 'execution': str(execution)},
-                ]
+                manifest = self.enable_ordinary(reserve=reserve)
                 self.pin_qualification(manifest=manifest)
                 self.check()
                 ordinary[1]['submittedGas'] -= 1
                 self.pin_qualification(manifest=manifest)
                 with self.assertRaisesRegex(AssertionError, 'ordinary submitted gas'):
                     self.check()
+
+    def test_ordinary_requires_full_preflight_history(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        self.pin_qualification(manifest=self.enable_ordinary(gaps=2))
+        with self.assertRaisesRegex(AssertionError, 'cannot cover preflight history'):
+            self.check()
+
+    def test_each_ordinary_suffix_covers_every_declared_range(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        manifest = self.enable_ordinary()
+        manifest['recovery']['ordinaryRanges'].append(
+            {'maxEvidenceBytes': 80_000, 'maxOperations': 20, 'maxGaps': '72', 'execution': '950001'})
+        rows = self.release['qualifiedBounds']['calls']['envelopes']['ordinary']
+        for row in rows:
+            row['executionGas'] += 50_000
+            row['submittedGas'] += 60_000
+        for suffix, row in enumerate(rows):
+            with self.subTest(suffix=suffix):
+                row['calldataBytes'] -= 1
+                self.pin_qualification(manifest=manifest)
+                with self.assertRaisesRegex(AssertionError, f'exceeds reviewed envelope for suffix {suffix}'):
+                    self.check()
+                row['calldataBytes'] += 1
+        rows[1]['executionGas'] -= 1
+        self.pin_qualification(manifest=manifest)
+        with self.assertRaisesRegex(AssertionError, 'exceeds reviewed envelope for suffix 1'):
+            self.check()
+        rows[1]['executionGas'] += 1
+        self.pin_qualification(manifest=manifest)
+        self.check()
 
     def test_invalid_values_cannot_be_qualified(self):
         self.complete()
