@@ -60,6 +60,27 @@ def check_erc20_profile():
     assert hashlib.sha256((ROOT / (vectors + 'vectors.json')).read_bytes()).hexdigest() == generator['sha256'], 'ERC20 vector digest mismatch'
     deployed = generator['contracts']['sdkFixture']
     assert hashlib.sha256((ROOT / (vectors + deployed['file'])).read_bytes()).hexdigest() == deployed['sha256'], 'ERC20 deployed fixture digest mismatch'
+    check_erc20_release(digest, profile)
+
+
+def check_erc20_release(digest, profile):
+    release = load('protocol/release-erc20-calibration.json')
+    assert release['artifactVersion'] == 1 and release['semanticProfileSha256'] == digest
+    assert release['admissionCaps'] == {
+        'submittedGas': 24_000_000, 'calldataBytes': 393_216, 'signedBytes': 524_288,
+        'predecessorReceiptBytes': 65_536, 'startOperations': 16, 'resumeOperations': 8,
+        'pages': 32, 'maxGapsPerCall': 1024, 'balanceProbeGas': profile['gasCaps']['balanceProbe'],
+        'tokenTransferGas': profile['gasCaps']['tokenTransfer'], 'reserveSegments': 64,
+    }
+    bounds = release['qualifiedBounds']
+    assert set(bounds) == {'calls', 'arrivals', 'inclusionAndFunding'}
+    complete = all(bound is not None for bound in bounds.values())
+    assert release['fundingQualified'] is complete, 'ERC20 funding qualification requires all release bounds'
+    assert release['evidence'], 'ERC20 release calibration evidence is required'
+    for name, expected in release['evidence'].items():
+        path = Path(name)
+        assert path.parent == Path('protocol/calibration') and path.suffix == '.json'
+        assert hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == expected, f'ERC20 calibration evidence digest mismatch: {name}'
 
 
 def main():
