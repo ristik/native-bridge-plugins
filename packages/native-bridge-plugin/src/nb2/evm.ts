@@ -68,7 +68,9 @@ export class LocalKeySigner implements EvmSigner {
  * (chain ID, nonce, fees, gas, target, value, data), signed by its own address. The journaled request is the decoded one.
  */
 export async function signTx(signer: EvmSigner, t: TxRequest): Promise<SignedTx> {
-  const raw = await signer.signTransaction(t);
+  const expected = structuredClone(t);
+  const address = Uint8Array.from(signer.address);
+  const raw = await signer.signTransaction(structuredClone(expected));
   let d: ReturnType<typeof decodeSignedTx>;
   try {
     d = decodeSignedTx(raw);
@@ -76,10 +78,11 @@ export async function signTx(signer: EvmSigner, t: TxRequest): Promise<SignedTx>
     throw new Error(`nb2: the signer returned a transaction that does not decode: ${String((e as Error)?.message ?? e)}`);
   }
   const r = d.request;
-  const same = r.chainId === t.chainId && r.nonce === t.nonce && r.maxPriorityFeePerGas === t.maxPriorityFeePerGas && r.maxFeePerGas === t.maxFeePerGas
-    && r.gas === t.gas && eq(r.to, t.to) && r.value === t.value && eq(r.data, t.data);
+  const same = r.chainId === expected.chainId && r.nonce === expected.nonce && r.maxPriorityFeePerGas === expected.maxPriorityFeePerGas
+    && r.maxFeePerGas === expected.maxFeePerGas && r.gas === expected.gas && eq(r.to, expected.to) && r.value === expected.value
+    && eq(r.data, expected.data);
   if (!same) throw new Error('nb2: the signer returned another transaction than the one requested');
-  if (!eq(d.from, signer.address)) throw new Error('nb2: the signed transaction is not from the signer\'s address');
+  if (!eq(d.from, address)) throw new Error('nb2: the signed transaction is not from the signer\'s address');
   return { raw, hash: d.hash, request: r };
 }
 

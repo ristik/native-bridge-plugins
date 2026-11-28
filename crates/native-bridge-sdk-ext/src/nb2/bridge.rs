@@ -50,8 +50,9 @@ use super::recovery::{
     GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoverySession,
 };
 use super::recovery_cost::{
-    preflight_recovery_with_signing_bounds, quote_erc20_call, AdmissionContext, Erc20OrdinaryBound,
-    Erc20SigningBounds, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
+    admitted_recovery_gas, preflight_recovery_with_signing_bounds, quote_erc20_call,
+    AdmissionContext, Erc20OrdinaryBound, Erc20SigningBounds, RecoveryBacklog, RecoveryCalibration,
+    RecoveryLimits,
 };
 use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
 use super::rules::{
@@ -2942,7 +2943,14 @@ impl NativeBridgeV2 {
         }
         let cuts = plan["runCuts"]
             .as_array()
-            .ok_or_else(|| Error::Other("missing admitted Run cuts".into()))?;
+            .ok_or_else(|| Error::Other("missing admitted Run cuts".into()))?
+            .iter()
+            .map(|cut| {
+                cut.as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
         let batch = plan["advanceGaps"].as_u64().unwrap_or(0);
         let burned = unhex(record.burned.as_deref().unwrap_or(""))?;
         let eta = unhex_n::<32>(record.eta.as_deref().unwrap_or(""))?;
@@ -2969,11 +2977,7 @@ impl NativeBridgeV2 {
                     if !checkpoint.gaps.is_empty() {
                         return fail_d(Rule::CapacityPreflight, "Run checkpoint has gap witnesses");
                     }
-                    let count = cut
-                        .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                        .unwrap_or(0);
-                    let packet = session.run(from, count, trust, prior)?;
+                    let packet = session.run(from, *cut, trust, prior)?;
                     from = packet.end;
                     packet.event
                 } else {
@@ -3017,12 +3021,74 @@ impl NativeBridgeV2 {
             }
             Ok(verified)
         })?;
+        let envelope = &plan["envelope"];
+        let saved_bid = envelope["maxFeePerGas"]
+            .as_str()
+            .or_else(|| plan["ordinary"]["maxFeePerGas"].as_str());
+        let prices = if let Some(bid) = saved_bid.filter(|_| !receipts.is_empty()) {
+            let limits = RecoveryLimits {
+                signed_bytes: envelope["signedBytes"]
+                    .as_u64()
+                    .unwrap_or(self.pins.max_encoded_tx_bytes)
+                    as usize,
+                calldata_bytes: envelope["calldataBytes"].as_u64().unwrap_or(393_216) as usize,
+                gas: envelope["gas"]
+                    .as_str()
+                    .map(undec64)
+                    .transpose()?
+                    .unwrap_or(self.pins.user_gas_limit),
+                chain_id: self.cfg.chain_id,
+                max_nonce: envelope["maxNonce"]
+                    .as_str()
+                    .map(undec64)
+                    .transpose()?
+                    .unwrap_or(u64::MAX),
+                max_fee_per_gas: undec(bid)?,
+                max_priority_fee_per_gas: undec(
+                    envelope["maxPriorityFeePerGas"].as_str().unwrap_or(bid),
+                )?,
+                max_transaction_fee: None,
+                balance: BigUint::default(),
+                fee_budget: BigUint::default(),
+            };
+            let ordinary = undec64(
+                plan["ordinary"]["attemptsBeforeFallback"]
+                    .as_str()
+                    .unwrap_or("0"),
+            )?;
+            let advances = undec64(plan["calls"].as_str().unwrap_or(""))?
+                .checked_sub(cuts.len() as u64 + ordinary + 1)
+                .ok_or_else(|| {
+                    Error::Other("admitted call count does not cover the recovery schedule".into())
+                })?;
+            let gas = admitted_recovery_gas(
+                &unhex(&record.source)?,
+                &cuts,
+                self.cfg.k,
+                usize::try_from(batch).unwrap_or(0),
+                &*policy.calibration,
+                &limits,
+            )?;
+            Some((gas, advances))
+        } else {
+            None
+        };
         for (index, receipt) in receipts.iter().enumerate() {
+            let completed = index + 1;
+            let gas = prices.as_ref().map(|(quotes, advances)| {
+                let completed_advances = completed.saturating_sub(quotes.run.len()) as u64;
+                let remaining = advances.saturating_sub(completed_advances);
+                quotes.run.iter().skip(completed).fold(
+                    BigUint::from(remaining) * quotes.advance + quotes.settle,
+                    |gas, amount| gas + *amount,
+                )
+            });
             self.journal.index_recovery_progress(
                 self.cfg.chain_id,
                 &record,
-                index as u64 + 1,
+                completed as u64,
                 receipt,
+                gas,
             )?;
         }
         Ok(())
@@ -3063,6 +3129,18 @@ impl NativeBridgeV2 {
         }
         let spent_calls = used.len() as u64;
         let spent_fee = used.values().sum();
+        let plan = &record.extra["recovery"];
+        let progress = self.journal.finalized_recovery_progress(
+            self.cfg.chain_id,
+            record,
+            Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
+        )?;
+        let suffix_fee = remaining_recovery_fee(
+            plan,
+            progress.as_ref(),
+            spent_calls,
+            Some(&policy.limits.max_fee_per_gas),
+        )?;
         self.journal.check_payer(
             self.cfg.chain_id,
             &payer,
@@ -3074,8 +3152,8 @@ impl NativeBridgeV2 {
                 finalized_block: Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
                 signing_nonce: Some(request.nonce),
                 remaining_calls: Some(remaining_recovery_calls(
-                    &record.extra["recovery"],
-                    0,
+                    plan,
+                    progress.as_ref().map_or(0, |p| p.completed),
                     spent_calls,
                 )?),
                 max_nonce: Some(policy.limits.max_nonce),
@@ -3085,7 +3163,7 @@ impl NativeBridgeV2 {
                         &payer,
                         request,
                         other,
-                        spent_calls,
+                        &suffix_fee,
                         &spent_fee,
                     )
                 }),
@@ -3103,7 +3181,7 @@ impl NativeBridgeV2 {
         payer: &[u8; 20],
         request: &TxRequest,
         other: &PayerCommitments,
-        spent_calls: u64,
+        suffix_fee: &BigUint,
         spent_fee: &BigUint,
     ) -> Result<()> {
         if self.cfg.erc20.is_none() {
@@ -3168,14 +3246,7 @@ impl NativeBridgeV2 {
         }
         let mut required = fee;
         if other.contested_drain {
-            let total = undec(record.extra["recovery"]["totalFee"].as_str().unwrap_or(""))?;
-            let consumed =
-                BigUint::from(spent_calls.min(undec64(field("attemptsBeforeFallback"))?))
-                    * undec(field("gas"))?
-                    * undec(field("maxFeePerGas"))?;
-            if total > consumed {
-                required = required.max(total - consumed);
-            }
+            required = required.max(suffix_fee.clone());
             if &required + spent_fee > limits.fee_budget {
                 return fail_d(
                     Rule::CapacityPreflight,

@@ -233,12 +233,45 @@ export interface PayerCommitments {
 
 /** Calls still reserved after a verified prefix of the admitted continuation. */
 export function remainingRecoveryCalls(plan: NonNullable<ReturnRecord['recovery']>, completed: bigint, ordinaryUsed = 0n): bigint {
-  const calls = undec(plan.calls);
   const prior = undec(plan.ordinary?.attemptsBeforeFallback ?? '0');
-  const used = completed > 0n || ordinaryUsed > prior ? prior : ordinaryUsed;
-  return calls > completed + used ? calls - completed - used : 1n;
+  const spent = ordinaryUsed > prior ? prior : ordinaryUsed;
+  const continuation = undec(plan.calls) - prior - completed;
+  return (continuation > 0n ? continuation : 1n) + prior - spent;
 }
 
+export function remainingOrdinaryAttempts(plan?: ReturnRecord['recovery'], used = 0n): bigint {
+  const prior = undec(plan?.ordinary?.attemptsBeforeFallback ?? '0');
+  return used < prior ? prior - used : 0n;
+}
+
+export function continuationReserve(continuation: bigint, ordinary: bigint, attempts: bigint): bigint {
+  return (attempts > 0n && ordinary > continuation ? ordinary : continuation) + attempts * ordinary;
+}
+
+interface RecoveryProgress { completed: bigint; continuationGas?: bigint }
+interface StoredRecoveryProgress { completed: Dec; continuationGas?: Dec }
+
+function recoveryProgressOf(value: string): RecoveryProgress {
+  const { completed, continuationGas } = JSON.parse(value) as StoredRecoveryProgress;
+  return { completed: undec(completed), continuationGas: continuationGas === undefined ? undefined : undec(continuationGas) };
+}
+
+/** Reprice the admitted gas exposure. Older records retain the original gas bound until their checkpoints are replayed. */
+export function remainingRecoveryFee(plan: NonNullable<ReturnRecord['recovery']>, progress: RecoveryProgress | undefined,
+  ordinaryUsed: bigint, ceiling?: bigint): bigint {
+  const total = undec(plan.totalFee);
+  const savedBid = plan.envelope?.maxFeePerGas ?? plan.ordinary?.maxFeePerGas;
+  if (savedBid === undefined) return total;
+  const admitted = undec(savedBid);
+  if (admitted === 0n || (ceiling !== undefined && ceiling <= 0n)) fail('CapacityPreflight', 'invalid continuation fee ceiling');
+  const price = ceiling ?? admitted;
+  const ordinary = undec(plan.ordinary?.gas ?? '0');
+  const attempts = remainingOrdinaryAttempts(plan, ordinaryUsed);
+  if (progress?.continuationGas !== undefined) return continuationReserve(progress.continuationGas, ordinary, attempts) * price;
+  const spent = remainingOrdinaryAttempts(plan) - attempts;
+  const left = total - spent * ordinary * admitted;
+  return left > 0n ? (left * price + admitted - 1n) / admitted : 0n;
+}
 /** Last nonce this return may use while leaving feasible nonce windows for the older returns. */
 export function payerNonceLimit(maxNonce: bigint, other: PayerCommitments): bigint {
   const windows = (other.nonceWindows ?? []).map((w) => ({ ...w, maxNonce: w.maxNonce ?? maxNonce }));
@@ -398,38 +431,43 @@ export class Journal {
 
   /** Publish a replayed checkpoint. Readers independently check execution finality before giving credit. */
   public async indexRecoveryProgress(chainId: bigint, record: ReturnRecord, completed: bigint,
-    block: { blockNumber: bigint; blockHash: Uint8Array }): Promise<void> {
+    block: { blockNumber: bigint; blockHash: Uint8Array }, continuationGas?: bigint): Promise<void> {
     const plan = record.recovery;
     if (!plan || completed < 1n) return;
     const path = this.recoveryProgressPath(chainId, record);
     const key = `${path}${dec(block.blockNumber)}/${toHex(block.blockHash)}`;
-    const count = remainingRecoveryCalls(plan, completed);
+    const value = JSON.stringify({ completed: dec(completed), continuationGas: continuationGas === undefined ? undefined : dec(continuationGas) });
     for (;;) {
       const previous = await this.store.get(key);
-      if ((previous !== null && undec(previous) <= count) || await this.store.putIf(key, previous, dec(count))) return;
+      if (previous !== null) {
+        const saved = recoveryProgressOf(previous);
+        if (saved.completed > completed || (saved.completed === completed && saved.continuationGas !== undefined &&
+          (continuationGas === undefined || saved.continuationGas >= continuationGas))) return;
+      }
+      if (await this.store.putIf(key, previous, value)) return;
     }
   }
 
   private recoveryProgressPath(chainId: bigint, record: ReturnRecord): string {
     const plan = record.recovery!;
-    return `nb2/payer-progress/v1/${chainId}/${record.domain.slice(2)}/${record.returnId.slice(2)}/` +
+    return `nb2/payer-progress/v2/${chainId}/${record.domain.slice(2)}/${record.returnId.slice(2)}/` +
       `${plan.generation.slice(2)}/${plan.calls}/${plan.ordinary?.attemptsBeforeFallback ?? '0'}/${plan.advanceGaps}/${plan.runCuts.join(',')}/`;
   }
 
-  private async recoveryCalls(chainId: bigint, record: ReturnRecord, ordinaryUsed: bigint, options: PayerCheck): Promise<bigint> {
-    let calls = remainingRecoveryCalls(record.recovery!, 0n, ordinaryUsed);
-    if (!options.finalizedBlock) return calls;
+  public async finalizedRecoveryProgress(chainId: bigint, record: ReturnRecord, finalizedBlock?: PayerCheck['finalizedBlock']): Promise<RecoveryProgress | undefined> {
+    if (!record.recovery || !finalizedBlock) return;
+    let progress: RecoveryProgress | undefined;
     const path = this.recoveryProgressPath(chainId, record);
     for (const key of await this.store.list(path)) {
       const value = await this.store.get(key);
       if (value === null) refuse('JournalNotPersisted', 'recovery checkpoint disappeared during payer reconciliation');
-      const remaining = undec(value);
-      if (remaining === 0n) refuse('BadInput', 'unpaid return needs a settlement call');
-      if (remaining >= calls) continue;
+      const candidate = recoveryProgressOf(value);
+      if (progress && (candidate.completed < progress.completed || (candidate.completed === progress.completed &&
+        (candidate.continuationGas ?? 0n) <= (progress.continuationGas ?? 0n)))) continue;
       const [number, hash] = key.slice(path.length).split('/');
-      if (await options.finalizedBlock(undec(number), unhex('0x' + hash))) calls = remaining;
+      if (await finalizedBlock(undec(number), unhex('0x' + hash))) progress = candidate;
     }
-    return calls;
+    return progress;
   }
 
   private async payerCommitments(chainId: bigint, payer: Uint8Array, target: string, ownsSlot: boolean, options: PayerCheck): Promise<PayerCommitments> {
@@ -464,9 +502,11 @@ export class Journal {
         fail('CapacityPreflight', 'another return needs its local signed sends indexed');
       }
       if (!active(rec)) continue;
-      commitment.fees += undec(rec.recovery!.totalFee);
+      const progress = await this.finalizedRecoveryProgress(chainId, rec, options.finalizedBlock);
+      const used = BigInt(ordinary.size);
+      commitment.fees += remainingRecoveryFee(rec.recovery!, progress, used);
       // The signed-nonce check below must pass before any of these ordinary nonces can count as used.
-      const calls = await this.recoveryCalls(chainId, rec, BigInt(ordinary.size), options);
+      const calls = remainingRecoveryCalls(rec.recovery!, progress?.completed ?? 0n, used);
       commitment.calls += calls;
       const cap = rec.recovery!.envelope?.maxNonce;
       (commitment.nonceWindows ??= []).push({ calls, maxNonce: cap === undefined ? undefined : undec(cap) });
@@ -531,7 +571,8 @@ export class Journal {
         const cap = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
         const maxNonce = payerNonceLimit(options.maxNonce !== undefined && options.maxNonce < cap ? options.maxNonce : cap, commitment);
         const calls = commitment.contestedDrain
-          ? options.remainingCalls ?? await this.recoveryCalls(chainId, current, 0n, options)
+          ? options.remainingCalls ?? remainingRecoveryCalls(current.recovery!,
+            (await this.finalizedRecoveryProgress(chainId, current, options.finalizedBlock))?.completed ?? 0n)
           : 1n;
         if (nonce === undefined || calls < 1n || nonce < (commitment.finalizedNonce ?? 0n) || nonce + calls - 1n > maxNonce) {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the payer nonce horizon');

@@ -152,10 +152,15 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
 
   // This fixture authenticates ordinary NB2 receipts and enables the ERC20 wallet's payer guard for execution.
   w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  rec.recovery!.envelope = { gas: String(caps.gas), signedBytes: caps.signedBytes, calldataBytes: caps.calldataBytes,
+    maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
+  await w.bridge.journal.putReturn(rec);
   await indexLocalRecoverySends(w);
-  const progress = await w.bridge.journal.store.list(`nb2/payer-progress/v1/${cfg.chainId}/`);
+  const progress = await w.bridge.journal.store.list(`nb2/payer-progress/v2/${cfg.chainId}/`);
   assert.equal(progress.length, 1);
-  assert.equal(await w.bridge.journal.store.get(progress[0]), '35');
+  const checkpoint = JSON.parse((await w.bridge.journal.store.get(progress[0]))!);
+  assert.equal(checkpoint.completed, '1');
+  assert.ok(BigInt(checkpoint.continuationGas) * caps.maxFeePerGas < BigInt(rec.recovery!.totalFee));
   const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const, payer: hx(w.signer.address) };
   const store = w.bridge.journal;
   await store.putReturn(other);
@@ -184,6 +189,13 @@ test('a legacy Run with only its first fee authorized leaves the payer free for 
   await burn(w, 'second', undefined, undefined, caps);
   const first = await w.returnRecord('coin');
   const second = await w.returnRecord('second');
+  const coldCalls = BigInt(first.recovery!.calls);
+  first.recovery!.calls = String(coldCalls + 2n);
+  first.recovery!.ordinary = { gas: '500000', calldataBytes: 393216, maxFeePerGas: String(caps.maxFeePerGas), attemptsBeforeFallback: '2' };
+  second.recovery!.envelope = { gas: String(caps.gas), signedBytes: caps.signedBytes, calldataBytes: caps.calldataBytes,
+    maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
+  await w.bridge.journal.putReturn(first);
+  await w.bridge.journal.putReturn(second);
   const session = await RecoverySession.create(chain.gamma, unhex(first.burned!),
     new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
   const run = await session.run(0, first.recovery!.runCuts[0], w.trust);
@@ -199,6 +211,8 @@ test('a legacy Run with only its first fee authorized leaves the payer free for 
   let signed = 0;
   w.signer.signTransaction = (request) => { signed++; return signer(request); };
   await assert.rejects(recoverStep(w, first, { ...caps, feeBudget: firstFee }), /recovery payer balance or nonce changed before signing/);
+  const nonce = await w.bridge.evm.nonce(w.signer.address);
+  await assert.rejects(recoverStep(w, first, { ...caps, maxNonce: nonce + coldCalls - 1n }), /remaining continuation schedule exceeds the payer nonce horizon/);
   assert.equal(signed, 0);
   assert.equal((await recoverStep(w, second, caps)).state, 'checkpoint');
   assert.equal(signed, 1);

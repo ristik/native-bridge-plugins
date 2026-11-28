@@ -27,7 +27,7 @@ import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, 
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
-  Journal, dec, hex, undec, unhex, payerNonceLimit, remainingRecoveryCalls, type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
+  Journal, dec, hex, undec, unhex, payerNonceLimit, remainingRecoveryCalls, remainingRecoveryFee, type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
 import { recoveredSettlementEta, recoveryGeneration, type RecoveryDeployment } from './recovery.js';
 import { preflightRecovery, quoteErc20Call, quoteOrdinaryExecution, type Erc20SigningBounds, type OrdinaryCalibrationRange,
@@ -257,7 +257,7 @@ export interface RedeemOptions {
   envelope?: ReturnAdmission['ordinaryEnvelope'];
   archives?: readonly EvmReader[];
   /** Current payer authorization for taking an exclusive legacy ERC20 slot. */
-  erc20Policy?: Pick<RecoveryLimits, 'maxNonce' | 'feeBudget'>;
+  erc20Policy?: Pick<RecoveryLimits, 'maxNonce' | 'maxFeePerGas' | 'feeBudget'>;
   admit?: (request: TxRequest, prior: readonly SendRecord[], remainingFee?: bigint) => Promise<void>;
 }
 
@@ -1643,8 +1643,9 @@ export class NativeBridgeV2 {
    */
   public submitRedeem(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
+    const payer: EvmSigner = { address: Uint8Array.from(signer.address), signTransaction: signer.signTransaction.bind(signer) };
     if (options.erc20Policy) options = { ...options, erc20Policy: { ...options.erc20Policy } };
-    return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, signer, options));
+    return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, payer, options));
   }
 
   private async submitRedeemInner(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
@@ -1691,7 +1692,7 @@ export class NativeBridgeV2 {
             }
             await this.reserveOrdinaryPayer(fresh, signer.address, request, options);
           } else {
-            await options.admit?.(request, fresh.sends);
+            await options.admit?.(structuredClone(request), structuredClone(fresh.sends));
           }
         }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
@@ -1736,7 +1737,6 @@ export class NativeBridgeV2 {
 
   private async reserveOrdinaryPayer(record: ReturnRecord, payer: Uint8Array, request: TxRequest, options: RedeemOptions): Promise<void> {
     const plan = record.recovery!;
-    const ordinary = plan.ordinary!;
     const used = new Map<bigint, bigint>();
     if (record.sends.length) {
       const finalized = await this.evm.nonce(payer, 'finalized');
@@ -1749,27 +1749,30 @@ export class NativeBridgeV2 {
       }
     }
     const spentCalls = BigInt(used.size);
+    const progress = await this.journal.finalizedRecoveryProgress(request.chainId, record,
+      (number, hash) => this.evm.isFinalizedBlock(number, hash));
     await this.checkErc20Payer(record, payer, true, undefined, {
-      nonce: request.nonce, maxNonce: options.erc20Policy?.maxNonce, remainingCalls: remainingRecoveryCalls(plan, 0n, spentCalls),
+      nonce: request.nonce, maxNonce: options.erc20Policy?.maxNonce, remainingCalls: remainingRecoveryCalls(plan, progress?.completed ?? 0n, spentCalls),
       beforeSigning: async (other) => {
         const packet = request.gas * request.maxFeePerGas;
         let needed = packet;
         if (other.contestedDrain) {
           const authorization = options.erc20Policy;
-          const attempts = undec(ordinary.attemptsBeforeFallback);
-          const consumed = spentCalls < attempts ? spentCalls : attempts;
-          const suffix = undec(plan.totalFee) - consumed * undec(ordinary.gas) * undec(ordinary.maxFeePerGas);
+          if (!authorization || authorization.maxFeePerGas < request.maxFeePerGas) {
+            fail('CapacityPreflight', 'remaining continuation schedule needs an authorized payer fee ceiling');
+          }
+          const suffix = remainingRecoveryFee(plan, progress, spentCalls, authorization.maxFeePerGas);
           if (suffix > needed) needed = suffix;
           let spent = 0n;
           for (const fee of used.values()) spent += fee;
-          if (!authorization || needed + spent > authorization.feeBudget) {
+          if (needed + spent > authorization.feeBudget) {
             fail('CapacityPreflight', 'remaining continuation schedule exceeds the authorized payer fee budget');
           }
         }
         if (needed > await this.freeErc20PayerBalance(payer, other)) {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the free payer balance');
         }
-        await options.admit!(request, record.sends, other.contestedDrain ? needed : undefined);
+        await options.admit!(structuredClone(request), structuredClone(record.sends), other.contestedDrain ? needed : undefined);
       },
     });
   }
@@ -2275,7 +2278,8 @@ export class NativeBridgeV2 {
 
   private async signed(signer: EvmSigner, to: Uint8Array, data: Uint8Array, value: bigint, gas: bigint, admit?: (request: TxRequest) => Promise<void>, replace?: { nonce: bigint; pooled: boolean; candidates: TxRequest[] }): Promise<SignedTx> {
     const [nonce, fees] = await Promise.all([this.evm.nonce(signer.address), this.evm.fees()]);
-    const request = { chainId: this.cfg.chainId, nonce, maxPriorityFeePerGas: fees.priority, maxFeePerGas: 2n * fees.baseFee + fees.priority, gas, to, value, data };
+    const request = { chainId: this.cfg.chainId, nonce, maxPriorityFeePerGas: fees.priority, maxFeePerGas: 2n * fees.baseFee + fees.priority,
+      gas, to: Uint8Array.from(to), value, data: Uint8Array.from(data) };
     if (replace) {
       if (await this.evm.nonce(signer.address, 'latest') !== replace.nonce) refuse('NotPending', 'payout nonce changed during replacement');
       request.nonce = replace.nonce;

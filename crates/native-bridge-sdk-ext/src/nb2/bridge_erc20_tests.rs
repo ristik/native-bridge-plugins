@@ -1165,7 +1165,7 @@ fn legacy_claim_checks_all_remaining_calls_before_granting_exclusivity() {
 }
 
 #[test]
-fn finalized_run_progress_allows_both_legacy_nonce_windows_to_drain() {
+fn finalized_runs_free_exact_nonce_and_balance_windows_for_both_legacy_returns() {
     use super::super::evm::LocalKeySigner;
     use super::super::recovery::RecoveryReceipt;
     let (bridge, rpc, held) = return_bridge(
@@ -1192,7 +1192,9 @@ fn finalized_run_progress_allows_both_legacy_nonce_windows_to_drain() {
             .extra
             .insert("executionPayer".into(), json!(hex(&payer)));
         record.extra["recovery"]["calls"] = json!("8");
+        record.extra["recovery"]["totalFee"] = json!("100");
         record.extra["recovery"]["envelope"]["maxNonce"] = json!(cap);
+        record.extra["recovery"]["envelope"]["maxFeePerGas"] = json!("1");
         journal.put_return(&record).unwrap();
         let packet = sign_tx(
             &signer,
@@ -1221,6 +1223,7 @@ fn finalized_run_progress_allows_both_legacy_nonce_windows_to_drain() {
                     tx_index: 0,
                     log_index: 0,
                 },
+                Some(80u64.into()),
             )
             .unwrap();
         record
@@ -1229,6 +1232,7 @@ fn finalized_run_progress_allows_both_legacy_nonce_windows_to_drain() {
     let mut earlier = legacy(&b, 2, "8", 1);
     let finalized = AtomicU64::new(19);
     rpc.finalized_nonce.store(2, Ordering::SeqCst);
+    rpc.balance.store(159, Ordering::SeqCst);
     let claim = |journal: &Journal, record: &ReturnRecord, nonce| {
         journal.check_payer(
             chain_id,
@@ -1242,6 +1246,12 @@ fn finalized_run_progress_allows_both_legacy_nonce_windows_to_drain() {
                 finalized_block: Some(&|number, hash| {
                     Ok(finalized.load(Ordering::SeqCst) >= number
                         && *hash == [(number - 19) as u8; 32])
+                }),
+                before_signing: Some(&|other| {
+                    if bridge.erc20_free_balance(&payer, other)? < 80u64.into() {
+                        return fail_d(Rule::CapacityPreflight, "insufficient free balance");
+                    }
+                    Ok(())
                 }),
                 ..Default::default()
             },
@@ -1258,7 +1268,22 @@ fn finalized_run_progress_allows_both_legacy_nonce_windows_to_drain() {
         .unwrap()
         .to_string()
         .contains("remaining continuation schedule"));
-    assert_eq!(claim(&b, &earlier, 2).unwrap().calls, 7);
+    rpc.finalized_nonce.store(0, Ordering::SeqCst);
+    assert!(claim(&b, &earlier, 2)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("signed nonce awaiting finalization"));
+    rpc.finalized_nonce.store(2, Ordering::SeqCst);
+    assert!(claim(&b, &earlier, 2)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("insufficient free balance"));
+    rpc.balance.store(160, Ordering::SeqCst);
+    let competing = claim(&b, &earlier, 2).unwrap();
+    assert_eq!(competing.calls, 7);
+    assert_eq!(competing.fees, 80u64.into());
     for nonce in 3..=8 {
         claim(&b, &earlier, nonce).unwrap();
     }
@@ -1318,16 +1343,16 @@ fn the_sdk_publishes_only_authenticated_recovery_checkpoints() {
     assert!(bridge
         .journal
         .store
-        .list("nb2/payer-progress/v1/")
+        .list("nb2/payer-progress/v2/")
         .unwrap()
         .is_empty());
     publish(receipt).unwrap();
-    let keys = bridge.journal.store.list("nb2/payer-progress/v1/").unwrap();
+    let keys = bridge.journal.store.list("nb2/payer-progress/v2/").unwrap();
     assert_eq!(keys.len(), 1);
-    assert_eq!(
-        bridge.journal.store.get(&keys[0]).unwrap().as_deref(),
-        Some("7")
-    );
+    let progress: Value =
+        serde_json::from_str(&bridge.journal.store.get(&keys[0]).unwrap().unwrap()).unwrap();
+    assert_eq!(progress["completed"], "1");
+    assert!(undec(progress["continuationGas"].as_str().unwrap()).unwrap() > BigUint::default());
 }
 
 #[test]
@@ -1386,7 +1411,26 @@ fn contested_ordinary_signing_requires_the_remaining_fee_budget_and_free_balance
         .sign_redeem_tx(&first, &signer, &request)
         .unwrap_err();
     assert!(err.to_string().contains("free payer balance"), "{err}");
-    rpc.balance.store(total * 2, Ordering::SeqCst);
+    rpc.balance.store(total * 3, Ordering::SeqCst);
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .max_fee_per_gas = 20u8.into();
+    let err = bridge
+        .sign_redeem_tx(&first, &signer, &request)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("authorized payer fee budget"),
+        "{err}"
+    );
+    bridge
+        .erc20_return_recovery
+        .as_mut()
+        .unwrap()
+        .limits
+        .fee_budget = (total * 2).into();
     bridge.sign_redeem_tx(&second, &signer, &request).unwrap();
     assert!(bridge
         .check_erc20_payer(&first, &payer, false, None)
@@ -1394,6 +1438,160 @@ fn contested_ordinary_signing_requires_the_remaining_fee_budget_and_free_balance
         .unwrap()
         .to_string()
         .contains("outstanding ERC20 return"));
+}
+
+#[test]
+fn finalized_runs_keep_ordinary_retries_reserved_until_their_nonces_are_used() {
+    use super::super::evm::LocalKeySigner;
+    use super::super::recovery::RecoveryReceipt;
+    let (bridge, rpc, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
+    let chain_id = bridge.cfg.chain_id;
+    let mut a = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    a.status = "burned".into();
+    a.extra["recovery"]["calls"] = json!("10");
+    a.extra["recovery"]["totalFee"] = json!("120");
+    a.extra["recovery"]["envelope"]["maxFeePerGas"] = json!("1");
+    a.extra["recovery"]["ordinary"]["attemptsBeforeFallback"] = json!("2");
+    a.extra["recovery"]["ordinary"]["maxFeePerGas"] = json!("1");
+    a.extra["recovery"]["ordinary"]["gas"] = json!("10");
+    let mut b = a.clone();
+    b.return_id = hex(&[0xab; 32]);
+    let journal = &bridge.journal;
+    journal.put_return(&a).unwrap();
+    journal.put_return(&b).unwrap();
+    journal
+        .index_recovery_progress(
+            chain_id,
+            &b,
+            1,
+            &RecoveryReceipt {
+                encoded: vec![],
+                block_number: 20,
+                block_hash: [0xfe; 32],
+                tx_index: 0,
+                log_index: 0,
+            },
+            Some(80u64.into()),
+        )
+        .unwrap();
+    let commitments = || {
+        journal
+            .check_payer(
+                chain_id,
+                &payer,
+                &a.return_id,
+                false,
+                &PayerCheck {
+                    drain: true,
+                    finalized_nonce: Some(&|| bridge.evm.nonce(&payer, "finalized")),
+                    finalized_block: Some(&|n, hash| Ok(n == 20 && *hash == [0xfe; 32])),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(commitments().calls, 9);
+    assert_eq!(commitments().fees, 100u64.into());
+    let tx = sign_tx(
+        &signer,
+        &TxRequest {
+            chain_id,
+            nonce: 1,
+            gas: 10,
+            max_fee_per_gas: 1u8.into(),
+            max_priority_fee_per_gas: 0u8.into(),
+            to: bridge.cfg.vault,
+            value: BigUint::default(),
+            data: vec![0x11; 68],
+        },
+    )
+    .unwrap();
+    b.sends.push(bridge.send_record(&tx));
+    journal.put_return(&b).unwrap();
+    rpc.finalized_nonce.store(2, Ordering::SeqCst);
+    assert_eq!(commitments().calls, 8);
+    assert_eq!(commitments().fees, 90u64.into());
+}
+
+#[test]
+fn ordinary_signer_cannot_return_altered_nonce_or_bid_after_the_fence() {
+    use super::super::evm::LocalKeySigner;
+    struct AlteringSigner<'a> {
+        key: &'a LocalKeySigner,
+        journal: &'a Journal,
+    }
+    impl EvmSigner for AlteringSigner<'_> {
+        fn address(&self) -> [u8; 20] {
+            self.key.address()
+        }
+        fn sign_transaction(&self, request: &TxRequest) -> core::result::Result<Vec<u8>, String> {
+            let slot = format!(
+                "nb2/payer/v1/{}/{}",
+                request.chain_id,
+                to_hex(&self.address())
+            );
+            assert_eq!(request.nonce, 1);
+            assert_eq!(request.max_fee_per_gas, 10u8.into());
+            assert!(self
+                .journal
+                .store
+                .get(&slot)
+                .unwrap()
+                .unwrap()
+                .ends_with("#nonce:1"));
+            let mut altered = request.clone();
+            altered.nonce += 1;
+            altered.max_fee_per_gas *= 2u8;
+            self.key.sign_transaction(&altered)
+        }
+    }
+    let (bridge, _, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let key = LocalKeySigner::new(&[0x35; 32]);
+    let mut rec = bridge
+        .plan_return(&held, &[0xab; 20], &key.address(), Some(0))
+        .unwrap()
+        .record;
+    rec.status = "burned".into();
+    bridge.journal.put_return(&rec).unwrap();
+    let request = TxRequest {
+        chain_id: bridge.cfg.chain_id,
+        nonce: 1,
+        gas: 100_000,
+        max_fee_per_gas: 10u8.into(),
+        max_priority_fee_per_gas: 1u8.into(),
+        to: bridge.cfg.vault,
+        value: BigUint::default(),
+        data: vec![0x11; 68],
+    };
+    let signer = AlteringSigner {
+        key: &key,
+        journal: &bridge.journal,
+    };
+    let error = bridge.sign_redeem_tx(&rec, &signer, &request).unwrap_err();
+    assert!(error.to_string().contains("another transaction"), "{error}");
+    assert!(bridge
+        .journal
+        .store
+        .list("nb2/payer-sends/v1/")
+        .unwrap()
+        .is_empty());
+    let exact = bridge.sign_redeem_tx(&rec, &key, &request).unwrap();
+    assert_eq!(exact.request, request);
 }
 
 #[test]

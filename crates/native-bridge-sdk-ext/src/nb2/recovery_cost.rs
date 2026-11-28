@@ -10,7 +10,7 @@ use super::recovery::RecoveryDeployment;
 use super::rlp::{rlp_bytes, rlp_list, rlp_u64_enc, rlp_uint_enc};
 use super::rules::{burn_index, verify_seal_receipt};
 use super::segment::gap_proof_len;
-use super::token::{decode_token, MAX_TRANSFER_PAIR};
+use super::token::{decode_token, Token, MAX_TRANSFER_PAIR};
 use super::trust::TrustInput;
 use super::verify::verify_held;
 
@@ -198,6 +198,158 @@ struct Span {
     pub end: usize,
     claims: usize,
 }
+
+fn prospective_run_spans(held: &[u8], token: &Token) -> (Vec<Span>, usize) {
+    let mut spans = Vec::new();
+    let mut pos = 14;
+    let skip = |pos: &mut usize| {
+        let len = u32::from_be_bytes(held[*pos..*pos + 4].try_into().unwrap()) as usize;
+        *pos += 4 + len;
+    };
+    for (index, level) in token.levels().enumerate() {
+        let start = pos;
+        for _ in 0..3 {
+            skip(&mut pos);
+        }
+        pos += 8;
+        spans.push(Span {
+            start,
+            end: pos,
+            claims: if index == 0 { 2 } else { 1 },
+        });
+        for _ in &level.transfers {
+            let start = pos;
+            skip(&mut pos);
+            spans.push(Span {
+                start,
+                end: pos,
+                claims: 1,
+            });
+        }
+    }
+    let end = pos + MAX_TRANSFER_PAIR + 4;
+    spans.push(Span {
+        start: pos,
+        end,
+        claims: 1,
+    });
+    (spans, end)
+}
+
+fn quote_run_cut(
+    spans: &[Span],
+    n: usize,
+    from: usize,
+    end: usize,
+    calibration: &dyn RecoveryCalibration,
+    limits: &RecoveryLimits,
+    erc20: bool,
+) -> Option<RecoveryQuote> {
+    let opening = spans[from..end]
+        .iter()
+        .map(|op| SPARSE + op.claims * (34 + SPARSE))
+        .sum();
+    let shape = run_shape(
+        spans,
+        from,
+        end,
+        n,
+        if from == 0 { 0 } else { RECEIPT_BYTES },
+        opening,
+    )?;
+    quote_range(shape, usize::from(from != 0), calibration, limits, erc20)
+}
+
+fn quote_settlement_suffixes(
+    batch: usize,
+    width: usize,
+    calibration: &dyn RecoveryCalibration,
+    limits: &RecoveryLimits,
+    erc20: bool,
+) -> Option<RecoveryQuote> {
+    let mut best: Option<RecoveryQuote> = None;
+    for count in 0..batch {
+        let quote = quote_range(
+            gap_shape(RecoveryEntry::RedeemRecovered, count, width),
+            1,
+            calibration,
+            limits,
+            erc20,
+        )?;
+        if best
+            .as_ref()
+            .map_or(true, |previous| quote.fee > previous.fee)
+        {
+            best = Some(quote);
+        }
+    }
+    best
+}
+
+#[cfg(feature = "host")]
+pub(crate) struct AdmittedRecoveryGas {
+    pub run: Vec<u64>,
+    pub advance: u64,
+    pub settle: u64,
+}
+
+/// Reconstruct the exact admission quote for a saved schedule without choosing different cut sizes.
+#[cfg(feature = "host")]
+pub(crate) fn admitted_recovery_gas(
+    held: &[u8],
+    cuts: &[usize],
+    k: u64,
+    batch: usize,
+    calibration: &dyn RecoveryCalibration,
+    limits: &RecoveryLimits,
+) -> Result<AdmittedRecoveryGas> {
+    let token = decode_token(held)?;
+    let (spans, n) = prospective_run_spans(held, &token);
+    let mut from = 0;
+    let mut run = Vec::new();
+    for &count in cuts {
+        let end = from + count;
+        if !(1..=16).contains(&count) || end > spans.len() {
+            return fail_d(Rule::CapacityPreflight, "invalid admitted Run schedule");
+        }
+        let Some(quote) = quote_run_cut(&spans, n, from, end, calibration, limits, true) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "admitted Run cut is outside the release limits",
+            );
+        };
+        run.push(quote.gas);
+        from = end;
+    }
+    if from != spans.len() || !(1..=1024).contains(&batch) {
+        return fail_d(
+            Rule::CapacityPreflight,
+            "invalid admitted recovery schedule",
+        );
+    }
+    let width = gap_proof_len(k);
+    let (Some(advance), Some(settle)) = (
+        quote_range(
+            gap_shape(RecoveryEntry::AdvanceGaps, batch, width),
+            1,
+            calibration,
+            limits,
+            true,
+        ),
+        quote_settlement_suffixes(batch, width, calibration, limits, true),
+    ) else {
+        return fail_d(
+            Rule::CapacityPreflight,
+            "admitted gap batch or settlement suffix is outside the release limits",
+        );
+    };
+    Ok(AdmittedRecoveryGas {
+        run,
+        advance: advance.gas,
+        settle: settle.gas,
+    })
+}
+
 fn calldata_size(payload: usize) -> usize {
     68 + payload.div_ceil(32) * 32
 }
@@ -421,60 +573,9 @@ pub fn preflight_recovery_with_signing_bounds(
     if burn_index(&cfg, &domain, seal.as_ref()).0 != backlog.signed_start {
         return fail_d(Rule::CapacityPreflight, "unauthenticated signed start");
     }
-    let mut spans = Vec::new();
-    let mut pos = 14;
-    let skip = |pos: &mut usize| {
-        let len = u32::from_be_bytes(held[*pos..*pos + 4].try_into().unwrap()) as usize;
-        *pos += 4 + len;
-    };
-    for (index, level) in token.levels().enumerate() {
-        let start = pos;
-        for _ in 0..3 {
-            skip(&mut pos);
-        }
-        pos += 8;
-        spans.push(Span {
-            start,
-            end: pos,
-            claims: if index == 0 { 2 } else { 1 },
-        });
-        for _ in &level.transfers {
-            let start = pos;
-            skip(&mut pos);
-            spans.push(Span {
-                start,
-                end: pos,
-                claims: 1,
-            });
-        }
-    }
-    let n = pos + MAX_TRANSFER_PAIR + 4;
-    spans.push(Span {
-        start: pos,
-        end: n,
-        claims: 1,
-    });
-    let quoted = |from: usize, end: usize| {
-        let opening = spans[from..end]
-            .iter()
-            .map(|op| SPARSE + op.claims * (34 + SPARSE))
-            .sum();
-        let shape = run_shape(
-            &spans,
-            from,
-            end,
-            n,
-            if from == 0 { 0 } else { RECEIPT_BYTES },
-            opening,
-        )?;
-        quote_range(
-            shape,
-            usize::from(from != 0),
-            ctx.calibration,
-            ctx.limits,
-            erc20,
-        )
-    };
+    let (spans, n) = prospective_run_spans(held, &token);
+    let quoted =
+        |from, end| quote_run_cut(&spans, n, from, end, ctx.calibration, ctx.limits, erc20);
     if (0..spans.len()).any(|i| quoted(i, i + 1).is_none()) {
         return fail_d(Rule::CapacityPreflight, "indivisible run operation");
     }
@@ -554,22 +655,10 @@ pub fn preflight_recovery_with_signing_bounds(
         return fail_d(Rule::CapacityPreflight, "unqualified catch-up horizon");
     }
     // Every suffix smaller than the advance batch may be needed at settlement.
-    let mut settle: Option<RecoveryQuote> = None;
-    for count in 0..q {
-        let Some(quote) = quote_range(
-            gap_shape(RecoveryEntry::RedeemRecovered, count, width),
-            1,
-            ctx.calibration,
-            ctx.limits,
-            erc20,
-        ) else {
-            return fail_d(Rule::CapacityPreflight, "unqualified settlement suffix");
-        };
-        if settle.as_ref().map_or(true, |best| quote.fee > best.fee) {
-            settle = Some(quote);
-        }
-    }
-    let settle = settle.expect("positive gap batch");
+    let Some(settle) = quote_settlement_suffixes(q, width, ctx.calibration, ctx.limits, erc20)
+    else {
+        return fail_d(Rule::CapacityPreflight, "unqualified settlement suffix");
+    };
     let mut total_fee = &settle.fee + &advance.fee * advance_calls;
     for quote in &run {
         total_fee += &quote.fee;

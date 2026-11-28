@@ -409,7 +409,7 @@ test('a legacy claimant must leave a feasible full schedule for the earlier nonc
   }
 });
 
-test('finalized Run progress lets both eight-call legacy returns drain at caps 15 and 8', async () => {
+test('finalized Runs let both legacy returns drain at the exact 15/8 nonce and balance boundary', async () => {
   const { x, bridge, held, store } = await heldPair();
   const payer = x.payer.address;
   const { chainId } = x.cfg;
@@ -418,7 +418,8 @@ test('finalized Run progress lets both eight-call legacy returns drain at caps 1
   const b = new Journal(store, key('partial earlier domain'));
   const legacy = (journal: Journal, maxNonce: string) => ({
     ...record, ...journal.base(), returnId: hex(key('partial ' + maxNonce)), status: 'burned' as const, executionPayer: hex(payer),
-    recovery: { ...record.recovery!, calls: '8', ordinary: undefined, envelope: { ...record.recovery!.envelope!, maxNonce } },
+    recovery: { ...record.recovery!, calls: '8', totalFee: '100', ordinary: undefined,
+      envelope: { ...record.recovery!.envelope!, maxNonce, maxFeePerGas: '1' } },
   });
   const later = legacy(a, '15');
   const earlier = legacy(b, '8');
@@ -428,18 +429,28 @@ test('finalized Run progress lets both eight-call legacy returns drain at caps 1
     const raw = await signTx(x.payer, { chainId, nonce: BigInt(index), gas: 100_000n, maxFeePerGas: 10n,
       maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
     await journal.indexPayerSends(legacy, [raw.raw]);
-    await journal.indexRecoveryProgress(chainId, legacy, 1n, { blockNumber: BigInt(index + 20), blockHash: checkpoints[index] });
+    await journal.indexRecoveryProgress(chainId, legacy, 1n, { blockNumber: BigInt(index + 20), blockHash: checkpoints[index] }, 80n);
   }
   let finalizedNonce = 2n;
   let finalizedHeight = 19n;
+  let balance = 159n;
+  bridge.evm.balance = async () => balance;
   const claim = (journal: Journal, legacy: typeof later, signingNonce: bigint) => journal.checkReturnPayer(chainId, payer, legacy.returnId, true, {
     mode: 'drain', signingNonce, finalizedNonce: async () => finalizedNonce,
     finalizedBlock: async (number, hash) => number <= finalizedHeight && hex(hash) === hex(checkpoints[Number(number) - 20]),
+    beforeSigning: async (other) => { if (await bridge['freeErc20PayerBalance'](payer, other) < 80n) throw new Error('insufficient free balance'); },
   });
   await assert.rejects(claim(b, earlier, 2n), /remaining continuation schedule/);
   finalizedHeight = 21n;
   await assert.rejects(claim(a, later, 2n), /remaining continuation schedule/);
-  assert.equal((await claim(b, earlier, 2n)).calls, 7n);
+  finalizedNonce = 0n;
+  await assert.rejects(claim(b, earlier, 2n), /signed nonce awaiting finalization/);
+  finalizedNonce = 2n;
+  await assert.rejects(claim(b, earlier, 2n), /insufficient free balance/);
+  balance = 160n;
+  const other = await claim(b, earlier, 2n);
+  assert.equal(other.calls, 7n);
+  assert.equal(other.fees, 80n);
   for (let nonce = 3n; nonce <= 8n; nonce++) await claim(b, earlier, nonce);
   await b.putReturn({ ...earlier, status: 'paid', paid: { txHash: hex(key('earlier settled')), blockNumber: '22' } });
   finalizedNonce = 9n;
@@ -460,15 +471,84 @@ test('an ordinary claimant must authorize the full legacy suffix before reservin
   const admit = async () => { admitted++; };
   const feeBudget = BigInt(a.recovery!.totalFee);
   await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
-    admit, erc20Policy: { maxNonce: 255n, feeBudget: request.gas * request.maxFeePerGas },
+    admit, erc20Policy: { maxNonce: 255n, maxFeePerGas: 30n, feeBudget: request.gas * request.maxFeePerGas },
   }), /authorized payer fee budget/);
   await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
-    admit, erc20Policy: { maxNonce: request.nonce, feeBudget },
+    admit, erc20Policy: { maxNonce: request.nonce, maxFeePerGas: 30n, feeBudget },
   }), /remaining continuation schedule/);
+  await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
+    admit, erc20Policy: { maxNonce: 255n, maxFeePerGas: 60n, feeBudget },
+  }), /authorized payer fee budget/);
   assert.equal(admitted, 0);
-  await bridge['reserveOrdinaryPayer'](b, payer, request, { admit, erc20Policy: { maxNonce: 255n, feeBudget } });
+  await bridge['reserveOrdinaryPayer'](b, payer, request, { admit, erc20Policy: { maxNonce: 255n, maxFeePerGas: 60n, feeBudget: 2n * feeBudget } });
   assert.equal(admitted, 1);
   await assert.rejects(bridge.checkErc20Payer(a, payer), /outstanding ERC20 return/);
+});
+
+test('a finalized Run retains unused ordinary retry nonces and fees', async () => {
+  const { x, bridge, held } = await heldPair();
+  const payer = x.payer.address;
+  const chainId = x.cfg.chainId;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const plan = { ...record.recovery!, calls: '10', totalFee: '120',
+    envelope: { ...record.recovery!.envelope!, maxFeePerGas: '1' },
+    ordinary: { ...record.recovery!.ordinary!, gas: '10', maxFeePerGas: '1', attemptsBeforeFallback: '2' } };
+  const a = { ...record, status: 'burned' as const, recovery: plan };
+  const b = { ...a, returnId: hex(key('other return retains ordinary retries')) };
+  const journal = bridge.journal;
+  await journal.putReturn(a);
+  await journal.putReturn(b);
+  await journal.indexRecoveryProgress(chainId, b, 1n, { blockNumber: 20n, blockHash: key('run checkpoint') }, 80n);
+  const other = () => journal.checkReturnPayer(chainId, payer, a.returnId, false, {
+    mode: 'drain', finalizedBlock: async () => true, finalizedNonce: async () => 2n,
+  });
+  assert.equal((await other()).calls, 9n);
+  assert.equal((await other()).fees, 100n);
+  const send = await signTx(x.payer, { chainId, nonce: 1n, gas: 10n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n,
+    to: x.cfg.vault, value: 0n, data: new Uint8Array(68) });
+  await journal.putReturn({ ...b, sends: [bridge['sendRecord'](send)] });
+  assert.equal((await other()).calls, 8n);
+  assert.equal((await other()).fees, 90n);
+});
+
+test('ordinary admission cannot mutate the request that the payer journal fences and signs', async () => {
+  const { x, bridge, held, store } = await heldPair();
+  const payer = x.payer.address;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const a = { ...record, status: 'burned' as const };
+  const b = { ...a, returnId: hex(key('contested ordinary request')) };
+  await bridge.journal.putReturn(a);
+  await bridge.journal.putReturn(b);
+  const data = new Uint8Array(68).fill(17);
+  const nonce = await bridge.evm.nonce(payer);
+  const fees = await bridge.evm.fees();
+  const bid = 2n * fees.baseFee + fees.priority;
+  let admitted = 0;
+  const signer = { address: payer, signTransaction: async (request: Parameters<typeof x.payer.signTransaction>[0]) => {
+    assert.equal(request.nonce, nonce);
+    assert.equal(request.maxFeePerGas, bid);
+    assert.deepEqual(request.data, data);
+    assert.deepEqual(request.to, x.cfg.vault);
+    const reservation = await store.get(`nb2/payer/v1/${x.cfg.chainId}/${toHex(payer)}`);
+    assert.ok(reservation?.endsWith(`#nonce:${nonce}`));
+    return x.payer.signTransaction(request);
+  } };
+  const tx = await bridge['signed'](signer, x.cfg.vault, data, 0n, 100_000n, (request) =>
+    bridge['reserveOrdinaryPayer'](a, payer, request, {
+      erc20Policy: { maxNonce: 255n, maxFeePerGas: 30n, feeBudget: BigInt(a.recovery!.totalFee) },
+      admit: async (copy) => {
+        admitted++;
+        copy.nonce += 1n;
+        copy.maxFeePerGas *= 2n;
+        copy.maxPriorityFeePerGas += 1n;
+        copy.data.fill(0);
+        copy.to.fill(0);
+      },
+    }));
+  assert.equal(admitted, 1);
+  assert.equal(tx.request.nonce, nonce);
+  assert.equal(tx.request.maxFeePerGas, bid);
+  assert.deepEqual(tx.request.data, data);
 });
 
 test('two SDK attempts can both decline without releasing the payer while either still owns it', async () => {

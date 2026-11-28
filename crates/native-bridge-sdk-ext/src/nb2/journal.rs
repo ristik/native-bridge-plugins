@@ -413,12 +413,79 @@ pub(crate) fn remaining_recovery_calls(
             .as_str()
             .unwrap_or("0"),
     )?;
-    let used = if completed > 0 {
-        prior
-    } else {
-        prior.min(ordinary_used)
+    let attempts = prior.saturating_sub(ordinary_used);
+    let continuation = calls.saturating_sub(prior).saturating_sub(completed).max(1);
+    continuation
+        .checked_add(attempts)
+        .ok_or_else(|| Error::Other("invalid recovery call count".into()))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredRecoveryProgress {
+    completed: Dec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_gas: Option<Dec>,
+}
+
+pub(crate) struct RecoveryProgress {
+    pub completed: u64,
+    pub continuation_gas: Option<BigUint>,
+}
+
+impl RecoveryProgress {
+    fn decode(value: &str) -> Result<Self> {
+        let saved: StoredRecoveryProgress =
+            serde_json::from_str(value).map_err(|e| Error::Other(e.to_string()))?;
+        Ok(Self {
+            completed: undec64(&saved.completed)?,
+            continuation_gas: saved.continuation_gas.as_deref().map(undec).transpose()?,
+        })
+    }
+
+    fn preferred_to(&self, previous: &Self) -> bool {
+        self.completed > previous.completed
+            || (self.completed == previous.completed
+                && self.continuation_gas > previous.continuation_gas)
+    }
+}
+
+pub(crate) fn remaining_recovery_fee(
+    plan: &Value,
+    progress: Option<&RecoveryProgress>,
+    ordinary_used: u64,
+    ceiling: Option<&BigUint>,
+) -> Result<BigUint> {
+    let total = undec(plan["totalFee"].as_str().unwrap_or(""))?;
+    let ordinary = &plan["ordinary"];
+    let Some(bid) = plan["envelope"]["maxFeePerGas"]
+        .as_str()
+        .or_else(|| ordinary["maxFeePerGas"].as_str())
+    else {
+        return Ok(total);
     };
-    Ok(calls.saturating_sub(completed).saturating_sub(used).max(1))
+    let admitted = undec(bid)?;
+    let price = ceiling.unwrap_or(&admitted);
+    if admitted == BigUint::default() || *price == BigUint::default() {
+        return fail_d(Rule::CapacityPreflight, "invalid continuation fee ceiling");
+    }
+    let ordinary_gas = undec(ordinary["gas"].as_str().unwrap_or("0"))?;
+    let prior = undec64(ordinary["attemptsBeforeFallback"].as_str().unwrap_or("0"))?;
+    let spent = prior.min(ordinary_used);
+    let attempts = prior - spent;
+    if let Some(gas) = progress.and_then(|p| p.continuation_gas.as_ref()) {
+        let route = if attempts > 0 {
+            gas.max(&ordinary_gas)
+        } else {
+            gas
+        };
+        return Ok((route + BigUint::from(attempts) * &ordinary_gas) * price);
+    }
+    let consumed = BigUint::from(spent) * ordinary_gas * &admitted;
+    if total <= consumed {
+        return Ok(BigUint::default());
+    }
+    Ok(((total - consumed) * price + &admitted - 1u8) / admitted)
 }
 
 impl PayerCommitments {
@@ -673,6 +740,7 @@ impl Journal {
         record: &ReturnRecord,
         completed: u64,
         receipt: &super::recovery::RecoveryReceipt,
+        continuation_gas: Option<BigUint>,
     ) -> Result<()> {
         let path = self.recovery_progress_path(chain_id, record)?;
         let key = format!(
@@ -680,15 +748,23 @@ impl Journal {
             receipt.block_number,
             to_hex(&receipt.block_hash)
         );
-        let count = remaining_recovery_calls(&record.extra["recovery"], completed, 0)?;
+        let progress = RecoveryProgress {
+            completed,
+            continuation_gas,
+        };
+        let value = serde_json::to_string(&StoredRecoveryProgress {
+            completed: dec(completed),
+            continuation_gas: progress.continuation_gas.as_ref().map(dec),
+        })
+        .expect("recovery progress encodes");
         loop {
             let previous = self.store.get(&key)?;
             if previous
                 .as_deref()
-                .map(undec64)
+                .map(RecoveryProgress::decode)
                 .transpose()?
-                .is_some_and(|n| n <= count)
-                || self.store.put_if(&key, previous.as_deref(), &dec(count))?
+                .is_some_and(|saved| !progress.preferred_to(&saved))
+                || self.store.put_if(&key, previous.as_deref(), &value)?
             {
                 return Ok(());
             }
@@ -708,7 +784,7 @@ impl Journal {
             .collect::<Vec<_>>()
             .join(",");
         Ok(format!(
-            "nb2/payer-progress/v1/{chain_id}/{}/{}/{}/{}/{}/{}/{cuts}/",
+            "nb2/payer-progress/v2/{chain_id}/{}/{}/{}/{}/{}/{}/{cuts}/",
             &record.base.domain[2..],
             &record.return_id[2..],
             &generation[2..],
@@ -720,16 +796,15 @@ impl Journal {
         ))
     }
 
-    fn recovery_calls(
+    pub(crate) fn finalized_recovery_progress(
         &self,
         chain_id: u64,
         record: &ReturnRecord,
-        ordinary_used: u64,
-        check: &PayerCheck<'_>,
-    ) -> Result<u64> {
-        let mut calls = remaining_recovery_calls(&record.extra["recovery"], 0, ordinary_used)?;
-        let Some(finalized) = check.finalized_block else {
-            return Ok(calls);
+        finalized: Option<&PayerFinalityCheck<'_>>,
+    ) -> Result<Option<RecoveryProgress>> {
+        let mut progress = None;
+        let Some(finalized) = finalized else {
+            return Ok(None);
         };
         let path = self.recovery_progress_path(chain_id, record)?;
         for key in self.store.list(&path)? {
@@ -739,24 +814,21 @@ impl Journal {
                     "recovery checkpoint disappeared during payer reconciliation",
                 );
             };
-            let remaining = undec64(&value)?;
-            if remaining == 0 {
-                return refuse(
-                    WalletReason::BadInput,
-                    "unpaid return needs a settlement call",
-                );
-            }
-            if remaining >= calls {
+            let candidate = RecoveryProgress::decode(&value)?;
+            if progress
+                .as_ref()
+                .is_some_and(|previous| !candidate.preferred_to(previous))
+            {
                 continue;
             }
             let (number, hash) = key[path.len()..]
                 .split_once('/')
                 .ok_or_else(|| Error::Other("invalid recovery checkpoint key".into()))?;
             if finalized(undec64(number)?, &unhex_n(&format!("0x{hash}"))?)? {
-                calls = remaining;
+                progress = Some(candidate);
             }
         }
-        Ok(calls)
+        Ok(progress)
     }
 
     fn other_payer_resources(
@@ -839,9 +911,13 @@ impl Journal {
             }
             if active {
                 let recovery = &rec.extra["recovery"];
-                out.fees += undec(recovery["totalFee"].as_str().unwrap_or(""))?;
+                let progress =
+                    self.finalized_recovery_progress(chain_id, &rec, check.finalized_block)?;
+                let used = ordinary.len() as u64;
+                out.fees += remaining_recovery_fee(recovery, progress.as_ref(), used, None)?;
                 // The signed-nonce check below must pass before ordinary nonces count as used.
-                let calls = self.recovery_calls(chain_id, &rec, ordinary.len() as u64, check)?;
+                let calls =
+                    remaining_recovery_calls(recovery, progress.map_or(0, |p| p.completed), used)?;
                 out.calls += u128::from(calls);
                 let cap = recovery["envelope"]["maxNonce"]
                     .as_str()
@@ -994,7 +1070,18 @@ impl Journal {
                 let calls = if contested_drain {
                     match check.remaining_calls {
                         Some(calls) => calls,
-                        None => self.recovery_calls(chain_id, &current, 0, check)?,
+                        None => {
+                            let progress = self.finalized_recovery_progress(
+                                chain_id,
+                                &current,
+                                check.finalized_block,
+                            )?;
+                            remaining_recovery_calls(
+                                recovery,
+                                progress.map_or(0, |p| p.completed),
+                                0,
+                            )?
+                        }
                     }
                 } else {
                     1
