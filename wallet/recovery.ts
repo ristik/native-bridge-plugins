@@ -154,15 +154,19 @@ async function otherErc20Reserves(w: Wallet, rec: ReturnRecord, payer: Uint8Arra
 /** Reserve the greatest fee at each payer nonce. At most one replacement can be mined. */
 async function reservedFees(w: Wallet, rec: ReturnRecord, payer: Uint8Array, ordinary: readonly SendRecord[] = rec.sends, replacing?: bigint): Promise<FeeReservations> {
   const recovery = loadRecovery(w, rec);
-  const raw = [...ordinary.map((send) => send.raw), ...recoveryPackets(recovery)];
-  const byNonce = w.bridge.cfg.erc20 ? await w.bridge.journal.payerFeeMaxima(rec, w.bridge.cfg.chainId, payer) : new Map<bigint, bigint>();
+  const { journal, cfg } = w.bridge;
   const legacy = uint(recovery?.fees ?? '0');
-  if (w.bridge.cfg.erc20 && legacy !== 0n) unsupportedErc20Return();
-  for (const signed of raw) {
-    const { request, from } = decodeSignedTx(bytes(signed));
-    if (!eq(from, payer) || request.chainId !== w.bridge.cfg.chainId) continue;
-    const fee = request.gas * request.maxFeePerGas;
-    if (fee > (byNonce.get(request.nonce) ?? 0n)) byNonce.set(request.nonce, fee);
+  let byNonce = new Map<bigint, bigint>();
+  if (cfg.erc20) {
+    await checkRecoveryPayerFees(journal, cfg.chainId, await journal.ret(rec.returnId) ?? rec, recovery);
+    byNonce = await journal.payerFeeMaxima(rec, cfg.chainId, payer);
+  } else {
+    for (const signed of [...ordinary.map((send) => send.raw), ...recoveryPackets(recovery)]) {
+      const { request, from } = decodeSignedTx(bytes(signed));
+      if (eq(from, payer) && request.chainId === cfg.chainId) {
+        byNonce.set(request.nonce, maxFee(request.gas * request.maxFeePerGas, byNonce.get(request.nonce) ?? 0n));
+      }
+    }
   }
   const replacementFee = replacing === undefined ? 0n : byNonce.get(replacing) ?? 0n;
   if (replacing !== undefined) byNonce.delete(replacing);
@@ -585,14 +589,17 @@ function recoveryPackets(saved?: RecoveryJournal): string[] {
   return raw;
 }
 
-/** Check the separate wallet journal against the already durable ERC20 payer state. */
+async function checkRecoveryPayerFees(journal: Wallet['bridge']['journal'], chainId: bigint,
+  record: ReturnRecord, saved?: RecoveryJournal): Promise<void> {
+  if (uint(saved?.fees ?? '0') !== 0n) unsupportedErc20Return();
+  for (const raw of recoveryPackets(saved)) await journal.requireIndexedPayerSend(chainId, record, bytes(raw));
+}
+
+/** Check every ERC20 recovery file against already durable payer state. */
 export async function checkLocalErc20Returns(w: Wallet): Promise<void> {
   const { journal, cfg } = w.bridge;
-  for (const record of await journal.returns()) {
-    await journal.requireErc20ReturnState(cfg.chainId, record);
-    const saved = loadRecovery(w, record);
-    if (uint(saved?.fees ?? '0') !== 0n) unsupportedErc20Return();
-    for (const raw of recoveryPackets(saved)) await journal.preparePayerBroadcast(record, cfg.chainId, bytes(raw));
+  for (const { record, chainId } of await journal.erc20Returns(cfg.chainId)) {
+    await checkRecoveryPayerFees(journal, chainId, record, loadRecovery(w, record));
   }
 }
 
@@ -1050,7 +1057,6 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
               (fees.replacementFee > 0n && await evm.nonce(w.signer.address, 'finalized') > nonce)) {
             throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');
           }
-          await w.bridge.journal.preparePayerSigning(current, w.bridge.cfg.chainId, w.signer.address);
         },
       });
     }

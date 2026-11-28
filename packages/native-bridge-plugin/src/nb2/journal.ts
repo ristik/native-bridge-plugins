@@ -13,8 +13,10 @@
  * BEFORE the step it enables (secret before value, burn request before certification, every signed transaction before broadcast).
  */
 import { eq as eqBytes, fromHex, toHex } from '../bytes.js';
+import { decodeReceiptBacking, isNativeUctDeposit } from './deposit.js';
 import { fail, refuse } from './errors.js';
 import { decodeSignedTx } from './evm.js';
+import { decodeToken } from './token.js';
 
 export const JOURNAL_FORMAT = 'unicity-nb2-journal';
 export const JOURNAL_VERSION = 1;
@@ -303,6 +305,18 @@ function requireExecutionPayer(record: ReturnRecord, payer: Uint8Array): void {
   if (bound && !eqBytes(bound, payer)) refuse('NotPending', `return is bound to execution payer ${hex(bound)}`);
 }
 
+function isNativeReturn(record: ReturnRecord): boolean {
+  try {
+    const token = decodeToken(unhex(record.source));
+    const justification = (token.ancestors[0] ?? token).mint.justification;
+    if (justification === null) return false;
+    const backing = decodeReceiptBacking(justification);
+    return hex(backing.d) === record.domain && isNativeUctDeposit(backing.proof, backing.d);
+  } catch {
+    return false;
+  }
+}
+
 export function unsupportedErc20Return(): never {
   return refuse('BadInput', 'unsupported pre-release ERC20 record: start a fresh wallet');
 }
@@ -429,6 +443,28 @@ export class Journal {
     return records;
   }
 
+  /** Validate every ERC20 return and EVM signing fence before opening or reusing a payer. */
+  public async erc20Returns(chainId: bigint): Promise<{ key: string; record: ReturnRecord; chainId: bigint }[]> {
+    const prefix = 'nb2/payer/v1/';
+    for (const key of await this.store.list(prefix)) {
+      await this.requireNonceFenceFeeIndex(key.slice(prefix.length), await this.store.get(key));
+    }
+    const records = [];
+    for (const { key, record } of await this.allReturns()) {
+      const registered = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
+      const own = record.domain === hex(this.domain);
+      if (!own && registered === null && record.erc20PayerState === undefined &&
+          record.recovery?.envelope === undefined && isNativeReturn(record)) continue;
+      const first = record.sends[0];
+      const signedChain = first && decodeSignedTx(unhex(first.raw)).request.chainId;
+      const chain = own ? chainId : registered === null ? signedChain : undec(registered);
+      if (chain === undefined) unsupportedErc20Return();
+      await this.requireErc20ReturnState(chain, record);
+      records.push({ key, record, chainId: chain });
+    }
+    return records;
+  }
+
   /** Record the highest signed nonce before offering an exact transaction to any RPC. */
   public async retainPayerSend(record: ReturnRecord, raw: Uint8Array): Promise<void> {
     const { from, request } = decodeSignedTx(raw);
@@ -465,6 +501,13 @@ export class Journal {
     if (!await this.payerHistoryComplete(path)) refuse('JournalNotPersisted', 'payer fee index completion was not persisted');
   }
 
+  private async requireNonceFenceFeeIndex(scope: string, slot: string | null): Promise<void> {
+    const [owner, state] = slot?.split('#') ?? [];
+    if (!state?.startsWith('nonce:')) return;
+    const match = returnKey.exec(owner);
+    if (!match || !await this.payerHistoryComplete(`${scope}/${match[1]}/${match[2]}`)) unsupportedErc20Return();
+  }
+
   /** Check stored ERC20 state before opening the domain or acting on a return. */
   public async requireErc20ReturnState(chainId: bigint, record: ReturnRecord): Promise<void> {
     const chain = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
@@ -494,15 +537,16 @@ export class Journal {
   }
 
   public async openErc20PayerJournal(chainId: bigint): Promise<void> {
-    for (const record of await this.returns()) await this.requireErc20ReturnState(chainId, record);
+    await this.erc20Returns(chainId);
     await this.registerPayerChain(chainId);
   }
 
-  private async requireIndexedPayerSend(chainId: bigint, record: ReturnRecord, raw: Uint8Array, highest?: bigint): Promise<void> {
+  public async requireIndexedPayerSend(chainId: bigint, record: ReturnRecord, raw: Uint8Array, highest?: bigint): Promise<void> {
     const { from, request } = decodeSignedTx(raw);
     if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
     requireExecutionPayer(record, from);
     const path = this.payerSendPath(chainId, from, record);
+    if (!await this.payerHistoryComplete(path)) unsupportedErc20Return();
     const fee = await this.store.get(`nb2/payer-fees/v1/${path}/${request.nonce}`);
     const watermark = highest === undefined ? await this.store.get(`nb2/payer-sends/v1/${path}`) : dec(highest);
     if (watermark === null || undec(watermark) < request.nonce || fee === null || undec(fee) < request.gas * request.maxFeePerGas) {
@@ -518,6 +562,8 @@ export class Journal {
     requireExecutionPayer(history, payer);
     const path = this.payerSendPath(chainId, payer, history);
     await this.requireErc20ReturnState(chainId, history);
+    const scope = `${chainId}/${toHex(payer)}`;
+    await this.requireNonceFenceFeeIndex(scope, await this.store.get(`nb2/payer/v1/${scope}`));
     const prefix = `nb2/payer-fees/v1/${path}/`;
     const keys = await this.store.list(prefix);
     if ((keys.length > 0 || await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) &&
@@ -544,7 +590,6 @@ export class Journal {
     if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
     const history = await this.ret(record.returnId) ?? record;
     await this.payerFeeMaxima(history, chainId, from);
-    if (!await this.payerHistoryComplete(this.payerSendPath(chainId, from, history))) unsupportedErc20Return();
     await this.requireIndexedPayerSend(chainId, history, raw);
   }
 
@@ -609,12 +654,12 @@ export class Journal {
     const active = (rec: ReturnRecord) => rec.status !== 'planned' && rec.status !== 'paid' && !!rec.recovery &&
       ((rec.payer ?? rec.recipient) === address || rec.executionPayer === address);
     let draining = false;
-    for (const { key, record: rec } of await this.allReturns()) {
+    for (const { key, record: rec, chainId: recordChain } of await this.erc20Returns(chainId)) {
       if (key === target) {
         draining = active(rec);
         continue;
       }
-      if (await this.store.get(`nb2/domain-chain/v1/${rec.domain.slice(2)}`) !== dec(chainId)) continue;
+      if (recordChain !== chainId) continue;
       const ordinary = new Set<bigint>();
       for (const send of rec.sends) {
         const { from, request } = decodeSignedTx(unhex(send.raw));
@@ -622,9 +667,6 @@ export class Journal {
           includeNonce(request.nonce);
           ordinary.add(request.nonce);
         }
-      }
-      if (active(rec) || ordinary.size > 0 || rec.executionPayer === address) {
-        await this.requireErc20ReturnState(chainId, rec);
       }
       if (!active(rec)) continue;
       const progress = await this.finalizedRecoveryProgress(chainId, rec, options.finalizedBlock);
@@ -660,10 +702,12 @@ export class Journal {
     const record = await this.ret(id);
     if (record) await this.requireErc20ReturnState(chainId, record);
     await this.registerPayerChain(chainId);
-    const key = `nb2/payer/v1/${chainId}/${toHex(payer)}`;
+    const scope = `${chainId}/${toHex(payer)}`;
+    const key = `nb2/payer/v1/${scope}`;
     const target = this.key('return', id.slice(2));
     for (;;) {
       const held = await this.store.get(key);
+      await this.requireNonceFenceFeeIndex(scope, held);
       const [owner, state] = held?.split('#') ?? [];
       const heldNonce = state?.startsWith('nonce:') ? undec(state.slice(6)) : undefined;
       if (owner && owner !== target) {
@@ -705,6 +749,7 @@ export class Journal {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the payer nonce horizon');
         }
         await options.beforeSigning?.(commitment);
+        await this.preparePayerSigning(current, chainId, payer);
         claimed = target + '#nonce:' + dec(owner === target && heldNonce !== undefined && heldNonce > nonce ? heldNonce : nonce);
       }
       const attempts = state?.startsWith('burn:') ? state.slice(5).split(',') : undefined;

@@ -307,24 +307,8 @@ pub(crate) fn verify_receipt_log_at(
         uc.input_record.block_hash.as_deref(),
         uc.input_record.hash.as_deref(),
     )?;
-    let value = match mpt_verify(&header.receipts_root, &rlp_index_key(p.tx_index), &p.nodes) {
-        Ok(v) => v,
-        Err(_) => return fail(Rule::ReceiptPath),
-    };
-    let logs = decode_receipt(&value)?;
-    if p.log_index >= logs.kids.len() as u64 {
-        return fail(Rule::LogIndex);
-    }
-    let l = &logs.kids[p.log_index as usize];
-    if !l.list
-        || l.kids.len() != 3
-        || l.kids[0].list
-        || l.kids[0].str.len() != 20
-        || !l.kids[1].list
-        || l.kids[2].list
-    {
-        return fail(Rule::LogIndex);
-    }
+    let value = deposit_receipt_value(p, &header)?;
+    let l = deposit_receipt_log(p, &value)?;
     // the emitter before the topics (section 6.2 step 5)
     if l.kids[0].str != emitter {
         return fail(Rule::LogEmitter);
@@ -342,6 +326,47 @@ pub(crate) fn verify_receipt_log_at(
         data: l.kids[2].str.to_vec(),
         header,
     })
+}
+
+fn deposit_receipt_value(p: &DepositProof, header: &Header) -> Result<Vec<u8>> {
+    mpt_verify(&header.receipts_root, &rlp_index_key(p.tx_index), &p.nodes)
+        .or_else(|_| fail(Rule::ReceiptPath))
+}
+
+fn deposit_receipt_log<'a>(p: &DepositProof, value: &'a [u8]) -> Result<RlpItem<'a>> {
+    let logs = decode_receipt(value)?;
+    if p.log_index >= logs.kids.len() as u64 {
+        return fail(Rule::LogIndex);
+    }
+    let l = logs
+        .kids
+        .into_iter()
+        .nth(p.log_index as usize)
+        .expect("checked receipt log index");
+    if !l.list
+        || l.kids.len() != 3
+        || l.kids[0].list
+        || l.kids[0].str.len() != 20
+        || !l.kids[1].list
+        || l.kids[2].list
+    {
+        return fail(Rule::LogIndex);
+    }
+    Ok(l)
+}
+
+/// Identify a native record in a shared journal from its locally retained root mint receipt.
+#[cfg(feature = "host")]
+pub(crate) fn is_native_uct_deposit(p: &DepositProof, domain: &[u8]) -> Result<bool> {
+    let value = deposit_receipt_value(p, &super::header::decode_header(&p.header)?)?;
+    let log = deposit_receipt_log(p, &value)?;
+    let topics = &log.kids[1].kids;
+    Ok(topics.len() == 2
+        && !topics[0].list
+        && topics[0].str == topic::deposited()
+        && !topics[1].list
+        && topics[1].str.len() == 32
+        && log.kids[2].str.get(..32) == Some(domain))
 }
 
 /// The 224-byte data of Deposited(n, D, v, rho, firstOwner).

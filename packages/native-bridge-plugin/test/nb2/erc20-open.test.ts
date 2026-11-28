@@ -6,7 +6,7 @@ import { toHex } from '../../src/bytes.js';
 import { addressWord, decodeBytesReturn } from '../../src/nb2/abi.js';
 import { ERC20_PROFILE_HASH, IMPORTED_TIP_PROFILE_HASH, NativeBridgeV2, type RedeemOptions, type ReturnAdmission } from '../../src/nb2/bridge.js';
 import { ascii, u256 } from '../../src/nb2/cbor.js';
-import { decodeConfig, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
+import { decodeConfig, domainOf, PRODUCTION_PARAMS } from '../../src/nb2/config.js';
 import { HE } from '../../src/nb2/crypto.js';
 import { decodeReceiptBacking, depositedData, TOPIC } from '../../src/nb2/deposit.js';
 import { LocalKeySigner, signTx } from '../../src/nb2/evm.js';
@@ -402,6 +402,68 @@ test('ERC20 startup, signing and rebroadcast refuse pre-release records without 
   x.finalized(8n);
   await assert.rejects(reopen(), refused);
   await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, hex(key('new return after unsupported Paid'))), refused);
+});
+
+test('ERC20 open rejects an unregistered foreign pending send on any chain', async () => {
+  const { x, bridge, held, store } = await heldPair();
+  const payer = x.payer.address;
+  const chain = x.cfg.chainId;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const native = JSON.parse(readFileSync(new URL('../../../../tests/nb2-journal/rust-written.json', import.meta.url), 'utf8'));
+  for (const [key, value] of Object.entries(native.journal)) {
+    if (key.includes('/return/')) await store.putIf(key, null, value as string);
+  }
+  await NativeBridgeV2.open({ ...x.options(), journal: store });
+  const { Assets } = JSON.parse(readFileSync(new URL('../../../../protocol/vectors/erc20-nb2/vectors.json', import.meta.url), 'utf8'));
+  const foreign = new Journal(store, domainOf(bytes('0x' + Assets[0].Gamma.replace(/^0x/, ''))));
+  assert.notDeepEqual(foreign.domain, bridge.domain);
+  const returnId = hex(key('foreign pre-release pending'));
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  for (const chainId of [chain, chain + 1n]) {
+    const tx = await signTx(x.payer, { chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
+      maxPriorityFeePerGas: 1n, to: bytes(deployment.assets[0].vault), value: 0n, data: new Uint8Array() });
+    const pending = { ...record, ...foreign.base(), returnId, status: 'submitted' as const,
+      source: `0x${Assets[0].Held.replace(/^0x/, '')}` as const, recovery: undefined, erc20PayerState: undefined,
+      executionPayer: hex(payer), sends: [bridge['sendRecord'](tx)] };
+    await foreign.putReturn(pending);
+    const payerState = () => JSON.stringify([...store.map].filter(([key]) => !key.endsWith('/trust-sync')));
+    const before = payerState();
+    await assert.rejects(NativeBridgeV2.open({ ...x.options(), journal: store }), refused);
+    await assert.rejects(bridge.journal.checkReturnPayer(chain, payer, record.returnId, true), refused);
+    assert.ok(payerState() === before, 'refusal leaves the foreign record and payer state intact');
+  }
+  await foreign.registerPayerChain(chain + 1n);
+  await assert.rejects(NativeBridgeV2.open({ ...x.options(), journal: store }), refused);
+});
+
+test('an EVM nonce fence requires its existing scoped fee index', async () => {
+  const { x, bridge, held, store } = await heldPair();
+  const payer = x.payer.address;
+  const { chainId } = x.cfg;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const burned = { ...record, status: 'burned' as const, burnRequest: hex(key('confirmed holder burn')) };
+  await bridge.journal.putReturn(burned);
+  const scope = `${chainId}/${toHex(payer)}`;
+  const slot = `nb2/payer/v1/${scope}`;
+  const owner = `${bridge.journal.prefix}return/${record.returnId.slice(2)}`;
+  const index = `nb2/payer-fee-index/v2/${scope}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+  const fence = owner + '#nonce:7';
+  await store.putIf(slot, null, fence);
+  const reopen = () => NativeBridgeV2.open({ ...x.options(), journal: store });
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  const claim = () => bridge.journal.checkReturnPayer(chainId, payer, record.returnId, true, { signingNonce: 7n });
+  await assert.rejects(reopen(), refused);
+  await assert.rejects(bridge.journal.preparePayerSigning(burned, chainId, payer), refused);
+  await assert.rejects(claim(), refused);
+  assert.equal(await store.get(index), null);
+  assert.equal(await store.get(slot), fence);
+  await store.putIf(slot, fence, owner);
+  await reopen();
+  assert.equal(await store.get(index), null);
+  await claim();
+  assert.equal(await store.get(index), '1');
+  assert.equal(await store.get(slot), fence);
+  await reopen();
 });
 
 test('a claimant must leave a feasible full schedule for the earlier nonce deadline', async () => {

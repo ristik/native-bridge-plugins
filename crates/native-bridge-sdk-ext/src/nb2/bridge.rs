@@ -3211,10 +3211,7 @@ impl NativeBridgeV2 {
                         other,
                         completed,
                         spent_calls,
-                    )?;
-                    self.journal
-                        .prepare_payer_signing(record, request.chain_id, &payer)?;
-                    Ok(())
+                    )
                 }),
                 ..Default::default()
             },

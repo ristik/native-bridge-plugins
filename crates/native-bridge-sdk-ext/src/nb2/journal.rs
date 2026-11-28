@@ -21,8 +21,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::deposit::{decode_receipt_backing, is_native_uct_deposit};
 use super::errors::{fail_d, refuse, Error, Result, Rule, WalletReason};
 use super::evm::decode_signed_tx;
+use super::token::decode_token;
 use super::util::{from_hex, to_hex};
 
 pub const JOURNAL_FORMAT: &str = "unicity-nb2-journal";
@@ -573,6 +575,19 @@ fn payer_send_path(chain_id: u64, payer: &[u8], record: &ReturnRecord) -> String
     )
 }
 
+fn is_native_return(record: &ReturnRecord) -> Result<bool> {
+    let token = decode_token(&unhex(&record.source)?)?;
+    let Some(justification) = token
+        .levels()
+        .next()
+        .and_then(|root| root.mint.justification.as_deref())
+    else {
+        return Ok(false);
+    };
+    let backing = decode_receipt_backing(justification)?;
+    Ok(hex(&backing.d) == record.base.domain && is_native_uct_deposit(&backing.proof, &backing.d)?)
+}
+
 pub(crate) fn unsupported_erc20_return<T>() -> Result<T> {
     refuse(
         WalletReason::BadInput,
@@ -749,6 +764,88 @@ impl Journal {
         Ok(out)
     }
 
+    fn all_returns(&self) -> Result<Vec<(String, ReturnRecord)>> {
+        let mut records = Vec::new();
+        for key in self.store.list("nb2/v1/")? {
+            let Some((domain, id)) = return_path(&key) else {
+                continue;
+            };
+            let Some(raw) = self.store.get(&key)? else {
+                return refuse(
+                    WalletReason::JournalNotPersisted,
+                    "return disappeared during payer reconciliation",
+                );
+            };
+            let rec: ReturnRecord =
+                serde_json::from_str(&raw).map_err(|err| Error::Other(err.to_string()))?;
+            if rec.base.domain != format!("0x{domain}")
+                || rec.return_id != format!("0x{id}")
+                || rec.base.kind != "return"
+                || rec.base.version != JOURNAL_VERSION
+                || rec.base.format != JOURNAL_FORMAT
+            {
+                return refuse(WalletReason::BadInput, "invalid return in shared journal");
+            }
+            records.push((key, rec));
+        }
+        Ok(records)
+    }
+
+    fn erc20_returns(&self, chain_id: u64) -> Result<Vec<(String, ReturnRecord, u64)>> {
+        let prefix = "nb2/payer/v1/";
+        for key in self.store.list(prefix)? {
+            self.require_nonce_fence_fee_index(
+                &key[prefix.len()..],
+                self.store.get(&key)?.as_deref(),
+            )?;
+        }
+        let mut records = Vec::new();
+        for (key, record) in self.all_returns()? {
+            let domain = &record.base.domain[2..];
+            let registered = self.store.get(&format!("nb2/domain-chain/v1/{domain}"))?;
+            let own = record.base.domain == hex(&self.domain);
+            if !own
+                && registered.is_none()
+                && !record.extra.contains_key("erc20PayerState")
+                && record
+                    .extra
+                    .get("recovery")
+                    .and_then(|r| r.get("envelope"))
+                    .is_none()
+                && is_native_return(&record).unwrap_or(false)
+            {
+                continue;
+            }
+            let signed_chain = record
+                .sends
+                .first()
+                .map(|send| {
+                    Ok::<_, Error>(
+                        decode_signed_tx(&unhex(&send.raw)?)
+                            .map_err(Error::Other)?
+                            .request
+                            .chain_id,
+                    )
+                })
+                .transpose()?;
+            let chain = if own {
+                Some(chain_id)
+            } else {
+                registered
+                    .as_deref()
+                    .map(undec64)
+                    .transpose()?
+                    .or(signed_chain)
+            };
+            let Some(chain) = chain else {
+                return unsupported_erc20_return();
+            };
+            self.require_erc20_return_state(chain, &record)?;
+            records.push((key, record, chain));
+        }
+        Ok(records)
+    }
+
     /// Record the signed fee and highest nonce before offering an exact transaction to any RPC.
     pub fn retain_payer_send(&self, record: &ReturnRecord, raw: &[u8]) -> Result<()> {
         let tx = decode_signed_tx(raw).map_err(Error::Other)?;
@@ -810,6 +907,22 @@ impl Journal {
                 WalletReason::JournalNotPersisted,
                 "payer fee index completion was not persisted",
             );
+        }
+        Ok(())
+    }
+
+    fn require_nonce_fence_fee_index(&self, scope: &str, slot: Option<&str>) -> Result<()> {
+        let Some((owner, state)) = slot.and_then(|value| value.split_once('#')) else {
+            return Ok(());
+        };
+        if !state.starts_with("nonce:") {
+            return Ok(());
+        }
+        let Some((domain, id)) = return_path(owner) else {
+            return unsupported_erc20_return();
+        };
+        if !self.payer_history_complete(&format!("{scope}/{domain}/{id}"))? {
+            return unsupported_erc20_return();
         }
         Ok(())
     }
@@ -885,9 +998,7 @@ impl Journal {
     }
 
     pub(crate) fn open_erc20_payer_journal(&self, chain_id: u64) -> Result<()> {
-        for record in self.returns()? {
-            self.require_erc20_return_state(chain_id, &record)?;
-        }
+        self.erc20_returns(chain_id)?;
         self.register_payer_chain(chain_id)
     }
 
@@ -951,6 +1062,11 @@ impl Journal {
         record.require_execution_payer(payer)?;
         let path = payer_send_path(chain_id, payer, record);
         self.require_erc20_return_state(chain_id, record)?;
+        let scope = format!("{chain_id}/{}", to_hex(payer));
+        self.require_nonce_fence_fee_index(
+            &scope,
+            self.store.get(&format!("nb2/payer/v1/{scope}"))?.as_deref(),
+        )?;
         let prefix = format!("nb2/payer-fees/v1/{path}/");
         let keys = self.store.list(&prefix)?;
         if (!keys.is_empty()
@@ -1141,26 +1257,7 @@ impl Journal {
         let mut draining = false;
         let mut include_nonce =
             |nonce| highest = Some(highest.map_or(nonce, |previous: u64| previous.max(nonce)));
-        for key in self.store.list("nb2/v1/")? {
-            let Some((domain, id)) = return_path(&key) else {
-                continue;
-            };
-            let Some(raw) = self.store.get(&key)? else {
-                return refuse(
-                    WalletReason::JournalNotPersisted,
-                    "return disappeared during payer reconciliation",
-                );
-            };
-            let rec: ReturnRecord =
-                serde_json::from_str(&raw).map_err(|err| Error::Other(err.to_string()))?;
-            if rec.base.domain != format!("0x{domain}")
-                || rec.return_id != format!("0x{id}")
-                || rec.base.kind != "return"
-                || rec.base.version != JOURNAL_VERSION
-                || rec.base.format != JOURNAL_FORMAT
-            {
-                return refuse(WalletReason::BadInput, "invalid return in shared journal");
-            }
+        for (key, rec, record_chain) in self.erc20_returns(chain_id)? {
             let executing =
                 rec.extra.get("executionPayer").and_then(Value::as_str) == Some(&address);
             let active = rec.status != "planned"
@@ -1171,12 +1268,7 @@ impl Journal {
                 draining = active;
                 continue;
             }
-            if self
-                .store
-                .get(&format!("nb2/domain-chain/v1/{domain}"))?
-                .as_deref()
-                != Some(&dec(chain_id))
-            {
+            if record_chain != chain_id {
                 continue;
             }
             let mut ordinary = std::collections::BTreeSet::new();
@@ -1186,9 +1278,6 @@ impl Journal {
                     include_nonce(tx.request.nonce);
                     ordinary.insert(tx.request.nonce);
                 }
-            }
-            if active || !ordinary.is_empty() || executing {
-                self.require_erc20_return_state(chain_id, &rec)?;
             }
             if active {
                 let recovery = &rec.extra["recovery"];
@@ -1272,10 +1361,12 @@ impl Journal {
             self.require_erc20_return_state(chain_id, &record)?;
         }
         self.register_payer_chain(chain_id)?;
-        let key = format!("nb2/payer/v1/{chain_id}/{}", to_hex(payer));
+        let scope = format!("{chain_id}/{}", to_hex(payer));
+        let key = format!("nb2/payer/v1/{scope}");
         let target = self.key("return", Some(&id[2..]));
         loop {
             let held = self.store.get(&key)?;
+            self.require_nonce_fence_fee_index(&scope, held.as_deref())?;
             let held_text = held.as_deref().unwrap_or_default();
             let (owner, state) = held_text.split_once('#').unwrap_or((held_text, ""));
             let owns_slot = owner == target;
@@ -1382,6 +1473,7 @@ impl Journal {
                 if let Some(validate) = check.before_signing {
                     validate(&out)?;
                 }
+                self.prepare_payer_signing(&current, chain_id, payer)?;
                 let highest = held_nonce
                     .filter(|_| owns_slot)
                     .map_or(nonce, |n| n.max(nonce));

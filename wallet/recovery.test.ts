@@ -8,7 +8,7 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  CERTIFICATION_DEPTH, EvmReader, GapTree, NativeBridgeV2, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
+  CERTIFICATION_DEPTH, EvmReader, GapTree, Journal, NativeBridgeV2, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx, domainOf,
   evidenceOf, firstOwnerOf, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
   type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryCalibration, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
@@ -185,6 +185,33 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   segment = 2n;
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 2);
+
+  const current = (await store.ret(rec.returnId))!;
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  const [earlier, latest] = (saved.attempts as string[]).map((raw) => decodeSignedTx(unhex(raw)).request);
+  assert.ok(earlier.nonce < latest.nonce);
+  const scope = `${cfg.chainId}/${current.executionPayer!.slice(2)}/${current.domain.slice(2)}/${current.returnId.slice(2)}`;
+  const feePrefix = `nb2/payer-fees/v1/${scope}/`;
+  const journalPath = join(w.dir, 'journal.json');
+  const complete = readFileSync(journalPath, 'utf8');
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  const signer = t.mock.method(w.signer, 'signTransaction', async () => { throw new Error('signer reached'); });
+  const ordinary = { ...latest, nonce: latest.nonce + 1n };
+  for (const earlierFee of [undefined, String(earlier.gas * earlier.maxFeePerGas - 1n)]) {
+    const damaged = JSON.parse(complete);
+    if (earlierFee === undefined) delete damaged[feePrefix + earlier.nonce];
+    else damaged[feePrefix + earlier.nonce] = earlierFee;
+    writeFileSync(journalPath, JSON.stringify(damaged));
+    const shared = await store.payerFeeMaxima(current, cfg.chainId, w.signer.address);
+    assert.equal(shared.get(latest.nonce), latest.gas * latest.maxFeePerGas);
+    assert.ok((shared.get(earlier.nonce) ?? 0n) < earlier.gas * earlier.maxFeePerGas);
+    await assert.rejects(checkLocalErc20Returns(w), refused);
+    await assert.rejects(w.bridge['reserveOrdinaryPayer'](current, w.signer.address, ordinary, ordinaryPayout(w, current, caps)), refused);
+    await assert.rejects(recoverStep(w, current, caps), refused);
+    assert.equal(signer.mock.callCount(), 0);
+    assert.equal(await store.store.get(feePrefix + earlier.nonce), earlierFee ?? null);
+  }
+  writeFileSync(journalPath, complete);
 });
 
 test('a Run with only its first fee authorized leaves the payer free for another return', async (t) => {
@@ -337,6 +364,36 @@ test('wallet startup refuses pre-release ERC20 pending and Paid records while UC
   erc20 = true;
   await assert.rejects(open('holder', recordingRpc), refused);
   assert.equal(readFileSync(storePath, 'utf8'), after);
+});
+
+test('wallet startup refuses ERC20 mode for an unregistered foreign pending return', async (t) => {
+  const { w, open, cfg, deployment } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const record = await w.returnRecord('coin');
+  record.erc20PayerState = 1;
+  delete record.payer;
+  await w.bridge.journal.putReturn(record);
+  await w.bridge.journal.registerPayerChain(cfg.chainId);
+  const openSdk = NativeBridgeV2.open.bind(NativeBridgeV2);
+  t.mock.method(NativeBridgeV2, 'open', async (...args: Parameters<typeof openSdk>) => {
+    const bridge = await openSdk(...args);
+    bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+    return bridge;
+  });
+  await open('holder');
+
+  const { Assets } = JSON.parse(readFileSync(new URL('../protocol/vectors/erc20-nb2/vectors.json', import.meta.url), 'utf8'));
+  const { Gamma, Held } = Assets[0] as { Gamma: string; Held: string };
+  const foreign = new Journal(w.bridge.journal.store, domainOf(unhex('0x' + Gamma.replace(/^0x/, ''))));
+  const tx = await signTx(w.signer, { chainId: cfg.chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
+    maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: new Uint8Array() });
+  await foreign.putReturn({ ...record, ...foreign.base(), returnId: hx(key('foreign ERC20 pending')), status: 'submitted',
+    source: `0x${Held.replace(/^0x/, '')}`, erc20PayerState: undefined, recovery: undefined, executionPayer: hx(w.signer.address),
+    sends: [{ raw: hx(tx.raw), hash: hx(tx.hash), nonce: '7', gas: '100000', at: '0' }] });
+  const file = join(w.dir, 'journal.json');
+  const before = readFileSync(file, 'utf8');
+  await assert.rejects(open('holder'), /unsupported pre-release ERC20 record: start a fresh wallet/);
+  assert.equal(readFileSync(file, 'utf8'), before);
 });
 
 test('a peer payout keeps the wallet packet reserved after it drops out of the mempool', async (t) => {

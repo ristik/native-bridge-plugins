@@ -1154,6 +1154,175 @@ fn erc20_startup_signing_and_rebroadcast_refuse_pre_release_records_without_inde
 }
 
 #[test]
+fn erc20_open_refuses_an_unregistered_foreign_pending_send_on_any_chain() {
+    use super::super::evm::LocalKeySigner;
+    let (bridge, _, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
+    let chain = bridge.cfg.chain_id;
+    let journal = &bridge.journal;
+    let record = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    let native: Value = serde_json::from_str(include_str!(
+        "../../../../tests/nb2-journal/ts-written.json"
+    ))
+    .unwrap();
+    for (key, value) in native["journal"].as_object().unwrap() {
+        if key.contains("/return/") {
+            journal
+                .store
+                .put_if(key, None, value.as_str().unwrap())
+                .unwrap();
+        }
+    }
+    journal.open_erc20_payer_journal(chain).unwrap();
+    let (vectors, _, _) = vector();
+    let asset = &vectors["Assets"][1];
+    let domain = domain_of(&bytes(&asset["Gamma"]));
+    assert_ne!(domain, bridge.domain);
+    let foreign = Journal::new(journal.store.clone(), domain);
+    let mut pending = record.clone();
+    pending.base = foreign.base("return");
+    pending.return_id = hex(&[0x27; 32]);
+    pending.status = "submitted".into();
+    pending.source = hex(&bytes(&asset["Held"]));
+    pending.extra.remove("erc20PayerState");
+    pending.extra.remove("recovery");
+    pending
+        .extra
+        .insert("executionPayer".into(), json!(hex(&payer)));
+    for chain_id in [chain, chain + 1] {
+        let request = TxRequest {
+            chain_id,
+            nonce: 7,
+            gas: 100_000,
+            max_fee_per_gas: 10u8.into(),
+            max_priority_fee_per_gas: 1u8.into(),
+            to: arr(&bytes(&asset["Vault"])),
+            value: BigUint::default(),
+            data: vec![],
+        };
+        pending.sends = vec![bridge.send_record(&sign_tx(&signer, &request).unwrap())];
+        foreign.put_return(&pending).unwrap();
+        let keys = journal.store.list("").unwrap();
+        let before = keys
+            .iter()
+            .map(|key| journal.store.get(key).unwrap())
+            .collect::<Vec<_>>();
+        for error in [
+            journal.open_erc20_payer_journal(chain).unwrap_err(),
+            journal
+                .check_return_payer(chain, &payer, &record.return_id, true)
+                .unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported pre-release ERC20 record: start a fresh wallet"),
+                "{error}"
+            );
+        }
+        assert_eq!(journal.store.list("").unwrap(), keys);
+        assert_eq!(
+            keys.iter()
+                .map(|key| journal.store.get(key).unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+    foreign.register_payer_chain(chain + 1).unwrap();
+    let error = journal.open_erc20_payer_journal(chain).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported pre-release ERC20 record: start a fresh wallet"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_evm_nonce_fence_requires_its_existing_scoped_fee_index() {
+    let (bridge, _, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let payer = [0xcd; 20];
+    let chain = bridge.cfg.chain_id;
+    let journal = &bridge.journal;
+    let mut record = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    record.status = "burned".into();
+    record.burn_request = Some(hex(&[0x32; 32]));
+    journal.put_return(&record).unwrap();
+    let scope = format!("{chain}/{}", to_hex(&payer));
+    let slot = format!("nb2/payer/v1/{scope}");
+    let owner = format!(
+        "nb2/v1/{}/return/{}",
+        &record.base.domain[2..],
+        &record.return_id[2..]
+    );
+    let index = format!(
+        "nb2/payer-fee-index/v2/{scope}/{}/{}",
+        &record.base.domain[2..],
+        &record.return_id[2..]
+    );
+    let fence = format!("{owner}#nonce:7");
+    journal.store.put_if(&slot, None, &fence).unwrap();
+    let claim = || {
+        journal.check_payer(
+            chain,
+            &payer,
+            &record.return_id,
+            true,
+            &PayerCheck {
+                signing_nonce: Some(7),
+                ..Default::default()
+            },
+        )
+    };
+    for error in [
+        journal.open_erc20_payer_journal(chain).unwrap_err(),
+        journal
+            .prepare_payer_signing(&record, chain, &payer)
+            .unwrap_err(),
+        claim().err().expect("the incomplete fence must refuse"),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported pre-release ERC20 record: start a fresh wallet"),
+            "{error}"
+        );
+    }
+    assert!(journal.store.get(&index).unwrap().is_none());
+    assert_eq!(
+        journal.store.get(&slot).unwrap().as_deref(),
+        Some(fence.as_str())
+    );
+    journal.store.put_if(&slot, Some(&fence), &owner).unwrap();
+    journal.open_erc20_payer_journal(chain).unwrap();
+    assert!(journal.store.get(&index).unwrap().is_none());
+    claim().unwrap();
+    assert_eq!(journal.store.get(&index).unwrap().as_deref(), Some("1"));
+    assert_eq!(
+        journal.store.get(&slot).unwrap().as_deref(),
+        Some(fence.as_str())
+    );
+    journal.open_erc20_payer_journal(chain).unwrap();
+}
+
+#[test]
 fn a_claim_checks_all_remaining_calls_before_granting_exclusivity() {
     let (bridge, _, held) = return_bridge(
         24_000_001,

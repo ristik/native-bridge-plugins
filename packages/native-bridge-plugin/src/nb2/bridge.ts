@@ -1813,7 +1813,6 @@ export class NativeBridgeV2 {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the free payer balance');
         }
         await options.admit!(structuredClone(request), structuredClone(record.sends), needed);
-        await this.journal.preparePayerSigning(record, request.chainId, payer);
       },
     });
   }
