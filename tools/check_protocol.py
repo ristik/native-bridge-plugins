@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tarfile
 import tomllib
@@ -81,20 +82,30 @@ def check_erc20_release(digest, profile):
     }
     evidence = release['evidence']
     assert isinstance(evidence, dict) and REQUIRED_ERC20_EVIDENCE <= evidence.keys(), 'missing required ERC20 evidence pin'
+    manifest_bytes = None
     for name, expected in evidence.items():
         path = Path(name)
         assert path.parent == Path('protocol/calibration') and path.suffix == '.json'
-        assert hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == expected, f'ERC20 calibration evidence digest mismatch: {name}'
+        data = (ROOT / path).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == expected, f'ERC20 calibration evidence digest mismatch: {name}'
+        if name == QUALIFIED_ERC20_MANIFEST:
+            manifest_bytes = data
     qualified = release['fundingQualified']
     assert type(qualified) is bool, 'invalid ERC20 funding qualification flag'
     bounds = release['qualifiedBounds']
     fields(bounds, {'calls', 'arrivals', 'inclusionAndFunding'}, 'qualifiedBounds')
     complete = all(bound is not None for bound in bounds.values())
     assert not qualified or complete, 'ERC20 funding qualification requires all release bounds'
+    manifest = read_erc20_wallet_manifest(manifest_bytes) if manifest_bytes is not None else None
+    caps = release['admissionCaps']
     if any(bound is not None for bound in bounds.values()):
         deployment = release.get('deployment')
         check_erc20_deployment(deployment)
-        check_erc20_bounds(bounds, release['admissionCaps'], int(deployment['chainId']))
+        reserve = decimal(manifest['gasReserve'], 0, 2**256 - 1, 'manifest gas reserve') if manifest else 0
+        check_erc20_bounds(bounds, caps, int(deployment['chainId']), reserve)
+    if manifest is not None:
+        assert complete, 'ERC20 wallet manifest requires complete release bounds'
+        check_erc20_wallet_manifest(manifest, release['deployment'], digest, bounds, caps)
     if qualified or QUALIFIED_ERC20_EVIDENCE in evidence:
         assert QUALIFIED_ERC20_EVIDENCE in evidence, 'missing deployment-specific ERC20 qualification evidence pin'
         record = load(QUALIFIED_ERC20_EVIDENCE)
@@ -107,9 +118,7 @@ def check_erc20_release(digest, profile):
         assert record['qualifiedBoundsSha256'] == hashlib.sha256(canonical).hexdigest(), 'qualification evidence bounds mismatch'
         hex_field(record['walletManifestSha256'], 64, 'walletManifestSha256')
         assert evidence.get(QUALIFIED_ERC20_MANIFEST) == record['walletManifestSha256'], 'missing or mismatched qualified ERC20 wallet manifest pin'
-        manifest = load(QUALIFIED_ERC20_MANIFEST)
-        assert manifest['pins']['erc20']['fundingQualified'] is True, 'qualified ERC20 wallet manifest must enable funding'
-        assert manifest['pins']['vaultRuntimeCodeHash'] == release['deployment']['vaultRuntimeHash'], 'qualified ERC20 wallet manifest vault runtime mismatch'
+        assert manifest['fundingQualified'] is True, 'qualified ERC20 wallet manifest must enable funding'
         support = record['supportingEvidence']
         fields(support, set(bounds), 'qualification supporting evidence')
         for name in support.values():
@@ -139,11 +148,81 @@ def hex_field(value, digits, label, prefix=''):
 def check_erc20_deployment(deployment):
     addresses = {'vault', 'recovery', 'token'}
     hashes = {'executionGenesis', 'rootPin', 'pins', 'vaultRuntimeHash', 'recoveryRuntimeHash', 'tokenRuntimeHash'}
-    fields(deployment, addresses | hashes | {'chainId', 'authorityProfileSha256'}, 'deployment')
+    fields(deployment, addresses | hashes | {'chainId', 'authorityProfileSha256', 'gammaSha256'}, 'deployment')
     decimal(deployment['chainId'], 1, 2**64 - 1, 'chainId')
     for name in addresses | hashes:
         hex_field(deployment[name], 40 if name in addresses else 64, name, '0x')
-    hex_field(deployment['authorityProfileSha256'], 64, 'authorityProfileSha256')
+    for name in ('authorityProfileSha256', 'gammaSha256'):
+        hex_field(deployment[name], 64, name)
+
+
+def read_erc20_wallet_manifest(data):
+    source = Path(__file__).resolve().parent
+    result = subprocess.run(['node', '--import', 'tsx', str(source / 'read_erc20_wallet_manifest.ts')],
+                            cwd=source.parent, input=data, capture_output=True)
+    assert result.returncode == 0, f'invalid qualified ERC20 wallet manifest: {result.stderr.decode().strip()}'
+    return json.loads(result.stdout)
+
+
+def check_erc20_wallet_manifest(manifest, deployment, digest, bounds, caps):
+    assert manifest['semanticProfileSha256'] == digest, 'ERC20 wallet manifest gamma semantic profile mismatch'
+    for name, actual in manifest['deployment'].items():
+        assert actual == deployment[name], f'ERC20 wallet manifest {name} mismatch'
+    arrivals, funding = bounds['arrivals'], bounds['inclusionAndFunding']
+    for name in ('duringProgress', 'peakSeals', 'elapsedMs', 'receiptP99Ms', 'advancePeakSeals',
+                 'finalInclusionMs', 'finalPeakSeals', 'qualifiedForMs'):
+        assert manifest['backlog'][name] == str(arrivals[name]), f'ERC20 wallet manifest backlog {name} mismatch'
+    windows = manifest['signingWindows']
+    for name, expected in {'progressWindowMs': str(funding['progressWindowMs']), 'maxRunCalls': funding['maxRunCalls'],
+                           'advanceWindowMs': str(arrivals['advanceWindowMs']),
+                           'ordinaryInclusionMs': str(funding['ordinaryInclusionMs'])}.items():
+        actual = windows.get(name, '0' if name == 'ordinaryInclusionMs' else None)
+        assert type(actual) is type(expected) and actual == expected, f'ERC20 wallet manifest signing window {name} mismatch'
+    limits = {'userGasLimit': 'submittedGas', 'maxEncodedTxBytes': 'signedBytes'}
+    envelopes = bounds['calls']['envelopes']
+    for name, field in limits.items():
+        minimum = max(row[field] for rows in envelopes.values() for row in rows)
+        decimal(manifest[name], minimum, caps[field], f'manifest {name}')
+    assert manifest['returnReserveSegments'] == str(caps['reserveSegments']), 'ERC20 wallet manifest segment reserve mismatch'
+    check_erc20_manifest_ranges(manifest, envelopes, caps)
+
+
+def check_erc20_manifest_ranges(manifest, envelopes, caps):
+    expected = {(entry, i): row for entry, rows in envelopes.items() if entry != 'ordinary' for i, row in enumerate(rows)}
+    covered = set()
+    for entry in manifest['ranges']:
+        fields(entry, {'minReceiptBytes', 'max', 'execution'}, 'manifest recovery range')
+        shape = entry['max']
+        fields(shape, {'entry', 'operations', 'gaps', 'receiptBytes', 'calldataBytes', 'pages', 'openingBytes'}, 'manifest recovery shape')
+        minimum_receipt = uint(entry['minReceiptBytes'], 0, caps['predecessorReceiptBytes'], 'manifest minimum receipt bytes')
+        receipt = uint(shape['receiptBytes'], minimum_receipt, caps['predecessorReceiptBytes'], 'manifest maximum receipt bytes')
+        operations = uint(shape['operations'], 0, caps['startOperations'], 'manifest operations')
+        gaps = uint(shape['gaps'], 0, caps['maxGapsPerCall'], 'manifest gaps')
+        pages = uint(shape['pages'], 0, caps['pages'], 'manifest pages')
+        opening = uint(shape['openingBytes'], 0, caps['calldataBytes'], 'manifest opening bytes')
+        calldata = uint(shape['calldataBytes'], 68, caps['calldataBytes'], 'manifest calldata bytes')
+        execution = decimal(entry['execution'], 1, caps['submittedGas'], 'manifest execution gas')
+        if shape['entry'] == 'run':
+            assert operations > 0 and gaps == 0 and pages > 0, 'invalid ERC20 manifest Run range'
+            keys = [('start', operations - 1)] if minimum_receipt == 0 else []
+            if receipt > 0:
+                keys.append(('resume', operations - 1))
+        else:
+            assert operations == pages == opening == 0 and receipt > 0, 'invalid ERC20 manifest gap range'
+            assert shape['entry'] in {'advanceGaps', 'redeemRecovered'}, 'invalid ERC20 manifest recovery entry'
+            keys = [(shape['entry'], gaps - int(shape['entry'] == 'advanceGaps'))]
+        for key in keys:
+            row = expected.get(key)
+            assert row and execution == row['executionGas'] and calldata == row['calldataBytes'], 'ERC20 wallet manifest recovery range mismatch'
+            # The wallet prices every future predecessor at the full receipt cap.
+            if key[0] == 'start' or (minimum_receipt <= 1 and receipt == caps['predecessorReceiptBytes']):
+                covered.add(key)
+    assert covered == expected.keys(), 'incomplete ERC20 wallet manifest recovery ranges'
+    ordinary = envelopes['ordinary']
+    assert bool(manifest['ordinary']) == bool(ordinary), 'ERC20 wallet manifest ordinary ranges mismatch'
+    for quote in manifest['ordinary']:
+        assert any(quote['calldataBytes'] <= row['calldataBytes'] and int(quote['executionGas']) <= row['executionGas']
+                   and int(quote['submittedGas']) <= row['submittedGas'] for row in ordinary), 'ERC20 wallet manifest ordinary range exceeds reviewed envelope'
 
 
 def erc20_envelope_bytes(chain_id, calldata, gas):
@@ -158,7 +237,7 @@ def erc20_envelope_bytes(chain_id, calldata, gas):
     return 1 + prefix(body) + body
 
 
-def check_erc20_calls(calls, caps, chain_id):
+def check_erc20_calls(calls, caps, chain_id, gas_reserve):
     fields(calls, {'maxStartOperations', 'maxResumeOperations', 'advanceBatch', 'envelopes'}, 'calls')
     start = uint(calls['maxStartOperations'], 1, caps['startOperations'], 'Start operation cap')
     resume = uint(calls['maxResumeOperations'], 1, caps['resumeOperations'], 'Resume operation cap')
@@ -175,15 +254,17 @@ def check_erc20_calls(calls, caps, chain_id):
             calldata = uint(row['calldataBytes'], 68, caps['calldataBytes'], f'{entry} calldata')
             execution = uint(row['executionGas'], 1, caps['submittedGas'], f'{entry} execution gas')
             allowance = 500_000 if entry == 'redeemRecovered' else 0
+            if entry == 'ordinary':
+                allowance = max(500_000, gas_reserve)
             minimum = 21_000 + 16 * calldata + (6 * execution + 4) // 5 + allowance
             gas = uint(row['submittedGas'], minimum, caps['submittedGas'], f'{entry} submitted gas')
             uint(row['signedBytes'], erc20_envelope_bytes(chain_id, calldata, gas), caps['signedBytes'], f'{entry} signed bytes')
 
 
-def check_erc20_bounds(bounds, caps, chain_id):
+def check_erc20_bounds(bounds, caps, chain_id, gas_reserve):
     calls, arrivals, funding = (bounds[k] for k in ('calls', 'arrivals', 'inclusionAndFunding'))
     if calls is not None:
-        check_erc20_calls(calls, caps, chain_id)
+        check_erc20_calls(calls, caps, chain_id, gas_reserve)
     maximum = 2**64 - 1
     if arrivals is not None:
         names = {'maxObservedBacklog', 'duringProgress', 'peakSeals', 'elapsedMs', 'receiptP99Ms',

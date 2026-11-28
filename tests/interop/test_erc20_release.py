@@ -1,6 +1,7 @@
 """Release qualification is a one-way gate over validated calibration data."""
 
 from copy import deepcopy
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ from tools import check_protocol as checker
 
 
 RELEASE = 'protocol/release-erc20-calibration.json'
+DEPLOYMENT_FIXTURE = 'protocol/vectors/erc20-nb2/sdk-deployment.json.gz'
 
 
 class Erc20ReleaseTests(unittest.TestCase):
@@ -19,6 +21,7 @@ class Erc20ReleaseTests(unittest.TestCase):
         self.profile = checker.load('protocol/profile-erc20.json')
         self.release = checker.load(RELEASE)
         self.digest = self.release['semanticProfileSha256']
+        self.fixture = json.loads(gzip.decompress((checker.ROOT / DEPLOYMENT_FIXTURE).read_bytes()))
         self.tmp = TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -39,11 +42,21 @@ class Erc20ReleaseTests(unittest.TestCase):
         checker.check_erc20_release(self.digest, self.profile)
 
     def complete(self):
+        asset = self.fixture['assets'][1]
+        config = bytes.fromhex(asset['config'][2:])
+        length = int.from_bytes(config[32:64], 'big')
+        self.gamma = config[64:64 + length]
+        log = self.fixture['activation']['logs'][1]['data'][2:]
         self.release['deployment'] = {
             'chainId': '31337',
-            **{name: '0x' + '11' * 20 for name in ('vault', 'recovery', 'token')},
-            **{name: '0x' + 'ab' * 32 for name in ('executionGenesis', 'rootPin', 'pins',
-                                                  'vaultRuntimeHash', 'recoveryRuntimeHash', 'tokenRuntimeHash')},
+            **{name: asset[name] for name in ('vault', 'recovery', 'token')},
+            'executionGenesis': self.fixture['genesis']['hash'],
+            'rootPin': '0x8d0759c87fd19a9677e12e605655dd90d8ce1ae78d713c032fd693c53df93366',
+            'pins': '0x396fe025656869b30d83929df20dddc5dc848b2f23a1620a19c985ea45ce9687',
+            'vaultRuntimeHash': '0x' + log[64:128],
+            'recoveryRuntimeHash': '0x' + log[128:192],
+            'tokenRuntimeHash': '0x' + 'ab' * 32,
+            'gammaSha256': hashlib.sha256(self.gamma).hexdigest(),
             'authorityProfileSha256': 'cd' * 32,
         }
         call = {'calldataBytes': 100_000, 'signedBytes': 100_220, 'executionGas': 900_000, 'submittedGas': 3_500_000}
@@ -67,11 +80,47 @@ class Erc20ReleaseTests(unittest.TestCase):
             },
         }
 
-    def pin_qualification(self, *, manifest_funding=True, **overrides):
+    def make_manifest(self, *, funding=True, reserve=500_000):
+        deployment = self.release['deployment']
+        bounds = self.release['qualifiedBounds']
+        timing = bounds['inclusionAndFunding']
+        ranges = []
+        for entry, rows in bounds['calls']['envelopes'].items():
+            if entry == 'ordinary':
+                continue
+            run = entry in {'start', 'resume'}
+            for i, row in enumerate(rows):
+                ranges.append({'minReceiptBytes': 0 if entry == 'start' else 1, 'execution': str(row['executionGas']),
+                               'max': {'entry': 'run' if run else entry, 'operations': i + 1 if run else 0,
+                                       'gaps': 0 if run else i + int(entry == 'advanceGaps'),
+                                       'pages': 32 if run else 0, 'openingBytes': 18_000 if run else 0,
+                                       'receiptBytes': 0 if entry == 'start' else 65_536,
+                                       'calldataBytes': row['calldataBytes']}})
+        return {
+            'pins': {'gamma': '0x' + self.gamma.hex(), 'build': 'production', 'stateReadOnly': False,
+                     'vaultRuntimeCodeHash': deployment['vaultRuntimeHash'], 'gasReserve': str(reserve),
+                     'userGasLimit': '24000000', 'maxEncodedTxBytes': 524_288, 'returnReserveSegments': 64,
+                     'deploymentBlock': int(self.fixture['activation']['blockNumber'], 16),
+                     'erc20': {'fundingQualified': funding, 'factory': self.fixture['factory'],
+                               'factoryRuntimeHash': '0x44c45c4feecc27a4fab03dcefea2c4297166783a2c51e87763ecc0034ae744f0',
+                               'vaultInitcodeHash': self.fixture['vaultInitcodeHash'],
+                               'recoveryInitcodeHash': self.fixture['recoveryInitcodeHash'],
+                               'activationTx': self.fixture['activation']['transactionHash']}},
+            'trust': {'bundle': 'trust-base.bundle.cbor'},
+            'recovery': {'salt': self.fixture['generation'], 'address': deployment['recovery'],
+                         'runtimeHash': deployment['recoveryRuntimeHash'], 'pins': deployment['pins'], 'ranges': ranges,
+                         'backlog': {name: str(value) for name, value in bounds['arrivals'].items()
+                                     if name not in {'maxObservedBacklog', 'advanceWindowMs'}},
+                         'signingWindows': {'progressWindowMs': str(timing['progressWindowMs']), 'maxRunCalls': timing['maxRunCalls'],
+                                            'advanceWindowMs': str(bounds['arrivals']['advanceWindowMs']),
+                                            'ordinaryInclusionMs': str(timing['ordinaryInclusionMs'])}},
+        }
+
+    def pin_qualification(self, *, manifest=None, **overrides):
         bounds = self.release['qualifiedBounds']
         payload = json.dumps(bounds, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()
-        manifest = {'pins': {'vaultRuntimeCodeHash': self.release['deployment']['vaultRuntimeHash'],
-                             'erc20': {'fundingQualified': manifest_funding}}}
+        if manifest is None:
+            manifest = self.make_manifest()
         manifest_path = checker.QUALIFIED_ERC20_MANIFEST
         self.release['evidence'][manifest_path] = self.write_bytes(manifest_path, json.dumps(manifest).encode())
         record = {
@@ -126,7 +175,7 @@ class Erc20ReleaseTests(unittest.TestCase):
     def test_promotion_requires_the_exact_wallet_manifest(self):
         self.complete()
         self.release['fundingQualified'] = True
-        self.pin_qualification(manifest_funding=False)
+        self.pin_qualification(manifest=self.make_manifest(funding=False))
         with self.assertRaisesRegex(AssertionError, 'must enable funding'):
             self.check()
         self.pin_qualification()
@@ -152,6 +201,67 @@ class Erc20ReleaseTests(unittest.TestCase):
             self.check()
         self.pin_qualification()
         self.check()
+
+    def test_promotion_refuses_malformed_manifest_and_mismatched_recovery(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        cases = [
+            ('recovery', 'pins', '0x' + '01' * 32, 'recovery pins differ from gamma'),
+            ('recovery', 'runtimeHash', '0x' + '01' * 32, 'recoveryRuntimeHash mismatch'),
+            ('recovery', 'ranges', [], 'incomplete ERC20 wallet manifest recovery ranges'),
+            ('pins', 'gamma', '0x1234', 'ConfigShape'),
+        ]
+        for section, field, value, reason in cases:
+            with self.subTest(field=field):
+                manifest = self.make_manifest()
+                manifest[section][field] = value
+                self.pin_qualification(manifest=manifest)
+                with self.assertRaisesRegex(AssertionError, reason):
+                    self.check()
+        manifest = self.make_manifest()
+        resume = next(r for r in manifest['recovery']['ranges']
+                      if r['max']['entry'] == 'run' and r['minReceiptBytes'] == 1)
+        resume['max']['receiptBytes'] -= 1
+        self.pin_qualification(manifest=manifest)
+        with self.assertRaisesRegex(AssertionError, 'incomplete ERC20 wallet manifest recovery ranges'):
+            self.check()
+
+    def test_promotion_refuses_mismatched_windows_and_gamma_digest(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        manifest = self.make_manifest()
+        manifest['recovery']['signingWindows']['advanceWindowMs'] = '9000'
+        self.pin_qualification(manifest=manifest)
+        with self.assertRaisesRegex(AssertionError, 'signing window advanceWindowMs mismatch'):
+            self.check()
+        self.release['deployment']['gammaSha256'] = '01' * 32
+        self.pin_qualification()
+        with self.assertRaisesRegex(AssertionError, 'gammaSha256 mismatch'):
+            self.check()
+
+    def test_minimum_ordinary_gas_uses_the_manifest_reserve_with_a_floor(self):
+        self.complete()
+        self.release['fundingQualified'] = True
+        bounds = self.release['qualifiedBounds']
+        bounds['inclusionAndFunding'].update(ordinaryAttempts=1, ordinaryInclusionMs=9_000)
+        ordinary = bounds['calls']['envelopes']['ordinary']
+        calldata, execution = 4_868, 900_001  # ABI for 4096 evidence bytes and two K64 gap proofs.
+        for reserve, allowance in [(250_000, 500_000), (700_000, 700_000)]:
+            with self.subTest(reserve=reserve):
+                minimum = 21_000 + 16 * calldata + 1_080_002 + allowance
+                row = {'calldataBytes': calldata, 'signedBytes': calldata + 200,
+                       'executionGas': execution, 'submittedGas': minimum}
+                ordinary[:] = [row.copy() for _ in range(3)]
+                manifest = self.make_manifest(reserve=reserve)
+                manifest['recovery']['ordinaryRanges'] = [
+                    {'maxEvidenceBytes': 4096, 'maxOperations': 4, 'maxGaps': '2', 'execution': str(execution)},
+                ]
+                self.pin_qualification(manifest=manifest)
+                self.check()
+                ordinary[1]['submittedGas'] -= 1
+                self.pin_qualification(manifest=manifest)
+                with self.assertRaisesRegex(AssertionError, 'ordinary submitted gas'):
+                    self.check()
 
     def test_invalid_values_cannot_be_qualified(self):
         self.complete()
