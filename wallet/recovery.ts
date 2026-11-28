@@ -64,8 +64,8 @@ interface ReleaseRecovery {
   signingWindows?: Omit<Erc20SigningBounds, 'feeWindowMs' | 'ordinary'> & { ordinaryInclusionMs?: bigint };
 }
 
-function recoveryRelease(w: Wallet): ReleaseRecovery {
-  const r = w.release.recovery as {
+export function readRecoveryRelease(release: Wallet['release'], vaultRuntimeHash: Uint8Array, domain: Uint8Array): ReleaseRecovery {
+  const r = release.recovery as {
     salt: string; address: string; runtimeHash: string; pins: string;
     ranges: (Omit<RecoveryCalibration['ranges'][number], 'execution'> & { execution: string })[];
     backlog: Record<keyof Omit<RecoveryBacklog, 'signedStart' | 'observed'>, string>;
@@ -73,8 +73,8 @@ function recoveryRelease(w: Wallet): ReleaseRecovery {
   } | undefined;
   if (!r || !Array.isArray(r.ranges) || !r.backlog) throw new Nb2Error('CapacityPreflight', 'qualified recovery release is required');
   const deployment = { salt: bytes(r.salt, 32), recovery: bytes(r.address, 20), runtimeHash: bytes(r.runtimeHash, 32),
-    pins: bytes(r.pins, 32), vaultRuntimeHash: w.pins.vaultRuntimeCodeHash };
-  const { pins, runtimeHash, vaultRuntimeHash } = deployment;
+    pins: bytes(r.pins, 32), vaultRuntimeHash };
+  const { pins, runtimeHash } = deployment;
   const calibration = { pins, runtimeHash, vaultRuntimeHash,
     ranges: r.ranges.map(({ minReceiptBytes, max, execution }) => ({ minReceiptBytes, max, execution: uint(execution) })) };
   const b = r.backlog;
@@ -85,12 +85,16 @@ function recoveryRelease(w: Wallet): ReleaseRecovery {
     }
     return BigInt(value);
   };
-  return { deployment, calibration, generation: recoveryGeneration(deployment.salt, w.bridge.domain),
+  return { deployment, calibration, generation: recoveryGeneration(deployment.salt, domain),
     signingWindows: windows && { progressWindowMs: bound(windows.progressWindowMs), maxRunCalls: windows.maxRunCalls, advanceWindowMs: bound(windows.advanceWindowMs),
       ordinaryInclusionMs: windows.ordinaryInclusionMs === undefined ? undefined : bound(windows.ordinaryInclusionMs) },
     backlog: { duringProgress: bound(b.duringProgress), peakSeals: bound(b.peakSeals), elapsedMs: bound(b.elapsedMs), receiptP99Ms: bound(b.receiptP99Ms),
       advancePeakSeals: bound(b.advancePeakSeals), finalInclusionMs: bound(b.finalInclusionMs), finalPeakSeals: bound(b.finalPeakSeals),
       qualifiedForMs: bound(b.qualifiedForMs) } };
+}
+
+function recoveryRelease(w: Wallet): ReleaseRecovery {
+  return readRecoveryRelease(w.release, w.pins.vaultRuntimeCodeHash, w.bridge.domain);
 }
 
 async function checkGraph(w: Wallet, release: ReleaseRecovery): Promise<void> {
@@ -208,8 +212,8 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
   };
 }
 
-function ordinaryRanges(w: Wallet): OrdinaryCalibrationRange[] | undefined {
-  const release = w.release.recovery as { ordinaryRanges?: {
+export function readOrdinaryRanges(manifest: Wallet['release']): OrdinaryCalibrationRange[] | undefined {
+  const release = manifest.recovery as { ordinaryRanges?: {
     maxEvidenceBytes: number; maxOperations: number; maxGaps: string; execution: string;
   }[] } | undefined;
   if (release?.ordinaryRanges === undefined) return undefined;
@@ -223,7 +227,7 @@ function ordinaryRanges(w: Wallet): OrdinaryCalibrationRange[] | undefined {
 
 function ordinaryEnvelope(w: Wallet, policy: PayerPolicy): ReturnAdmission['ordinaryEnvelope'] {
   const erc20 = !!w.bridge.cfg.erc20;
-  const ranges = ordinaryRanges(w);
+  const ranges = readOrdinaryRanges(w.release);
   return { encodedBytes: erc20 ? w.pins.maxEncodedTxBytes : BigInt(Math.min(policy.signedBytes, policy.calldataBytes)),
     gas: erc20 && policy.gas > 24_000_000n ? 24_000_000n : policy.gas,
     gasFor: ranges && ((shape) => quoteOrdinaryExecution(shape, ranges, w.pins.gasReserve)) };
@@ -233,7 +237,7 @@ function erc20RecoveryInput(w: Wallet, policy: PayerPolicy): Erc20ReturnRecovery
   const { deployment, calibration, backlog, signingWindows } = recoveryRelease(w);
   return { deployment, calibration, backlog, limits: { ...policy, balance: (1n << 256n) - 1n },
     signingBounds: signingWindows && policy.feeWindowMs !== undefined ? { ...signingWindows, feeWindowMs: policy.feeWindowMs } : undefined,
-    ordinaryRanges: ordinaryRanges(w), ordinaryAttempts: { attemptsBeforeFallback: policy.ordinaryAttemptsBeforeFallback ?? 0n,
+    ordinaryRanges: readOrdinaryRanges(w.release), ordinaryAttempts: { attemptsBeforeFallback: policy.ordinaryAttemptsBeforeFallback ?? 0n,
       inclusionMs: signingWindows?.ordinaryInclusionMs ?? 0n } };
 }
 
