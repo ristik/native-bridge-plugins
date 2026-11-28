@@ -268,7 +268,8 @@ test('recovery RPC proves the parent with the canonical child companion and its 
   assert.deepEqual(await reader.certificateOf(block.header, block.hash, true), block.uc);
   assert.deepEqual(requested, [['0x' + toHex(child.hash)]]);
   wrongChild = true;
-  await assert.rejects(reader.certificateOf(block.header, block.hash, true), { reason: 'CompanionUnknown' });
+  await assert.rejects(reader.certificateOf(block.header, block.hash, true), { reason: 'ProviderFault' });
+  assert.equal(requested.length, 1);
   wrongChild = false;
   badRecord = true;
   await assert.rejects(reader.certificateOf(block.header, block.hash, true));
