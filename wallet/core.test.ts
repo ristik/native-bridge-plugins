@@ -352,9 +352,19 @@ test('redeem opens no retry at the registry wait deadline', async (t) => {
 });
 
 test('connectionOf derives the aggregator from the RPC origin, and --aggregator overrides it', () => {
-  const release = join(mkdtempSync(join(tmpdir(), 'nb2-conn-')), 'nb2-release.json');
+  const release = join(tmp(), 'nb2-release.json');
   writeFileSync(release, '{}');
   assert.equal(connectionOf({ release, rpc: 'https://pos.example.net/rpc' }).aggregator, 'https://pos.example.net/aggregator');
   assert.equal(connectionOf({ release, rpc: 'http://rpc:8545/' }).aggregator, 'http://rpc:8545/aggregator');
+  const rpc = 'https://[::1]:443/gateway/rpc?network=test#fragment';
+  assert.equal(connectionOf({ release, rpc }).aggregator, 'https://[::1]/aggregator');
+  assert.equal(connectionOf({ release, rpc }).rpc, rpc);
   assert.equal(connectionOf({ release, rpc: 'https://pos.example.net/rpc', aggregator: 'https://agg.example.net/x' }).aggregator, 'https://agg.example.net/x');
+});
+
+test('connectionOf gives a friendly error for invalid RPC URLs even with an explicit aggregator', () => {
+  for (const rpc of ['node/rpc', 'https://host:invalid/rpc', 'file:///rpc', 'ws://host/rpc']) {
+    assert.throws(() => connectionOf({ release: 'unused.json', rpc, aggregator: 'https://agg.example.net' }),
+      { message: 'Invalid RPC URL. Use an absolute HTTP or HTTPS URL for --rpc.' });
+  }
 });

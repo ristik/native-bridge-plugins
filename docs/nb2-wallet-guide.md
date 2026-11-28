@@ -222,9 +222,9 @@ A provider that invents a Paid can delay a redemption, never stop it, and the va
 `AlreadyPaid` refuses a second payout if the claim was real after all.
 
 Every height-driven loop (log scans, depth and horizon checks) runs to `EvmReader.saneHead()`:
-the reader's `eth_blockNumber`, trusted only as far as the reader serves the block at that
-height. A head it does not serve (a lying `0xffffffff`) is bounded by a binary search for the
-highest served block, so it costs a few header reads, not a scan of the claimed range. A holder who learned of Paid before
+the reader's `eth_blockNumber`, checked against the header it serves at that height. If the
+header is missing, the wallet checks its cached height with the current reader and uses expanding
+probes and bisection to find a served height. If every probe misses, the head is unknown. A holder who learned of Paid before
 burn certification can attach the matching burn terminal by import or retrieve it with
 `burn` using the same signed request.
 
@@ -575,9 +575,9 @@ The table says what each error means and what your wallet does when it reaches y
 | `BadConfig` (vault) | the vault's constructor | the configuration is not one this build accepts (wrong K or B) | an operator's error at deployment; a wallet never meets it from a deployed vault |
 | `UnlockRecovery` | verification | an unlock in the lineage uses recovery ID 2 or 3 | the token is still valid on Unicity but can't be returned; refuse to accept it for a return |
 | Token verification rules (spec sections 14.1 to 14.4: `Truncated`, `NonCanonical`, `Shape`, ..., `MintSalt`, `SecretOpening`, `CDMismatch`, `InclusionProof`, `SealEpoch`, `SealRoot`, `QuorumNotMet`, `SplitSum` and the rest) | verifyToken, planReturn, and the verification of any token you receive | the token or its lineage is invalid: a malformed encoding, a mint that doesn't open its deposit, a bad inclusion proof or certificate | refuse the token; don't try to return it. The plug-in's own `QuorumNotMet` here means a certificate really lacks its quorum under the held trust history. It is not the vault's registry lag. |
-| HTTP 429, or 503 "busy" | any gateway call | rate limit, or both large-body slots in use | back off and retry (the plug-in's `HttpJsonRpc` does) |
+| HTTP 429, or 503 "busy" | known reads | rate limit, or both large-body slots in use | back off and retry within the transport budget |
 | HTTP 400, connection closed | `eth_sendRawTransaction`, `eth_call`, `eth_estimateGas` | the body is over the gateway's large-body bound; it is refused on its declared length, unread | a transaction within `maxEncodedTxBytes` never hits this; the preflight keeps a return within it |
-| HTTP 503 "broadcast may be partial" | `eth_sendRawTransaction` | ambiguous: the transaction may still be included | poll the receipt of the locally computed hash and look for `Paid(eta)` before resending (automatic) |
+| HTTP 502, 503, 504, or no usable reply | `eth_sendRawTransaction` | ambiguous. The transaction may still be included. | poll the receipt of the locally computed hash and look for `Paid(eta)` before resending (automatic) |
 
 ### The registry lag right after a burn
 
@@ -725,10 +725,18 @@ What the package's public gateway enforces, and what the plug-in does about it:
 - Bodies are at most 16 KiB, except `eth_call`, `eth_estimateGas` and `eth_sendRawTransaction`, which take up to 4.5 MiB (room for a
   512 KiB transaction hex-encoded). A body declared larger is refused with HTTP 400 and the connection is closed, unread. At most two large
   bodies are read at once (503 "busy": retry).
-- Rate limits answer HTTP 429; the plug-in backs off.
-- One answer is at most 8 MiB (HTTP 413 above it). The plug-in halves a log window on a 413 or on the node's result-count error.
-- `eth_sendRawTransaction` is relayed to every validator. Its HTTP 503 ("broadcast may be partial") is ambiguous: the plug-in polls the
-  receipt of the hash it computed itself, and checks `Paid(eta)`, before it sends anything again.
+- `HttpJsonRpc` allows four read requests in flight per transport. It retries allow-listed reads on HTTP 429 and 503 with jittered
+  backoff, up to two retries and five seconds of total wait by default. A `Retry-After` header (delta-seconds or HTTP date) sets the
+  delay when it fits the remaining budget. A browser reading a cross-origin RPC needs that header exposed by CORS. The reference
+  CLI can continue waiting for a known read within its outer retry budget. HTTP errors carry the gateway's JSON envelope message
+  when present.
+- One answer is at most 8 MiB (HTTP 413 above it). The plug-in halves a log window for an answer-size, result-count or explicit
+  block-range limit. It handles throttling by backing off on the original window.
+- The plug-in uses a 1 gwei priority fee fallback only for a successful HTTP response with JSON-RPC `-32601` from
+  `eth_maxPriorityFeePerGas`. Transport failures and other RPC errors surface to the caller.
+- `eth_sendRawTransaction` is relayed to every validator. HTTP 502, 503, 504, a timeout, or a reply without the expected hash can leave
+  the transaction in flight. The wallet reconciles the receipt by its local hash and checks `Paid(eta)` for redemption. When the
+  journal offers a pending send again, it uses the same signed bytes.
 - Retention: the nodes behind the gateway are proof sources, so companions, receipts and logs are served for the life of the deployment.
   Deposit evidence can be fetched at any time after the deposit's child block exists, and segment logs from the deployment block on. The
   wallet still builds `J` right away and keeps it with the token, so minting never depends on a provider.

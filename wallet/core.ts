@@ -34,7 +34,7 @@ import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import { concat, eq, toHex } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
   HttpJsonRpc, LocalKeySigner, NativeBridgeV2, PRODUCTION_TRUST_FRESHNESS_MS, TESTNET_TRUST_FRESHNESS_MS, Nb2Error, RpcError, WalletError, appendTransfer, certifyChecked, decodeToken, deriveBridgeKey, evidenceOf,
-  DEFAULT_KEY_SCHEME, freshMask, JOURNAL_FORMAT, JOURNAL_VERSION, localOwner, transferRequest, verifyHeld,
+  DEFAULT_KEY_SCHEME, freshMask, isReadRpcMethod, JOURNAL_FORMAT, JOURNAL_VERSION, localOwner, transferRequest, verifyHeld,
   type Aggregator, type DepositPlan, type DeploymentPins, type GasModel, type JournalStore, type JsonRpc, type ReconcileResult, type ReturnPlan,
   type IntentsRecord, type ReturnRecord,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
@@ -109,6 +109,10 @@ export interface WalletConfig extends Connection {
 
 /** A connection with the manifest's neighbours as defaults: the bundle and pin the manifest names, the gateway's /aggregator route, a sibling of the RPC path (the release names no aggregator URL). */
 export function connectionOf(o: { release: string; rpc: string; trustBundle?: string; trustPin?: string; aggregator?: string }): Connection {
+  const invalidRpc = 'Invalid RPC URL. Use an absolute HTTP or HTTPS URL for --rpc.';
+  let rpcUrl: URL;
+  try { rpcUrl = new URL(o.rpc); } catch { throw new Error(invalidRpc); }
+  if (rpcUrl.protocol !== 'http:' && rpcUrl.protocol !== 'https:') throw new Error(invalidRpc);
   const release = resolve(o.release);
   const m = JSON.parse(readFileSync(release, 'utf8')) as { trust?: { bundle?: string } };
   const here = dirname(release);
@@ -117,7 +121,7 @@ export function connectionOf(o: { release: string; rpc: string; trustBundle?: st
     trustBundle: resolve(o.trustBundle ?? join(here, m.trust?.bundle ?? 'trust-base.bundle.cbor')),
     trustPin: resolve(o.trustPin ?? join(here, 'trust-base.genesis.entryid')),
     rpc: o.rpc,
-    aggregator: o.aggregator ?? `${new URL(o.rpc).origin}/aggregator`,
+    aggregator: o.aggregator ?? `${rpcUrl.origin}/aggregator`,
   };
 }
 
@@ -606,19 +610,13 @@ const NOT_YET = ['CompanionUnknown', 'Unconfirmed', 'NoEntryForEpoch'];
 
 export interface TransportRetryOptions { budgetMs?: number; baseMs?: number; capMs?: number; sleep?: (ms: number) => Promise<void>; random?: () => number }
 
-/** The methods that change the chain: never retried by readRetrying (an HTTP 503 from a send is ambiguous, #1121). */
-const SENDS = new Set(['eth_sendRawTransaction', 'eth_sendTransaction']);
-
 /**
- * The wallet's RPC with every read waited out on a retryable transport error (`transportRetry`: HTTP 429/502/503/504 or no answer) and
- * every send passed through once. The gateway rate-limits per client, and a step's parallel reads (deposit gas estimation, a return's
- * graph and admission reads, a recovery step's archive receipt reads) can exceed it: a read is idempotent, so it waits; a send never
- * repeats here (the bridge reconciles it by its hash).
+ * Wait out retryable transport errors for known reads. Other calls pass through once.
  */
 export function readRetrying(rpc: JsonRpc, note?: (reason: string) => void, o?: TransportRetryOptions): JsonRpc {
   return {
     call: <T>(method: string, params: unknown[]): Promise<T> =>
-      SENDS.has(method) ? rpc.call<T>(method, params) : transportRetry(() => rpc.call<T>(method, params), note, o),
+      isReadRpcMethod(method) ? transportRetry(() => rpc.call<T>(method, params), note, o) : rpc.call<T>(method, params),
   };
 }
 
