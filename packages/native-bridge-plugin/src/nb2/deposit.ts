@@ -7,7 +7,7 @@ import { MAJ_ARRAY, array, ascii, bstr, bytesN, cArr, cBytes, cTag, cUint, scanB
 import { DOMAIN, MAX_DEPOSIT, MAX_INDEX, TAG, V2_VERSION, type Config } from './config.js';
 import { HE, HU } from './crypto.js';
 import { fail } from './errors.js';
-import { bindHeader, type Header } from './header.js';
+import { bindHeader, decodeHeader, type Header } from './header.js';
 import { MptError, mptVerify } from './mpt.js';
 import { rlpDecode, rlpIndexKey, rlpUint, type RlpItem } from './rlp.js';
 import { encodePredicate, valueData, type MintTx } from './token.js';
@@ -128,6 +128,18 @@ function decodeReceipt(v: Uint8Array): RlpItem {
 export async function verifyReceiptLog(c: Config, t: TrustInput, p: DepositProof, emitter: Uint8Array = c.vault): Promise<ReceiptLog> {
   const uc = await verifyEvmUc(t, p.uc, c);
   const header = bindHeader(p.header, uc.inputRecord.blockHash, uc.inputRecord.nullableHash);
+  const l = depositReceiptLog(p, header);
+  // the emitter before the topics (section 6.2 step 5)
+  if (!eq(l.kids[0].str, emitter)) fail('LogEmitter');
+  const topics: Uint8Array[] = [];
+  for (const tp of l.kids[1].kids) {
+    if (tp.list || tp.str.length !== 32) fail('LogTopics');
+    topics.push(tp.str);
+  }
+  return { address: l.kids[0].str, topics, data: l.kids[2].str, header };
+}
+
+function depositReceiptLog(p: DepositProof, header: Header): RlpItem {
   let value: Uint8Array;
   try {
     value = mptVerify(header.receiptsRoot, rlpIndexKey(p.txIndex), p.nodes);
@@ -139,14 +151,15 @@ export async function verifyReceiptLog(c: Config, t: TrustInput, p: DepositProof
   if (p.logIndex >= BigInt(logs.kids.length)) fail('LogIndex');
   const l = logs.kids[Number(p.logIndex)];
   if (!l.list || l.kids.length !== 3 || l.kids[0].list || l.kids[0].str.length !== 20 || !l.kids[1].list || l.kids[2].list) fail('LogIndex');
-  // the emitter before the topics (section 6.2 step 5)
-  if (!eq(l.kids[0].str, emitter)) fail('LogEmitter');
-  const topics: Uint8Array[] = [];
-  for (const tp of l.kids[1].kids) {
-    if (tp.list || tp.str.length !== 32) fail('LogTopics');
-    topics.push(tp.str);
-  }
-  return { address: l.kids[0].str, topics, data: l.kids[2].str, header };
+  return l;
+}
+
+/** Identify a native record in a shared journal from its locally retained root mint receipt. */
+export function isNativeUctDeposit(p: DepositProof, domain: Uint8Array): boolean {
+  const log = depositReceiptLog(p, decodeHeader(p.header));
+  const topics = log.kids[1].kids;
+  return topics.length === 2 && !topics[0].list && eq(topics[0].str, TOPIC.Deposited) && !topics[1].list && topics[1].str.length === 32
+    && eq(log.kids[2].str.subarray(0, 32), domain);
 }
 
 /** The 224-byte data of Deposited(n, D, v, rho, firstOwner). */

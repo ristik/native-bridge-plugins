@@ -27,9 +27,13 @@ import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, 
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
-  Journal, dec, hex, undec, unhex, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
+  Journal, continuationReserve, dec, executionPayerOf, hex, undec, unhex, payerNonceLimit, remainingOrdinaryAttempts, remainingRecoveryCalls,
+  type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
-import { recoveredSettlementEta } from './recovery.js';
+import { recoveredSettlementEta, recoveryGeneration, type RecoveryDeployment } from './recovery.js';
+import { checkRecoveryCalibration, preflightRecovery, quoteErc20Call, quoteOrdinaryExecution, quoteScheduledRecoveryFee,
+  type Erc20SigningBounds, type OrdinaryCalibrationRange,
+  type RecoveryBacklog, type RecoveryCalibration, type RecoveryLimits } from './recovery-cost.js';
 import { burnIndex, capacityExceeded, capacityPreflight, maxProofs, checkStateRead, verifySealReceipt, type SealReceipt } from './rules.js';
 import { AmbiguousBroadcast, CERTIFICATION_DEPTH, EvmReader, ProofUnavailable, RpcError, revertDataOf, type JsonRpc, type ReceiptJson } from './rpc.js';
 import type { RawLog } from './abi.js';
@@ -128,6 +132,19 @@ export async function previewErc20Recipient(evm: EvmReader, cfg: Config, recipie
   }
   return refuse('RecipientRefused', 'the ERC20 payout simulation did not confirm an exact transfer');
 }
+
+/** Verify the three deployed dependencies against the authenticated recovery runtime's immutables. */
+export async function verifyRecoveryDependencies(evm: EvmReader, recovery: Uint8Array): Promise<void> {
+  const [receipts, lineage, receiptHash, lineageHash, registryHash] = await Promise.all(
+    ['RECEIPTS()', 'LINEAGE()', 'RECEIPTS_HASH()', 'LINEAGE_HASH()', 'REGISTRY_HASH()'].map((getter) => evm.call(recovery, assetSelector(getter))));
+  const address = (word: Uint8Array) => word.length === 32 && beInt(word.subarray(0, 12)) === 0n ? word.subarray(12) : fail('CapacityPreflight', 'invalid recovery helper address');
+  const helpers = [address(receipts), address(lineage), unhex('0xff00000000000000000000000000000000000002')];
+  const expected = [receiptHash, lineageHash, registryHash];
+  const runtimes = await Promise.all(helpers.map((helper) => evm.code(helper)));
+  if (runtimes.some((code, i) => code.length === 0 || !eq(HE(code), expected[i]))) {
+    fail('CapacityPreflight', 'recovery dependency runtime differs from its pinned hash');
+  }
+}
 /** The deployment manifest pins outside D (section 4.3; the manifest schema is NB2-09's). */
 export interface DeploymentPins {
   gamma: Uint8Array;
@@ -221,15 +238,30 @@ export interface ReturnPlan {
 export interface ReturnAdmission {
   ordinaryEnvelope?: { encodedBytes: bigint; gas: bigint; gasFor?: (shape: RedeemShape) => bigint | null };
   checkOrdinary?(record: ReturnRecord, gas: bigint): Promise<void>;
+  /** Optional UCT admission policy. ERC20 uses the release inputs below. */
   recover?(record: ReturnRecord): Promise<NonNullable<ReturnRecord['recovery']>>;
+  erc20Recovery?: Erc20ReturnRecovery;
   beforeCertification?(record: ReturnRecord): Promise<void>;
+}
+
+export interface Erc20ReturnRecovery {
+  deployment: RecoveryDeployment;
+  calibration: RecoveryCalibration;
+  backlog: Omit<RecoveryBacklog, 'signedStart' | 'observed'>;
+  limits: Omit<RecoveryLimits, 'chainId' | 'worstCaseEnvelope'>;
+  signingBounds?: Omit<Erc20SigningBounds, 'ordinary'>;
+  ordinaryAttempts?: Pick<NonNullable<Erc20SigningBounds['ordinary']>, 'attemptsBeforeFallback' | 'inclusionMs'>;
+  ordinaryRanges?: readonly OrdinaryCalibrationRange[];
 }
 
 export interface RedeemOptions {
   recovery?: Uint8Array;
   envelope?: ReturnAdmission['ordinaryEnvelope'];
   archives?: readonly EvmReader[];
-  admit?: (request: TxRequest, prior: readonly SendRecord[]) => Promise<void>;
+  /** Current payer authorization for a contested ERC20 claim. */
+  erc20Policy?: Omit<RecoveryLimits, 'chainId' | 'worstCaseEnvelope' | 'balance'>;
+  erc20Recovery?: Pick<Erc20ReturnRecovery, 'deployment' | 'calibration'>;
+  admit?: (request: TxRequest, prior: readonly SendRecord[], remainingFee?: bigint) => Promise<void>;
 }
 
 export interface RedeemTx { returnId: Uint8Array; calldata: Uint8Array; gasLimit: bigint; P: bigint; endpoint: bigint; history: Uint8Array; eta: Uint8Array; claimedStart: bigint }
@@ -361,6 +393,7 @@ export class NativeBridgeV2 {
         if (!opts.pins.erc20) return refuse('BadDeployment', 'the ERC20 activation pins are missing');
         await checkErc20Activation(b.evm, b.cfg, opts.pins.gamma, opts.pins.erc20,
           opts.pins.vaultRuntimeCodeHash, opts.pins.deploymentBlock, (verify) => b.retryingTrust(verify));
+        await b.journal.openErc20PayerJournal(b.cfg.chainId);
       }
     }
     return b;
@@ -1123,12 +1156,14 @@ export class NativeBridgeV2 {
           if (age > (this.opts.maxSealAgeBlocks ?? 7_200n)) warnings.push(`the newest seal receipt served is ${age} blocks old: the provider may be hiding newer seals; the burn then owes more history`);
         }
       }
-      const existing = await this.journal.retForUpdate(hex(returnId));
+      const saved = await this.journal.retForUpdate(hex(returnId));
+      const existing = saved && this.cfg.erc20 ? await this.journal.requireErc20ReturnState(this.cfg.chainId, saved) : saved;
       if (existing !== null && existing.status !== 'planned') refuse('NotPending', `this part's return is already ${existing.status}`);
       const record: ReturnRecord = {
         ...this.journal.base(), kind: 'return', returnId: hex(returnId), source: hex(token), amount: dec(held.amount), recipient: hex(recipient), a: dec(a),
         startHead: hex(startHead), fromBlock: dec(fromBlock), ...(sealReceipt ? { sealReceipt: hex(sealReceipt) } : {}), payer: hex(payer), status: 'planned', sends: [],
       };
+      if (this.cfg.erc20) record.erc20PayerState = 1;
       const pf = await this.admitReturn(record, held.amount, opts.admission);
       await this.journal.putReturn(record);
       return { returnId, amount: held.amount, recipient, a, cObs: pf.cObs, pNow: pf.pNow, pMax: pf.pMax, marginSegments: pf.pMax - pf.need, gasLimit: pf.gas, warnings, record };
@@ -1173,7 +1208,7 @@ export class NativeBridgeV2 {
    * The section 12.5 preflight for burning `token` at index `a` to `recipient`, with a fresh endpoint estimate (c_obs = max(c, a); the
    * state read is an availability assumption, not evidence) and the payer's funds for the worst-case gas limit.
    */
-  private async preflight(token: Uint8Array, amount: bigint, recipient: Uint8Array, a: bigint, payer: Uint8Array, admission?: ReturnAdmission): Promise<{ cObs: bigint; pNow: bigint; need: bigint; pMax: bigint; gas: bigint }> {
+  private async preflight(token: Uint8Array, amount: bigint, recipient: Uint8Array, a: bigint, payer: Uint8Array, admission?: ReturnAdmission) {
     const envelope = admission?.ordinaryEnvelope;
     if (!envelope?.gasFor && !(await this.gasApplies())) {
       fail('CapacityPreflight', `the gas model ${this.gas.name} is not calibrated for this deployment (its verifier, helper and vault code, its native gas schedule): supply a GasModel for it`);
@@ -1192,18 +1227,20 @@ export class NativeBridgeV2 {
     const lMax = envelope && envelope.encodedBytes < pins.maxEncodedTxBytes ? envelope.encodedBytes : pins.maxEncodedTxBytes;
     const userGasLimit = envelope && envelope.gas < pins.userGasLimit ? envelope.gas : pins.userGasLimit;
     const pf = capacityPreflight({ lMax, lT, lO, K: this.cfg.K, a, cObs, reserve: pins.returnReserveSegments, gasAt, userGasLimit });
-    if (admission?.checkOrdinary) return { cObs, ...pf };
+    const calldataBytes = redeemCalldataLength(Number(lT), pf.need === 0n ? 0 : 32 + Number(pf.need) * gapProofLen(this.cfg.K));
+    if (admission?.checkOrdinary) return { cObs, ...pf, calldataBytes };
     // the payer must fund the worst-case gas limit at the current fee level (twice the base fee plus the priority fee)
     const fees = await this.evm.fees();
     const cost = pf.gas * (2n * fees.baseFee + fees.priority);
     const bal = await this.evm.balance(payer);
     if (bal < cost) refuse('InsufficientFunds', `the payer holds ${bal} wei, the worst-case gas limit ${pf.gas} needs ${cost}`);
-    return { cObs, ...pf };
+    return { cObs, ...pf, calldataBytes };
   }
 
   private async admitReturn(record: ReturnRecord, amount: bigint, admission?: ReturnAdmission) {
     this.requireErc20Qualification();
     delete record.recovery;
+    if (this.cfg.erc20) return this.admitErc20Return(record, amount, admission?.erc20Recovery);
     const a = undec(record.a);
     let ordinary: Awaited<ReturnType<NativeBridgeV2['preflight']>>;
     try {
@@ -1217,11 +1254,119 @@ export class NativeBridgeV2 {
       const observed = undec(record.recovery.observed);
       return { cObs: observed, pNow: observed > a ? observed - a : 0n, need: 0n, pMax: 0n, gas: 0n };
     }
-    if (this.cfg.erc20) {
-      if (!admission?.recover) return fail('CapacityPreflight', 'a bounded ERC20 continuation quote is required');
-      await admission.recover(structuredClone(record));
-    }
     return ordinary;
+  }
+
+  private erc20Limits(limits: Erc20ReturnRecovery['limits']): RecoveryLimits {
+    const { chainId } = this.cfg;
+    return { ...limits, chainId, worstCaseEnvelope: false,
+      signedBytes: Math.min(limits.signedBytes, Number(this.opts.pins.maxEncodedTxBytes)),
+      gas: limits.gas < this.opts.pins.userGasLimit ? limits.gas : this.opts.pins.userGasLimit };
+  }
+
+  private async checkErc20Funds(record: ReturnRecord, limits: RecoveryLimits, replacing?: bigint) {
+    const payer = unhex(record.payer ?? record.recipient);
+    const other = await this.checkErc20Payer(record, payer);
+    const [free, nonce, fees] = await Promise.all([
+      this.freeErc20PayerBalance(payer, other), replacing ?? this.evm.nonce(payer), this.evm.fees(),
+    ]);
+    const currentBid = 2n * fees.baseFee + fees.priority;
+    if (currentBid > limits.maxFeePerGas || fees.priority > limits.maxPriorityFeePerGas) {
+      fail('CapacityPreflight', 'current fees exceed the continuation bid limits');
+    }
+    return { nonce: other.finalizedNonce !== undefined && other.finalizedNonce > nonce ? other.finalizedNonce : nonce,
+      maxNonce: payerNonceLimit(limits.maxNonce, other), balance: free < limits.balance ? free : limits.balance };
+  }
+
+  private async freeErc20PayerBalance(payer: Uint8Array, other: PayerCommitments): Promise<bigint> {
+    const [balance, pending, finalized] = await Promise.all([this.evm.balance(payer), this.evm.balance(payer, 'pending'),
+      other.finalizedNonce === undefined ? undefined : this.evm.balance(payer, 'finalized')]);
+    const visible = balance < pending ? balance : pending;
+    const free = (finalized !== undefined && finalized < visible ? finalized : visible) - other.fees;
+    return free > 0n ? free : 0n;
+  }
+
+  /** Check persisted payer commitments, including nonces omitted from the pending RPC view. */
+  public checkErc20Payer(record: ReturnRecord, payer: Uint8Array, reserve = false, fence?: string,
+    send?: { nonce: bigint; remainingCalls: bigint; maxNonce?: bigint; beforeSigning?: (other: PayerCommitments) => Promise<void> }) {
+    return this.journal.checkReturnPayer(this.cfg.chainId, payer, record.returnId, reserve, {
+      mode: record.status === 'planned' ? 'admit' : 'drain', finalizedNonce: () => this.evm.nonce(payer, 'finalized'), fence,
+      finalizedBlock: (number, hash) => this.evm.isFinalizedBlock(number, hash),
+      signingNonce: send?.nonce, remainingCalls: send?.remainingCalls, maxNonce: send?.maxNonce, beforeSigning: send?.beforeSigning,
+    });
+  }
+
+  private checkErc20Reserve(plan: NonNullable<ReturnRecord['recovery']>, funds: { nonce: bigint; maxNonce: bigint; balance: bigint }): void {
+    if (funds.nonce + undec(plan.calls) - 1n > funds.maxNonce) fail('CapacityPreflight', 'continuation schedule exceeds the declared nonce horizon');
+    if (undec(plan.totalFee) > funds.balance) fail('CapacityPreflight', 'insufficient free payer balance');
+  }
+
+  /** Price a complete ERC20 continuation from release inputs, including when adopting an already signed burn. */
+  public async qualifyErc20Recovery(record: ReturnRecord, input: Erc20ReturnRecovery, replacing?: bigint) {
+    return this.quoteErc20Continuation(structuredClone(record), structuredClone(input), undefined, replacing);
+  }
+
+  private async verifyErc20RecoveryRelease({ deployment, calibration }: Pick<Erc20ReturnRecovery, 'deployment' | 'calibration'>): Promise<void> {
+    const token = this.cfg.erc20?.token;
+    const pins = this.opts.pins.erc20;
+    if (!token || !pins) fail('CapacityPreflight', 'a pinned ERC20 deployment is required');
+    const recovery = erc20Create2(pins.factory, HE(addressWord(token)), pins.recoveryInitcodeHash);
+    checkRecoveryCalibration(this.cfg, deployment, calibration, this.cfg.chainId);
+    const [runtime, vault] = await Promise.all([this.evm.code(recovery), this.evm.code(this.cfg.vault)]);
+    if (!eq(deployment.recovery, recovery) || !deployment.vaultRuntimeHash || !eq(deployment.vaultRuntimeHash, this.opts.pins.vaultRuntimeCodeHash) ||
+        !eq(HE(runtime), deployment.runtimeHash) || !eq(HE(vault), deployment.vaultRuntimeHash)) {
+      fail('CapacityPreflight', 'continuation calibration differs from the deployed graph');
+    }
+    await verifyRecoveryDependencies(this.evm, recovery);
+  }
+
+  private async quoteErc20Continuation(record: ReturnRecord, input: Erc20ReturnRecovery,
+    ordinary?: { gas: bigint; calldataBytes: number }, replacing?: bigint): Promise<NonNullable<ReturnRecord['recovery']>> {
+    await this.verifyErc20RecoveryRelease(input);
+    const { deployment, calibration } = input;
+    const limits = this.erc20Limits(input.limits);
+    const funds = await this.checkErc20Funds(record, limits, replacing);
+    const a = undec(record.a);
+    const { segment } = await this.evm.vaultState(this.cfg.vault);
+    const observed = segment > a ? segment : a;
+    const backlog = { ...input.backlog, signedStart: a, observed };
+    const bounds = input.signingBounds && { ...input.signingBounds,
+      ordinary: ordinary && { ...ordinary, attemptsBeforeFallback: input.ordinaryAttempts?.attemptsBeforeFallback ?? 0n,
+        inclusionMs: input.ordinaryAttempts?.inclusionMs ?? 0n } };
+    const plan = await this.retryingTrust((trust) => preflightRecovery(this.opts.pins.gamma, unhex(record.source), trust,
+      buildParams(this.opts.pins.build), deployment, calibration, { ...limits, balance: funds.balance }, backlog,
+      record.sealReceipt ? unhex(record.sealReceipt) : undefined, bounds));
+    const priced = { generation: hex(recoveryGeneration(deployment.salt, this.domain)),
+      calls: dec(BigInt(plan.run.length) + plan.advance.calls + 1n + plan.priorAttempts), totalFee: dec(plan.totalFee),
+      runCuts: plan.run.map((cut) => cut.shape.operations), advanceGaps: plan.advance.quote.shape.gaps,
+      observed: dec(observed), progressEnd: dec(observed + backlog.duringProgress), receiptP99Ms: dec(backlog.receiptP99Ms),
+      finalInclusionMs: dec(backlog.finalInclusionMs), qualifiedForMs: dec(backlog.qualifiedForMs),
+      envelope: { gas: dec(limits.gas), signedBytes: limits.signedBytes, calldataBytes: limits.calldataBytes, maxNonce: dec(limits.maxNonce),
+        maxFeePerGas: dec(limits.maxFeePerGas), maxPriorityFeePerGas: dec(limits.maxPriorityFeePerGas) },
+      ordinary: ordinary && { gas: dec(ordinary.gas), calldataBytes: ordinary.calldataBytes,
+        maxFeePerGas: dec(limits.maxFeePerGas), attemptsBeforeFallback: dec(plan.priorAttempts) } };
+    this.checkErc20Reserve(priced, funds);
+    return priced;
+  }
+
+  private async admitErc20Return(record: ReturnRecord, amount: bigint, input?: Erc20ReturnRecovery) {
+    if (!input) fail('CapacityPreflight', 'a bounded ERC20 continuation quote is required');
+    input = structuredClone(input);
+    const a = undec(record.a);
+    const limits = this.erc20Limits(input.limits);
+    let ordinary: Awaited<ReturnType<NativeBridgeV2['preflight']>> | undefined;
+    try {
+      const candidate = await this.preflight(unhex(record.source), amount, unhex(record.recipient), a, unhex(record.payer ?? record.recipient), {
+        ordinaryEnvelope: { encodedBytes: this.opts.pins.maxEncodedTxBytes, gas: limits.gas,
+          gasFor: input.ordinaryRanges && ((shape) => quoteOrdinaryExecution(shape, input!.ordinaryRanges!, this.opts.pins.gasReserve)) },
+      });
+      if (quoteErc20Call(candidate.calldataBytes, candidate.gas, limits)) ordinary = candidate;
+    } catch (e) {
+      if (!((e instanceof Nb2Error && e.rule === 'CapacityPreflight') || (e instanceof WalletError && e.reason === 'InsufficientFunds'))) throw e;
+    }
+    record.recovery = await this.quoteErc20Continuation(record, input, ordinary);
+    const observed = undec(record.recovery.observed);
+    return ordinary ?? { cObs: observed, pNow: observed - a, need: 0n, pMax: 0n, gas: 0n };
   }
 
   private async verifyReturnAnchor(rec: ReturnRecord): Promise<void> {
@@ -1270,6 +1415,7 @@ export class NativeBridgeV2 {
     const { source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator } = rec;
     const verified: ReturnRecord = { ...this.journal.base(), kind: 'return', status: 'burn-requested', sends: [],
       source, amount, returnId, recipient, a, startHead, fromBlock, sealReceipt, burnTx, burnRequest, certificationLocator };
+    if (this.cfg.erc20) verified.erc20PayerState = 1;
     if (burned) {
       const part = decodeEvidence(evidenceOf(burned));
       const final = part.proofs.at(-1);
@@ -1284,7 +1430,8 @@ export class NativeBridgeV2 {
       verified.eta = eta;
     }
     return this.locked(`return/${returnId.slice(2)}`, async () => {
-      const existing = await this.journal.retForUpdate(returnId);
+      const saved = await this.journal.retForUpdate(returnId);
+      const existing = saved && this.cfg.erc20 ? await this.journal.requireErc20ReturnState(this.cfg.chainId, saved) : saved;
       if (existing?.burnRequest !== undefined &&
         (existing.burnRequest !== burnRequest || existing.burnTx !== burnTx || existing.returnId !== returnId ||
           existing.source !== source || existing.amount !== amount || existing.recipient !== recipient || existing.a !== a ||
@@ -1333,7 +1480,8 @@ export class NativeBridgeV2 {
   }
 
   private async returnRecord(id: Uint8Array): Promise<ReturnRecord> {
-    return (await this.journal.retForUpdate(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
+    const record = (await this.journal.retForUpdate(hex(id))) ?? refuse('JournalNotPersisted', `no journal entry for return ${hexq(id)}`);
+    return this.cfg.erc20 ? this.journal.requireErc20ReturnState(this.cfg.chainId, record) : record;
   }
 
   /**
@@ -1345,16 +1493,18 @@ export class NativeBridgeV2 {
     returnId = Uint8Array.from(returnId);
     const recipient = expectedRecipient && Uint8Array.from(expectedRecipient);
     const recoverProof = options?.recoverProof;
-    return this.locked(`return/${toHex(returnId)}`, () => this.burnInner(returnId, owner, admission, recipient, recoverProof));
+    return this.locked(`return/${toHex(returnId)}`, async () => {
+      const record = await this.returnRecord(returnId);
+      return this.burnInner(returnId, record, owner, admission, recipient, recoverProof);
+    });
   }
 
-  private async burnInner(returnId: Uint8Array, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array,
+  private async burnInner(returnId: Uint8Array, rec: ReturnRecord, owner?: OwnerSigner, admission?: ReturnAdmission, expectedRecipient?: Uint8Array,
     recoverProof?: boolean): Promise<{ burned: Uint8Array; eta: Uint8Array; verdict: Verdict }> {
-    const rec = await this.returnRecord(returnId);
     if (rec.status === 'planned') {
       // the last check before the irreversible step: the preflight again, at the journaled index, against a fresh state
       if (owner === undefined) return refuse('BadInput', 'only the holder can sign a new burn');
-      if (admission) await this.verifyReturnAnchor(rec);
+      if (admission || this.cfg.erc20) await this.verifyReturnAnchor(rec);
       const recipient = unhex(rec.recipient);
       this.checkReturnRecipient(recipient);
       if (expectedRecipient && !eq(recipient, expectedRecipient)) refuse('BadInput', 'planned return does not match the authorized recipient');
@@ -1363,10 +1513,31 @@ export class NativeBridgeV2 {
       if (rec.returnId !== hex(returnId) || !eq(HU(source), returnId) || held.amount !== undec(rec.amount)) {
         refuse('BadInput', 'planned return does not match the verified source and amount');
       }
-      await this.admitReturn(rec, held.amount, admission);
+      const admissionSnapshot = this.cfg.erc20 && admission?.erc20Recovery
+        ? { ...admission, erc20Recovery: structuredClone(admission.erc20Recovery) } : admission;
+      await this.admitReturn(rec, held.amount, admissionSnapshot);
       await previewErc20Recipient(this.evm, this.cfg, recipient, held.amount);
       const R = encodeReturnData({ d: this.domain, asset: this.cfg.asset, recipient, amount: held.amount, minIndex: undec(rec.a) });
-      const { tx, cd } = await transferRequest(source, owner, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
+      const { cancel, retain } = this.cfg.erc20 ? await this.checkErc20Payer(rec, unhex(rec.payer ?? rec.recipient), true, hex(freshMask())) : {};
+      let signing = false;
+      let declined = false;
+      let signed: Awaited<ReturnType<typeof transferRequest>>;
+      try {
+        if (this.cfg.erc20) {
+          this.checkErc20Reserve(rec.recovery!, await this.checkErc20Funds(rec, this.erc20Limits(admissionSnapshot!.erc20Recovery!.limits)));
+        }
+        signed = await transferRequest(source, { publicKey: owner.publicKey, signUnlock: async (message) => {
+          signing = true;
+          try { return await owner.signUnlock(message); }
+          catch (e) { declined = e instanceof WalletError && e.reason === 'SigningDeclined'; throw e; }
+        } }, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
+      } catch (e) {
+        if (!signing || declined) await cancel?.();
+        else await retain?.();
+        throw e;
+      }
+      await retain?.();
+      const { tx, cd } = signed;
       rec.burnTx = hex(tx);
       rec.burnRequest = hex(cd);
       const request = parseCertification(cd);
@@ -1485,7 +1656,11 @@ export class NativeBridgeV2 {
    */
   public submitRedeem(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
-    return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, signer, options));
+    const payer: EvmSigner = { address: Uint8Array.from(signer.address), signTransaction: signer.signTransaction.bind(signer) };
+    if (options.erc20Policy || options.erc20Recovery) options = {
+      ...options, erc20Policy: options.erc20Policy && { ...options.erc20Policy }, erc20Recovery: structuredClone(options.erc20Recovery),
+    };
+    return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, payer, options));
   }
 
   private async submitRedeemInner(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
@@ -1493,7 +1668,7 @@ export class NativeBridgeV2 {
     // Reconciliation, construction and the journal CAS share this snapshot.
     const fresh = await this.returnRecord(returnId);
     const first = fresh.sends[0] && decodeSignedTx(unhex(fresh.sends[0].raw));
-    const payer = fresh.executionPayer ? unhex(fresh.executionPayer) : first?.from;
+    const payer = executionPayerOf(fresh);
     const different = payer && !eq(payer, signer.address);
     const pending = { recovery: options.recovery };
     let expired: TxRequest | undefined;
@@ -1519,10 +1694,26 @@ export class NativeBridgeV2 {
       }
       const gas = rtx.gasLimit * gasBump > this.opts.pins.userGasLimit ? this.opts.pins.userGasLimit : rtx.gasLimit * gasBump;
       const tx = await this.signed(signer, this.cfg.vault, rtx.calldata, 0n, gas,
-        options.admit && ((request) => options.admit!(request, fresh.sends)), expired && {
+        async (request) => {
+          if (this.cfg.erc20) {
+            const ordinary = fresh.recovery?.ordinary;
+            const prior = new Set(fresh.sends.map((send) => undec(send.nonce)));
+            if (!ordinary || (!prior.has(request.nonce) && BigInt(prior.size) >= undec(ordinary.attemptsBeforeFallback)) ||
+              !quoteErc20Call(request.data.length, request.gas, {
+                ...request, maxNonce: request.nonce, gas: undec(ordinary.gas), calldataBytes: ordinary.calldataBytes,
+                maxFeePerGas: undec(ordinary.maxFeePerGas), signedBytes: Number(this.opts.pins.maxEncodedTxBytes), balance: 0n, feeBudget: 0n,
+              }) || request.maxFeePerGas > undec(ordinary.maxFeePerGas) || !options.admit) {
+              fail('CapacityPreflight', 'ordinary attempt exceeds its signing reserve');
+            }
+            await this.reserveOrdinaryPayer(fresh, signer.address, request, options);
+          } else {
+            await options.admit?.(structuredClone(request), structuredClone(fresh.sends));
+          }
+        }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
             .map((send) => decodeSignedTx(unhex(send.raw)).request),
         });
+      if (this.cfg.erc20) await this.journal.retainPayerSend(fresh, tx.raw);
       // Until the exact call passes preflight it has never been broadcast. Leave
       // the burn rebuildable, including its history and route, on any refusal.
       await this.checkOrdinaryImport(fresh, tx.raw);
@@ -1535,6 +1726,7 @@ export class NativeBridgeV2 {
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.saneHead());
       await this.journal.putReturn(fresh);
       expired = undefined;
+      if (this.cfg.erc20) await this.journal.preparePayerBroadcast(fresh, this.cfg.chainId, tx.raw);
       const r = await this.broadcastAndWait(tx);
       if (r === null) return { state: 'pending', txHash: tx.hash };
       const outcome = await this.reconcileRecord(fresh, archives, { readOnly: true, pending });
@@ -1556,6 +1748,72 @@ export class NativeBridgeV2 {
       throw e === null ? new Nb2Error('PayoutFailed', detail) : redeemRefusal(e, detail);
     }
     return { state: 'not-paid' };
+  }
+
+  private async reserveOrdinaryPayer(record: ReturnRecord, payer: Uint8Array, request: TxRequest, options: RedeemOptions): Promise<void> {
+    const plan = record.recovery!;
+    const used = new Set<bigint>();
+    if (record.sends.length) {
+      const finalized = await this.evm.nonce(payer, 'finalized');
+      for (const send of record.sends) {
+        const tx = decodeSignedTx(unhex(send.raw));
+        const { nonce, chainId } = tx.request;
+        if (!eq(tx.from, payer) || chainId !== request.chainId || nonce >= finalized || nonce >= request.nonce) continue;
+        used.add(nonce);
+      }
+    }
+    const spentCalls = BigInt(used.size);
+    const progress = await this.journal.finalizedRecoveryProgress(request.chainId, record,
+      (number, hash) => this.evm.isFinalizedBlock(number, hash));
+    const completed = progress?.completed ?? 0n;
+    await this.checkErc20Payer(record, payer, true, undefined, {
+      nonce: request.nonce, maxNonce: options.erc20Policy?.maxNonce, remainingCalls: remainingRecoveryCalls(plan, completed, spentCalls),
+      beforeSigning: async (other) => {
+        const packet = request.gas * request.maxFeePerGas;
+        const fees = await this.journal.payerFees(record, request.chainId, payer, request.nonce);
+        if (fees.atNonce > 0n && request.nonce < await this.evm.nonce(payer, 'finalized')) {
+          fail('CapacityPreflight', 'ordinary replacement nonce is already finalized');
+        }
+        let needed = fees.atNonce > packet ? fees.atNonce : packet;
+        const authorization = options.erc20Policy;
+        if (other.contestedDrain) {
+          if (!authorization || typeof authorization.maxFeePerGas !== 'bigint' || authorization.maxFeePerGas <= 0n ||
+            authorization.maxFeePerGas < request.maxFeePerGas) {
+            fail('CapacityPreflight', 'remaining continuation schedule needs an authorized payer fee ceiling');
+          }
+          const release = options.erc20Recovery;
+          if (!release) fail('CapacityPreflight', 'remaining continuation schedule needs authenticated release calibration');
+          await this.verifyErc20RecoveryRelease(release);
+          if (plan.generation !== hex(recoveryGeneration(release.deployment.salt, this.domain))) {
+            fail('CapacityPreflight', 'remaining continuation belongs to another recovery generation');
+          }
+          const limits = this.erc20Limits({ ...authorization, balance: 0n });
+          if (request.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || !quoteErc20Call(request.data.length, request.gas, {
+            ...limits, maxNonce: request.nonce, maxFeePerGas: request.maxFeePerGas, maxPriorityFeePerGas: request.maxPriorityFeePerGas,
+          })) fail('CapacityPreflight', 'ordinary call is outside the current payer limits');
+          const runs = BigInt(plan.runCuts.length);
+          const scheduledAdvances = undec(plan.calls) - remainingOrdinaryAttempts(plan) - 1n - runs;
+          if (scheduledAdvances < 0n) fail('CapacityPreflight', 'admitted call count does not cover the recovery schedule');
+          const advances = scheduledAdvances - (completed > runs ? completed - runs : 0n);
+          const fallback = quoteScheduledRecoveryFee(unhex(record.source), this.cfg.K, {
+            cuts: plan.runCuts, completedRuns: Number(completed < runs ? completed : runs),
+            batch: plan.advanceGaps, advances: advances > 0n ? advances : 0n,
+          }, release.calibration, limits);
+          const attempts = remainingOrdinaryAttempts(plan, spentCalls);
+          const ordinary = undec(plan.ordinary!.gas) * limits.maxFeePerGas;
+          const allowance = attempts > 0n ? ordinary : 0n;
+          const remainder = continuationReserve(fallback, ordinary, attempts) - allowance;
+          needed = remainder + (needed > allowance ? needed : allowance);
+        }
+        if (typeof authorization?.feeBudget === 'bigint' && needed + fees.prior > authorization.feeBudget) {
+          fail('CapacityPreflight', 'remaining continuation schedule exceeds the authorized payer fee budget');
+        }
+        if (needed > await this.freeErc20PayerBalance(payer, other)) {
+          fail('CapacityPreflight', 'remaining continuation schedule exceeds the free payer balance');
+        }
+        await options.admit!(structuredClone(request), structuredClone(record.sends), needed);
+      },
+    });
   }
 
   /**
@@ -1883,6 +2141,7 @@ export class NativeBridgeV2 {
         return { state: 'pending', txHash };
       }
       if (resubmit) {
+        if (this.cfg.erc20) await this.journal.preparePayerBroadcast(rec, this.cfg.chainId, raw);
         try { await this.evm.sendRaw(raw); }
         catch (error) {
           if (onExpired && error instanceof RpcError && /replacement transaction underpriced/i.test(error.message) &&
@@ -2058,7 +2317,8 @@ export class NativeBridgeV2 {
 
   private async signed(signer: EvmSigner, to: Uint8Array, data: Uint8Array, value: bigint, gas: bigint, admit?: (request: TxRequest) => Promise<void>, replace?: { nonce: bigint; pooled: boolean; candidates: TxRequest[] }): Promise<SignedTx> {
     const [nonce, fees] = await Promise.all([this.evm.nonce(signer.address), this.evm.fees()]);
-    const request = { chainId: this.cfg.chainId, nonce, maxPriorityFeePerGas: fees.priority, maxFeePerGas: 2n * fees.baseFee + fees.priority, gas, to, value, data };
+    const request = { chainId: this.cfg.chainId, nonce, maxPriorityFeePerGas: fees.priority, maxFeePerGas: 2n * fees.baseFee + fees.priority,
+      gas, to: Uint8Array.from(to), value, data: Uint8Array.from(data) };
     if (replace) {
       if (await this.evm.nonce(signer.address, 'latest') !== replace.nonce) refuse('NotPending', 'payout nonce changed during replacement');
       request.nonce = replace.nonce;

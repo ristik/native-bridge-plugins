@@ -12,8 +12,11 @@
  * (they exceed 2^53). A record is written whole; `put` resolves only once the record is durable. The plug-in writes each record
  * BEFORE the step it enables (secret before value, burn request before certification, every signed transaction before broadcast).
  */
-import { fromHex, toHex } from '../bytes.js';
-import { refuse } from './errors.js';
+import { eq as eqBytes, fromHex, toHex } from '../bytes.js';
+import { decodeReceiptBacking, isNativeUctDeposit } from './deposit.js';
+import { fail, refuse } from './errors.js';
+import { decodeSignedTx } from './evm.js';
+import { decodeToken } from './token.js';
 
 export const JOURNAL_FORMAT = 'unicity-nb2-journal';
 export const JOURNAL_VERSION = 1;
@@ -168,11 +171,18 @@ export interface ReturnRecord extends Base {
   recovery?: {
     generation: Hex; calls: Dec; totalFee: Dec; runCuts: number[]; advanceGaps: number;
     observed: Dec; receiptP99Ms: Dec; finalInclusionMs: Dec; qualifiedForMs: Dec;
+    /** Maximum segment already covered by the Run arrival allowance at signing. */
+    progressEnd?: Dec;
+    /** ERC20 signing ceilings used to price portable calls. */
+    envelope?: { gas: Dec; signedBytes: number; calldataBytes: number; maxNonce: Dec; maxFeePerGas: Dec; maxPriorityFeePerGas: Dec };
+    ordinary?: { gas: Dec; calldataBytes: number; maxFeePerGas: Dec; attemptsBeforeFallback: Dec };
   };
   /** The certified burned part: the redeem evidence's token. */
   burned?: Hex;
   eta?: Hex;
   sends: SendRecord[];
+  /** Written when this journal creates an ERC20 return under the payer-slot protocol. */
+  erc20PayerState?: 1;
   /** The payer of the first durable payout send, shared by both routes. */
   executionPayer?: Hex;
   /** A mined payment hint whose certified proof is still being fetched. */
@@ -197,6 +207,119 @@ export const dec = (v: bigint | number): Dec => BigInt(v).toString(10);
 export function undec(s: Dec): bigint {
   if (!/^(0|[1-9][0-9]*)$/.test(s)) refuse('BadInput', `journal field ${s} is not a decimal`);
   return BigInt(s);
+}
+
+const ERC20_RETURN_VALIDATION_RETRIES = 3;
+const returnKey = /^nb2\/v1\/([0-9a-f]{64})\/return\/([0-9a-f]{64})$/;
+
+export interface PayerCheck {
+  mode?: 'admit' | 'drain';
+  finalizedNonce?: () => Promise<bigint>;
+  finalizedBlock?: (number: bigint, hash: Uint8Array) => Promise<boolean>;
+  /** A unique fence for a new holder signing attempt. */
+  fence?: Hex;
+  /** The exact nonce to fence before invoking an EVM signer. */
+  signingNonce?: bigint;
+  /** Remaining calls, after replaying verified progress, including the packet about to be signed. */
+  remainingCalls?: bigint;
+  maxNonce?: bigint;
+  beforeSigning?: (commitments: PayerCommitments) => Promise<void>;
+}
+
+export interface PayerCommitments {
+  fees: bigint;
+  calls: bigint;
+  nonceWindows?: { calls: bigint; maxNonce?: bigint }[];
+  finalizedNonce?: bigint;
+  contestedDrain?: boolean;
+  cancel?: () => Promise<void>;
+  retain?: () => Promise<void>;
+}
+
+/** Calls still reserved after a verified prefix of the admitted continuation. */
+export function remainingRecoveryCalls(plan: NonNullable<ReturnRecord['recovery']>, completed: bigint, ordinaryUsed = 0n): bigint {
+  const prior = undec(plan.ordinary?.attemptsBeforeFallback ?? '0');
+  const spent = ordinaryUsed > prior ? prior : ordinaryUsed;
+  const continuation = undec(plan.calls) - prior - completed;
+  return (continuation > 0n ? continuation : 1n) + prior - spent;
+}
+
+export function remainingOrdinaryAttempts(plan?: ReturnRecord['recovery'], used = 0n): bigint {
+  const prior = undec(plan?.ordinary?.attemptsBeforeFallback ?? '0');
+  return used < prior ? prior - used : 0n;
+}
+
+export function continuationReserve(continuation: bigint, ordinary: bigint, attempts: bigint): bigint {
+  return (attempts > 0n && ordinary > continuation ? ordinary : continuation) + attempts * ordinary;
+}
+
+interface RecoveryProgress { completed: bigint; continuationGas?: bigint }
+interface StoredRecoveryProgress { completed: Dec; continuationGas?: Dec }
+
+function recoveryProgressOf(value: string): RecoveryProgress {
+  const { completed, continuationGas } = JSON.parse(value) as StoredRecoveryProgress;
+  return { completed: undec(completed), continuationGas: continuationGas === undefined ? undefined : undec(continuationGas) };
+}
+
+/** Price other returns at their admitted ceiling. A verified checkpoint can supply the remaining gas. */
+function remainingRecoveryFee(plan: NonNullable<ReturnRecord['recovery']>, progress: RecoveryProgress | undefined,
+  ordinaryUsed: bigint): bigint {
+  const total = undec(plan.totalFee);
+  const savedBid = plan.envelope?.maxFeePerGas ?? plan.ordinary?.maxFeePerGas;
+  if (savedBid === undefined) return total;
+  const admitted = undec(savedBid);
+  if (admitted === 0n) fail('CapacityPreflight', 'invalid continuation fee ceiling');
+  const ordinary = undec(plan.ordinary?.gas ?? '0');
+  const attempts = remainingOrdinaryAttempts(plan, ordinaryUsed);
+  if (progress?.continuationGas !== undefined) return continuationReserve(progress.continuationGas, ordinary, attempts) * admitted;
+  const spent = remainingOrdinaryAttempts(plan) - attempts;
+  const left = total - spent * ordinary * admitted;
+  return left > 0n ? left : 0n;
+}
+/** Last nonce this return may use while leaving feasible nonce windows for the older returns. */
+export function payerNonceLimit(maxNonce: bigint, other: PayerCommitments): bigint {
+  const windows = (other.nonceWindows ?? []).map((w) => ({ ...w, maxNonce: w.maxNonce ?? maxNonce }));
+  windows.sort((a, b) => a.maxNonce === b.maxNonce ? 0 : a.maxNonce < b.maxNonce ? -1 : 1);
+  let calls = 0n;
+  let limit = maxNonce;
+  for (const window of windows) {
+    calls += window.calls;
+    const before = window.maxNonce - calls;
+    if (before < limit) limit = before;
+  }
+  return limit;
+}
+
+/** The first ordinary sender binds legacy records that predate the execution-payer field. */
+export function executionPayerOf(record: ReturnRecord): Uint8Array | undefined {
+  const first = record.sends[0] && decodeSignedTx(unhex(record.sends[0].raw)).from;
+  if (record.executionPayer === undefined) return first;
+  const payer = unhex(record.executionPayer);
+  if (payer.length !== 20 || (first && !eqBytes(payer, first))) {
+    refuse('BadInput', 'execution payer disagrees with the return journal');
+  }
+  return payer;
+}
+
+function requireExecutionPayer(record: ReturnRecord, payer: Uint8Array): void {
+  const bound = executionPayerOf(record);
+  if (bound && !eqBytes(bound, payer)) refuse('NotPending', `return is bound to execution payer ${hex(bound)}`);
+}
+
+function isNativeReturn(record: ReturnRecord): boolean {
+  try {
+    const token = decodeToken(unhex(record.source));
+    const justification = (token.ancestors[0] ?? token).mint.justification;
+    if (justification === null) return false;
+    const backing = decodeReceiptBacking(justification);
+    return hex(backing.d) === record.domain && isNativeUctDeposit(backing.proof, backing.d);
+  } catch {
+    return false;
+  }
+}
+
+export function unsupportedErc20Return(): never {
+  return refuse('BadInput', 'unsupported pre-release ERC20 record: start a fresh wallet');
 }
 
 /** The typed journal over a store, keyed by deployment. */
@@ -305,6 +428,377 @@ export class Journal {
     for (const k of keys) out.push((await this.read<ReturnRecord>(k, 'return'))!);
     return out;
   }
+
+  private async readSharedReturn(key: string, domain: string, id: string): Promise<ReturnRecord> {
+    const raw = await this.store.get(key);
+    if (raw === null) refuse('JournalNotPersisted', 'return disappeared during payer reconciliation');
+    const record = JSON.parse(raw) as ReturnRecord;
+    if (record.domain !== '0x' + domain || record.returnId !== '0x' + id || record.kind !== 'return'
+      || record.format !== JOURNAL_FORMAT || record.version !== JOURNAL_VERSION) refuse('BadInput', 'invalid return in shared journal');
+    return record;
+  }
+
+  public async allReturns(): Promise<{ key: string; record: ReturnRecord }[]> {
+    const records: { key: string; record: ReturnRecord }[] = [];
+    for (const key of await this.store.list('nb2/v1/')) {
+      const match = returnKey.exec(key);
+      if (match) records.push({ key, record: await this.readSharedReturn(key, match[1], match[2]) });
+    }
+    return records;
+  }
+
+  /** Validate every ERC20 return and EVM signing fence before opening or reusing a payer. */
+  public async erc20Returns(chainId: bigint): Promise<{ key: string; record: ReturnRecord; chainId: bigint }[]> {
+    const prefix = 'nb2/payer/v1/';
+    for (const key of await this.store.list(prefix)) {
+      await this.requireNonceFenceFeeIndex(key.slice(prefix.length), await this.store.get(key));
+    }
+    const records = [];
+    for (const { key, record } of await this.allReturns()) {
+      const registered = await this.store.get(`nb2/domain-chain/v1/${record.domain.slice(2)}`);
+      const own = record.domain === hex(this.domain);
+      if (!own && registered === null && record.erc20PayerState === undefined &&
+          record.recovery?.envelope === undefined && isNativeReturn(record)) continue;
+      const first = record.sends[0];
+      const signedChain = first && decodeSignedTx(unhex(first.raw)).request.chainId;
+      const chain = own ? chainId : registered === null ? signedChain : undec(registered);
+      if (chain === undefined) unsupportedErc20Return();
+      records.push({ key, record: await this.requireErc20ReturnState(chain, record), chainId: chain });
+    }
+    return records;
+  }
+
+  /** Record the highest signed nonce before offering an exact transaction to any RPC. */
+  public async retainPayerSend(record: ReturnRecord, raw: Uint8Array): Promise<void> {
+    const { from, request } = decodeSignedTx(raw);
+    requireExecutionPayer(record, from);
+    const payer = this.payerSendPath(request.chainId, from, record);
+    await this.retainPayerMaximum(`nb2/payer-fees/v1/${payer}/${request.nonce}`, request.gas * request.maxFeePerGas);
+    await this.retainPayerMaximum(`nb2/payer-sends/v1/${payer}`, request.nonce);
+  }
+
+  private payerSendPath(chainId: bigint, payer: Uint8Array, record: ReturnRecord): string {
+    return `${chainId}/${toHex(payer)}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+  }
+
+  private async retainPayerMaximum(key: string, value: bigint): Promise<void> {
+    for (;;) {
+      const previous = await this.store.get(key);
+      if ((previous !== null && undec(previous) >= value) || await this.store.putIf(key, previous, dec(value))) return;
+    }
+  }
+
+  /** Pin this deployment domain to the chain authenticated by the SDK. */
+  public async registerPayerChain(chainId: bigint): Promise<void> {
+    const key = `nb2/domain-chain/v1/${toHex(this.domain)}`;
+    await this.store.putIf(key, null, dec(chainId));
+    if (await this.store.get(key) !== dec(chainId)) refuse('BadInput', 'journal domain has another chain ID');
+  }
+
+  private async payerHistoryComplete(path: string): Promise<boolean> {
+    return await this.store.get(`nb2/payer-fee-index/v2/${path}`) === '1';
+  }
+
+  private async completePayerHistory(path: string): Promise<void> {
+    await this.store.putIf(`nb2/payer-fee-index/v2/${path}`, null, '1');
+    if (!await this.payerHistoryComplete(path)) refuse('JournalNotPersisted', 'payer fee index completion was not persisted');
+  }
+
+  private async requireNonceFenceFeeIndex(scope: string, slot: string | null): Promise<void> {
+    const [owner, state] = slot?.split('#') ?? [];
+    if (!state?.startsWith('nonce:')) return;
+    const match = returnKey.exec(owner);
+    if (!match || !await this.payerHistoryComplete(`${scope}/${match[1]}/${match[2]}`)) unsupportedErc20Return();
+  }
+
+  /** Check ERC20 state, refreshing the return before refusing on a status-dependent mismatch. */
+  public async requireErc20ReturnState(chainId: bigint, record: ReturnRecord): Promise<ReturnRecord> {
+    const domain = record.domain.slice(2);
+    const id = record.returnId.slice(2);
+    if (await this.store.get(`nb2/domain-chain/v1/${domain}`) !== dec(chainId)) unsupportedErc20Return();
+    const owner = `nb2/v1/${domain}/return/${id}`;
+    for (let retries = 0; ; retries++) {
+      if (await this.hasErc20ReturnState(chainId, owner, record)) return record;
+
+      // Handoff follows Paid and can change both the slot and the finalized nonce watermark.
+      const latest = await this.readSharedReturn(owner, domain, id);
+      if (JSON.stringify(latest) === JSON.stringify(record)) unsupportedErc20Return();
+      if (retries === ERC20_RETURN_VALIDATION_RETRIES) {
+        refuse('JournalConflict', 'ERC20 return changed repeatedly during payer validation, retry');
+      }
+      record = latest;
+    }
+  }
+
+  private async hasErc20ReturnState(chainId: bigint, owner: string, record: ReturnRecord): Promise<boolean> {
+    const payer = executionPayerOf(record);
+    if (payer) {
+      const path = this.payerSendPath(chainId, payer, record);
+      const highest = await this.store.get(`nb2/payer-sends/v1/${path}`);
+      if (!await this.payerHistoryComplete(path) || highest === null) return false;
+      const fees = `nb2/payer-fees/v1/${path}/`;
+      const hasFee = record.status === 'paid' ? (await this.store.list(fees)).length > 0 : (await this.store.get(fees + highest)) !== null;
+      if (!hasFee) return false;
+      // The exact fees for retained packets are required in every status.
+      for (const { raw } of record.sends) {
+        await this.requireIndexedPayerSend(chainId, record, unhex(raw), undec(highest));
+      }
+      return true;
+    }
+    if (record.status === 'submitted') return false;
+    const holderBurn = record.status !== 'planned' && record.status !== 'paid' &&
+      record.payer !== undefined && record.burnRequest !== undefined;
+    if (record.erc20PayerState === 1 && !holderBurn) return true;
+    // An unpaid local burn keeps its slot before the first signed EVM packet.
+    const slot = await this.store.get(`nb2/payer/v1/${chainId}/${toHex(unhex(record.payer ?? record.recipient))}`);
+    return slot?.split('#')[0] === owner;
+  }
+
+  public async openErc20PayerJournal(chainId: bigint): Promise<void> {
+    await this.erc20Returns(chainId);
+    await this.registerPayerChain(chainId);
+  }
+
+  public async requireIndexedPayerSend(chainId: bigint, record: ReturnRecord, raw: Uint8Array, highest?: bigint): Promise<void> {
+    const { from, request } = decodeSignedTx(raw);
+    if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
+    requireExecutionPayer(record, from);
+    const path = this.payerSendPath(chainId, from, record);
+    if (!await this.payerHistoryComplete(path)) unsupportedErc20Return();
+    const fee = await this.store.get(`nb2/payer-fees/v1/${path}/${request.nonce}`);
+    const watermark = highest === undefined ? await this.store.get(`nb2/payer-sends/v1/${path}`) : dec(highest);
+    if (watermark === null || undec(watermark) < request.nonce || fee === null || undec(fee) < request.gas * request.maxFeePerGas) {
+      unsupportedErc20Return();
+    }
+  }
+
+  /** Read the maximum signed fee at each nonce across both return routes. */
+  public async payerFeeMaxima(record: ReturnRecord, chainId: bigint, payer: Uint8Array): Promise<Map<bigint, bigint>> {
+    if (record.domain !== hex(this.domain)) refuse('BadInput', 'return belongs to another payer journal domain');
+    requireExecutionPayer(record, payer);
+    const history = await this.requireErc20ReturnState(chainId, await this.ret(record.returnId) ?? record);
+    requireExecutionPayer(history, payer);
+    const path = this.payerSendPath(chainId, payer, history);
+    const scope = `${chainId}/${toHex(payer)}`;
+    await this.requireNonceFenceFeeIndex(scope, await this.store.get(`nb2/payer/v1/${scope}`));
+    const prefix = `nb2/payer-fees/v1/${path}/`;
+    const keys = await this.store.list(prefix);
+    if ((keys.length > 0 || await this.store.get(`nb2/payer-sends/v1/${path}`) !== null) &&
+        !await this.payerHistoryComplete(path)) unsupportedErc20Return();
+    const fees = new Map<bigint, bigint>();
+    for (const key of keys) {
+      const value = await this.store.get(key);
+      if (value === null) refuse('JournalNotPersisted', 'signed fee disappeared during payer reconciliation');
+      fees.set(undec(key.slice(prefix.length)), undec(value));
+    }
+    return fees;
+  }
+
+  /** Check an existing scope or initialize an empty one before asking the payer to sign. */
+  public async preparePayerSigning(record: ReturnRecord, chainId: bigint, payer: Uint8Array): Promise<Map<bigint, bigint>> {
+    const fees = await this.payerFeeMaxima(record, chainId, payer);
+    await this.completePayerHistory(this.payerSendPath(chainId, payer, record));
+    return fees;
+  }
+
+  /** Check the original payer and the indexed exact packet before any RPC send. */
+  public async preparePayerBroadcast(record: ReturnRecord, chainId: bigint, raw: Uint8Array): Promise<void> {
+    const { from, request } = decodeSignedTx(raw);
+    if (request.chainId !== chainId) refuse('BadInput', 'signed payer packet belongs to another chain');
+    const history = await this.ret(record.returnId) ?? record;
+    await this.payerFeeMaxima(history, chainId, from);
+    await this.requireIndexedPayerSend(chainId, history, raw);
+  }
+
+  public async payerFees(record: ReturnRecord, chainId: bigint, payer: Uint8Array, nonce: bigint): Promise<{ prior: bigint; atNonce: bigint }> {
+    const fees = await this.payerFeeMaxima(record, chainId, payer);
+    const atNonce = fees.get(nonce) ?? 0n;
+    fees.delete(nonce);
+    let prior = 0n;
+    for (const fee of fees.values()) prior += fee;
+    return { prior, atNonce };
+  }
+
+  /** Publish a replayed checkpoint. Readers independently check execution finality before giving credit. */
+  public async indexRecoveryProgress(chainId: bigint, record: ReturnRecord, completed: bigint,
+    block: { blockNumber: bigint; blockHash: Uint8Array }, continuationGas?: bigint): Promise<void> {
+    const plan = record.recovery;
+    if (!plan || completed < 1n) return;
+    const path = this.recoveryProgressPath(chainId, record);
+    const key = `${path}${dec(block.blockNumber)}/${toHex(block.blockHash)}`;
+    const value = JSON.stringify({ completed: dec(completed), continuationGas: continuationGas === undefined ? undefined : dec(continuationGas) });
+    for (;;) {
+      const previous = await this.store.get(key);
+      if (previous !== null) {
+        const saved = recoveryProgressOf(previous);
+        if (saved.completed > completed || (saved.completed === completed && saved.continuationGas !== undefined &&
+          (continuationGas === undefined || saved.continuationGas >= continuationGas))) return;
+      }
+      if (await this.store.putIf(key, previous, value)) return;
+    }
+  }
+
+  private recoveryProgressPath(chainId: bigint, record: ReturnRecord): string {
+    const plan = record.recovery!;
+    return `nb2/payer-progress/v2/${chainId}/${record.domain.slice(2)}/${record.returnId.slice(2)}/` +
+      `${plan.generation.slice(2)}/${plan.calls}/${plan.ordinary?.attemptsBeforeFallback ?? '0'}/${plan.advanceGaps}/${plan.runCuts.join(',')}/`;
+  }
+
+  public async finalizedRecoveryProgress(chainId: bigint, record: ReturnRecord, finalizedBlock?: PayerCheck['finalizedBlock']): Promise<RecoveryProgress | undefined> {
+    if (!record.recovery || !finalizedBlock) return;
+    let progress: RecoveryProgress | undefined;
+    const path = this.recoveryProgressPath(chainId, record);
+    for (const key of await this.store.list(path)) {
+      const value = await this.store.get(key);
+      if (value === null) refuse('JournalNotPersisted', 'recovery checkpoint disappeared during payer reconciliation');
+      const candidate = recoveryProgressOf(value);
+      if (progress && (candidate.completed < progress.completed || (candidate.completed === progress.completed &&
+        (candidate.continuationGas ?? 0n) <= (progress.continuationGas ?? 0n)))) continue;
+      const [number, hash] = key.slice(path.length).split('/');
+      if (await finalizedBlock(undec(number), unhex('0x' + hash))) progress = candidate;
+    }
+    return progress;
+  }
+
+  private async payerCommitments(chainId: bigint, payer: Uint8Array, target: string, ownsSlot: boolean, options: PayerCheck): Promise<PayerCommitments> {
+    const address = hex(payer);
+    const path = `nb2/payer-sends/v1/${chainId}/${toHex(payer)}/`;
+    const [, domain, id] = returnKey.exec(target)!;
+    const own = `${domain}/${id}`;
+    let highest: bigint | undefined;
+    const commitment: PayerCommitments = { fees: 0n, calls: 0n };
+    const includeNonce = (nonce: bigint) => { if (highest === undefined || nonce > highest) highest = nonce; };
+    const active = (rec: ReturnRecord) => rec.status !== 'planned' && rec.status !== 'paid' && !!rec.recovery &&
+      ((rec.payer ?? rec.recipient) === address || rec.executionPayer === address);
+    let draining = false;
+    for (const { key, record: rec, chainId: recordChain } of await this.erc20Returns(chainId)) {
+      if (key === target) {
+        draining = active(rec);
+        continue;
+      }
+      if (recordChain !== chainId) continue;
+      const ordinary = new Set<bigint>();
+      for (const send of rec.sends) {
+        const { from, request } = decodeSignedTx(unhex(send.raw));
+        if (request.chainId === chainId && eqBytes(from, payer)) {
+          includeNonce(request.nonce);
+          ordinary.add(request.nonce);
+        }
+      }
+      if (!active(rec)) continue;
+      const progress = await this.finalizedRecoveryProgress(chainId, rec, options.finalizedBlock);
+      const used = BigInt(ordinary.size);
+      commitment.fees += remainingRecoveryFee(rec.recovery!, progress, used);
+      // The signed-nonce check below must pass before any of these ordinary nonces can count as used.
+      const calls = remainingRecoveryCalls(rec.recovery!, progress?.completed ?? 0n, used);
+      commitment.calls += calls;
+      const cap = rec.recovery!.envelope?.maxNonce;
+      (commitment.nonceWindows ??= []).push({ calls, maxNonce: cap === undefined ? undefined : undec(cap) });
+    }
+    for (const key of await this.store.list(path)) {
+      if (key === path + own) continue;
+      const value = await this.store.get(key);
+      if (value === null) refuse('JournalNotPersisted', 'signed nonce disappeared during payer reconciliation');
+      includeNonce(undec(value));
+    }
+    if (highest !== undefined) {
+      const finalized = await options.finalizedNonce?.();
+      if (finalized === undefined || finalized <= highest) fail('CapacityPreflight', 'payer has a local signed nonce awaiting finalization');
+      commitment.finalizedNonce = finalized;
+    }
+    if (commitment.calls !== 0n && (options.mode !== 'drain' || (!draining && !ownsSlot))) {
+      fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
+    }
+    return commitment;
+  }
+
+  /** Admit one new return per payer. Existing funded returns can drain in sequence. */
+  public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false, options: PayerCheck = {}): Promise<PayerCommitments> {
+    if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
+    if (options.fence && options.signingNonce !== undefined) refuse('BadInput', 'payer claim cannot sign both a burn and an EVM packet');
+    const record = await this.ret(id);
+    if (record) await this.requireErc20ReturnState(chainId, record);
+    await this.registerPayerChain(chainId);
+    const scope = `${chainId}/${toHex(payer)}`;
+    const key = `nb2/payer/v1/${scope}`;
+    const target = this.key('return', id.slice(2));
+    for (;;) {
+      const held = await this.store.get(key);
+      await this.requireNonceFenceFeeIndex(scope, held);
+      const [owner, state] = held?.split('#') ?? [];
+      const heldNonce = state?.startsWith('nonce:') ? undec(state.slice(6)) : undefined;
+      if (owner && owner !== target) {
+        if (!returnKey.test(owner)) refuse('BadInput', 'invalid ERC20 payer reservation');
+        const raw = await this.store.get(owner);
+        const previous = raw === null ? null : JSON.parse(raw) as ReturnRecord;
+        if (previous?.status !== 'paid' || !previous.paid) fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
+      }
+      const commitment = await this.payerCommitments(chainId, payer, target, owner === target, options);
+      if (owner !== target && heldNonce !== undefined) {
+        const finalized = commitment.finalizedNonce ?? await options.finalizedNonce?.();
+        if (finalized === undefined || finalized <= heldNonce) fail('CapacityPreflight', 'payer has a local signing nonce awaiting finalization');
+        commitment.finalizedNonce = finalized;
+        if (reserve) {
+          const [, domain, returned] = returnKey.exec(owner)!;
+          await this.retainPayerMaximum(`nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${domain}/${returned}`, heldNonce);
+        }
+      }
+      if (!reserve) return commitment;
+
+      const nonce = options.signingNonce;
+      let claimed = owner === target ? held! : target;
+      commitment.contestedDrain = owner !== target && options.mode === 'drain' && commitment.calls > 0n;
+      if (nonce !== undefined || commitment.contestedDrain) {
+        const saved = await this.ret(id);
+        const current = saved && await this.requireErc20ReturnState(chainId, saved);
+        if (!current || current.status === 'paid' || current.status === 'planned') {
+          fail('CapacityPreflight', 'return is no longer eligible for payer signing');
+        }
+        if (nonce !== undefined) requireExecutionPayer(current, payer);
+        const admitted = current.recovery?.envelope?.maxNonce;
+        const cap = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
+        const maxNonce = payerNonceLimit(options.maxNonce !== undefined && options.maxNonce < cap ? options.maxNonce : cap, commitment);
+        const calls = commitment.contestedDrain
+          ? options.remainingCalls ?? remainingRecoveryCalls(current.recovery!,
+            (await this.finalizedRecoveryProgress(chainId, current, options.finalizedBlock))?.completed ?? 0n)
+          : 1n;
+        if (nonce === undefined || calls < 1n || nonce < (commitment.finalizedNonce ?? 0n) || nonce + calls - 1n > maxNonce) {
+          fail('CapacityPreflight', 'remaining continuation schedule exceeds the payer nonce horizon');
+        }
+        await options.beforeSigning?.(commitment);
+        await this.preparePayerSigning(current, chainId, payer);
+        claimed = target + '#nonce:' + dec(owner === target && heldNonce !== undefined && heldNonce > nonce ? heldNonce : nonce);
+      }
+      const attempts = state?.startsWith('burn:') ? state.slice(5).split(',') : undefined;
+      const fence = options.fence;
+      if (fence && (owner !== target || attempts)) {
+        claimed = target + '#burn:' + [...(owner === target ? attempts ?? [] : []), fence].join(',');
+      }
+      if (claimed === held && nonce === undefined) return commitment;
+      if (!await this.store.putIf(key, held, claimed)) continue;
+      if (fence && claimed.startsWith(target + '#burn:')) {
+        const finish = async (unsigned: boolean) => {
+          const prefix = target + '#burn:';
+          for (;;) {
+            const live = await this.store.get(key);
+            if (!live?.startsWith(prefix)) return;
+            const attempts = live.slice(prefix.length).split(',');
+            if (!attempts.includes(fence)) return;
+            const current = await this.ret(id);
+            const remaining = attempts.filter((attempt) => attempt !== fence);
+            const next = unsigned && current?.status === 'planned' && !current.burnRequest
+              ? remaining.length ? prefix + remaining.join(',') : ''
+              : target;
+            if (await this.store.putIf(key, live, next)) return;
+          }
+        };
+        commitment.cancel = () => finish(true);
+        commitment.retain = () => finish(false);
+      }
+      return commitment;
+    }
+  }
+
 }
 
 /**

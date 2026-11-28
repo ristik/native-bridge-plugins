@@ -13,8 +13,8 @@ use super::deposit::{
 };
 use super::errors::{fail_d, refuse, Result, Rule, WalletReason};
 use super::recovery_cost::{
-    quote_recovery, RecoveryCalibration, RecoveryEntry, RecoveryLimits, RecoveryQuote,
-    RecoveryShape,
+    quote_erc20_recovery, quote_recovery, RecoveryCalibration, RecoveryEntry, RecoveryLimits,
+    RecoveryQuote, RecoveryShape, ERC20_RESUME_OPERATIONS,
 };
 use super::rules::verify_seal_receipt;
 use super::segment::{fold_history, gap_proof_len, GapTree};
@@ -30,6 +30,10 @@ const VERSION: [u8; 2] = [1, 1];
 const PAGE_SIZE: usize = 4096;
 const CALLDATA_CAP: usize = 393_216;
 const RECEIPT_CAP: usize = 65_536;
+
+pub fn recovery_generation(salt: &[u8; 32], domain: &[u8; 32]) -> [u8; 32] {
+    hash("GEN", &[salt, domain])
+}
 
 fn hash(label: &str, parts: &[&[u8]]) -> Hash {
     let domain = he(&[b"UNICITY/NB2/CONT/1.1/", label.as_bytes()]);
@@ -371,6 +375,7 @@ fn operations(
 }
 
 /// Identities from the authenticated deployment.
+#[derive(Clone)]
 pub struct RecoveryDeployment {
     pub salt: Hash,
     pub recovery: [u8; 20],
@@ -527,7 +532,7 @@ impl RecoverySession {
             &(evidence.len() as u64).to_be_bytes(),
             &pages.root(),
         ]);
-        let generation = hash("GEN", &[&deployment.salt, &domain]);
+        let generation = recovery_generation(&deployment.salt, &domain);
         let session = hash(
             "SESSION",
             &[
@@ -562,6 +567,10 @@ impl RecoverySession {
     }
     pub fn operation_count(&self) -> usize {
         self.ops.len()
+    }
+
+    pub fn redemption_id(&self) -> Hash {
+        self.verdict.eta
     }
 
     fn event(&self, kind: EventKind, data: Vec<u8>) -> RecoveryEvent {
@@ -681,6 +690,9 @@ impl RecoverySession {
     ) -> Result<()> {
         if self.deployment.pins != calibration.pins()
             || self.deployment.runtime_hash != calibration.runtime_hash()
+            || (self.cfg.erc20.is_some()
+                && (self.deployment.vault_runtime_hash.is_none()
+                    || self.deployment.vault_runtime_hash != calibration.vault_runtime_hash()))
             || self.cfg.chain_id != limits.chain_id
         {
             return fail_d(Rule::CapacityPreflight, "unqualified recovery deployment");
@@ -698,10 +710,21 @@ impl RecoverySession {
         prior: Option<(u64, &[u8])>,
     ) -> Result<(RunPacket, RecoveryQuote)> {
         self.check_calibration(calibration, limits)?;
-        for count in (1..=self.ops.len().saturating_sub(from).min(16)).rev() {
+        let erc20 = self.cfg.erc20.is_some();
+        let max = if erc20 && prior.is_some() {
+            ERC20_RESUME_OPERATIONS
+        } else {
+            16
+        };
+        let quote = if erc20 {
+            quote_erc20_recovery
+        } else {
+            quote_recovery
+        };
+        for count in (1..=self.ops.len().saturating_sub(from).min(max)).rev() {
             match self.run(from, count, trust, prior) {
                 Ok(packet) => {
-                    if let Some(quote) = quote_recovery(packet.shape, calibration, limits) {
+                    if let Some(quote) = quote(packet.shape, calibration, limits) {
                         return Ok((packet, quote));
                     }
                 }

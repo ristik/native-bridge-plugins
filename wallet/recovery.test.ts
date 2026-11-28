@@ -8,9 +8,9 @@ import { encodeTrustBaseResponse } from '@unicitylabs/state-transition-sdk/lib/a
 import { TrustBaseStatus } from '@unicitylabs/state-transition-sdk/lib/api/bft/trustbase/TrustBaseRange.js';
 import { eq } from '../packages/native-bridge-plugin/src/bytes.js';
 import {
-  CERTIFICATION_DEPTH, EvmReader, GapTree, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx,
-  evidenceOf, firstOwnerOf, quoteRecoveryGapBatch, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
-  type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryEvent,
+  CERTIFICATION_DEPTH, EvmReader, GapTree, Journal, NativeBridgeV2, Nb2Error, SELECTOR, RecoveryAuthority, RecoverySession, RpcError, TEST_PARAMS, WalletError, appendTransfer, buildHistory, decodeSignedTx, domainOf,
+  evidenceOf, firstOwnerOf, quoteRecovery, quoteRecoveryGapBatch, quoteScheduledRecoveryFee, recoveryGeneration, recoveryRpcSource, signTx, transferRequest, verifyReturn, verdictAbi,
+  type Aggregator, type GasModel, type JsonRpc, type ReturnRecord, type RecoveryCalibration, type RecoveryEvent,
 } from '../packages/native-bridge-plugin/src/nb2/index.js';
 import { HE } from '../packages/native-bridge-plugin/src/nb2/crypto.js';
 import { ascii, u256 } from '../packages/native-bridge-plugin/src/nb2/cbor.js';
@@ -18,7 +18,7 @@ import { signaturePredicate } from '../packages/native-bridge-plugin/src/nb2/tok
 import { FakeChain, FakeAggregator, key, makeConfig, makeRoot, roundNow, roundAtLeast } from '../packages/native-bridge-plugin/test/nb2/world.js';
 import { nextEpoch } from '../packages/native-bridge-plugin/test/rootfixture.js';
 import { Wallet, burn, connectionOf, readRetrying, retry, transportRetry, hx, io, mint, planDeposit, planReturn, receive, redeem, resumePayout, sendDeposit, transfer, unhex } from './core.js';
-import { importReturn, ordinaryPayout, publishReturnBackup, reconcileReturn, qualifyExistingRecovery, recoverStep, restoreReturn, walletAdmission, type PayerPolicy } from './recovery.js';
+import { importReturn, checkLocalErc20Returns, ordinaryPayout, publishReturnBackup, reconcileReturn, qualifyExistingRecovery, recoverStep, restoreReturn, walletAdmission, type PayerPolicy } from './recovery.js';
 
 const caps: PayerPolicy = { signedBytes: 524_288, calldataBytes: 524_288, gas: 24_000_000n, maxNonce: 10_000n,
   maxFeePerGas: 30n, maxPriorityFeePerGas: 2n, maxTransactionFee: 10n ** 9n, feeBudget: 10n ** 12n, archives: [] };
@@ -126,6 +126,393 @@ test('refused preflight never certifies a spend, and receive verifies the full p
   assert.equal(other.entry('coin').amount, '19');
 });
 
+test('Run replay consumes signed arrivals and preserves the other return’s payer reserve', async (t) => {
+  const { w, chain, deployment, cfg } = await setup(t);
+  const raw = w.release.recovery as { ranges: { max: { entry: string; operations: number; gaps: number } }[]; backlog: Record<string, string> };
+  raw.ranges = raw.ranges.filter(({ max }) => max.entry === 'run' ? max.operations === 1 : max.gaps <= 3);
+  Object.assign(raw.backlog, { duringProgress: '2', advancePeakSeals: '1', qualifiedForMs: '33025' });
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  assert.deepEqual(rec.recovery!.runCuts, [1, 1]);
+  assert.equal(rec.recovery!.advanceGaps, 3);
+  assert.equal(rec.recovery!.progressEnd, '2');
+  assert.equal(rec.recovery!.calls, '36'); // two Runs, 33 Advances and settlement
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  let packet = await session.run(0, 1, w.trust);
+  chain.coldCall = async (_vault, to, data) => {
+    if (!eq(to, deployment.recovery)) return;
+    assert.deepEqual(data, packet.calldata);
+    return [{ address: to, topics: packet.event.topics, data: packet.event.data }];
+  };
+  // Use UCT receipt fixtures with the current ERC20 payer journal.
+  w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  rec.erc20PayerState = 1;
+  delete rec.payer;
+  rec.recovery!.envelope = { gas: String(caps.gas), signedBytes: caps.signedBytes, calldataBytes: caps.calldataBytes,
+    maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
+  await w.bridge.journal.putReturn(rec);
+  await w.bridge.journal.registerPayerChain(cfg.chainId);
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  const path = join(w.dir, `recovery-${rec.returnId.slice(2)}.json`);
+  const { cuts, attempts } = JSON.parse(readFileSync(path, 'utf8'));
+  packet = await session.run(1, 1, w.trust, { seq: 1n, receipt: unhex(cuts[0].location.proof) });
+
+  await checkLocalErc20Returns(w);
+  const signed = decodeSignedTx(unhex(attempts[0])).request;
+  assert.deepEqual(await w.bridge.journal.payerFees(rec, cfg.chainId, w.signer.address, signed.nonce + 1n),
+    { prior: signed.gas * signed.maxFeePerGas, atNonce: 0n });
+  const progress = await w.bridge.journal.store.list(`nb2/payer-progress/v2/${cfg.chainId}/`);
+  assert.equal(progress.length, 1);
+  const checkpoint = JSON.parse((await w.bridge.journal.store.get(progress[0]))!);
+  assert.equal(checkpoint.completed, '1');
+  assert.ok(BigInt(checkpoint.continuationGas) * caps.maxFeePerGas < BigInt(rec.recovery!.totalFee));
+  const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const,
+    executionPayer: undefined };
+  const store = w.bridge.journal;
+  await store.putReturn(other);
+  chain.fund(w.signer.address, BigInt(other.recovery!.totalFee) - chain.balanceOf(w.signer.address));
+  const state = w.bridge.evm.vaultState.bind(w.bridge.evm);
+  let segment = 2n;
+  w.bridge.evm.vaultState = async (vault) => ({ ...await state(vault), segment });
+  await assert.rejects(recoverStep(w, rec, caps), /packet exceeds the remaining payer limits/);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 1);
+  await store.retForUpdate(other.returnId);
+  await store.putReturn({ ...other, status: 'paid' });
+  chain.fund(w.signer.address, 10n ** 18n);
+  segment = 3n;
+  await assert.rejects(recoverStep(w, rec, caps), /observed arrivals exceed the admitted Run endpoint/);
+  segment = 2n;
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 2);
+
+  const current = (await store.ret(rec.returnId))!;
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  const [earlier, latest] = (saved.attempts as string[]).map((raw) => decodeSignedTx(unhex(raw)).request);
+  assert.ok(earlier.nonce < latest.nonce);
+  const scope = `${cfg.chainId}/${current.executionPayer!.slice(2)}/${current.domain.slice(2)}/${current.returnId.slice(2)}`;
+  const feePrefix = `nb2/payer-fees/v1/${scope}/`;
+  const journalPath = join(w.dir, 'journal.json');
+  const complete = readFileSync(journalPath, 'utf8');
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  const signer = t.mock.method(w.signer, 'signTransaction', async () => { throw new Error('signer reached'); });
+  const ordinary = { ...latest, nonce: latest.nonce + 1n };
+  for (const earlierFee of [undefined, String(earlier.gas * earlier.maxFeePerGas - 1n)]) {
+    const damaged = JSON.parse(complete);
+    if (earlierFee === undefined) delete damaged[feePrefix + earlier.nonce];
+    else damaged[feePrefix + earlier.nonce] = earlierFee;
+    writeFileSync(journalPath, JSON.stringify(damaged));
+    const shared = await store.payerFeeMaxima(current, cfg.chainId, w.signer.address);
+    assert.equal(shared.get(latest.nonce), latest.gas * latest.maxFeePerGas);
+    assert.ok((shared.get(earlier.nonce) ?? 0n) < earlier.gas * earlier.maxFeePerGas);
+    await assert.rejects(checkLocalErc20Returns(w), refused);
+    await assert.rejects(w.bridge['reserveOrdinaryPayer'](current, w.signer.address, ordinary, ordinaryPayout(w, current, caps)), refused);
+    await assert.rejects(recoverStep(w, current, caps), refused);
+    assert.equal(signer.mock.callCount(), 0);
+    assert.equal(await store.store.get(feePrefix + earlier.nonce), earlierFee ?? null);
+  }
+  writeFileSync(journalPath, complete);
+});
+
+test('a Run with only its first fee authorized leaves the payer free for another return', async (t) => {
+  const { w, chain, deployment, cfg } = await setup(t);
+  await planDeposit(w, 'second', 21n);
+  await sendDeposit(w, 'second');
+  await mint(w, 'second');
+  await burn(w, 'coin', undefined, undefined, caps);
+  await burn(w, 'second', undefined, undefined, caps);
+  const first = await w.returnRecord('coin');
+  const second = await w.returnRecord('second');
+  const coldCalls = BigInt(first.recovery!.calls);
+  first.recovery!.calls = String(coldCalls + 2n);
+  first.recovery!.ordinary = { gas: '500000', calldataBytes: 393216, maxFeePerGas: String(caps.maxFeePerGas), attemptsBeforeFallback: '2' };
+  second.recovery!.envelope = { gas: String(caps.gas), signedBytes: caps.signedBytes, calldataBytes: caps.calldataBytes,
+    maxNonce: String(caps.maxNonce), maxFeePerGas: String(caps.maxFeePerGas), maxPriorityFeePerGas: String(caps.maxPriorityFeePerGas) };
+  first.erc20PayerState = 1;
+  second.erc20PayerState = 1;
+  delete first.payer;
+  delete second.payer;
+  await w.bridge.journal.putReturn(first);
+  await w.bridge.journal.putReturn(second);
+  const session = await RecoverySession.create(chain.gamma, unhex(first.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const run = await session.run(0, first.recovery!.runCuts[0], w.trust);
+  const firstFee = (1_221_000n + 16n * BigInt(run.calldata.length)) * caps.maxFeePerGas;
+  assert.ok(firstFee < BigInt(first.recovery!.totalFee));
+  const secondSession = await RecoverySession.create(chain.gamma, unhex(second.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const secondRun = await secondSession.run(0, second.recovery!.runCuts[0], w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: to, topics: secondRun.event.topics, data: secondRun.event.data }] : undefined;
+  w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  await w.bridge.journal.registerPayerChain(cfg.chainId);
+  const signer = w.signer.signTransaction.bind(w.signer);
+  let signed = 0;
+  w.signer.signTransaction = (request) => { signed++; return signer(request); };
+  await assert.rejects(recoverStep(w, first, { ...caps, feeBudget: firstFee }), /recovery payer balance or nonce changed before signing/);
+  const nonce = await w.bridge.evm.nonce(w.signer.address);
+  await assert.rejects(recoverStep(w, first, { ...caps, maxNonce: nonce + coldCalls - 1n }), /remaining continuation schedule exceeds the payer nonce horizon/);
+  assert.equal(signed, 0);
+  assert.equal((await recoverStep(w, second, caps)).state, 'checkpoint');
+  assert.equal(signed, 1);
+  await assert.rejects(recoverStep(w, first, caps), /outstanding ERC20 return/);
+});
+
+test('a contested ordinary handoff reserves the old fee and the entire fallback if the old call wins', async (t) => {
+  const { w, cfg, chain, deployment } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const plan = rec.recovery!;
+  const payer = w.signer.address;
+  const nonce = await w.bridge.evm.nonce(payer);
+  const old = await signTx(w.signer, { chainId: cfg.chainId, nonce, gas: 100_000n, maxFeePerGas: caps.maxFeePerGas,
+    maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: (await w.bridge.buildRedeem(unhex(rec.returnId))).calldata });
+  const oldFee = old.request.gas * old.request.maxFeePerGas;
+  rec.erc20PayerState = 1;
+  delete rec.payer;
+  plan.ordinary = { gas: '40000', calldataBytes: 393216, maxFeePerGas: String(caps.maxFeePerGas), attemptsBeforeFallback: '1' };
+  const coldCalls = BigInt(plan.calls);
+  plan.calls = String(coldCalls + 1n);
+  const other = { ...rec, returnId: hx(key('other return at handoff')), sends: [],
+    recovery: { ...plan, ordinary: undefined, calls: String(coldCalls) } };
+  const journal = w.bridge.journal;
+  await journal.putReturn(rec);
+  await journal.putReturn(other);
+  await journal.registerPayerChain(cfg.chainId);
+  await journal.preparePayerSigning(rec, cfg.chainId, payer);
+  await journal.retainPayerSend(rec, old.raw);
+  rec.sends.push({ raw: hx(old.raw), hash: hx(old.hash), nonce: String(nonce), gas: String(old.request.gas), at: '0' });
+  await journal.putReturn(rec);
+  w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  t.mock.method(w.bridge, 'expiredOrdinaryNonce', async () => nonce);
+  const eipLimits = { ...caps, chainId: cfg.chainId, balance: 0n };
+  const ranges = (w.release.recovery as { ranges: (Omit<RecoveryCalibration['ranges'][number], 'execution'> & { execution: string })[] }).ranges;
+  const calibration = { ...deployment, ranges: ranges.map((range) => ({ ...range, execution: BigInt(range.execution) })) };
+  const fallback = quoteScheduledRecoveryFee(unhex(rec.source), cfg.K, {
+    cuts: plan.runCuts, completedRuns: 0, batch: plan.advanceGaps, advances: coldCalls - BigInt(plan.runCuts.length) - 1n,
+  }, calibration, eipLimits);
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const run = await session.run(0, plan.runCuts[0], w.trust);
+  const firstRunFee = quoteRecovery(run.shape, calibration, eipLimits, true)!.fee;
+  const allowance = BigInt(plan.ordinary.gas) * caps.maxFeePerGas;
+  assert.ok(allowance < oldFee && oldFee < firstRunFee && firstRunFee < fallback);
+  const larger = await signTx(w.signer, { ...old.request, gas: 150_000n });
+  const largestFee = larger.request.gas * larger.request.maxFeePerGas;
+  assert.ok(oldFee < largestFee && largestFee < firstRunFee);
+  await journal.retainPayerSend(rec, larger.raw);
+  const sign = t.mock.method(w.signer, 'signTransaction', async () => { throw new Error('payer signer reached'); });
+  await assert.rejects(recoverStep(w, rec, { ...caps, feeBudget: fallback + allowance }), /recovery payer balance or nonce changed/);
+  await assert.rejects(recoverStep(w, rec, { ...caps, feeBudget: fallback + oldFee }), /recovery payer balance or nonce changed/);
+  await assert.rejects(recoverStep(w, rec, { ...caps, feeBudget: fallback + largestFee - 1n }), /recovery payer balance or nonce changed/);
+  assert.equal(sign.mock.callCount(), 0);
+  assert.deepEqual(await journal.store.list('nb2/payer/v1/'), []);
+  await assert.rejects(recoverStep(w, rec, { ...caps, feeBudget: fallback + largestFee }), /payer signer reached/);
+  assert.equal(sign.mock.callCount(), 1);
+});
+
+test('wallet startup refuses pre-release ERC20 pending and Paid records while UCT still resends', async (t) => {
+  const { w, open, chain, cfg, deployment, rpc } = await setup(t, true);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const id = (await w.returnRecord('coin')).returnId;
+  const sidecar = join(w.dir, `recovery-${id.slice(2)}.json`);
+  assert.equal(existsSync(sidecar), false);
+  const send = t.mock.method(w.bridge.evm, 'sendRaw', async () => { throw new Error('old SDK send lost'); });
+  await assert.rejects(w.bridge.submitRedeem(unhex(id), w.signer), /old SDK send lost/);
+  assert.equal(send.mock.callCount(), 1);
+  const record = (await w.bridge.journal.ret(id))!;
+  assert.equal(record.recovery, undefined);
+  assert.equal(record.erc20PayerState, undefined);
+  assert.equal(record.executionPayer, hx(w.signer.address));
+  const [ordinary] = record.sends;
+  const sendNonce = decodeSignedTx(unhex(ordinary.raw)).request.nonce;
+  const scope = `${cfg.chainId}/${record.executionPayer!.slice(2)}/${record.domain.slice(2)}/${id.slice(2)}`;
+  await w.bridge.journal.registerPayerChain(cfg.chainId);
+  const watermark = `nb2/payer-sends/v1/${scope}`;
+  assert.ok(await w.bridge.journal.store.putIf(watermark, null, String(sendNonce - 1n)));
+  const storePath = join(w.dir, 'journal.json');
+  const before = readFileSync(storePath, 'utf8');
+  let erc20 = true;
+  const openSdk = NativeBridgeV2.open.bind(NativeBridgeV2);
+  t.mock.method(NativeBridgeV2, 'open', async (...args: Parameters<typeof openSdk>) => {
+    const bridge = await openSdk(...args);
+    if (erc20) bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+    return bridge;
+  });
+  const offered: string[] = [];
+  const recordingRpc: JsonRpc = { call: async <T>(method: string, args: unknown[]): Promise<T> => {
+    if (method === 'eth_sendRawTransaction') offered.push(args[0] as string);
+    return rpc.call<T>(method, args);
+  } };
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(open('holder', recordingRpc), refused);
+    assert.deepEqual(offered, []);
+    assert.equal(readFileSync(storePath, 'utf8'), before);
+    assert.equal(existsSync(sidecar), false);
+  }
+
+  erc20 = false;
+  const native = await open('holder', recordingRpc);
+  const first = await reconcileReturn(native, record);
+  assert.deepEqual(offered, [ordinary.raw]);
+  await chain.mine([]);
+  const paid = first.result.state === 'paid' ? first : await reconcileReturn(native, record);
+  assert.equal(paid.result.state, 'paid');
+  assert.equal((await native.bridge.evm.nonce(w.signer.address, 'finalized')), sendNonce + 1n);
+  const after = readFileSync(storePath, 'utf8');
+  erc20 = true;
+  await assert.rejects(open('holder', recordingRpc), refused);
+  assert.equal(readFileSync(storePath, 'utf8'), after);
+});
+
+test('wallet startup refuses ERC20 mode for an unregistered foreign pending return', async (t) => {
+  const { w, open, cfg, deployment } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const record = await w.returnRecord('coin');
+  record.erc20PayerState = 1;
+  delete record.payer;
+  await w.bridge.journal.putReturn(record);
+  await w.bridge.journal.registerPayerChain(cfg.chainId);
+  const openSdk = NativeBridgeV2.open.bind(NativeBridgeV2);
+  t.mock.method(NativeBridgeV2, 'open', async (...args: Parameters<typeof openSdk>) => {
+    const bridge = await openSdk(...args);
+    bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+    return bridge;
+  });
+  await open('holder');
+
+  const { Assets } = JSON.parse(readFileSync(new URL('../protocol/vectors/erc20-nb2/vectors.json', import.meta.url), 'utf8'));
+  const { Gamma, Held } = Assets[0] as { Gamma: string; Held: string };
+  const foreign = new Journal(w.bridge.journal.store, domainOf(unhex('0x' + Gamma.replace(/^0x/, ''))));
+  const tx = await signTx(w.signer, { chainId: cfg.chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
+    maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: new Uint8Array() });
+  await foreign.putReturn({ ...record, ...foreign.base(), returnId: hx(key('foreign ERC20 pending')), status: 'submitted',
+    source: `0x${Held.replace(/^0x/, '')}`, erc20PayerState: undefined, recovery: undefined, executionPayer: hx(w.signer.address),
+    sends: [{ raw: hx(tx.raw), hash: hx(tx.hash), nonce: '7', gas: '100000', at: '0' }] });
+  const file = join(w.dir, 'journal.json');
+  const before = readFileSync(file, 'utf8');
+  await assert.rejects(open('holder'), /unsupported pre-release ERC20 record: start a fresh wallet/);
+  assert.equal(readFileSync(file, 'utf8'), before);
+});
+
+test('a peer payout keeps the wallet packet reserved after it drops out of the mempool', async (t) => {
+  const { w, open, chain, deployment, cfg } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const session = await RecoverySession.create(chain.gamma, unhex(rec.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const packet = await session.run(0, session.operationCount, w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: to, topics: packet.event.topics, data: packet.event.data }] : undefined;
+  const peer = await open('peer settling first');
+  chain.fund(peer.signer.address, 10n ** 18n);
+  const ordinary = await w.bridge.buildRedeem(unhex(rec.returnId));
+  const other = await signTx(peer.signer, { chainId: cfg.chainId, nonce: 0n, gas: ordinary.gasLimit,
+    maxFeePerGas: 23n, maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: ordinary.calldata });
+  const journal = w.bridge.journal;
+  const erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  rec.erc20PayerState = 1;
+  delete rec.payer;
+  await journal.putReturn(rec);
+  await journal.registerPayerChain(cfg.chainId);
+  w.bridge.cfg.erc20 = erc20;
+  await journal.checkReturnPayer(cfg.chainId, w.signer.address, rec.returnId, true);
+  assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
+  chain.autoMine = false;
+  assert.equal((await recoverStep(w, rec, caps)).state, 'pending');
+  const file = join(w.dir, 'recovery-' + rec.returnId.slice(2) + '.json');
+  const pending = unhex(JSON.parse(readFileSync(file, 'utf8')).pending.raw);
+  chain.dropPool();
+  const signed = decodeSignedTx(pending).request;
+  const payerPath = `${cfg.chainId}/${hx(w.signer.address).slice(2)}/${rec.domain.slice(2)}/${rec.returnId.slice(2)}`;
+  const index = `nb2/payer-fees/v1/${payerPath}/${signed.nonce}`;
+  const journalFile = join(w.dir, 'journal.json');
+  const complete = readFileSync(journalFile, 'utf8');
+  const incomplete = JSON.parse(complete);
+  delete incomplete[index];
+  writeFileSync(journalFile, JSON.stringify(incomplete));
+  const refused = /unsupported pre-release ERC20 record: start a fresh wallet/;
+  const broadcast = t.mock.method(w.bridge.evm, 'sendRaw', async () => { throw new Error('unexpected RPC send'); });
+  await assert.rejects(checkLocalErc20Returns(w), refused);
+  await assert.rejects(recoverStep(w, rec, caps), refused);
+  assert.equal(broadcast.mock.callCount(), 0);
+  assert.equal(await journal.store.get(index), null);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).pending.raw, hx(pending));
+  broadcast.mock.restore();
+  writeFileSync(journalFile, complete);
+  await checkLocalErc20Returns(w);
+  w.bridge.cfg.erc20 = undefined;
+
+  await chain.mine([other.raw]);
+  await chain.mine([]);
+  const paid = await recoverStep(w, rec, caps);
+  assert.equal(paid.state, 'paid');
+  assert.equal(hx(paid.txHash), hx(other.hash));
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).settled.submitted.raw, hx(pending));
+  const next = { ...rec, returnId: hx(key('new return after peer payout')), status: 'planned' as const };
+  w.bridge.cfg.erc20 = erc20;
+  await checkLocalErc20Returns(w);
+  const nonce = decodeSignedTx(pending).request.nonce;
+  assert.equal(await w.bridge.evm.nonce(w.signer.address, 'pending'), nonce);
+  await assert.rejects(w.bridge.checkErc20Payer(next, w.signer.address), /signed nonce awaiting finalization/);
+  await chain.mine([pending]);
+  await chain.mine([]);
+  assert.equal((await w.bridge.checkErc20Payer(next, w.signer.address)).finalizedNonce, nonce + 1n);
+});
+
+test('a peer payout cannot release the payer while the recovery signer is outstanding or ambiguous', async (t) => {
+  const { w, open, chain, deployment, cfg } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const peer = await open('peer pays while the signer is waiting');
+  chain.fund(peer.signer.address, 10n ** 18n);
+  const ordinary = await w.bridge.buildRedeem(unhex(rec.returnId));
+  const payment = await signTx(peer.signer, { chainId: cfg.chainId, nonce: 0n, gas: ordinary.gasLimit,
+    maxFeePerGas: 23n, maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: ordinary.calldata });
+  // Use receipt fixtures for proof verification and the ERC20 guard for local execution.
+  const erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  rec.erc20PayerState = 1;
+  delete rec.payer;
+  await w.bridge.journal.putReturn(rec);
+  await w.bridge.journal.registerPayerChain(cfg.chainId);
+  w.bridge.cfg.erc20 = erc20;
+  await w.bridge.checkErc20Payer(rec, w.signer.address, true);
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const localSign = w.signer.signTransaction.bind(w.signer);
+  const next = { ...rec, returnId: hx(key('next burn after the signer race')), status: 'planned' as const };
+  let raw!: Uint8Array;
+  w.signer.signTransaction = async (request) => {
+    raw = await localSign(request);
+    enter();
+    await waiting;
+    throw new Error('recovery signer disconnected');
+  };
+  const attempting = assert.rejects(recoverStep(w, rec, caps), /recovery signer disconnected/);
+  await Promise.race([entered, attempting.then(() => assert.fail('recovery did not enter the signer'))]);
+  try {
+    await chain.mine([payment.raw]);
+    await chain.mine([]);
+    w.bridge.cfg.erc20 = undefined;
+    const { result: paid } = await reconcileReturn(w, rec, caps);
+    assert.equal(paid.state, 'paid');
+    assert.equal(hx(paid.txHash), hx(payment.hash));
+    w.bridge.cfg.erc20 = erc20;
+    await assert.rejects(w.bridge.checkErc20Payer(next, w.signer.address, true), /signing nonce awaiting finalization/);
+  } finally {
+    release();
+  }
+  await attempting;
+  await assert.rejects(w.bridge.checkErc20Payer(next, w.signer.address, true), /signing nonce awaiting finalization/);
+  await chain.mine([raw]);
+  await chain.mine([]);
+  const nonce = decodeSignedTx(raw).request.nonce;
+  assert.equal((await w.bridge.checkErc20Payer(next, w.signer.address, true)).finalizedNonce, nonce + 1n);
+});
+
 test('a qualified ordinary envelope takes precedence over the cold route', async (t) => {
   const { w } = await setup(t, true);
   const plan = await planReturn(w, 'coin', undefined, undefined, { ...caps, calldataBytes: 393_216 });
@@ -229,6 +616,21 @@ test('a reopened wallet refuses an altered planned recipient and keeps the origi
     await burn(reopened, 'coin', undefined, undefined, caps);
     assert.equal((await reopened.returnRecord('coin')).recipient, hx(address));
   }
+});
+
+test('ordinary wallet admission budgets the higher signed fee at the replacement nonce once', async (t) => {
+  const { w, cfg } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const nonce = await w.bridge.evm.nonce(w.signer.address);
+  const request = { chainId: cfg.chainId, nonce, gas: 100_000n, maxFeePerGas: 15n, maxPriorityFeePerGas: 1n,
+    to: cfg.vault, value: 0n, data: new Uint8Array(68) };
+  const older = await signTx(w.signer, { ...request, maxFeePerGas: 30n });
+  const prior = [{ raw: hx(older.raw), hash: hx(older.hash), nonce: String(nonce), gas: String(request.gas), at: '0' }];
+  const oldFee = older.request.gas * older.request.maxFeePerGas;
+  const policy = { ...caps, maxFeePerGas: 20n, feeBudget: oldFee };
+  await assert.rejects(ordinaryPayout(w, rec, { ...policy, feeBudget: oldFee - 1n }).admit!(request, prior), /remaining payer limits/);
+  await ordinaryPayout(w, rec, policy).admit!(request, prior);
 });
 
 test('ordinary signing re-prices the reserve against the newest bid inside the payer cap', async (t) => {
@@ -1009,6 +1411,10 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   const relay = await open('ordinary-relayer', transport);
   chain.fund(relay.signer.address, 10n ** 18n);
   const ordinary = await restoreReturn(relay, original);
+  ordinary.erc20PayerState = 1;
+  await relay.bridge.journal.putReturn(ordinary);
+  await relay.bridge.journal.registerPayerChain(cfg.chainId);
+  await relay.bridge.journal.preparePayerSigning(ordinary, cfg.chainId, relay.signer.address);
   chain.coldCall = async (_vault, to, data) => {
     if (eq(to, cfg.vault) && eq(data.subarray(0, 4), SELECTOR.redeem)) throw new Nb2Error('PayoutFailed');
     return undefined;
@@ -1017,6 +1423,7 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   await chain.mine([]);
   const sends = (await relay.bridge.journal.ret(rec.returnId))!.sends;
   assert.equal(sends.length, 1);
+  await relay.bridge.journal.retainPayerSend(ordinary, unhex(sends[0].raw));
 
   const cold = await qualifyExistingRecovery(w, rec, caps);
   const session = await RecoverySession.create(chain.gamma, unhex(cold.burned!),
@@ -1052,6 +1459,22 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   assert.deepEqual((await restoreReturn(reopened, portable)).sends, adopted.sends);
   const localPlan = await qualifyExistingRecovery(reopened, adopted, caps);
   assert.equal(localPlan.recovery, undefined);
+  // An imported Complete can only use funds left after the payer's outstanding ERC20 return.
+  const journalStore = reopened.bridge.journal;
+  reopened.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  const pledged = { ...localPlan, returnId: hx(key('pledged payer balance')), status: 'burned' as const,
+    payer: hx(reopened.signer.address), burnRequest: undefined, executionPayer: undefined, sends: [], recovery: { ...cold.recovery!, totalFee: String(cost) } };
+  await journalStore.putReturn(pledged);
+  await checkLocalErc20Returns(reopened);
+
+  await reopened.bridge.checkErc20Payer(pledged, reopened.signer.address, true);
+  chain.fund(reopened.signer.address, cost - chain.balanceOf(reopened.signer.address));
+  await assert.rejects(recoverStep(reopened, localPlan, caps), /payer already has an outstanding ERC20 return/);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).pending, undefined);
+  await journalStore.retForUpdate(pledged.returnId);
+  await journalStore.putReturn({ ...pledged, status: 'paid', paid: { txHash: hx(key('pledged return paid')), blockNumber: '1' } });
+  reopened.bridge.cfg.erc20 = undefined;
+  chain.fund(reopened.signer.address, 10n ** 18n);
   await assert.rejects(recoverStep(reopened, localPlan, { ...caps, feeBudget: cost - 1n }), { rule: 'CapacityPreflight' });
   chain.autoMine = false;
   assert.equal((await recoverStep(reopened, localPlan, { ...caps, feeBudget: cost })).state, 'pending');

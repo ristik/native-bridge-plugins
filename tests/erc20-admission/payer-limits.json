@@ -1,0 +1,15 @@
+{
+  "chainId": 31337,
+  "maxNonce": 255,
+  "maxFeePerGas": 10,
+  "maxPriorityFeePerGas": 2,
+  "ordinary": { "calldataBytes": 120004, "gas": 1500000, "signedBytes": 120114 },
+  "recovery": { "calldataBytes": 68004, "gas": 1000000 },
+  "cases": [
+    { "signedBytes": 120114, "gas": 1500000, "route": "ordinary" },
+    { "signedBytes": 120113, "gas": 1500000, "route": "continuation" },
+    { "signedBytes": 120114, "gas": 1499999, "route": "continuation" },
+    { "signedBytes": 120114, "gas": 999999, "route": "refused" },
+    { "signedBytes": 68113, "gas": 1500000, "route": "refused" }
+  ]
+}

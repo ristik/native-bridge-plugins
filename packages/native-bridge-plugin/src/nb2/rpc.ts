@@ -338,6 +338,14 @@ export class EvmReader {
     return { header, hash: HE(encodeHeader(header)) };
   }
 
+  /** Only the exact certified block at or below the execution finality boundary can discharge work. */
+  public async isFinalizedBlock(number: bigint, hash: Uint8Array): Promise<boolean> {
+    const finalized = await this.rpc.call<{ number: string } | null>('eth_getBlockByNumber', ['finalized', false]);
+    if (!finalized || qtyOf(finalized.number, 'finalized block number') < number) return false;
+    const block = await this.headerByNumber(number);
+    return block !== null && block.header.number === number && eq(block.hash, hash);
+  }
+
   /**
    * The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child does not
    * exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
@@ -628,7 +636,7 @@ export class EvmReader {
     return bytesOf(await this.rpc.call('eth_getCode', [hexOf(address), 'latest']), 'eth_getCode');
   }
 
-  public async balance(address: Uint8Array, tag: 'latest' | bigint = 'latest'): Promise<bigint> {
+  public async balance(address: Uint8Array, tag: 'latest' | 'pending' | 'finalized' | bigint = 'latest'): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_getBalance', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getBalance');
   }
 
@@ -651,7 +659,7 @@ export class EvmReader {
   }
 
   /** The account nonce: 'pending' counts the pool (for signing), 'latest' only mined transactions (for deciding a send is dead). */
-  public async nonce(address: Uint8Array, tag: 'pending' | 'latest' | bigint = 'pending'): Promise<bigint> {
+  public async nonce(address: Uint8Array, tag: 'pending' | 'latest' | 'finalized' | bigint = 'pending'): Promise<bigint> {
     return qtyOf(await this.rpc.call('eth_getTransactionCount', [hexOf(address), typeof tag === 'bigint' ? qty(tag) : tag]), 'eth_getTransactionCount');
   }
 

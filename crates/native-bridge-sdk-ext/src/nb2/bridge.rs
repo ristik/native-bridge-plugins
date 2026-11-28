@@ -46,9 +46,13 @@ use super::gas::{
     create_address, redeem_tx_framing, DeploymentCode, GasModel, MeasuredGasModel, RedeemShape,
 };
 use super::journal::*;
-use super::recovery::RecoveryDeployment;
+use super::recovery::{
+    GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoverySession,
+};
 use super::recovery_cost::{
-    preflight_recovery, AdmissionContext, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
+    admitted_recovery_gas, check_recovery_calibration, preflight_recovery_with_signing_bounds,
+    quote_erc20_call, AdmissionContext, Erc20OrdinaryBound, Erc20SigningBounds, RecoveryBacklog,
+    RecoveryCalibration, RecoveryLimits, RecoverySuffix,
 };
 use super::rpc::{Estimate, EvmReader, JsonRpc, ReceiptJson, SendError};
 use super::rules::{
@@ -62,7 +66,8 @@ use super::token::{
 };
 use super::tokenops::{
     append_transfer, certify_checked, child_mint, fresh_mask, mint_request, split_plan,
-    token_of_child, token_of_mint, transfer_request, Aggregator, OwnerSigner, SplitOutput,
+    token_of_child, token_of_mint, transfer_request, transfer_request_with, Aggregator,
+    OwnerSigner, SplitOutput,
 };
 use super::trust::{bind_trust, TrustInput};
 use super::util::{arr, be_int, cat, u256, u256_64};
@@ -115,6 +120,40 @@ pub struct Erc20ReturnRecovery {
     pub backlog: RecoveryBacklog,
     /// Upper limits for the payer. The bridge further caps them by the deployment and live balance.
     pub limits: RecoveryLimits,
+    pub signing_bounds: Erc20SigningBounds,
+    /// Maximum mined ordinary attempts before fallback and maximum time per attempt in milliseconds.
+    pub ordinary_attempts: Option<(u64, u64)>,
+}
+
+/// A continuation receipt and, for an Advance, the certified segment exclusion witnesses.
+pub struct Erc20RecoveryCheckpoint<'a> {
+    pub receipt: &'a [u8],
+    pub gaps: &'a [Vec<u8>],
+}
+
+fn recovery_run_cuts(plan: &serde_json::Value) -> Result<Vec<usize>> {
+    Ok(plan["runCuts"]
+        .as_array()
+        .ok_or_else(|| Error::Other("missing admitted Run cuts".into()))?
+        .iter()
+        .map(|cut| {
+            cut.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0)
+        })
+        .collect())
+}
+
+fn recovery_advance_calls(plan: &serde_json::Value, runs: usize, ordinary: u64) -> Result<u64> {
+    let minimum = (runs as u64)
+        .checked_add(ordinary)
+        .and_then(|n| n.checked_add(1));
+    let calls = undec64(plan["calls"].as_str().unwrap_or(""))?;
+    minimum
+        .and_then(|minimum| calls.checked_sub(minimum))
+        .ok_or_else(|| {
+            Error::Other("admitted call count does not cover the recovery schedule".into())
+        })
 }
 
 /// The bridge's inputs.
@@ -463,6 +502,7 @@ impl NativeBridgeV2 {
         }
         if b.cfg.erc20.is_some() {
             b.verify_erc20_activation()?;
+            b.journal.open_erc20_payer_journal(b.cfg.chain_id)?;
         }
         Ok(b)
     }
@@ -1820,7 +1860,7 @@ impl NativeBridgeV2 {
                     }
                 }
             }
-            let record = ReturnRecord {
+            let mut record = ReturnRecord {
                 base: self.journal.base("return"),
                 return_id: hex(&return_id),
                 source: hex(token),
@@ -1841,8 +1881,16 @@ impl NativeBridgeV2 {
                 paid: None,
                 extra: Default::default(),
             };
-            let (c_obs, ordinary) = self.admit_return(&record, token, &held.amount, &recipient, a, payer)?;
+            if self.cfg.erc20.is_some() {
+                record.extra.insert("erc20PayerState".into(), json!(1));
+            }
+            let (c_obs, ordinary) = self.admit_return(&mut record, token, &held.amount, &recipient, a, payer)?;
             if let Some(existing) = self.journal.ret_for_update(&hex(&return_id))? {
+                let existing = if self.cfg.erc20.is_some() {
+                    self.journal.require_erc20_return_state(self.cfg.chain_id, &existing)?.unwrap_or(existing)
+                } else {
+                    existing
+                };
                 if existing.status != "planned" {
                     return refuse(WalletReason::NotPending, format!("this part's return is already {}", existing.status));
                 }
@@ -2010,7 +2058,7 @@ impl NativeBridgeV2 {
 
     fn admit_return(
         &self,
-        record: &ReturnRecord,
+        record: &mut ReturnRecord,
         source: &[u8],
         amount: &BigUint,
         recipient: &[u8; 20],
@@ -2031,13 +2079,22 @@ impl NativeBridgeV2 {
             }
             Err(error) => return Err(error),
         };
-        self.quote_erc20_continuation(record, source, a, observed, payer)?;
-        Ok((observed, ordinary))
+        let offered =
+            self.quote_erc20_continuation(record, source, a, observed, payer, ordinary)?;
+        Ok((observed, ordinary.filter(|_| offered)))
     }
 
     fn return_record(&self, id: &[u8; 32]) -> Result<ReturnRecord> {
         match self.journal.ret_for_update(&hex(id))? {
-            Some(r) => Ok(r),
+            Some(r) => {
+                if self.cfg.erc20.is_some() {
+                    return Ok(self
+                        .journal
+                        .require_erc20_return_state(self.cfg.chain_id, &r)?
+                        .unwrap_or(r));
+                }
+                Ok(r)
+            }
             None => refuse(
                 WalletReason::JournalNotPersisted,
                 format!("no journal entry for return {}", hex(id)),
@@ -2047,50 +2104,57 @@ impl NativeBridgeV2 {
 
     fn quote_erc20_continuation(
         &self,
-        record: &ReturnRecord,
+        record: &mut ReturnRecord,
         source: &[u8],
         a: u64,
         observed: u64,
         payer: &[u8],
-    ) -> Result<()> {
-        let Some(erc20) = &self.cfg.erc20 else {
-            return Ok(());
-        };
-        let (Some(quote), Some(pins)) = (&self.erc20_return_recovery, &self.pins.erc20) else {
+        ordinary: Option<PreflightResult>,
+    ) -> Result<bool> {
+        if self.cfg.erc20.is_none() {
+            return Ok(ordinary.is_some());
+        }
+        let Some(quote) = &self.erc20_return_recovery else {
             return fail_d(
                 Rule::CapacityPreflight,
                 "a bounded ERC20 continuation quote is required",
             );
         };
-        let recovery = erc20_create2(
-            &pins.factory,
-            &he(&[&address_word(&erc20.token)]),
-            &pins.recovery_initcode_hash,
-        );
-        if quote.deployment.recovery != recovery
-            || quote.deployment.vault_runtime_hash != Some(self.pins.vault_runtime_code_hash)
-            || he(&[&self.evm.code(&recovery)?]) != quote.deployment.runtime_hash
-        {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "continuation calibration differs from the deployed graph",
-            );
-        }
+        self.verify_erc20_recovery_deployment(&quote.deployment)?;
+        self.check_erc20_bid(&quote.limits)?;
         let mut limits = quote.limits.clone();
-        let (base_fee, priority) = self.evm.fees()?;
-        if priority > limits.max_priority_fee_per_gas
-            || BigUint::from(2u8) * base_fee + priority > limits.max_fee_per_gas
-        {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "current fees exceed the continuation bid limits",
-            );
-        }
         limits.signed_bytes = limits
             .signed_bytes
             .min(self.pins.max_encoded_tx_bytes as usize);
         limits.gas = limits.gas.min(self.pins.user_gas_limit);
-        limits.balance = limits.balance.min(self.evm.balance(payer)?);
+        let other = self.check_erc20_payer(record, payer, false, None)?;
+        limits.balance = limits.balance.min(self.erc20_free_balance(payer, &other)?);
+        let ordinary = ordinary
+            .map(|pf| {
+                let return_data = encode_return_data(&ReturnData {
+                    d: self.domain,
+                    asset: self.cfg.asset,
+                    recipient: unhex_n(&record.recipient)?,
+                    amount: undec(&record.amount)?,
+                    min_index: a,
+                });
+                let evidence = evidence_of(source).len() + burn_pair_bound(return_data.len());
+                let history = if pf.need == 0 {
+                    0
+                } else {
+                    32 + pf.need as usize * super::segment::gap_proof_len(self.cfg.k)
+                };
+                let (attempts_before_fallback, inclusion_ms) =
+                    quote.ordinary_attempts.unwrap_or_default();
+                Ok::<_, Error>(Erc20OrdinaryBound {
+                    gas: pf.gas,
+                    calldata_bytes: super::abi::redeem_calldata_length(evidence, history),
+                    attempts_before_fallback,
+                    inclusion_ms,
+                })
+            })
+            .transpose()?
+            .filter(|call| quote_erc20_call(call.calldata_bytes, call.gas, &limits).is_some());
         let backlog = RecoveryBacklog {
             signed_start: a,
             observed,
@@ -2098,7 +2162,7 @@ impl NativeBridgeV2 {
         };
         let seal = record.seal_receipt.as_deref().map(unhex).transpose()?;
         let admission = self.retrying_trust(|trust| {
-            preflight_recovery(
+            preflight_recovery_with_signing_bounds(
                 &AdmissionContext {
                     gamma: &self.pins.gamma,
                     trust,
@@ -2110,13 +2174,128 @@ impl NativeBridgeV2 {
                 source,
                 &backlog,
                 seal.as_deref(),
+                Some(&quote.signing_bounds),
+                ordinary.as_ref(),
             )
         })?;
-        let calls = admission.run.len() as u64 + admission.advance_calls + 1;
-        let nonce = self.evm.nonce(payer, "pending")?;
-        if nonce
-            .checked_add(calls - 1)
-            .map_or(true, |last| last > limits.max_nonce)
+        let calls = admission.run.len() as u128
+            + u128::from(admission.advance_calls)
+            + 1
+            + u128::from(admission.prior_attempts);
+        self.check_erc20_nonce(payer, calls, limits.max_nonce, &other)?;
+        let mut schedule = serde_json::json!({
+            "generation": hex(&super::recovery::recovery_generation(&quote.deployment.salt, &self.domain)),
+            "calls": dec(calls),
+            "totalFee": dec(&admission.total_fee),
+            "runCuts": admission.run.iter().map(|call| call.shape.operations).collect::<Vec<_>>(),
+            "advanceGaps": admission.advance.shape.gaps,
+            "observed": dec(observed),
+            "progressEnd": dec(observed + backlog.during_progress),
+            "envelope": { "gas": dec(limits.gas), "signedBytes": limits.signed_bytes, "calldataBytes": limits.calldata_bytes,
+                "maxNonce": dec(limits.max_nonce), "maxFeePerGas": dec(&limits.max_fee_per_gas),
+                "maxPriorityFeePerGas": dec(&limits.max_priority_fee_per_gas) },
+            "receiptP99Ms": dec(backlog.receipt_p99_ms),
+            "finalInclusionMs": dec(backlog.final_inclusion_ms),
+            "qualifiedForMs": dec(backlog.qualified_for_ms),
+        });
+        let offered = ordinary.is_some();
+        if let Some(ordinary) = ordinary {
+            schedule["ordinary"] = serde_json::json!({
+                "gas": dec(ordinary.gas), "calldataBytes": ordinary.calldata_bytes,
+                "maxFeePerGas": dec(&limits.max_fee_per_gas), "attemptsBeforeFallback": dec(ordinary.attempts_before_fallback),
+            });
+        }
+        record.extra.insert("recovery".into(), schedule);
+        Ok(offered)
+    }
+
+    fn verify_erc20_recovery_deployment(&self, deployment: &RecoveryDeployment) -> Result<()> {
+        let (Some(erc20), Some(pins)) = (&self.cfg.erc20, &self.pins.erc20) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "a pinned ERC20 deployment is required",
+            );
+        };
+        let recovery = erc20_create2(
+            &pins.factory,
+            &he(&[&address_word(&erc20.token)]),
+            &pins.recovery_initcode_hash,
+        );
+        if deployment.recovery != recovery
+            || deployment.vault_runtime_hash != Some(self.pins.vault_runtime_code_hash)
+            || he(&[&self.evm.code(&recovery)?]) != deployment.runtime_hash
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation calibration differs from the deployed graph",
+            );
+        }
+        self.verify_recovery_dependencies(&recovery)
+    }
+
+    fn verify_erc20_recovery_release(&self, policy: &Erc20ReturnRecovery) -> Result<()> {
+        check_recovery_calibration(
+            &self.cfg,
+            &policy.deployment,
+            &*policy.calibration,
+            policy.limits.chain_id,
+        )?;
+        self.verify_erc20_recovery_deployment(&policy.deployment)
+    }
+
+    fn verify_recovery_dependencies(&self, recovery: &[u8; 20]) -> Result<()> {
+        let address = |getter| {
+            let word = self.evm.call(recovery, &sel(getter), None)?;
+            if word.len() != 32 || word[..12].iter().any(|v| *v != 0) {
+                return fail_d(Rule::CapacityPreflight, "invalid recovery helper address");
+            }
+            Ok(arr::<20>(&word[12..]))
+        };
+        let registry = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for (helper, getter) in [
+            (address("RECEIPTS()")?, "RECEIPTS_HASH()"),
+            (address("LINEAGE()")?, "LINEAGE_HASH()"),
+            (registry, "REGISTRY_HASH()"),
+        ] {
+            let runtime = self.evm.code(&helper)?;
+            let expected = self.evm.call(recovery, &sel(getter), None)?;
+            if runtime.is_empty() || he(&[&runtime]).as_slice() != expected {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "recovery dependency runtime differs from its pinned hash",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_erc20_bid(&self, limits: &RecoveryLimits) -> Result<()> {
+        let (base_fee, priority) = self.evm.fees()?;
+        if priority > limits.max_priority_fee_per_gas
+            || BigUint::from(2u8) * base_fee + priority > limits.max_fee_per_gas
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "current fees exceed the continuation bid limits",
+            );
+        }
+        Ok(())
+    }
+
+    fn check_erc20_nonce(
+        &self,
+        payer: &[u8],
+        calls: u128,
+        max_nonce: u64,
+        other: &PayerCommitments,
+    ) -> Result<()> {
+        let nonce = self
+            .evm
+            .nonce(payer, "pending")?
+            .max(other.finalized_nonce.unwrap_or(0));
+        if other
+            .nonce_limit(max_nonce)
+            .map_or(true, |cap| u128::from(nonce) + calls - 1 > u128::from(cap))
         {
             return fail_d(
                 Rule::CapacityPreflight,
@@ -2154,12 +2333,16 @@ impl NativeBridgeV2 {
     /// makes another.
     pub fn burn(&self, return_id: &[u8; 32], owner: &dyn OwnerSigner) -> Result<Burned> {
         self.locked(&format!("return/{}", hex(return_id)), || {
-            self.burn_inner(return_id, owner)
+            self.burn_inner(return_id, owner, self.return_record(return_id)?)
         })
     }
 
-    fn burn_inner(&self, return_id: &[u8; 32], owner: &dyn OwnerSigner) -> Result<Burned> {
-        let mut rec = self.return_record(return_id)?;
+    fn burn_inner(
+        &self,
+        return_id: &[u8; 32],
+        owner: &dyn OwnerSigner,
+        mut rec: ReturnRecord,
+    ) -> Result<Burned> {
         let recipient: [u8; 20] = unhex_n(&rec.recipient)?;
         let amount = undec(&rec.amount)?;
         let a = undec64(&rec.a)?;
@@ -2186,7 +2369,7 @@ impl NativeBridgeV2 {
                 Some(p) => unhex(p)?,
             };
             let source = unhex(&rec.source)?;
-            self.admit_return(&rec, &source, &amount, &recipient, a, &payer)?;
+            self.admit_return(&mut rec, &source, &amount, &recipient, a, &payer)?;
             self.preview_erc20_recipient(&recipient, &amount)?;
             let r = encode_return_data(&ReturnData {
                 d: self.domain,
@@ -2195,16 +2378,70 @@ impl NativeBridgeV2 {
                 amount: amount.clone(),
                 min_index: a,
             });
-            let req = transfer_request(
-                &source,
-                owner,
-                &TransferTx {
-                    recipient: burn_predicate(&hu(&[&r])),
-                    mask: fresh_mask().to_vec(),
-                    data: Some(r),
-                    deadline: None,
-                },
-            )?;
+            let mask = fresh_mask();
+            let claim = if self.cfg.erc20.is_some() {
+                self.check_erc20_payer(&rec, &payer, true, Some(&hex(&fresh_mask())))?
+                    .fence
+            } else {
+                None
+            };
+            let mut signing = false;
+            let signed = (|| {
+                if let Some(policy) = self
+                    .erc20_return_recovery
+                    .as_ref()
+                    .filter(|_| self.cfg.erc20.is_some())
+                {
+                    self.check_erc20_bid(&policy.limits)?;
+                    let other = self.check_erc20_payer(&rec, &payer, false, None)?;
+                    let schedule = &rec.extra["recovery"];
+                    let calls = undec64(schedule["calls"].as_str().unwrap_or(""))?;
+                    self.check_erc20_nonce(
+                        &payer,
+                        u128::from(calls),
+                        policy.limits.max_nonce,
+                        &other,
+                    )?;
+                    let total = undec(schedule["totalFee"].as_str().unwrap_or(""))?;
+                    if total > self.erc20_free_balance(&payer, &other)? {
+                        return fail_d(Rule::CapacityPreflight, "insufficient free payer balance");
+                    }
+                }
+                transfer_request_with(
+                    &source,
+                    owner,
+                    &TransferTx {
+                        recipient: burn_predicate(&hu(&[&r])),
+                        mask: mask.to_vec(),
+                        data: Some(r),
+                        deadline: None,
+                    },
+                    |message| {
+                        signing = true;
+                        if self.cfg.erc20.is_some() {
+                            owner.sign_unlock_for_burn(message)
+                        } else {
+                            owner.sign_unlock(message).map_err(Error::Other)
+                        }
+                    },
+                )
+            })();
+            let req = match signed {
+                Ok(req) => req,
+                Err(error) => {
+                    if let Some(fence) = claim {
+                        if !signing || error.reason() == Some(WalletReason::SigningDeclined) {
+                            self.journal.cancel_unsigned_return(&rec.return_id, fence)?;
+                        } else {
+                            self.journal.retain_return_attempt(&rec.return_id, fence)?;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(fence) = claim {
+                self.journal.retain_return_attempt(&rec.return_id, fence)?;
+            }
             rec.burn_tx = Some(hex(&req.tx));
             rec.burn_request = Some(hex(&req.cd));
             rec.status = "burn-requested".into();
@@ -2430,7 +2667,11 @@ impl NativeBridgeV2 {
         signer: &dyn EvmSigner,
     ) -> Result<ReconcileResult> {
         let mut expired = None;
-        let prior = self.reconcile_inner_with_expiry(return_id, &mut expired)?;
+        let prior = self.reconcile_inner_with_expiry(
+            return_id,
+            &mut expired,
+            self.cfg.erc20.as_ref().map(|_| signer.address()).as_ref(),
+        )?;
         if !matches!(prior, ReconcileResult::NotPaid { .. })
             && !expired
                 .as_ref()
@@ -2464,14 +2705,15 @@ impl NativeBridgeV2 {
             } else {
                 None
             };
-            let tx = self.signed_with_replacement(
-                signer,
+            let request = self.transaction_request(
+                &signer.address(),
                 &self.cfg.vault,
                 &rtx.calldata,
                 BigUint::default(),
                 gas,
                 replacement.as_ref(),
             )?;
+            let tx = self.sign_redeem_tx(&fresh, signer, &request)?;
             self.check_ordinary_import(&fresh, Some(&tx.raw))?;
             if let Some((old, _)) = &expired {
                 if self.evm.nonce(&old.from, "latest")? != old.request.nonce {
@@ -2480,6 +2722,12 @@ impl NativeBridgeV2 {
                     });
                 }
             }
+            if self.cfg.erc20.is_some() {
+                fresh
+                    .extra
+                    .entry("executionPayer")
+                    .or_insert_with(|| serde_json::Value::String(hex(&signer.address())));
+            }
             fresh.sends.push(self.send_record(&tx));
             fresh.status = "submitted".into();
             if fresh.first_send_block.is_none() {
@@ -2487,6 +2735,10 @@ impl NativeBridgeV2 {
             }
             self.journal.put_return(&fresh)?;
             expired = None;
+            if self.cfg.erc20.is_some() {
+                self.journal
+                    .prepare_payer_broadcast(&fresh, self.cfg.chain_id, &tx.raw)?;
+            }
             let Some(r) = self.broadcast_and_wait(&tx)? else {
                 return Ok(ReconcileResult::Pending {
                     tx_hash: tx.hash.to_vec(),
@@ -2556,13 +2808,14 @@ impl NativeBridgeV2 {
     }
 
     fn reconcile_inner(&self, return_id: &[u8; 32]) -> Result<ReconcileResult> {
-        self.reconcile_inner_with_expiry(return_id, &mut None)
+        self.reconcile_inner_with_expiry(return_id, &mut None, None)
     }
 
     fn reconcile_inner_with_expiry(
         &self,
         return_id: &[u8; 32],
         expired: &mut Option<(DecodedTx, bool)>,
+        payer: Option<&[u8; 20]>,
     ) -> Result<ReconcileResult> {
         let mut rec = self.return_record(return_id)?;
         if rec.status == "paid" {
@@ -2573,6 +2826,9 @@ impl NativeBridgeV2 {
             });
         }
         let Some(eta_hex) = rec.eta.clone() else {
+            if let Some(payer) = payer {
+                rec.require_execution_payer(payer)?;
+            }
             return Ok(ReconcileResult::NotPaid { last_failure: None });
         };
         let eta = unhex(&eta_hex)?;
@@ -2587,6 +2843,9 @@ impl NativeBridgeV2 {
             if let Some(v) = self.verified_paid(rec.clone(), &l.transaction_hash)? {
                 return Ok(v);
             }
+        }
+        if let Some(payer) = payer {
+            rec.require_execution_payer(payer)?;
         }
         let mut sends = rec.sends.clone();
         let landed = self.landed_send(&mut sends, Some(&rec))?;
@@ -2714,49 +2973,477 @@ impl NativeBridgeV2 {
         value: BigUint,
         gas: u64,
     ) -> Result<SignedTx> {
-        self.signed_with_replacement(signer, to, data, value, gas, None)
+        sign_tx(
+            signer,
+            &self.transaction_request(&signer.address(), to, data, value, gas, None)?,
+        )
     }
 
-    fn signed_with_replacement(
+    /// Replay the admitted recovery prefix and publish it for wallets sharing this payer store.
+    pub fn index_erc20_recovery_progress(
         &self,
+        return_id: &[u8; 32],
+        checkpoints: &[Erc20RecoveryCheckpoint<'_>],
+    ) -> Result<()> {
+        let Some(policy) = &self.erc20_return_recovery else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation lacks an authenticated ERC20 release",
+            );
+        };
+        self.verify_erc20_recovery_release(policy)?;
+        let Some(record) = self
+            .journal
+            .ret(&hex(return_id))?
+            .filter(|r| r.burned.is_some())
+        else {
+            return refuse(
+                WalletReason::NotPending,
+                "continuation needs a certified return",
+            );
+        };
+        let plan = &record.extra["recovery"];
+        let generation = hex(&super::recovery::recovery_generation(
+            &policy.deployment.salt,
+            &self.domain,
+        ));
+        if plan["generation"].as_str() != Some(&generation) {
+            return refuse(
+                WalletReason::BadDeployment,
+                "continuation belongs to another generation",
+            );
+        }
+        let cuts = recovery_run_cuts(plan)?;
+        let batch = plan["advanceGaps"].as_u64().unwrap_or(0);
+        let burned = unhex(record.burned.as_deref().unwrap_or(""))?;
+        let eta = unhex_n::<32>(record.eta.as_deref().unwrap_or(""))?;
+        let receipts = self.retrying_trust(|trust| {
+            let session = RecoverySession::create(
+                &self.pins.gamma,
+                &evidence_of(&burned),
+                RecoveryAuthority::new(trust.clone(), |_| Ok(())),
+                &build_params(self.pins.build),
+                policy.deployment.clone(),
+            )?;
+            if session.redemption_id() != eta {
+                return refuse(
+                    WalletReason::BadInput,
+                    "continuation session has the wrong redemption ID",
+                );
+            }
+            let mut from = 0;
+            let mut prior = None;
+            let mut cursor: Option<GapCursor> = None;
+            let mut verified = Vec::new();
+            for (index, checkpoint) in checkpoints.iter().enumerate() {
+                let event = if let Some(cut) = cuts.get(index) {
+                    if !checkpoint.gaps.is_empty() {
+                        return fail_d(Rule::CapacityPreflight, "Run checkpoint has gap witnesses");
+                    }
+                    let packet = session.run(from, *cut, trust, prior)?;
+                    from = packet.end;
+                    packet.event
+                } else {
+                    let Some((seq, receipt)) = prior.filter(|_| from == session.operation_count())
+                    else {
+                        return fail_d(
+                            Rule::CapacityPreflight,
+                            "Advance requires the completed Run schedule",
+                        );
+                    };
+                    if batch == 0 || checkpoint.gaps.len() as u64 != batch {
+                        return fail_d(
+                            Rule::CapacityPreflight,
+                            "Advance must cover the admitted gap batch",
+                        );
+                    }
+                    let start = if cursor.is_none() {
+                        Some(unhex_n(&record.start_head)?)
+                    } else {
+                        None
+                    };
+                    let packet = session.gaps(
+                        GapEntry::Advance,
+                        trust,
+                        &GapPredecessor {
+                            seq,
+                            receipt,
+                            cursor: cursor.take(),
+                        },
+                        checkpoint.gaps,
+                        start,
+                    )?;
+                    cursor = Some(GapCursor {
+                        next: packet.next,
+                        head: packet.head.expect("Advance has an endpoint"),
+                    });
+                    packet.event.expect("Advance has a checkpoint")
+                };
+                verified.push(session.verify_event(trust, checkpoint.receipt, &event)?);
+                prior = Some((index as u64 + 1, checkpoint.receipt));
+            }
+            Ok(verified)
+        })?;
+        let envelope = &plan["envelope"];
+        let saved_bid = envelope["maxFeePerGas"]
+            .as_str()
+            .or_else(|| plan["ordinary"]["maxFeePerGas"].as_str());
+        let prices = if let Some(bid) = saved_bid.filter(|_| !receipts.is_empty()) {
+            let limits = RecoveryLimits {
+                signed_bytes: envelope["signedBytes"]
+                    .as_u64()
+                    .unwrap_or(self.pins.max_encoded_tx_bytes)
+                    as usize,
+                calldata_bytes: envelope["calldataBytes"].as_u64().unwrap_or(393_216) as usize,
+                gas: envelope["gas"]
+                    .as_str()
+                    .map(undec64)
+                    .transpose()?
+                    .unwrap_or(self.pins.user_gas_limit),
+                chain_id: self.cfg.chain_id,
+                max_nonce: envelope["maxNonce"]
+                    .as_str()
+                    .map(undec64)
+                    .transpose()?
+                    .unwrap_or(u64::MAX),
+                max_fee_per_gas: undec(bid)?,
+                max_priority_fee_per_gas: undec(
+                    envelope["maxPriorityFeePerGas"].as_str().unwrap_or(bid),
+                )?,
+                max_transaction_fee: None,
+                balance: BigUint::default(),
+                fee_budget: BigUint::default(),
+            };
+            let ordinary = undec64(
+                plan["ordinary"]["attemptsBeforeFallback"]
+                    .as_str()
+                    .unwrap_or("0"),
+            )?;
+            let advances = recovery_advance_calls(plan, cuts.len(), ordinary)?;
+            let gas = admitted_recovery_gas(
+                &unhex(&record.source)?,
+                RecoverySuffix {
+                    cuts: &cuts,
+                    completed_runs: 0,
+                    batch: usize::try_from(batch).unwrap_or(0),
+                    advances,
+                },
+                self.cfg.k,
+                &*policy.calibration,
+                &limits,
+            )?;
+            Some((gas, advances))
+        } else {
+            None
+        };
+        for (index, receipt) in receipts.iter().enumerate() {
+            let completed = index + 1;
+            let gas = prices.as_ref().map(|(quotes, advances)| {
+                let completed_advances = completed.saturating_sub(quotes.run.len()) as u64;
+                let remaining = advances.saturating_sub(completed_advances);
+                quotes.run.iter().skip(completed).fold(
+                    BigUint::from(remaining) * quotes.advance + quotes.settle,
+                    |gas, amount| gas + *amount,
+                )
+            });
+            self.journal.index_recovery_progress(
+                self.cfg.chain_id,
+                &record,
+                completed as u64,
+                receipt,
+                gas,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn sign_redeem_tx(
+        &self,
+        record: &ReturnRecord,
         signer: &dyn EvmSigner,
+        request: &TxRequest,
+    ) -> Result<SignedTx> {
+        if self.cfg.erc20.is_none() {
+            return sign_tx(signer, request);
+        }
+        let payer = signer.address();
+        record.require_execution_payer(&payer)?;
+        let Some(policy) = &self.erc20_return_recovery else {
+            return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
+        };
+        let mut used = std::collections::BTreeSet::new();
+        if !record.sends.is_empty() {
+            let finalized = self.evm.nonce(&payer, "finalized")?;
+            for send in &record.sends {
+                let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
+                let nonce = tx.request.nonce;
+                if tx.from != payer
+                    || tx.request.chain_id != request.chain_id
+                    || nonce >= finalized
+                    || nonce >= request.nonce
+                {
+                    continue;
+                }
+                used.insert(nonce);
+            }
+        }
+        let spent_calls = used.len() as u64;
+        let plan = &record.extra["recovery"];
+        let progress = self.journal.finalized_recovery_progress(
+            self.cfg.chain_id,
+            record,
+            Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
+        )?;
+        let completed = progress.map_or(0, |p| p.completed);
+        self.journal.check_payer(
+            self.cfg.chain_id,
+            &payer,
+            &record.return_id,
+            true,
+            &PayerCheck {
+                drain: true,
+                finalized_nonce: Some(&|| self.evm.nonce(&payer, "finalized")),
+                finalized_block: Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
+                signing_nonce: Some(request.nonce),
+                remaining_calls: Some(remaining_recovery_calls(plan, completed, spent_calls)?),
+                max_nonce: Some(policy.limits.max_nonce),
+                before_signing: Some(&|other| {
+                    self.check_erc20_ordinary_attempt(
+                        record,
+                        &payer,
+                        request,
+                        other,
+                        completed,
+                        spent_calls,
+                    )
+                }),
+                ..Default::default()
+            },
+        )?;
+        let tx = sign_tx(signer, request)?;
+        self.journal.retain_payer_send(record, &tx.raw)?;
+        Ok(tx)
+    }
+
+    fn check_erc20_ordinary_attempt(
+        &self,
+        record: &ReturnRecord,
+        payer: &[u8; 20],
+        request: &TxRequest,
+        other: &PayerCommitments,
+        completed: u64,
+        spent_calls: u64,
+    ) -> Result<()> {
+        if self.cfg.erc20.is_none() {
+            return Ok(());
+        }
+        let plan = &record.extra["recovery"];
+        let Some(ordinary) = plan.get("ordinary") else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary route lacks a signing reserve",
+            );
+        };
+        let Some(policy) = &self.erc20_return_recovery else {
+            return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
+        };
+        let field = |name| {
+            ordinary
+                .get(name)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+        };
+        let prior = record
+            .sends
+            .iter()
+            .map(|sent| sent.nonce.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut fallback_limits = policy.limits.clone();
+        fallback_limits.gas = fallback_limits.gas.min(self.pins.user_gas_limit);
+        fallback_limits.signed_bytes = fallback_limits
+            .signed_bytes
+            .min(self.pins.max_encoded_tx_bytes as usize);
+        let mut limits = fallback_limits.clone();
+        let ordinary_gas = undec64(field("gas"))?;
+        let attempts = undec64(field("attemptsBeforeFallback"))?;
+        limits.gas = limits.gas.min(ordinary_gas);
+        limits.calldata_bytes = limits
+            .calldata_bytes
+            .min(ordinary["calldataBytes"].as_u64().unwrap_or(0) as usize);
+        limits.max_fee_per_gas = limits.max_fee_per_gas.min(undec(field("maxFeePerGas"))?);
+        limits.max_priority_fee_per_gas = limits
+            .max_priority_fee_per_gas
+            .min(limits.max_fee_per_gas.clone());
+        let Some((_, fee)) = quote_erc20_call(request.data.len(), request.gas, &limits) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary call is outside the ERC20 admission limits",
+            );
+        };
+        if (!prior.contains(dec(request.nonce).as_str()) && prior.len() as u64 >= attempts)
+            || request.max_fee_per_gas > limits.max_fee_per_gas
+            || request.max_priority_fee_per_gas > limits.max_priority_fee_per_gas
+            || fee > limits.fee_budget
+            || fee > limits.balance
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary attempt exceeds its signing reserve",
+            );
+        }
+        let fees = self
+            .journal
+            .payer_fees(record, request.chain_id, payer, request.nonce)?;
+        if fees.at_nonce != BigUint::default()
+            && request.nonce < self.evm.nonce(payer, "finalized")?
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "ordinary replacement nonce is already finalized",
+            );
+        }
+        let mut required = fee.max(fees.at_nonce);
+        if other.contested_drain {
+            self.verify_erc20_recovery_release(policy)?;
+            let generation = hex(&super::recovery::recovery_generation(
+                &policy.deployment.salt,
+                &self.domain,
+            ));
+            if plan["generation"].as_str() != Some(&generation) {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "remaining continuation belongs to another recovery generation",
+                );
+            }
+            let cuts = recovery_run_cuts(plan)?;
+            let advances = recovery_advance_calls(plan, cuts.len(), attempts)?
+                .saturating_sub(completed.saturating_sub(cuts.len() as u64));
+            let suffix = admitted_recovery_gas(
+                &unhex(&record.source)?,
+                RecoverySuffix {
+                    cuts: &cuts,
+                    completed_runs: usize::try_from(completed)
+                        .unwrap_or(usize::MAX)
+                        .min(cuts.len()),
+                    batch: plan["advanceGaps"]
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(0),
+                    advances,
+                },
+                self.cfg.k,
+                &*policy.calibration,
+                &fallback_limits,
+            )?;
+            let continuation_gas = suffix.run.into_iter().fold(
+                BigUint::from(advances) * suffix.advance + suffix.settle,
+                |sum, gas| sum + gas,
+            );
+            let attempts = attempts.saturating_sub(spent_calls);
+            let route = if attempts > 0 {
+                continuation_gas.max(ordinary_gas.into())
+            } else {
+                continuation_gas
+            };
+            let ceiling = &fallback_limits.max_fee_per_gas;
+            let allowance = if attempts > 0 {
+                BigUint::from(ordinary_gas) * ceiling
+            } else {
+                BigUint::default()
+            };
+            let other_work =
+                (route + BigUint::from(attempts.saturating_sub(1)) * ordinary_gas) * ceiling;
+            required = other_work + required.max(allowance);
+        }
+        if &required + fees.prior > limits.fee_budget {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "remaining continuation schedule exceeds the authorized payer fee budget",
+            );
+        }
+        if required > limits.balance || required > self.erc20_free_balance(payer, other)? {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "remaining continuation schedule exceeds the free payer balance",
+            );
+        }
+        Ok(())
+    }
+
+    fn check_erc20_payer(
+        &self,
+        record: &ReturnRecord,
+        payer: &[u8],
+        reserve: bool,
+        fence: Option<&str>,
+    ) -> Result<PayerCommitments> {
+        self.journal.check_payer(
+            self.cfg.chain_id,
+            payer,
+            &record.return_id,
+            reserve,
+            &PayerCheck {
+                drain: record.status != "planned",
+                finalized_nonce: Some(&|| self.evm.nonce(payer, "finalized")),
+                finalized_block: Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
+                fence,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn erc20_free_balance(&self, payer: &[u8], other: &PayerCommitments) -> Result<BigUint> {
+        let mut balance = self
+            .evm
+            .balance(payer)?
+            .min(self.evm.balance_at(payer, "pending")?);
+        if other.finalized_nonce.is_some() {
+            balance = balance.min(self.evm.balance_at(payer, "finalized")?);
+        }
+        Ok(if balance > other.fees {
+            balance - &other.fees
+        } else {
+            BigUint::default()
+        })
+    }
+
+    fn transaction_request(
+        &self,
+        payer: &[u8; 20],
         to: &[u8; 20],
         data: &[u8],
         value: BigUint,
         gas: u64,
         replace: Option<&(TxRequest, bool)>,
-    ) -> Result<SignedTx> {
+    ) -> Result<TxRequest> {
         let (base_fee, mut priority) = self.evm.fees()?;
         let mut max_fee = BigUint::from(2u8) * base_fee + &priority;
         let nonce = if let Some((prior, pooled)) = replace {
-            if self.evm.nonce(&signer.address(), "latest")? != prior.nonce {
+            if self.evm.nonce(payer, "latest")? != prior.nonce {
                 return refuse(
                     WalletReason::NotPending,
                     "payout nonce changed during replacement",
                 );
             }
-            if *pooled || self.evm.nonce(&signer.address(), "pending")? > prior.nonce {
+            if *pooled || self.evm.nonce(payer, "pending")? > prior.nonce {
                 let bump = |bid: &BigUint| bid + bid / 10u8 + 1u8;
                 max_fee = max_fee.max(bump(&prior.max_fee_per_gas));
                 priority = priority.max(bump(&prior.max_priority_fee_per_gas));
             }
             prior.nonce
         } else {
-            self.evm.nonce(&signer.address(), "pending")?
+            self.evm.nonce(payer, "pending")?
         };
-        sign_tx(
-            signer,
-            &TxRequest {
-                chain_id: self.cfg.chain_id,
-                nonce,
-                max_priority_fee_per_gas: priority,
-                max_fee_per_gas: max_fee,
-                gas,
-                to: *to,
-                value,
-                data: data.to_vec(),
-            },
-        )
+        Ok(TxRequest {
+            chain_id: self.cfg.chain_id,
+            nonce,
+            max_priority_fee_per_gas: priority,
+            max_fee_per_gas: max_fee,
+            gas,
+            to: *to,
+            value,
+            data: data.to_vec(),
+        })
     }
 
     fn send_record(&self, tx: &SignedTx) -> SendRecord {
@@ -2840,6 +3527,10 @@ impl NativeBridgeV2 {
                         );
                     }
                     return Err(error);
+                }
+                if self.cfg.erc20.is_some() {
+                    self.journal
+                        .prepare_payer_broadcast(rec, self.cfg.chain_id, &raw)?;
                 }
             }
             if let Err(error) = self.send_raw_tolerant(&raw) {

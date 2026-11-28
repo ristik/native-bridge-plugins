@@ -80,6 +80,7 @@ export function wrap(outer: Rule, e: unknown): never {
  * an unknown or malformed seal companion), and the plug-in's own safety refusals of NB2-07.
  */
 export type WalletReason =
+  | 'SigningDeclined' // a signer guarantees it produced no signature
   | 'StateReadNotAdmitted' // a plain state() read on a deployment without stateReadOnly: not evidence (section 12.2)
   | 'CompanionUnknown' // the node does not hold the block on its canonical chain: re-resolve and retry (section 12.7)
   | 'CompanionProvider' // a companion whose witnesses are not [certificate, technical record]: use another provider
