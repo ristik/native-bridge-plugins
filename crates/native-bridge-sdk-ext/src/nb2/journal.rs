@@ -380,7 +380,15 @@ pub struct PayerCheck<'a> {
     pub drain: bool,
     pub finalized_nonce: Option<&'a dyn Fn() -> Result<u64>>,
     pub fence: Option<&'a str>,
+    /// Exact nonce to fence before invoking an EVM signer.
+    pub signing_nonce: Option<u64>,
+    /// Calls still to execute, including the packet about to be signed.
+    pub remaining_calls: Option<u64>,
+    pub max_nonce: Option<u64>,
+    pub before_signing: Option<&'a PayerSigningCheck<'a>>,
 }
+
+pub type PayerSigningCheck<'a> = dyn Fn(&PayerCommitments) -> Result<()> + 'a;
 
 #[derive(Default)]
 pub struct PayerCommitments {
@@ -412,7 +420,7 @@ impl PayerCommitments {
 
 pub struct PayerFence {
     key: String,
-    claim: String,
+    attempt: String,
 }
 
 fn return_path(key: &str) -> Option<(&str, &str)> {
@@ -601,16 +609,18 @@ impl Journal {
             &record.base.domain[2..],
             &record.return_id[2..]
         );
+        self.retain_payer_nonce(&key, tx.request.nonce)
+    }
+
+    fn retain_payer_nonce(&self, key: &str, nonce: u64) -> Result<()> {
         loop {
-            let previous = self.store.get(&key)?;
+            let previous = self.store.get(key)?;
             if previous
                 .as_deref()
                 .map(undec64)
                 .transpose()?
-                .is_some_and(|n| n >= tx.request.nonce)
-                || self
-                    .store
-                    .put_if(&key, previous.as_deref(), &dec(tx.request.nonce))?
+                .is_some_and(|n| n >= nonce)
+                || self.store.put_if(key, previous.as_deref(), &dec(nonce))?
             {
                 return Ok(());
             }
@@ -697,7 +707,7 @@ impl Journal {
             {
                 continue;
             }
-            if rec.status == "paid"
+            if rec.status != "planned"
                 && executing
                 && self
                     .store
@@ -707,7 +717,7 @@ impl Journal {
             {
                 return fail_d(
                     Rule::CapacityPreflight,
-                    "paid return needs its local signed sends indexed",
+                    "another return needs its local signed sends indexed",
                 );
             }
             if active {
@@ -776,6 +786,12 @@ impl Journal {
         if payer.len() != 20 {
             return refuse(WalletReason::BadInput, "invalid ERC20 payer");
         }
+        if check.fence.is_some() && check.signing_nonce.is_some() {
+            return refuse(
+                WalletReason::BadInput,
+                "payer claim cannot sign both a burn and an EVM packet",
+            );
+        }
         unhex_n::<32>(id)?;
         let domain_key = format!("nb2/domain-chain/v1/{}", to_hex(&self.domain));
         self.store.put_if(&domain_key, None, &dec(chain_id))?;
@@ -789,10 +805,11 @@ impl Journal {
         let target = self.key("return", Some(&id[2..]));
         loop {
             let held = self.store.get(&key)?;
-            let owner = held
-                .as_deref()
-                .map(|s| s.split('#').next().expect("first component"));
-            if let Some(owner) = owner.filter(|s| !s.is_empty() && *s != target) {
+            let held_text = held.as_deref().unwrap_or_default();
+            let (owner, state) = held_text.split_once('#').unwrap_or((held_text, ""));
+            let owns_slot = owner == target;
+            let held_nonce = state.strip_prefix("nonce:").map(undec64).transpose()?;
+            if !owns_slot && !owner.is_empty() {
                 if return_path(owner).is_none() {
                     return refuse(WalletReason::BadInput, "invalid ERC20 payer reservation");
                 }
@@ -809,46 +826,144 @@ impl Journal {
                     );
                 }
             }
-            let mut out = self.other_payer_resources(
-                chain_id,
-                payer,
-                &target,
-                owner == Some(&target),
-                check,
-            )?;
-            if owner == Some(&target) {
-                if !reserve
-                    || held.as_deref() == Some(&target)
-                    || self.store.put_if(&key, held.as_deref(), &target)?
-                {
-                    return Ok(out);
+            let mut out = self.other_payer_resources(chain_id, payer, &target, owns_slot, check)?;
+            if let Some(nonce) = held_nonce.filter(|_| !owns_slot) {
+                let finalized = match out.finalized_nonce {
+                    Some(nonce) => Some(nonce),
+                    None => check.finalized_nonce.map(|read| read()).transpose()?,
+                };
+                if finalized.map_or(true, |finalized| finalized <= nonce) {
+                    return fail_d(
+                        Rule::CapacityPreflight,
+                        "payer has a local signing nonce awaiting finalization",
+                    );
                 }
-                continue;
+                out.finalized_nonce = finalized;
+                if reserve {
+                    let (domain, id) = return_path(owner).expect("validated payer slot");
+                    self.retain_payer_nonce(
+                        &format!(
+                            "nb2/payer-sends/v1/{chain_id}/{}/{domain}/{id}",
+                            to_hex(payer)
+                        ),
+                        nonce,
+                    )?;
+                }
             }
             if !reserve {
                 return Ok(out);
             }
-            let claim = check
-                .fence
-                .map_or_else(|| target.clone(), |fence| format!("{target}#{fence}"));
+            let mut claim = if owns_slot { held_text } else { &target }.to_owned();
+            let contested_drain = !owns_slot && check.drain && out.calls > 0;
+            if check.signing_nonce.is_some() || contested_drain {
+                let Some(current) = self
+                    .ret(id)?
+                    .filter(|r| r.status != "paid" && r.status != "planned")
+                else {
+                    return fail_d(
+                        Rule::CapacityPreflight,
+                        "return is no longer eligible for payer signing",
+                    );
+                };
+                let recovery = &current.extra["recovery"];
+                let cap = recovery["envelope"]["maxNonce"]
+                    .as_str()
+                    .map(undec64)
+                    .transpose()?
+                    .unwrap_or(u64::MAX)
+                    .min(check.max_nonce.unwrap_or(u64::MAX));
+                let calls = if contested_drain {
+                    match check.remaining_calls {
+                        Some(calls) => calls,
+                        None => undec64(recovery["calls"].as_str().unwrap_or(""))?,
+                    }
+                } else {
+                    1
+                };
+                let Some(nonce) = check.signing_nonce.filter(|&nonce| {
+                    calls > 0
+                        && nonce >= out.finalized_nonce.unwrap_or(0)
+                        && out.nonce_limit(cap).is_some_and(|limit| {
+                            u128::from(nonce) + u128::from(calls) - 1 <= u128::from(limit)
+                        })
+                }) else {
+                    return fail_d(
+                        Rule::CapacityPreflight,
+                        "remaining continuation schedule exceeds the payer nonce horizon",
+                    );
+                };
+                if let Some(validate) = check.before_signing {
+                    validate(&out)?;
+                }
+                let highest = held_nonce
+                    .filter(|_| owns_slot)
+                    .map_or(nonce, |n| n.max(nonce));
+                claim = format!("{target}#nonce:{highest}");
+            }
+            let attempts = state.strip_prefix("burn:");
+            if let Some(fence) = check.fence.filter(|_| !owns_slot || attempts.is_some()) {
+                claim = match attempts.filter(|_| owns_slot) {
+                    Some(attempts) => format!("{target}#burn:{attempts},{fence}"),
+                    None => format!("{target}#burn:{fence}"),
+                };
+                out.fence = Some(PayerFence {
+                    key: key.clone(),
+                    attempt: fence.to_owned(),
+                });
+            }
+            if claim == held_text && check.signing_nonce.is_none() {
+                return Ok(out);
+            }
             if !self.store.put_if(&key, held.as_deref(), &claim)? {
                 continue;
-            }
-            if check.fence.is_some() {
-                out.fence = Some(PayerFence { key, claim });
             }
             return Ok(out);
         }
     }
 
     pub fn cancel_unsigned_return(&self, id: &str, fence: PayerFence) -> Result<()> {
-        if self
-            .ret(id)?
-            .is_some_and(|r| r.status == "planned" && r.burn_request.is_none())
-        {
-            self.store.put_if(&fence.key, Some(&fence.claim), "")?;
+        self.finish_return_attempt(id, fence, true)
+    }
+
+    pub fn retain_return_attempt(&self, id: &str, fence: PayerFence) -> Result<()> {
+        self.finish_return_attempt(id, fence, false)
+    }
+
+    fn finish_return_attempt(&self, id: &str, fence: PayerFence, unsigned: bool) -> Result<()> {
+        let target = self.key("return", Some(&id[2..]));
+        let prefix = format!("{target}#burn:");
+        loop {
+            let Some(held) = self.store.get(&fence.key)? else {
+                return Ok(());
+            };
+            let Some(attempts) = held.strip_prefix(&prefix) else {
+                return Ok(());
+            };
+            let attempts = attempts.split(',').collect::<Vec<_>>();
+            if !attempts.contains(&fence.attempt.as_str()) {
+                return Ok(());
+            }
+            let next = if unsigned
+                && self
+                    .ret(id)?
+                    .is_some_and(|r| r.status == "planned" && r.burn_request.is_none())
+            {
+                let remaining = attempts
+                    .into_iter()
+                    .filter(|attempt| *attempt != fence.attempt)
+                    .collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    String::new()
+                } else {
+                    format!("{prefix}{}", remaining.join(","))
+                }
+            } else {
+                target.clone()
+            };
+            if self.store.put_if(&fence.key, Some(&held), &next)? {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 }
 

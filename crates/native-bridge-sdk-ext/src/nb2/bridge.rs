@@ -2359,14 +2359,19 @@ impl NativeBridgeV2 {
             let req = match signed {
                 Ok(req) => req,
                 Err(error) => {
-                    if let Some(fence) = claim.filter(|_| {
-                        !signing || error.reason() == Some(WalletReason::SigningDeclined)
-                    }) {
-                        self.journal.cancel_unsigned_return(&rec.return_id, fence)?;
+                    if let Some(fence) = claim {
+                        if !signing || error.reason() == Some(WalletReason::SigningDeclined) {
+                            self.journal.cancel_unsigned_return(&rec.return_id, fence)?;
+                        } else {
+                            self.journal.retain_return_attempt(&rec.return_id, fence)?;
+                        }
                     }
                     return Err(error);
                 }
             };
+            if let Some(fence) = claim {
+                self.journal.retain_return_attempt(&rec.return_id, fence)?;
+            }
             rec.burn_tx = Some(hex(&req.tx));
             rec.burn_request = Some(hex(&req.cd));
             rec.status = "burn-requested".into();
@@ -2634,12 +2639,7 @@ impl NativeBridgeV2 {
                 gas,
                 replacement.as_ref(),
             )?;
-            self.check_erc20_ordinary_attempt(&fresh, &signer.address(), &request)?;
-            if self.cfg.erc20.is_some() {
-                self.check_erc20_payer(&fresh, &signer.address(), true, None)?;
-                self.check_erc20_ordinary_attempt(&fresh, &signer.address(), &request)?;
-            }
-            let tx = sign_tx(signer, &request)?;
+            let tx = self.sign_redeem_tx(&fresh, signer, &request)?;
             self.check_ordinary_import(&fresh, Some(&tx.raw))?;
             if let Some((old, _)) = &expired {
                 if self.evm.nonce(&old.from, "latest")? != old.request.nonce {
@@ -2652,9 +2652,6 @@ impl NativeBridgeV2 {
             fresh.status = "submitted".into();
             if fresh.first_send_block.is_none() {
                 fresh.first_send_block = Some(dec(self.evm.block_number()?));
-            }
-            if self.cfg.erc20.is_some() {
-                self.journal.retain_payer_send(&fresh, &tx.raw)?;
             }
             self.journal.put_return(&fresh)?;
             expired = None;
@@ -2891,11 +2888,55 @@ impl NativeBridgeV2 {
         )
     }
 
+    fn sign_redeem_tx(
+        &self,
+        record: &ReturnRecord,
+        signer: &dyn EvmSigner,
+        request: &TxRequest,
+    ) -> Result<SignedTx> {
+        if self.cfg.erc20.is_none() {
+            return sign_tx(signer, request);
+        }
+        let Some(policy) = &self.erc20_return_recovery else {
+            return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
+        };
+        let mut spent = std::collections::BTreeSet::new();
+        for send in &record.sends {
+            let nonce = undec64(&send.nonce)?;
+            if nonce < request.nonce {
+                spent.insert(nonce);
+            }
+        }
+        let calls = undec64(record.extra["recovery"]["calls"].as_str().unwrap_or(""))?;
+        let payer = signer.address();
+        self.journal.check_payer(
+            self.cfg.chain_id,
+            &payer,
+            &record.return_id,
+            true,
+            &PayerCheck {
+                drain: true,
+                finalized_nonce: Some(&|| self.evm.nonce(&payer, "finalized")),
+                signing_nonce: Some(request.nonce),
+                remaining_calls: Some(calls.saturating_sub(spent.len() as u64)),
+                max_nonce: Some(policy.limits.max_nonce),
+                before_signing: Some(&|other| {
+                    self.check_erc20_ordinary_attempt(record, &payer, request, other)
+                }),
+                ..Default::default()
+            },
+        )?;
+        let tx = sign_tx(signer, request)?;
+        self.journal.retain_payer_send(record, &tx.raw)?;
+        Ok(tx)
+    }
+
     fn check_erc20_ordinary_attempt(
         &self,
         record: &ReturnRecord,
         payer: &[u8; 20],
         request: &TxRequest,
+        other: &PayerCommitments,
     ) -> Result<()> {
         if self.cfg.erc20.is_none() {
             return Ok(());
@@ -2919,7 +2960,6 @@ impl NativeBridgeV2 {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
         };
-        let other = self.check_erc20_payer(record, payer, false, None)?;
         let prior = record
             .sends
             .iter()
@@ -2948,15 +2988,11 @@ impl NativeBridgeV2 {
         };
         if (!prior.contains(dec(request.nonce).as_str())
             && prior.len() as u64 >= undec64(field("attemptsBeforeFallback"))?)
-            || request.nonce < other.finalized_nonce.unwrap_or(0)
-            || other
-                .nonce_limit(limits.max_nonce)
-                .map_or(true, |cap| request.nonce > cap)
             || request.max_fee_per_gas > limits.max_fee_per_gas
             || request.max_priority_fee_per_gas > limits.max_priority_fee_per_gas
             || fee > limits.fee_budget
             || fee > limits.balance
-            || fee > self.erc20_free_balance(payer, &other)?
+            || fee > self.erc20_free_balance(payer, other)?
         {
             return fail_d(
                 Rule::CapacityPreflight,
@@ -2982,6 +3018,7 @@ impl NativeBridgeV2 {
                 drain: record.status != "planned",
                 finalized_nonce: Some(&|| self.evm.nonce(payer, "finalized")),
                 fence,
+                ..Default::default()
             },
         )
     }

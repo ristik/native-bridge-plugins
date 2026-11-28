@@ -1279,9 +1279,11 @@ export class NativeBridgeV2 {
   }
 
   /** Check persisted payer commitments, including nonces omitted from the pending RPC view. */
-  public checkErc20Payer(record: ReturnRecord, payer: Uint8Array, reserve = false, fence?: string) {
+  public checkErc20Payer(record: ReturnRecord, payer: Uint8Array, reserve = false, fence?: string,
+    send?: { nonce: bigint; remainingCalls: bigint; maxNonce?: bigint; beforeSigning?: (other: PayerCommitments) => Promise<void> }) {
     return this.journal.checkReturnPayer(this.cfg.chainId, payer, record.returnId, reserve, {
       mode: record.status === 'planned' ? 'admit' : 'drain', finalizedNonce: () => this.evm.nonce(payer, 'finalized'), fence,
+      signingNonce: send?.nonce, remainingCalls: send?.remainingCalls, maxNonce: send?.maxNonce, beforeSigning: send?.beforeSigning,
     });
   }
 
@@ -1499,7 +1501,7 @@ export class NativeBridgeV2 {
       await this.admitReturn(rec, held.amount, admissionSnapshot);
       await previewErc20Recipient(this.evm, this.cfg, recipient, held.amount);
       const R = encodeReturnData({ d: this.domain, asset: this.cfg.asset, recipient, amount: held.amount, minIndex: undec(rec.a) });
-      const { cancel } = this.cfg.erc20 ? await this.checkErc20Payer(rec, unhex(rec.payer ?? rec.recipient), true, hex(freshMask())) : {};
+      const { cancel, retain } = this.cfg.erc20 ? await this.checkErc20Payer(rec, unhex(rec.payer ?? rec.recipient), true, hex(freshMask())) : {};
       let signing = false;
       let declined = false;
       let signed: Awaited<ReturnType<typeof transferRequest>>;
@@ -1515,8 +1517,10 @@ export class NativeBridgeV2 {
         } }, { recipient: burnPredicate(HU(R)), mask: freshMask(), data: R, deadline: null });
       } catch (e) {
         if (!signing || declined) await cancel?.();
+        else await retain?.();
         throw e;
       }
+      await retain?.();
       const { tx, cd } = signed;
       rec.burnTx = hex(tx);
       rec.burnRequest = hex(cd);
@@ -1681,30 +1685,35 @@ export class NativeBridgeV2 {
               }) || request.maxFeePerGas > undec(ordinary.maxFeePerGas) || !options.admit) {
               fail('CapacityPreflight', 'ordinary attempt exceeds its signing reserve');
             }
-            const other = await this.checkErc20Payer(fresh, signer.address, true);
-            const admitted = fresh.recovery?.envelope?.maxNonce;
-            const maxNonce = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
-            if (request.nonce < (other.finalizedNonce ?? 0n) || request.nonce > payerNonceLimit(maxNonce, other) ||
-                request.gas * request.maxFeePerGas > await this.freeErc20PayerBalance(signer.address, other)) {
-              fail('CapacityPreflight', 'ordinary attempt exceeds the remaining payer balance or nonce horizon');
-            }
           }
           await options.admit?.(request, fresh.sends);
+          if (this.cfg.erc20) {
+            const spent = new Set(fresh.sends.map((send) => undec(send.nonce)).filter((nonce) => nonce < request.nonce));
+            const remainingCalls = undec(fresh.recovery!.calls) - BigInt(spent.size);
+            await this.checkErc20Payer(fresh, signer.address, true, undefined, {
+              nonce: request.nonce, remainingCalls, beforeSigning: async (other) => {
+                if (request.gas * request.maxFeePerGas > await this.freeErc20PayerBalance(signer.address, other)) {
+                  fail('CapacityPreflight', 'ordinary attempt exceeds the remaining payer balance');
+                }
+              },
+            });
+          }
         }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
             .map((send) => decodeSignedTx(unhex(send.raw)).request),
         });
+      if (this.cfg.erc20) await this.journal.retainPayerSend(fresh, tx.raw);
       // Until the exact call passes preflight it has never been broadcast. Leave
       // the burn rebuildable, including its history and route, on any refusal.
       await this.checkOrdinaryImport(fresh, tx.raw);
       if (expired && await this.evm.nonce(signer.address, 'latest') !== tx.request.nonce) {
         return { state: 'pending', txHash: unhex(fresh.sends.at(-1)!.hash) };
       }
+      if (this.cfg.erc20 && !fresh.executionPayer) await this.journal.indexPayerSends(fresh, []);
       fresh.executionPayer ??= hex(signer.address);
       fresh.sends.push(this.sendRecord(tx));
       fresh.status = 'submitted';
       fresh.firstSendBlock = fresh.firstSendBlock ?? dec(await this.evm.saneHead());
-      if (this.cfg.erc20) await this.journal.retainPayerSend(fresh, tx.raw);
       await this.journal.putReturn(fresh);
       expired = undefined;
       const r = await this.broadcastAndWait(tx);

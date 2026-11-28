@@ -344,7 +344,8 @@ test('legacy returns across domains keep their budgets and can claim the payer i
   await b.putReturn(second);
 
   await assert.rejects(bridge.planReturn(held, recipient, payer, { admission }), /outstanding ERC20 return/);
-  const other = await a.checkReturnPayer(chainId, payer, first.returnId, true, { mode: 'drain' });
+  const drain = { mode: 'drain' as const, signingNonce: 0n, finalizedNonce: async () => 1n };
+  const other = await a.checkReturnPayer(chainId, payer, first.returnId, true, drain);
   assert.equal(other.fees, 70n);
   assert.equal(other.calls, 7n);
   assert.equal(payerNonceLimit(255n, other), 248n);
@@ -352,20 +353,91 @@ test('legacy returns across domains keep their budgets and can claim the payer i
   await assert.rejects(b.checkReturnPayer(chainId, payer, second.returnId, true, { mode: 'drain' }), /outstanding ERC20 return/);
   await a.retForUpdate(first.returnId);
   await a.putReturn({ ...first, status: 'paid', paid: { txHash: hex(key('legacy paid a')), blockNumber: '21' } });
-  assert.equal((await b.checkReturnPayer(chainId, payer, second.returnId, true, { mode: 'drain' })).calls, 0n);
+  assert.equal((await b.checkReturnPayer(chainId, payer, second.returnId, true, { ...drain, signingNonce: 1n })).calls, 0n);
   await b.retForUpdate(second.returnId);
   await b.putReturn({ ...second, status: 'paid', paid: { txHash: hex(key('legacy paid b')), blockNumber: '22' } });
+  x.finalized(2n);
   await bridge.planReturn(held, recipient, payer, { admission });
 });
 
-test('a stale unsigned cancellation cannot release a concurrent retry’s payer claim', async () => {
-  const { x, bridge, held } = await heldPair();
-  const planned = await bridge.planReturn(held, recipient, x.payer.address, { admission: { erc20Recovery: admissionFor(x) } });
-  const journal = bridge.journal;
-  const { cancel } = await journal.checkReturnPayer(x.cfg.chainId, x.payer.address, planned.record.returnId, true, { fence: hex(key('first attempt')) });
-  assert.ok(cancel);
-  const retry = new Journal(journal.store, bridge.domain);
-  await retry.checkReturnPayer(x.cfg.chainId, x.payer.address, planned.record.returnId, true, { fence: hex(key('retry')) });
-  await cancel();
-  await assert.rejects(journal.checkReturnPayer(x.cfg.chainId, x.payer.address, hex(key('other return')), true), /outstanding ERC20 return/);
+test('a legacy drain waits for active recovery packets to be indexed and finalized', async () => {
+  const { x, bridge, held, store } = await heldPair();
+  const payer = x.payer.address;
+  const chainId = x.cfg.chainId;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const a = new Journal(store, key('legacy execution domain'));
+  const active = { ...record, ...a.base(), returnId: hex(key('legacy execution return')), status: 'burned' as const, executionPayer: hex(payer) };
+  const claimant = { ...record, status: 'burned' as const };
+  await a.putReturn(active);
+  await bridge.journal.putReturn(claimant);
+  const drain = { mode: 'drain' as const, signingNonce: 7n, finalizedNonce: () => bridge.evm.nonce(payer, 'finalized') };
+  await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, drain), /local signed sends indexed/);
+  const tx = await signTx(x.payer, { chainId, nonce: 7n, gas: 100_000n, maxFeePerGas: 10n,
+    maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
+  await a.indexPayerSends(active, [tx.raw]);
+  x.finalized(7n);
+  await assert.rejects(bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, drain), /signed nonce awaiting finalization/);
+  x.finalized(8n);
+  const other = await bridge.journal.checkReturnPayer(chainId, payer, claimant.returnId, true, { ...drain, signingNonce: 8n });
+  assert.equal(other.fees, BigInt(active.recovery!.totalFee));
+});
+
+test('a legacy claimant must leave a feasible full schedule for the earlier nonce deadline', async () => {
+  const store = new MemoryJournalStore();
+  const { x, bridge, held } = await heldPair(store);
+  const payer = x.payer.address;
+  const chainId = x.cfg.chainId;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const a = new Journal(store, key('later deadline'));
+  const b = new Journal(store, key('earlier deadline'));
+  const legacy = (journal: Journal, maxNonce: string) => ({
+    ...record, ...journal.base(), returnId: hex(key(maxNonce)), status: 'burned' as const,
+    recovery: { ...record.recovery!, calls: '8', envelope: { ...record.recovery!.envelope!, maxNonce } },
+  });
+  const later = legacy(a, '15');
+  const earlier = legacy(b, '8');
+  await a.putReturn(later);
+  await b.putReturn(earlier);
+  const drain = { mode: 'drain' as const, signingNonce: 0n, finalizedNonce: async () => 8n };
+  await assert.rejects(a.checkReturnPayer(chainId, payer, later.returnId, true, drain), /remaining continuation schedule/);
+  for (let nonce = 0n; nonce < 8n; nonce++) {
+    await b.checkReturnPayer(chainId, payer, earlier.returnId, true, { ...drain, signingNonce: nonce });
+  }
+  await b.putReturn({ ...earlier, status: 'paid', paid: { txHash: hex(key('earlier payout')), blockNumber: '21' } });
+  for (let nonce = 8n; nonce < 16n; nonce++) {
+    await a.checkReturnPayer(chainId, payer, later.returnId, true, { ...drain, signingNonce: nonce });
+  }
+});
+
+test('two SDK attempts can both decline without releasing the payer while either still owns it', async () => {
+  const { x, bridge, owner, firstHeld, held, store } = await heldPair();
+  const peer = await NativeBridgeV2.open({ ...x.options(), journal: store });
+  const admission = { erc20Recovery: admissionFor(x) };
+  const a = await bridge.planReturn(firstHeld, recipient, x.payer.address, { admission });
+  const b = await peer.planReturn(held, recipient, x.payer.address, { admission });
+  function decliningSigner() {
+    let entered!: () => void;
+    let release!: () => void;
+    const signing = new Promise<void>((resolve) => { entered = resolve; });
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const signer = { ...owner, signUnlock: async () => {
+      entered();
+      await wait;
+      throw new WalletError('SigningDeclined');
+    } };
+    return { signer, signing, release };
+  }
+  const first = decliningSigner();
+  const retry = decliningSigner();
+  const initial = assert.rejects(bridge.burn(a.returnId, first.signer, admission), { reason: 'SigningDeclined' });
+  await first.signing;
+  const second = assert.rejects(peer.burn(a.returnId, retry.signer, admission), { reason: 'SigningDeclined' });
+  await retry.signing;
+  first.release();
+  await initial;
+  await assert.rejects(bridge.burn(b.returnId, owner, admission), /outstanding ERC20 return/);
+  retry.release();
+  await second;
+  assert.equal((await bridge.journal.ret(a.record.returnId))!.status, 'planned');
+  await bridge.burn(b.returnId, owner, admission);
 });

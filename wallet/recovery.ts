@@ -487,7 +487,7 @@ export function archiveRequired(hash: Uint8Array, missing?: string): never {
 }
 
 async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec: ReturnRecord,
-  journal?: RecoveryJournal, cursor?: Cursor): Promise<void> {
+  journal?: RecoveryJournal, cursor?: Cursor): Promise<bigint> {
   const held = bytes(rec.source);
   const { runCuts, advanceGaps, observed: admittedObserved, progressEnd, envelope } = rec.recovery!;
   if (!cursor?.gap) checkSchedule(rec, w.bridge.returnHeadroom(held).operations);
@@ -510,9 +510,10 @@ async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec:
   const bound = progressEnd === undefined ? uint(admittedObserved) + release.backlog.duringProgress : uint(progressEnd);
   const running = !cursor?.gap && confirmedCuts < runCuts.length;
   if (cfg.erc20 && running && observed > bound) throw new Nb2Error('CapacityPreflight', 'observed arrivals exceed the admitted Run endpoint');
-  recoveryCatchUpCalls(advanceGaps, {
+  const gapCalls = recoveryCatchUpCalls(advanceGaps, {
     ...release.backlog, signedStart: covered, observed, duringProgress: running && bound > observed ? bound - observed : 0n,
   });
+  return BigInt(running ? runCuts.length - confirmedCuts : 0) + gapCalls + 1n;
 }
 
 type Cut = { kind: 'run'; count: number } | { kind: 'advance'; gaps: string[] } | { kind: 'settle'; gaps: string[] };
@@ -875,10 +876,12 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
 
   {
     const replacing = expired?.request.nonce ?? handoff?.nonce;
+    let remainingCalls: bigint;
     if (journal.complete) {
       rec = { ...rec, recovery: await qualifySettlement(w, rec, policy, cursor.gap?.cursor?.next ?? uint(rec.a), replacing) };
+      remainingCalls = uint(rec.recovery!.calls);
     } else {
-      await qualifyRestoredSchedule(w, release, rec, journal, cursor);
+      remainingCalls = await qualifyRestoredSchedule(w, release, rec, journal, cursor);
     }
     const current = (await w.bridge.journal.ret(rec.returnId))!;
     const reservations = reservedFees(w, current, w.signer.address, undefined, replacing);
@@ -946,12 +949,15 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       if (competing.state !== 'not-paid') return competing;
     }
     if (w.bridge.cfg.erc20) {
-      await w.bridge.checkErc20Payer(current, w.signer.address, true);
-      const live = await limitsOf(w, policy, w.signer.address, reservations, replacing, await otherErc20Reserves(w, current, w.signer.address));
       const reserve = journal.complete ? uint(rec.recovery!.totalFee) : quote.fee;
-      if (reserve > live.balance || reserve > live.feeBudget || nonce > live.maxNonce || nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
-        throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');
-      }
+      await w.bridge.checkErc20Payer(current, w.signer.address, true, undefined, {
+        nonce, remainingCalls, maxNonce: policy.maxNonce, beforeSigning: async (other) => {
+          const live = await limitsOf(w, policy, w.signer.address, reservations, replacing, other);
+          if (reserve > live.balance || reserve > live.feeBudget || nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
+            throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');
+          }
+        },
+      });
     }
     const tx = await signTx(w.signer, { chainId: limits.chainId, nonce, maxFeePerGas: limits.maxFeePerGas,
       maxPriorityFeePerGas: limits.maxPriorityFeePerGas, gas: quote.gas, to, value: 0n, data: calldata });

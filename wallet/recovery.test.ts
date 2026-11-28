@@ -211,6 +211,54 @@ test('a peer payout keeps the legacy wallet packet reserved after it drops out o
   assert.equal((await w.bridge.checkErc20Payer(next, w.signer.address)).finalizedNonce, nonce + 1n);
 });
 
+test('a peer payout cannot release the payer while the recovery signer is outstanding or ambiguous', async (t) => {
+  const { w, open, chain, deployment, cfg } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const peer = await open('peer pays while the signer is waiting');
+  chain.fund(peer.signer.address, 10n ** 18n);
+  const ordinary = await w.bridge.buildRedeem(unhex(rec.returnId));
+  const payment = await signTx(peer.signer, { chainId: cfg.chainId, nonce: 0n, gas: ordinary.gasLimit,
+    maxFeePerGas: 23n, maxPriorityFeePerGas: 1n, to: cfg.vault, value: 0n, data: ordinary.calldata });
+  // Use receipt fixtures for proof verification and the ERC20 guard for local execution.
+  const erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  w.bridge.cfg.erc20 = erc20;
+  await w.bridge.checkErc20Payer(rec, w.signer.address, true);
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const localSign = w.signer.signTransaction.bind(w.signer);
+  const next = { ...rec, returnId: hx(key('next burn after the signer race')), status: 'planned' as const };
+  let raw!: Uint8Array;
+  w.signer.signTransaction = async (request) => {
+    raw = await localSign(request);
+    enter();
+    await waiting;
+    throw new Error('recovery signer disconnected');
+  };
+  const attempting = assert.rejects(recoverStep(w, rec, caps), /recovery signer disconnected/);
+  await Promise.race([entered, attempting.then(() => assert.fail('recovery did not enter the signer'))]);
+  try {
+    await chain.mine([payment.raw]);
+    await chain.mine([]);
+    w.bridge.cfg.erc20 = undefined;
+    const { result: paid } = await reconcileReturn(w, rec, caps);
+    assert.equal(paid.state, 'paid');
+    assert.equal(hx(paid.txHash), hx(payment.hash));
+    w.bridge.cfg.erc20 = erc20;
+    await assert.rejects(w.bridge.checkErc20Payer(next, w.signer.address, true), /signing nonce awaiting finalization/);
+  } finally {
+    release();
+  }
+  await attempting;
+  await assert.rejects(w.bridge.checkErc20Payer(next, w.signer.address, true), /signing nonce awaiting finalization/);
+  await chain.mine([raw]);
+  await chain.mine([]);
+  const nonce = decodeSignedTx(raw).request.nonce;
+  assert.equal((await w.bridge.checkErc20Payer(next, w.signer.address, true)).finalizedNonce, nonce + 1n);
+});
+
 test('a qualified ordinary envelope takes precedence over the cold route', async (t) => {
   const { w } = await setup(t, true);
   const plan = await planReturn(w, 'coin', undefined, undefined, { ...caps, calldataBytes: 393_216 });
@@ -1143,6 +1191,7 @@ test('an ordinary relayer adopts a later portable Complete and keeps its own fee
   const pledged = { ...localPlan, returnId: hx(key('pledged payer balance')), status: 'burned' as const,
     payer: hx(reopened.signer.address), sends: [], recovery: { ...cold.recovery!, totalFee: String(cost) } };
   await journalStore.putReturn(pledged);
+  await indexLocalRecoverySends(reopened);
   await reopened.bridge.checkErc20Payer(pledged, reopened.signer.address, true);
   chain.fund(reopened.signer.address, cost - chain.balanceOf(reopened.signer.address));
   await assert.rejects(recoverStep(reopened, localPlan, caps), /payer already has an outstanding ERC20 return/);

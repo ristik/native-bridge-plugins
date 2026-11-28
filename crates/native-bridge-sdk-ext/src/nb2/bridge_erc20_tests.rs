@@ -780,6 +780,83 @@ fn peer_paid_holds_the_payer_until_the_local_recovery_nonce_is_finalized() {
         .unwrap();
 }
 
+#[test]
+fn peer_paid_while_the_evm_signer_is_outstanding_keeps_the_payer_reserved() {
+    use super::super::evm::LocalKeySigner;
+
+    struct AmbiguousSigner<F>([u8; 20], F);
+    impl<F: Fn()> EvmSigner for AmbiguousSigner<F> {
+        fn address(&self) -> [u8; 20] {
+            self.0
+        }
+        fn sign_transaction(&self, _: &TxRequest) -> core::result::Result<Vec<u8>, String> {
+            (self.1)();
+            Err("signer disconnected".into())
+        }
+    }
+    let (bridge, rpc, held) = return_bridge(
+        6_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let payer = LocalKeySigner::new(&[0x35; 32]).address();
+    let recipient = [0xab; 20];
+    let mut active = bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap()
+        .record;
+    active.return_id = hex(&[0xec; 32]);
+    active.status = "burned".into();
+    bridge.journal.put_return(&active).unwrap();
+    bridge
+        .journal
+        .check_return_payer(bridge.cfg.chain_id, &payer, &active.return_id, true)
+        .unwrap();
+    let peer = Journal::new(bridge.journal.store.clone(), bridge.domain);
+    let tx = TxRequest {
+        chain_id: bridge.cfg.chain_id,
+        nonce: 7,
+        max_priority_fee_per_gas: 1u8.into(),
+        max_fee_per_gas: 10u8.into(),
+        gas: undec64(
+            active.extra["recovery"]["ordinary"]["gas"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+        to: bridge.cfg.vault,
+        value: BigUint::default(),
+        data: vec![0x11; 68],
+    };
+    rpc.finalized_nonce.store(tx.nonce, Ordering::SeqCst);
+    let assert_reserved = || {
+        assert!(bridge
+            .plan_return(&held, &recipient, &payer, Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("signing nonce awaiting finalization"));
+    };
+    let signer = AmbiguousSigner(payer, || {
+        let mut paid = peer.ret_for_update(&active.return_id).unwrap().unwrap();
+        paid.status = "paid".into();
+        paid.paid = Some(PaidRecord {
+            tx_hash: hex(&[0xdd; 32]),
+            block_number: "9".into(),
+            extra: Default::default(),
+        });
+        peer.put_return(&paid).unwrap();
+        assert_reserved();
+    });
+    let error = bridge.sign_redeem_tx(&active, &signer, &tx).unwrap_err();
+    assert!(error.to_string().contains("signer disconnected"), "{error}");
+    assert_reserved();
+    rpc.finalized_nonce.store(tx.nonce + 1, Ordering::SeqCst);
+    bridge
+        .plan_return(&held, &recipient, &payer, Some(0))
+        .unwrap();
+}
+
 fn fixture_owner(held: &[u8]) -> super::super::tokenops::LocalOwner {
     let token = decode_token(held).unwrap();
     let parent = &token.ancestors[0].mint;
@@ -857,7 +934,7 @@ fn declined_signing_cancels_but_an_ambiguous_signer_keeps_the_payer() {
 
 #[test]
 fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
-    let (bridge, _, held) = return_bridge(
+    let (bridge, rpc, held) = return_bridge(
         24_000_001,
         1_000_000_000_000,
         1_000_000_000_000,
@@ -897,6 +974,8 @@ fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
         .contains("outstanding ERC20 return"));
     let drain = PayerCheck {
         drain: true,
+        signing_nonce: Some(0),
+        finalized_nonce: Some(&|| Ok(2)),
         ..Default::default()
     };
     let commitment = old_a
@@ -916,6 +995,10 @@ fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
         extra: Default::default(),
     });
     old_a.put_return(&a).unwrap();
+    let drain = PayerCheck {
+        signing_nonce: Some(2),
+        ..drain
+    };
     assert_eq!(
         old_b
             .check_payer(chain_id, &payer, &b.return_id, true, &drain)
@@ -930,13 +1013,151 @@ fn legacy_domains_drain_in_sequence_with_cross_domain_fee_and_nonce_reserves() {
         extra: Default::default(),
     });
     old_b.put_return(&b).unwrap();
+    rpc.finalized_nonce.store(3, Ordering::SeqCst);
     bridge
         .plan_return(&held, &recipient, &payer, Some(0))
         .unwrap();
 }
 
 #[test]
-fn stale_cancellation_cannot_release_a_retry_claim() {
+fn active_legacy_packets_must_be_indexed_and_finalized_before_another_return_drains() {
+    use super::super::evm::LocalKeySigner;
+    let (bridge, rpc, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let signer = LocalKeySigner::new(&[0x35; 32]);
+    let payer = signer.address();
+    let chain_id = bridge.cfg.chain_id;
+    let mut claimant = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    claimant.status = "burned".into();
+    bridge.journal.put_return(&claimant).unwrap();
+    let other = Journal::new(bridge.journal.store.clone(), [0xa1; 32]);
+    let mut active = claimant.clone();
+    active.base = other.base("return");
+    active.return_id = hex(&[0xa2; 32]);
+    active
+        .extra
+        .insert("executionPayer".into(), json!(hex(&payer)));
+    other.put_return(&active).unwrap();
+    let drain = PayerCheck {
+        drain: true,
+        signing_nonce: Some(7),
+        finalized_nonce: Some(&|| bridge.evm.nonce(&payer, "finalized")),
+        ..Default::default()
+    };
+    let claim = |check: &PayerCheck<'_>| {
+        bridge
+            .journal
+            .check_payer(chain_id, &payer, &claimant.return_id, true, check)
+    };
+    assert!(claim(&drain)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("local signed sends indexed"));
+    let packet = sign_tx(
+        &signer,
+        &TxRequest {
+            chain_id,
+            nonce: 7,
+            max_priority_fee_per_gas: 1u8.into(),
+            max_fee_per_gas: 10u8.into(),
+            gas: 100_000,
+            to: rpc.recovery,
+            value: BigUint::default(),
+            data: vec![],
+        },
+    )
+    .unwrap();
+    other.index_payer_sends(&active, &[&packet.raw]).unwrap();
+    rpc.finalized_nonce.store(7, Ordering::SeqCst);
+    assert!(claim(&drain)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("signed nonce awaiting finalization"));
+    rpc.finalized_nonce.store(8, Ordering::SeqCst);
+    let commitments = claim(&PayerCheck {
+        signing_nonce: Some(8),
+        ..drain
+    })
+    .unwrap();
+    assert_eq!(
+        commitments.fees,
+        undec(active.extra["recovery"]["totalFee"].as_str().unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn legacy_claim_checks_all_remaining_calls_before_granting_exclusivity() {
+    let (bridge, _, held) = return_bridge(
+        24_000_001,
+        1_000_000_000_000,
+        1_000_000_000_000,
+        Arc::new(NeverSign),
+    );
+    let chain = bridge.cfg.chain_id;
+    let payer = [0xcd; 20];
+    let template = bridge
+        .plan_return(&held, &[0xab; 20], &payer, Some(0))
+        .unwrap()
+        .record;
+    let a = Journal::new(bridge.journal.store.clone(), [0xa1; 32]);
+    let b = Journal::new(bridge.journal.store.clone(), [0xb1; 32]);
+    let legacy = |journal: &Journal, id: u8, cap: &str| {
+        let mut record = template.clone();
+        record.base = journal.base("return");
+        record.return_id = hex(&[id; 32]);
+        record.status = "burned".into();
+        record.extra["recovery"]["calls"] = json!("8");
+        record.extra["recovery"]["envelope"]["maxNonce"] = json!(cap);
+        journal.put_return(&record).unwrap();
+        record
+    };
+    let later = legacy(&a, 1, "15");
+    let mut earlier = legacy(&b, 2, "8");
+    let claim = |journal: &Journal, record: &ReturnRecord, nonce| {
+        journal.check_payer(
+            chain,
+            &payer,
+            &record.return_id,
+            true,
+            &PayerCheck {
+                drain: true,
+                signing_nonce: Some(nonce),
+                finalized_nonce: Some(&|| Ok(8)),
+                ..Default::default()
+            },
+        )
+    };
+    assert!(claim(&a, &later, 0)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("remaining continuation schedule"));
+    for nonce in 0..8 {
+        claim(&b, &earlier, nonce).unwrap();
+    }
+    earlier.status = "paid".into();
+    earlier.paid = Some(PaidRecord {
+        tx_hash: hex(&[2; 32]),
+        block_number: "21".into(),
+        extra: Default::default(),
+    });
+    b.put_return(&earlier).unwrap();
+    for nonce in 8..16 {
+        claim(&a, &later, nonce).unwrap();
+    }
+}
+
+#[test]
+fn two_refusals_release_the_claim_only_after_both_attempts_finish() {
     let (bridge, _, held) = return_bridge(
         24_000_001,
         1_000_000_000_000,
@@ -963,7 +1184,7 @@ fn stale_cancellation_cannot_release_a_retry_claim() {
         )
         .unwrap();
     let retry = Journal::new(bridge.journal.store.clone(), bridge.domain);
-    assert!(retry
+    let retry_fence = retry
         .check_payer(
             chain,
             &payer,
@@ -972,11 +1193,11 @@ fn stale_cancellation_cannot_release_a_retry_claim() {
             &PayerCheck {
                 fence: Some("retry"),
                 ..Default::default()
-            }
+            },
         )
         .unwrap()
         .fence
-        .is_none());
+        .unwrap();
     bridge
         .journal
         .cancel_unsigned_return(id, claimed.fence.take().unwrap())
@@ -984,4 +1205,9 @@ fn stale_cancellation_cannot_release_a_retry_claim() {
     assert!(retry
         .check_return_payer(chain, &payer, &hex(&[0xde; 32]), true)
         .is_err());
+    retry.cancel_unsigned_return(id, retry_fence).unwrap();
+    assert_eq!(retry.ret(id).unwrap().unwrap().status, "planned");
+    retry
+        .check_return_payer(chain, &payer, &hex(&[0xde; 32]), true)
+        .unwrap();
 }

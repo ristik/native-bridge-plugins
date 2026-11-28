@@ -212,6 +212,12 @@ export interface PayerCheck {
   finalizedNonce?: () => Promise<bigint>;
   /** A unique fence for a new holder signing attempt. */
   fence?: Hex;
+  /** The exact nonce to fence before invoking an EVM signer. */
+  signingNonce?: bigint;
+  /** Remaining calls, after replaying verified progress, including the packet about to be signed. */
+  remainingCalls?: bigint;
+  maxNonce?: bigint;
+  beforeSigning?: (commitments: PayerCommitments) => Promise<void>;
 }
 
 export interface PayerCommitments {
@@ -220,6 +226,7 @@ export interface PayerCommitments {
   nonceWindows?: { calls: bigint; maxNonce?: bigint }[];
   finalizedNonce?: bigint;
   cancel?: () => Promise<void>;
+  retain?: () => Promise<void>;
 }
 
 /** Last nonce this return may use while leaving feasible nonce windows for the older returns. */
@@ -362,9 +369,13 @@ export class Journal {
   public async retainPayerSend(record: ReturnRecord, raw: Uint8Array): Promise<void> {
     const { from, request } = decodeSignedTx(raw);
     const key = `nb2/payer-sends/v1/${request.chainId}/${toHex(from)}/${record.domain.slice(2)}/${record.returnId.slice(2)}`;
+    await this.retainPayerNonce(key, request.nonce);
+  }
+
+  private async retainPayerNonce(key: string, nonce: bigint): Promise<void> {
     for (;;) {
       const previous = await this.store.get(key);
-      if ((previous !== null && undec(previous) >= request.nonce) || await this.store.putIf(key, previous, dec(request.nonce))) return;
+      if ((previous !== null && undec(previous) >= nonce) || await this.store.putIf(key, previous, dec(nonce))) return;
     }
   }
 
@@ -398,9 +409,9 @@ export class Journal {
       const registered = await this.store.get(`nb2/domain-chain/v1/${rec.domain.slice(2)}`);
       // Pre-upgrade returns without chain metadata remain protected until their domain is opened.
       if (registered !== null && undec(registered) !== chainId) continue;
-      if (rec.status === 'paid' && rec.executionPayer === address &&
+      if (rec.status !== 'planned' && rec.executionPayer === address &&
           await this.store.get(`nb2/payer-index/v1/${rec.domain.slice(2)}/${rec.returnId.slice(2)}`) !== '1') {
-        fail('CapacityPreflight', 'paid return needs its local signed sends indexed');
+        fail('CapacityPreflight', 'another return needs its local signed sends indexed');
       }
       if (!active(rec)) continue;
       commitment.fees += undec(rec.recovery!.totalFee);
@@ -429,6 +440,7 @@ export class Journal {
   /** Admit one new return per payer. Existing funded returns can drain in sequence. */
   public async checkReturnPayer(chainId: bigint, payer: Uint8Array, id: Hex, reserve = false, options: PayerCheck = {}): Promise<PayerCommitments> {
     if (payer.length !== 20 || !/^0x[0-9a-f]{64}$/.test(id)) refuse('BadInput', 'invalid ERC20 payer or return ID');
+    if (options.fence && options.signingNonce !== undefined) refuse('BadInput', 'payer claim cannot sign both a burn and an EVM packet');
     const domainKey = `nb2/domain-chain/v1/${toHex(this.domain)}`;
     await this.store.putIf(domainKey, null, dec(chainId));
     if (await this.store.get(domainKey) !== dec(chainId)) refuse('BadInput', 'journal domain has another chain ID');
@@ -436,7 +448,8 @@ export class Journal {
     const target = this.key('return', id.slice(2));
     for (;;) {
       const held = await this.store.get(key);
-      const owner = held?.split('#')[0];
+      const [owner, state] = held?.split('#') ?? [];
+      const heldNonce = state?.startsWith('nonce:') ? undec(state.slice(6)) : undefined;
       if (owner && owner !== target) {
         if (!returnKey.test(owner)) refuse('BadInput', 'invalid ERC20 payer reservation');
         const raw = await this.store.get(owner);
@@ -444,19 +457,62 @@ export class Journal {
         if (previous?.status !== 'paid' || !previous.paid) fail('CapacityPreflight', 'payer already has an outstanding ERC20 return');
       }
       const commitment = await this.payerCommitments(chainId, payer, target, owner === target, options);
-      if (owner === target) {
-        if (!reserve || held === target) return commitment;
-        // A concurrent retry adopts the reservation. The old attempt can no longer cancel it.
-        if (await this.store.putIf(key, held!, target)) return commitment;
-        continue;
+      if (owner !== target && heldNonce !== undefined) {
+        const finalized = commitment.finalizedNonce ?? await options.finalizedNonce?.();
+        if (finalized === undefined || finalized <= heldNonce) fail('CapacityPreflight', 'payer has a local signing nonce awaiting finalization');
+        commitment.finalizedNonce = finalized;
+        if (reserve) {
+          const [, domain, returned] = returnKey.exec(owner)!;
+          await this.retainPayerNonce(`nb2/payer-sends/v1/${chainId}/${toHex(payer)}/${domain}/${returned}`, heldNonce);
+        }
       }
       if (!reserve) return commitment;
-      const claimed = options.fence ? target + '#' + options.fence : target;
-      if (!await this.store.putIf(key, held, claimed)) continue;
-      if (options.fence) commitment.cancel = async () => {
+
+      const nonce = options.signingNonce;
+      let claimed = owner === target ? held! : target;
+      if (nonce !== undefined || (owner !== target && options.mode === 'drain' && commitment.calls > 0n)) {
         const current = await this.ret(id);
-        if (current?.status === 'planned' && !current.burnRequest) await this.store.putIf(key, claimed, '');
-      };
+        if (!current || current.status === 'paid' || current.status === 'planned') {
+          fail('CapacityPreflight', 'return is no longer eligible for payer signing');
+        }
+        const admitted = current.recovery?.envelope?.maxNonce;
+        const cap = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
+        const maxNonce = payerNonceLimit(options.maxNonce !== undefined && options.maxNonce < cap ? options.maxNonce : cap, commitment);
+        const calls = owner !== target && commitment.calls > 0n
+          ? options.remainingCalls ?? undec(current.recovery!.calls)
+          : 1n;
+        if (nonce === undefined || calls < 1n || nonce < (commitment.finalizedNonce ?? 0n) || nonce + calls - 1n > maxNonce) {
+          fail('CapacityPreflight', 'remaining continuation schedule exceeds the payer nonce horizon');
+        }
+        await options.beforeSigning?.(commitment);
+        claimed = target + '#nonce:' + dec(owner === target && heldNonce !== undefined && heldNonce > nonce ? heldNonce : nonce);
+      }
+      const attempts = state?.startsWith('burn:') ? state.slice(5).split(',') : undefined;
+      const fence = options.fence;
+      if (fence && (owner !== target || attempts)) {
+        claimed = target + '#burn:' + [...(owner === target ? attempts ?? [] : []), fence].join(',');
+      }
+      if (claimed === held && nonce === undefined) return commitment;
+      if (!await this.store.putIf(key, held, claimed)) continue;
+      if (fence && claimed.startsWith(target + '#burn:')) {
+        const finish = async (unsigned: boolean) => {
+          const prefix = target + '#burn:';
+          for (;;) {
+            const live = await this.store.get(key);
+            if (!live?.startsWith(prefix)) return;
+            const attempts = live.slice(prefix.length).split(',');
+            if (!attempts.includes(fence)) return;
+            const current = await this.ret(id);
+            const remaining = attempts.filter((attempt) => attempt !== fence);
+            const next = unsigned && current?.status === 'planned' && !current.burnRequest
+              ? remaining.length ? prefix + remaining.join(',') : ''
+              : target;
+            if (await this.store.putIf(key, live, next)) return;
+          }
+        };
+        commitment.cancel = () => finish(true);
+        commitment.retain = () => finish(false);
+      }
       return commitment;
     }
   }
