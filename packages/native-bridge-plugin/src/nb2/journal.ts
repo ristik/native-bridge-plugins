@@ -210,6 +210,7 @@ const returnKey = /^nb2\/v1\/([0-9a-f]{64})\/return\/([0-9a-f]{64})$/;
 export interface PayerCheck {
   mode?: 'admit' | 'drain';
   finalizedNonce?: () => Promise<bigint>;
+  finalizedBlock?: (number: bigint, hash: Uint8Array) => Promise<boolean>;
   /** A unique fence for a new holder signing attempt. */
   fence?: Hex;
   /** The exact nonce to fence before invoking an EVM signer. */
@@ -225,8 +226,17 @@ export interface PayerCommitments {
   calls: bigint;
   nonceWindows?: { calls: bigint; maxNonce?: bigint }[];
   finalizedNonce?: bigint;
+  contestedDrain?: boolean;
   cancel?: () => Promise<void>;
   retain?: () => Promise<void>;
+}
+
+/** Calls still reserved after a verified prefix of the admitted continuation. */
+export function remainingRecoveryCalls(plan: NonNullable<ReturnRecord['recovery']>, completed: bigint, ordinaryUsed = 0n): bigint {
+  const calls = undec(plan.calls);
+  const prior = undec(plan.ordinary?.attemptsBeforeFallback ?? '0');
+  const used = completed > 0n || ordinaryUsed > prior ? prior : ordinaryUsed;
+  return calls > completed + used ? calls - completed - used : 1n;
 }
 
 /** Last nonce this return may use while leaving feasible nonce windows for the older returns. */
@@ -386,6 +396,42 @@ export class Journal {
     await this.store.putIf(key, null, '1');
   }
 
+  /** Publish a replayed checkpoint. Readers independently check execution finality before giving credit. */
+  public async indexRecoveryProgress(chainId: bigint, record: ReturnRecord, completed: bigint,
+    block: { blockNumber: bigint; blockHash: Uint8Array }): Promise<void> {
+    const plan = record.recovery;
+    if (!plan || completed < 1n) return;
+    const path = this.recoveryProgressPath(chainId, record);
+    const key = `${path}${dec(block.blockNumber)}/${toHex(block.blockHash)}`;
+    const count = remainingRecoveryCalls(plan, completed);
+    for (;;) {
+      const previous = await this.store.get(key);
+      if ((previous !== null && undec(previous) <= count) || await this.store.putIf(key, previous, dec(count))) return;
+    }
+  }
+
+  private recoveryProgressPath(chainId: bigint, record: ReturnRecord): string {
+    const plan = record.recovery!;
+    return `nb2/payer-progress/v1/${chainId}/${record.domain.slice(2)}/${record.returnId.slice(2)}/` +
+      `${plan.generation.slice(2)}/${plan.calls}/${plan.ordinary?.attemptsBeforeFallback ?? '0'}/${plan.advanceGaps}/${plan.runCuts.join(',')}/`;
+  }
+
+  private async recoveryCalls(chainId: bigint, record: ReturnRecord, ordinaryUsed: bigint, options: PayerCheck): Promise<bigint> {
+    let calls = remainingRecoveryCalls(record.recovery!, 0n, ordinaryUsed);
+    if (!options.finalizedBlock) return calls;
+    const path = this.recoveryProgressPath(chainId, record);
+    for (const key of await this.store.list(path)) {
+      const value = await this.store.get(key);
+      if (value === null) refuse('JournalNotPersisted', 'recovery checkpoint disappeared during payer reconciliation');
+      const remaining = undec(value);
+      if (remaining === 0n) refuse('BadInput', 'unpaid return needs a settlement call');
+      if (remaining >= calls) continue;
+      const [number, hash] = key.slice(path.length).split('/');
+      if (await options.finalizedBlock(undec(number), unhex('0x' + hash))) calls = remaining;
+    }
+    return calls;
+  }
+
   private async payerCommitments(chainId: bigint, payer: Uint8Array, target: string, ownsSlot: boolean, options: PayerCheck): Promise<PayerCommitments> {
     const address = hex(payer);
     const path = `nb2/payer-sends/v1/${chainId}/${toHex(payer)}/`;
@@ -402,9 +448,13 @@ export class Journal {
         draining = active(rec);
         continue;
       }
+      const ordinary = new Set<bigint>();
       for (const send of rec.sends) {
         const { from, request } = decodeSignedTx(unhex(send.raw));
-        if (request.chainId === chainId && eqBytes(from, payer)) includeNonce(request.nonce);
+        if (request.chainId === chainId && eqBytes(from, payer)) {
+          includeNonce(request.nonce);
+          ordinary.add(request.nonce);
+        }
       }
       const registered = await this.store.get(`nb2/domain-chain/v1/${rec.domain.slice(2)}`);
       // Pre-upgrade returns without chain metadata remain protected until their domain is opened.
@@ -415,7 +465,8 @@ export class Journal {
       }
       if (!active(rec)) continue;
       commitment.fees += undec(rec.recovery!.totalFee);
-      const calls = undec(rec.recovery!.calls);
+      // The signed-nonce check below must pass before any of these ordinary nonces can count as used.
+      const calls = await this.recoveryCalls(chainId, rec, BigInt(ordinary.size), options);
       commitment.calls += calls;
       const cap = rec.recovery!.envelope?.maxNonce;
       (commitment.nonceWindows ??= []).push({ calls, maxNonce: cap === undefined ? undefined : undec(cap) });
@@ -470,7 +521,8 @@ export class Journal {
 
       const nonce = options.signingNonce;
       let claimed = owner === target ? held! : target;
-      if (nonce !== undefined || (owner !== target && options.mode === 'drain' && commitment.calls > 0n)) {
+      commitment.contestedDrain = owner !== target && options.mode === 'drain' && commitment.calls > 0n;
+      if (nonce !== undefined || commitment.contestedDrain) {
         const current = await this.ret(id);
         if (!current || current.status === 'paid' || current.status === 'planned') {
           fail('CapacityPreflight', 'return is no longer eligible for payer signing');
@@ -478,8 +530,8 @@ export class Journal {
         const admitted = current.recovery?.envelope?.maxNonce;
         const cap = admitted === undefined ? (1n << 64n) - 1n : undec(admitted);
         const maxNonce = payerNonceLimit(options.maxNonce !== undefined && options.maxNonce < cap ? options.maxNonce : cap, commitment);
-        const calls = owner !== target && commitment.calls > 0n
-          ? options.remainingCalls ?? undec(current.recovery!.calls)
+        const calls = commitment.contestedDrain
+          ? options.remainingCalls ?? await this.recoveryCalls(chainId, current, 0n, options)
           : 1n;
         if (nonce === undefined || calls < 1n || nonce < (commitment.finalizedNonce ?? 0n) || nonce + calls - 1n > maxNonce) {
           fail('CapacityPreflight', 'remaining continuation schedule exceeds the payer nonce horizon');

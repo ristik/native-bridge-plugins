@@ -379,6 +379,7 @@ pub struct Journal {
 pub struct PayerCheck<'a> {
     pub drain: bool,
     pub finalized_nonce: Option<&'a dyn Fn() -> Result<u64>>,
+    pub finalized_block: Option<&'a PayerFinalityCheck<'a>>,
     pub fence: Option<&'a str>,
     /// Exact nonce to fence before invoking an EVM signer.
     pub signing_nonce: Option<u64>,
@@ -389,6 +390,7 @@ pub struct PayerCheck<'a> {
 }
 
 pub type PayerSigningCheck<'a> = dyn Fn(&PayerCommitments) -> Result<()> + 'a;
+pub type PayerFinalityCheck<'a> = dyn Fn(u64, &[u8; 32]) -> Result<bool> + 'a;
 
 #[derive(Default)]
 pub struct PayerCommitments {
@@ -396,7 +398,27 @@ pub struct PayerCommitments {
     pub calls: u128,
     nonce_windows: Vec<(u64, Option<u64>)>,
     pub finalized_nonce: Option<u64>,
+    pub contested_drain: bool,
     pub fence: Option<PayerFence>,
+}
+
+pub(crate) fn remaining_recovery_calls(
+    plan: &Value,
+    completed: u64,
+    ordinary_used: u64,
+) -> Result<u64> {
+    let calls = undec64(plan["calls"].as_str().unwrap_or(""))?;
+    let prior = undec64(
+        plan["ordinary"]["attemptsBeforeFallback"]
+            .as_str()
+            .unwrap_or("0"),
+    )?;
+    let used = if completed > 0 {
+        prior
+    } else {
+        prior.min(ordinary_used)
+    };
+    Ok(calls.saturating_sub(completed).saturating_sub(used).max(1))
 }
 
 impl PayerCommitments {
@@ -644,6 +666,99 @@ impl Journal {
         Ok(())
     }
 
+    /// Publish a replayed checkpoint. Readers check the exact block's execution finality before crediting it.
+    pub(crate) fn index_recovery_progress(
+        &self,
+        chain_id: u64,
+        record: &ReturnRecord,
+        completed: u64,
+        receipt: &super::recovery::RecoveryReceipt,
+    ) -> Result<()> {
+        let path = self.recovery_progress_path(chain_id, record)?;
+        let key = format!(
+            "{path}{}/{}",
+            receipt.block_number,
+            to_hex(&receipt.block_hash)
+        );
+        let count = remaining_recovery_calls(&record.extra["recovery"], completed, 0)?;
+        loop {
+            let previous = self.store.get(&key)?;
+            if previous
+                .as_deref()
+                .map(undec64)
+                .transpose()?
+                .is_some_and(|n| n <= count)
+                || self.store.put_if(&key, previous.as_deref(), &dec(count))?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn recovery_progress_path(&self, chain_id: u64, record: &ReturnRecord) -> Result<String> {
+        let plan = &record.extra["recovery"];
+        let generation = plan["generation"].as_str().unwrap_or("");
+        unhex_n::<32>(generation)?;
+        let cuts = plan["runCuts"]
+            .as_array()
+            .ok_or_else(|| Error::Other("missing admitted Run cuts".into()))?;
+        let cuts = cuts
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "nb2/payer-progress/v1/{chain_id}/{}/{}/{}/{}/{}/{}/{cuts}/",
+            &record.base.domain[2..],
+            &record.return_id[2..],
+            &generation[2..],
+            plan["calls"].as_str().unwrap_or(""),
+            plan["ordinary"]["attemptsBeforeFallback"]
+                .as_str()
+                .unwrap_or("0"),
+            plan["advanceGaps"]
+        ))
+    }
+
+    fn recovery_calls(
+        &self,
+        chain_id: u64,
+        record: &ReturnRecord,
+        ordinary_used: u64,
+        check: &PayerCheck<'_>,
+    ) -> Result<u64> {
+        let mut calls = remaining_recovery_calls(&record.extra["recovery"], 0, ordinary_used)?;
+        let Some(finalized) = check.finalized_block else {
+            return Ok(calls);
+        };
+        let path = self.recovery_progress_path(chain_id, record)?;
+        for key in self.store.list(&path)? {
+            let Some(value) = self.store.get(&key)? else {
+                return refuse(
+                    WalletReason::JournalNotPersisted,
+                    "recovery checkpoint disappeared during payer reconciliation",
+                );
+            };
+            let remaining = undec64(&value)?;
+            if remaining == 0 {
+                return refuse(
+                    WalletReason::BadInput,
+                    "unpaid return needs a settlement call",
+                );
+            }
+            if remaining >= calls {
+                continue;
+            }
+            let (number, hash) = key[path.len()..]
+                .split_once('/')
+                .ok_or_else(|| Error::Other("invalid recovery checkpoint key".into()))?;
+            if finalized(undec64(number)?, &unhex_n(&format!("0x{hash}"))?)? {
+                calls = remaining;
+            }
+        }
+        Ok(calls)
+    }
+
     fn other_payer_resources(
         &self,
         chain_id: u64,
@@ -691,10 +806,12 @@ impl Journal {
                 draining = active;
                 continue;
             }
+            let mut ordinary = std::collections::BTreeSet::new();
             for send in &rec.sends {
                 let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
                 if tx.request.chain_id == chain_id && tx.from.as_slice() == payer {
                     include_nonce(tx.request.nonce);
+                    ordinary.insert(tx.request.nonce);
                 }
             }
             if self
@@ -723,7 +840,8 @@ impl Journal {
             if active {
                 let recovery = &rec.extra["recovery"];
                 out.fees += undec(recovery["totalFee"].as_str().unwrap_or(""))?;
-                let calls = undec64(recovery["calls"].as_str().unwrap_or(""))?;
+                // The signed-nonce check below must pass before ordinary nonces count as used.
+                let calls = self.recovery_calls(chain_id, &rec, ordinary.len() as u64, check)?;
                 out.calls += u128::from(calls);
                 let cap = recovery["envelope"]["maxNonce"]
                     .as_str()
@@ -855,6 +973,7 @@ impl Journal {
             }
             let mut claim = if owns_slot { held_text } else { &target }.to_owned();
             let contested_drain = !owns_slot && check.drain && out.calls > 0;
+            out.contested_drain = contested_drain;
             if check.signing_nonce.is_some() || contested_drain {
                 let Some(current) = self
                     .ret(id)?
@@ -875,7 +994,7 @@ impl Journal {
                 let calls = if contested_drain {
                     match check.remaining_calls {
                         Some(calls) => calls,
-                        None => undec64(recovery["calls"].as_str().unwrap_or(""))?,
+                        None => self.recovery_calls(chain_id, &current, 0, check)?,
                     }
                 } else {
                     1

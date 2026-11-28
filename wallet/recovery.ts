@@ -175,9 +175,10 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
   if (!policy) return { recovery };
   return {
     envelope: ordinaryEnvelope(w, policy),
+    erc20Policy: { maxNonce: policy.maxNonce, feeBudget: policy.feeBudget },
     archives: readers(w, policy),
     recovery,
-    admit: async (req, prior) => {
+    admit: async (req, prior, remainingFee) => {
       if (w.release.recovery !== undefined) await checkGraph(w, recoveryRelease(w));
       const limits = await limitsOf(w, policy, w.signer.address, reservedFees(w, rec, w.signer.address, prior, req.nonce), req.nonce,
         await otherErc20Reserves(w, rec, w.signer.address));
@@ -185,9 +186,10 @@ export function ordinaryPayout(w: Wallet, rec: ReturnRecord, policy?: PayerPolic
       if (w.bridge.cfg.erc20 && !quoteErc20Call(req.data.length, req.gas, limits)) {
         throw new Nb2Error('CapacityPreflight', 'ordinary payment is outside the ERC20 admission limits');
       }
+      const needed = remainingFee !== undefined && remainingFee > fee ? remainingFee : fee;
       if (req.gas > limits.gas || req.nonce > limits.maxNonce || req.maxFeePerGas > limits.maxFeePerGas ||
         req.maxPriorityFeePerGas > limits.maxPriorityFeePerGas || req.data.length > limits.calldataBytes ||
-        (!w.bridge.cfg.erc20 && req.data.length + 256 > limits.signedBytes) || fee > limits.balance || fee > limits.feeBudget ||
+        (!w.bridge.cfg.erc20 && req.data.length + 256 > limits.signedBytes) || needed > limits.balance || needed > limits.feeBudget ||
         (limits.maxTransactionFee !== undefined && fee > limits.maxTransactionFee)) {
         throw new Nb2Error('CapacityPreflight', 'ordinary payment exceeds the remaining payer limits');
       }
@@ -487,23 +489,24 @@ export function archiveRequired(hash: Uint8Array, missing?: string): never {
 }
 
 async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec: ReturnRecord,
-  journal?: RecoveryJournal, cursor?: Cursor): Promise<bigint> {
+  journal: RecoveryJournal, cursor: Cursor, executionLimits?: RecoveryLimits): Promise<{ calls: bigint; fee: bigint }> {
   const held = bytes(rec.source);
   const { runCuts, advanceGaps, observed: admittedObserved, progressEnd, envelope } = rec.recovery!;
   if (!cursor?.gap) checkSchedule(rec, w.bridge.returnHeadroom(held).operations);
   const { cfg, evm } = w.bridge;
-  const limits: RecoveryLimits = {
+  const limits: RecoveryLimits = executionLimits ?? {
     gas: envelope ? uint(envelope.gas) : w.pins.userGasLimit,
     signedBytes: envelope?.signedBytes ?? Number(w.pins.maxEncodedTxBytes), calldataBytes: envelope?.calldataBytes ?? 393_216,
     chainId: cfg.chainId, maxNonce: envelope ? uint(envelope.maxNonce) : 0n, maxFeePerGas: envelope ? uint(envelope.maxFeePerGas) : 1n,
     maxPriorityFeePerGas: envelope ? uint(envelope.maxPriorityFeePerGas) : 0n,
     balance: 0n, feeBudget: 0n, worstCaseEnvelope: !envelope,
   };
-  if (!quoteRecoveryGapBatch(cfg.K, advanceGaps, release.calibration, limits)) {
+  const gaps = quoteRecoveryGapBatch(cfg.K, advanceGaps, release.calibration, limits);
+  if (!gaps) {
     throw new Nb2Error('CapacityPreflight', 'portable gap batch or settlement suffix is outside the release limits');
   }
-  const confirmedCuts = journal?.cuts.filter((item) => item.cut.kind === 'run').length ?? 0;
-  if (!cursor?.gap) checkRemainingRecoveryRuns(held, runCuts, confirmedCuts, release.calibration, limits, !!cfg.erc20);
+  const confirmedCuts = journal.cuts.filter((item) => item.cut.kind === 'run').length;
+  const runFee = cursor.gap ? 0n : checkRemainingRecoveryRuns(held, runCuts, confirmedCuts, release.calibration, limits, !!cfg.erc20);
   const covered = cursor?.gap?.cursor?.next ?? uint(rec.a);
   const { segment } = await evm.vaultState(cfg.vault);
   const observed = segment > covered ? segment : covered;
@@ -513,7 +516,8 @@ async function qualifyRestoredSchedule(w: Wallet, release: ReleaseRecovery, rec:
   const gapCalls = recoveryCatchUpCalls(advanceGaps, {
     ...release.backlog, signedStart: covered, observed, duringProgress: running && bound > observed ? bound - observed : 0n,
   });
-  return BigInt(running ? runCuts.length - confirmedCuts : 0) + gapCalls + 1n;
+  return { calls: BigInt(running ? runCuts.length - confirmedCuts : 0) + gapCalls + 1n,
+    fee: runFee + gapCalls * gaps.advance.fee + gaps.settle.fee };
 }
 
 type Cut = { kind: 'run'; count: number } | { kind: 'advance'; gaps: string[] } | { kind: 'settle'; gaps: string[] };
@@ -553,6 +557,13 @@ export async function indexLocalRecoverySends(w: Wallet): Promise<void> {
     if (saved?.pending) raw.push(saved.pending.raw);
     if (saved?.settled?.submitted) raw.push(saved.settled.submitted.raw);
     await w.bridge.journal.indexPayerSends(record, raw.map((signed) => bytes(signed)));
+    if (record.domain === hx(w.bridge.domain) && record.status !== 'paid' && record.recovery && saved && (saved.cuts.length || saved.complete)) {
+      const release = recoveryRelease(w);
+      await checkGraph(w, release);
+      const active = activeRecovery(record, saved);
+      const session = await openSession(w, release, active);
+      await replay(w, session, active, saved);
+    }
   }
 }
 export function hasPeerComplete(w: Wallet, rec: ReturnRecord): boolean {
@@ -643,6 +654,13 @@ async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal:
     journal.evidence !== hx(evidence)) throw new Error('recovery journal does not bind the certified evidence');
   if (!journal.complete) checkSchedule(rec, s.operationCount);
   const cursor = journal.complete ? await verifyComplete(w, s, journal.complete) : { from: 0 };
+  const progressRecord = await recoveryProgressRecord(w, rec, journal);
+  let completed = BigInt(journal.complete ? progressRecord?.recovery?.runCuts.length ?? 0 : 0);
+  if (completed && progressRecord && journal.complete) {
+    const location = journal.complete.location;
+    await w.bridge.journal.indexRecoveryProgress(w.bridge.cfg.chainId, progressRecord, completed,
+      { blockNumber: uint(location.blockNumber), blockHash: bytes(location.blockHash, 32) });
+  }
   for (const [i, item] of journal.cuts.entries()) {
     if (item.cut.kind === 'run' && item.cut.count !== rec.recovery!.runCuts[i]) throw new Error('portable cut disagrees with the admitted schedule');
     // The saved transaction hash is a lookup hint. The certificate binds the receipt index.
@@ -659,8 +677,17 @@ async function replay(w: Wallet, s: RecoverySession, rec: ReturnRecord, journal:
     if (item.seq !== String(cursor.prior!.seq) || item.state !== state ||
       item.endpoint !== (cursor.gap?.cursor && String(cursor.gap.cursor.next)) ||
       item.head !== (cursor.gap?.cursor && hx(cursor.gap.cursor.head))) throw new Error('saved checkpoint disagrees with the authenticated cut');
+    if (progressRecord && (item.cut.kind === 'run' || item.cut.gaps.length === progressRecord.recovery!.advanceGaps)) {
+      await w.bridge.journal.indexRecoveryProgress(w.bridge.cfg.chainId, progressRecord, ++completed, receipt);
+    }
   }
   return cursor;
+}
+
+async function recoveryProgressRecord(w: Wallet, rec: ReturnRecord, journal: RecoveryJournal): Promise<ReturnRecord | undefined> {
+  if (!w.bridge.cfg.erc20) return;
+  const record = journal.complete ? await w.bridge.journal.ret(rec.returnId) : rec;
+  if (record?.recovery) return record;
 }
 
 /** A receipt authenticates the cursor; its transaction must separately prove who used the nonce. */
@@ -881,7 +908,7 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       rec = { ...rec, recovery: await qualifySettlement(w, rec, policy, cursor.gap?.cursor?.next ?? uint(rec.a), replacing) };
       remainingCalls = uint(rec.recovery!.calls);
     } else {
-      remainingCalls = await qualifyRestoredSchedule(w, release, rec, journal, cursor);
+      ({ calls: remainingCalls } = await qualifyRestoredSchedule(w, release, rec, journal, cursor));
     }
     const current = (await w.bridge.journal.ret(rec.returnId))!;
     const reservations = reservedFees(w, current, w.signer.address, undefined, replacing);
@@ -949,11 +976,14 @@ export async function recoverStep(w: Wallet, rec: ReturnRecord, policy: PayerPol
       if (competing.state !== 'not-paid') return competing;
     }
     if (w.bridge.cfg.erc20) {
-      const reserve = journal.complete ? uint(rec.recovery!.totalFee) : quote.fee;
       await w.bridge.checkErc20Payer(current, w.signer.address, true, undefined, {
         nonce, remainingCalls, maxNonce: policy.maxNonce, beforeSigning: async (other) => {
           const live = await limitsOf(w, policy, w.signer.address, reservations, replacing, other);
-          if (reserve > live.balance || reserve > live.feeBudget || nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
+          const suffix = journal.complete ? { calls: remainingCalls, fee: uint(rec.recovery!.totalFee) }
+            : other.contestedDrain ? await qualifyRestoredSchedule(w, release, rec, journal, cursor, live) : { calls: 1n, fee: quote.fee };
+          const reserve = suffix.fee > quote.fee ? suffix.fee : quote.fee;
+          if (reserve > live.balance || reserve > live.feeBudget || nonce + suffix.calls - 1n > live.maxNonce ||
+              nonce !== (replacing ?? await w.bridge.evm.nonce(w.signer.address))) {
             throw new Nb2Error('CapacityPreflight', 'recovery payer balance or nonce changed before signing');
           }
         },
@@ -1005,7 +1035,7 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
   reconcile?: () => Promise<ReconcileResult>, preflighted = false): Promise<RecoveryResult> {
   const pending = journal.pending!;
   const { raw, hash, packet, request, from } = await openPendingPacket(w, rec, release, s, cursor, pending);
-  const confirm = (receipt: RecoveryReceipt, txHint = hx(hash)): RecoveryResult => {
+  const confirm = async (receipt: RecoveryReceipt, txHint = hx(hash)): Promise<RecoveryResult> => {
     if (pending.cut.kind === 'settle') throw new Error('settlement requires a certified Paid receipt');
     advanceCursor(cursor, packet, receipt.encoded);
     journal.cuts.push({ cut: pending.cut, location: location(txHint, receipt), seq: String(cursor.prior!.seq),
@@ -1015,6 +1045,13 @@ async function reconcilePendingPacket(w: Wallet, rec: ReturnRecord, release: Rel
     (journal.attempts ??= []).push(pending.raw);
     delete journal.pending;
     saveRecovery(w, rec, journal);
+    const progressRecord = await recoveryProgressRecord(w, rec, journal);
+    if (progressRecord) {
+      const plan = progressRecord.recovery!;
+      const completed = journal.cuts.filter(({ cut }) => cut.kind === 'run' || cut.gaps.length === plan.advanceGaps).length;
+      await w.bridge.journal.indexRecoveryProgress(w.bridge.cfg.chainId, progressRecord,
+        BigInt(completed + (journal.complete ? plan.runCuts.length : 0)), receipt);
+    }
     return { state: 'checkpoint', txHash: hash };
   };
   const ordinary = journal.ordinaryHandoff ? rec.sends.map((send) => send.raw) : [];

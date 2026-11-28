@@ -152,6 +152,10 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
 
   // This fixture authenticates ordinary NB2 receipts and enables the ERC20 wallet's payer guard for execution.
   w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  await indexLocalRecoverySends(w);
+  const progress = await w.bridge.journal.store.list(`nb2/payer-progress/v1/${cfg.chainId}/`);
+  assert.equal(progress.length, 1);
+  assert.equal(await w.bridge.journal.store.get(progress[0]), '35');
   const other = { ...rec, returnId: hx(key('other payout reserve')), status: 'burned' as const, payer: hx(w.signer.address) };
   const store = w.bridge.journal;
   await store.putReturn(other);
@@ -169,6 +173,36 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   segment = 2n;
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 2);
+});
+
+test('a legacy Run with only its first fee authorized leaves the payer free for another return', async (t) => {
+  const { w, chain, deployment } = await setup(t);
+  await planDeposit(w, 'second', 21n);
+  await sendDeposit(w, 'second');
+  await mint(w, 'second');
+  await burn(w, 'coin', undefined, undefined, caps);
+  await burn(w, 'second', undefined, undefined, caps);
+  const first = await w.returnRecord('coin');
+  const second = await w.returnRecord('second');
+  const session = await RecoverySession.create(chain.gamma, unhex(first.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const run = await session.run(0, first.recovery!.runCuts[0], w.trust);
+  const firstFee = (1_221_000n + 16n * BigInt(run.calldata.length)) * caps.maxFeePerGas;
+  assert.ok(firstFee < BigInt(first.recovery!.totalFee));
+  const secondSession = await RecoverySession.create(chain.gamma, unhex(second.burned!),
+    new RecoveryAuthority(w.trust, async () => undefined), TEST_PARAMS, deployment);
+  const secondRun = await secondSession.run(0, second.recovery!.runCuts[0], w.trust);
+  chain.coldCall = async (_vault, to) => eq(to, deployment.recovery)
+    ? [{ address: to, topics: secondRun.event.topics, data: secondRun.event.data }] : undefined;
+  w.bridge.cfg.erc20 = { token: new Uint8Array(20).fill(1), generation: deployment.salt, pins: deployment.pins };
+  const signer = w.signer.signTransaction.bind(w.signer);
+  let signed = 0;
+  w.signer.signTransaction = (request) => { signed++; return signer(request); };
+  await assert.rejects(recoverStep(w, first, { ...caps, feeBudget: firstFee }), /recovery payer balance or nonce changed before signing/);
+  assert.equal(signed, 0);
+  assert.equal((await recoverStep(w, second, caps)).state, 'checkpoint');
+  assert.equal(signed, 1);
+  await assert.rejects(recoverStep(w, first, caps), /outstanding ERC20 return/);
 });
 
 test('a peer payout keeps the legacy wallet packet reserved after it drops out of the mempool', async (t) => {

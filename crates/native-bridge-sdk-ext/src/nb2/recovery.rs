@@ -375,6 +375,7 @@ fn operations(
 }
 
 /// Identities from the authenticated deployment.
+#[derive(Clone)]
 pub struct RecoveryDeployment {
     pub salt: Hash,
     pub recovery: [u8; 20],
@@ -566,6 +567,10 @@ impl RecoverySession {
     }
     pub fn operation_count(&self) -> usize {
         self.ops.len()
+    }
+
+    pub fn redemption_id(&self) -> Hash {
+        self.verdict.eta
     }
 
     fn event(&self, kind: EventKind, data: Vec<u8>) -> RecoveryEvent {

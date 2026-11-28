@@ -409,6 +409,68 @@ test('a legacy claimant must leave a feasible full schedule for the earlier nonc
   }
 });
 
+test('finalized Run progress lets both eight-call legacy returns drain at caps 15 and 8', async () => {
+  const { x, bridge, held, store } = await heldPair();
+  const payer = x.payer.address;
+  const { chainId } = x.cfg;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const a = new Journal(store, key('partial later domain'));
+  const b = new Journal(store, key('partial earlier domain'));
+  const legacy = (journal: Journal, maxNonce: string) => ({
+    ...record, ...journal.base(), returnId: hex(key('partial ' + maxNonce)), status: 'burned' as const, executionPayer: hex(payer),
+    recovery: { ...record.recovery!, calls: '8', ordinary: undefined, envelope: { ...record.recovery!.envelope!, maxNonce } },
+  });
+  const later = legacy(a, '15');
+  const earlier = legacy(b, '8');
+  const checkpoints = [key('later checkpoint'), key('earlier checkpoint')];
+  for (const [index, journal, legacy] of [[0, a, later], [1, b, earlier]] as const) {
+    await journal.putReturn(legacy);
+    const raw = await signTx(x.payer, { chainId, nonce: BigInt(index), gas: 100_000n, maxFeePerGas: 10n,
+      maxPriorityFeePerGas: 1n, to: bytes(x.a.recovery), value: 0n, data: new Uint8Array() });
+    await journal.indexPayerSends(legacy, [raw.raw]);
+    await journal.indexRecoveryProgress(chainId, legacy, 1n, { blockNumber: BigInt(index + 20), blockHash: checkpoints[index] });
+  }
+  let finalizedNonce = 2n;
+  let finalizedHeight = 19n;
+  const claim = (journal: Journal, legacy: typeof later, signingNonce: bigint) => journal.checkReturnPayer(chainId, payer, legacy.returnId, true, {
+    mode: 'drain', signingNonce, finalizedNonce: async () => finalizedNonce,
+    finalizedBlock: async (number, hash) => number <= finalizedHeight && hex(hash) === hex(checkpoints[Number(number) - 20]),
+  });
+  await assert.rejects(claim(b, earlier, 2n), /remaining continuation schedule/);
+  finalizedHeight = 21n;
+  await assert.rejects(claim(a, later, 2n), /remaining continuation schedule/);
+  assert.equal((await claim(b, earlier, 2n)).calls, 7n);
+  for (let nonce = 3n; nonce <= 8n; nonce++) await claim(b, earlier, nonce);
+  await b.putReturn({ ...earlier, status: 'paid', paid: { txHash: hex(key('earlier settled')), blockNumber: '22' } });
+  finalizedNonce = 9n;
+  for (let nonce = 9n; nonce <= 15n; nonce++) await claim(a, later, nonce);
+});
+
+test('an ordinary claimant must authorize the full legacy suffix before reserving the payer', async () => {
+  const { x, bridge, held } = await heldPair();
+  const payer = x.payer.address;
+  const { record } = await bridge.planReturn(held, recipient, payer, { admission: { erc20Recovery: admissionFor(x) } });
+  const a = { ...record, status: 'burned' as const };
+  const b = { ...a, returnId: hex(key('second ordinary legacy return')) };
+  await bridge.journal.putReturn(a);
+  await bridge.journal.putReturn(b);
+  const request = { chainId: x.cfg.chainId, nonce: 1n, gas: 100_000n, maxFeePerGas: 10n,
+    maxPriorityFeePerGas: 1n, to: x.cfg.vault, value: 0n, data: new Uint8Array(68) };
+  let admitted = 0;
+  const admit = async () => { admitted++; };
+  const feeBudget = BigInt(a.recovery!.totalFee);
+  await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
+    admit, erc20Policy: { maxNonce: 255n, feeBudget: request.gas * request.maxFeePerGas },
+  }), /authorized payer fee budget/);
+  await assert.rejects(bridge['reserveOrdinaryPayer'](a, payer, request, {
+    admit, erc20Policy: { maxNonce: request.nonce, feeBudget },
+  }), /remaining continuation schedule/);
+  assert.equal(admitted, 0);
+  await bridge['reserveOrdinaryPayer'](b, payer, request, { admit, erc20Policy: { maxNonce: 255n, feeBudget } });
+  assert.equal(admitted, 1);
+  await assert.rejects(bridge.checkErc20Payer(a, payer), /outstanding ERC20 return/);
+});
+
 test('two SDK attempts can both decline without releasing the payer while either still owns it', async () => {
   const { x, bridge, owner, firstHeld, held, store } = await heldPair();
   const peer = await NativeBridgeV2.open({ ...x.options(), journal: store });

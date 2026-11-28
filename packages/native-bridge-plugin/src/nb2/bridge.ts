@@ -27,7 +27,7 @@ import { decodeSignedTx, replacementBid, signTx, type EvmSigner, type SignedTx, 
 import { bindHeader } from './header.js';
 import { MeasuredGasModel, createAddress, redeemTxFraming, type GasModel, type RedeemShape } from './gas.js';
 import {
-  Journal, dec, hex, undec, unhex, payerNonceLimit, type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
+  Journal, dec, hex, undec, unhex, payerNonceLimit, remainingRecoveryCalls, type PayerCommitments, type DepositRecord, type IntentsRecord, type JournalStore, type ReturnRecord, type SendRecord, type SplitRecord,
 } from './journal.js';
 import { recoveredSettlementEta, recoveryGeneration, type RecoveryDeployment } from './recovery.js';
 import { preflightRecovery, quoteErc20Call, quoteOrdinaryExecution, type Erc20SigningBounds, type OrdinaryCalibrationRange,
@@ -256,7 +256,9 @@ export interface RedeemOptions {
   recovery?: Uint8Array;
   envelope?: ReturnAdmission['ordinaryEnvelope'];
   archives?: readonly EvmReader[];
-  admit?: (request: TxRequest, prior: readonly SendRecord[]) => Promise<void>;
+  /** Current payer authorization for taking an exclusive legacy ERC20 slot. */
+  erc20Policy?: Pick<RecoveryLimits, 'maxNonce' | 'feeBudget'>;
+  admit?: (request: TxRequest, prior: readonly SendRecord[], remainingFee?: bigint) => Promise<void>;
 }
 
 export interface RedeemTx { returnId: Uint8Array; calldata: Uint8Array; gasLimit: bigint; P: bigint; endpoint: bigint; history: Uint8Array; eta: Uint8Array; claimedStart: bigint }
@@ -1283,6 +1285,7 @@ export class NativeBridgeV2 {
     send?: { nonce: bigint; remainingCalls: bigint; maxNonce?: bigint; beforeSigning?: (other: PayerCommitments) => Promise<void> }) {
     return this.journal.checkReturnPayer(this.cfg.chainId, payer, record.returnId, reserve, {
       mode: record.status === 'planned' ? 'admit' : 'drain', finalizedNonce: () => this.evm.nonce(payer, 'finalized'), fence,
+      finalizedBlock: (number, hash) => this.evm.isFinalizedBlock(number, hash),
       signingNonce: send?.nonce, remainingCalls: send?.remainingCalls, maxNonce: send?.maxNonce, beforeSigning: send?.beforeSigning,
     });
   }
@@ -1640,6 +1643,7 @@ export class NativeBridgeV2 {
    */
   public submitRedeem(returnId: Uint8Array, signer: EvmSigner, options: RedeemOptions = {}): Promise<ReconcileResult> {
     returnId = Uint8Array.from(returnId);
+    if (options.erc20Policy) options = { ...options, erc20Policy: { ...options.erc20Policy } };
     return this.locked(`return/${toHex(returnId)}`, () => this.submitRedeemInner(returnId, signer, options));
   }
 
@@ -1685,18 +1689,9 @@ export class NativeBridgeV2 {
               }) || request.maxFeePerGas > undec(ordinary.maxFeePerGas) || !options.admit) {
               fail('CapacityPreflight', 'ordinary attempt exceeds its signing reserve');
             }
-          }
-          await options.admit?.(request, fresh.sends);
-          if (this.cfg.erc20) {
-            const spent = new Set(fresh.sends.map((send) => undec(send.nonce)).filter((nonce) => nonce < request.nonce));
-            const remainingCalls = undec(fresh.recovery!.calls) - BigInt(spent.size);
-            await this.checkErc20Payer(fresh, signer.address, true, undefined, {
-              nonce: request.nonce, remainingCalls, beforeSigning: async (other) => {
-                if (request.gas * request.maxFeePerGas > await this.freeErc20PayerBalance(signer.address, other)) {
-                  fail('CapacityPreflight', 'ordinary attempt exceeds the remaining payer balance');
-                }
-              },
-            });
+            await this.reserveOrdinaryPayer(fresh, signer.address, request, options);
+          } else {
+            await options.admit?.(request, fresh.sends);
           }
         }, expired && {
           nonce: expired.nonce, pooled, candidates: fresh.sends.filter((send) => undec(send.nonce) === expired!.nonce)
@@ -1737,6 +1732,46 @@ export class NativeBridgeV2 {
       throw e === null ? new Nb2Error('PayoutFailed', detail) : redeemRefusal(e, detail);
     }
     return { state: 'not-paid' };
+  }
+
+  private async reserveOrdinaryPayer(record: ReturnRecord, payer: Uint8Array, request: TxRequest, options: RedeemOptions): Promise<void> {
+    const plan = record.recovery!;
+    const ordinary = plan.ordinary!;
+    const used = new Map<bigint, bigint>();
+    if (record.sends.length) {
+      const finalized = await this.evm.nonce(payer, 'finalized');
+      for (const send of record.sends) {
+        const tx = decodeSignedTx(unhex(send.raw));
+        const { nonce, gas, maxFeePerGas, chainId } = tx.request;
+        if (!eq(tx.from, payer) || chainId !== request.chainId || nonce >= finalized || nonce >= request.nonce) continue;
+        const fee = gas * maxFeePerGas;
+        if (fee > (used.get(nonce) ?? 0n)) used.set(nonce, fee);
+      }
+    }
+    const spentCalls = BigInt(used.size);
+    await this.checkErc20Payer(record, payer, true, undefined, {
+      nonce: request.nonce, maxNonce: options.erc20Policy?.maxNonce, remainingCalls: remainingRecoveryCalls(plan, 0n, spentCalls),
+      beforeSigning: async (other) => {
+        const packet = request.gas * request.maxFeePerGas;
+        let needed = packet;
+        if (other.contestedDrain) {
+          const authorization = options.erc20Policy;
+          const attempts = undec(ordinary.attemptsBeforeFallback);
+          const consumed = spentCalls < attempts ? spentCalls : attempts;
+          const suffix = undec(plan.totalFee) - consumed * undec(ordinary.gas) * undec(ordinary.maxFeePerGas);
+          if (suffix > needed) needed = suffix;
+          let spent = 0n;
+          for (const fee of used.values()) spent += fee;
+          if (!authorization || needed + spent > authorization.feeBudget) {
+            fail('CapacityPreflight', 'remaining continuation schedule exceeds the authorized payer fee budget');
+          }
+        }
+        if (needed > await this.freeErc20PayerBalance(payer, other)) {
+          fail('CapacityPreflight', 'remaining continuation schedule exceeds the free payer balance');
+        }
+        await options.admit!(request, record.sends, other.contestedDrain ? needed : undefined);
+      },
+    });
   }
 
   /**

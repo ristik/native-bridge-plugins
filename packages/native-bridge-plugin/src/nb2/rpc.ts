@@ -338,6 +338,14 @@ export class EvmReader {
     return { header, hash: HE(encodeHeader(header)) };
   }
 
+  /** Only the exact certified block at or below the execution finality boundary can discharge work. */
+  public async isFinalizedBlock(number: bigint, hash: Uint8Array): Promise<boolean> {
+    const finalized = await this.rpc.call<{ number: string } | null>('eth_getBlockByNumber', ['finalized', false]);
+    if (!finalized || qtyOf(finalized.number, 'finalized block number') < number) return false;
+    const block = await this.headerByNumber(number);
+    return block !== null && block.header.number === number && eq(block.hash, hash);
+  }
+
   /**
    * The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child does not
    * exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.

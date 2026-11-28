@@ -313,18 +313,24 @@ export function quoteRunCut(spans: readonly RecoveryRunSpan[], from: number, end
 
 /** Price each remaining scheduled run at the same bounds used at admission. */
 export function checkRemainingRecoveryRuns(held: Uint8Array, cuts: readonly number[], confirmedCuts: number,
-  calibration: RecoveryCalibration, limits: RecoveryLimits, erc20 = false): void {
+  calibration: RecoveryCalibration, limits: RecoveryLimits, erc20 = false): bigint {
   const { operations, quoted } = prospectiveRunQuotes(Uint8Array.from(held), calibration, limits, erc20);
+  let fee = 0n;
   let from = 0;
   for (const [index, count] of cuts.entries()) {
     const end = from + count;
     if (!Number.isSafeInteger(count) || count < 1 || count > 16 || end > operations) {
       fail('CapacityPreflight', 'invalid portable run cut');
     }
-    if (index >= confirmedCuts && quoted(from, end) === null) fail('CapacityPreflight', 'portable run cut is outside the release limits');
+    if (index >= confirmedCuts) {
+      const quote = quoted(from, end);
+      if (!quote) fail('CapacityPreflight', 'portable run cut is outside the release limits');
+      fee += quote.fee;
+    }
     from = end;
   }
   if (from !== operations) fail('CapacityPreflight', 'portable run cuts do not cover the lineage');
+  return fee;
 }
 
 export function scheduleRecoveryRuns(operations: number, quote: (from: number, end: number) => RecoveryQuote | null): RecoveryQuote[] {

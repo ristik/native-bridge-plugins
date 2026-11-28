@@ -509,6 +509,20 @@ impl<R: JsonRpc + ?Sized> EvmReader<R> {
         Ok(Some((header, hash)))
     }
 
+    pub fn is_finalized_block(&self, number: u64, hash: &[u8; 32]) -> Result<bool> {
+        let block = call(
+            &*self.rpc,
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+        )?;
+        if block.is_null() || qty64(&block["number"], "finalized block number")? < number {
+            return Ok(false);
+        }
+        Ok(self
+            .header_by_number(number)?
+            .is_some_and(|(header, canonical)| header.number_u64() == number && canonical == *hash))
+    }
+
     /// The certificate of block N: witness 0 of the companion of its child N+1 (section 12.7). Not yet served while the child
     /// does not exist (`CompanionUnknown`, retry after a round); `EvidencePruned` below the node's horizon.
     pub fn certificate_of(&self, header: &Header, hash: &[u8]) -> Result<Vec<u8>> {

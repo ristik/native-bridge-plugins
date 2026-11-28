@@ -46,7 +46,9 @@ use super::gas::{
     create_address, redeem_tx_framing, DeploymentCode, GasModel, MeasuredGasModel, RedeemShape,
 };
 use super::journal::*;
-use super::recovery::RecoveryDeployment;
+use super::recovery::{
+    GapCursor, GapEntry, GapPredecessor, RecoveryAuthority, RecoveryDeployment, RecoverySession,
+};
 use super::recovery_cost::{
     preflight_recovery_with_signing_bounds, quote_erc20_call, AdmissionContext, Erc20OrdinaryBound,
     Erc20SigningBounds, RecoveryBacklog, RecoveryCalibration, RecoveryLimits,
@@ -120,6 +122,12 @@ pub struct Erc20ReturnRecovery {
     pub signing_bounds: Erc20SigningBounds,
     /// Maximum mined ordinary attempts before fallback and maximum time per attempt in milliseconds.
     pub ordinary_attempts: Option<(u64, u64)>,
+}
+
+/// A continuation receipt and, for an Advance, the certified segment exclusion witnesses.
+pub struct Erc20RecoveryCheckpoint<'a> {
+    pub receipt: &'a [u8],
+    pub gaps: &'a [Vec<u8>],
 }
 
 /// The bridge's inputs.
@@ -2060,30 +2068,16 @@ impl NativeBridgeV2 {
         payer: &[u8],
         ordinary: Option<PreflightResult>,
     ) -> Result<bool> {
-        let Some(erc20) = &self.cfg.erc20 else {
+        if self.cfg.erc20.is_none() {
             return Ok(ordinary.is_some());
-        };
-        let (Some(quote), Some(pins)) = (&self.erc20_return_recovery, &self.pins.erc20) else {
+        }
+        let Some(quote) = &self.erc20_return_recovery else {
             return fail_d(
                 Rule::CapacityPreflight,
                 "a bounded ERC20 continuation quote is required",
             );
         };
-        let recovery = erc20_create2(
-            &pins.factory,
-            &he(&[&address_word(&erc20.token)]),
-            &pins.recovery_initcode_hash,
-        );
-        if quote.deployment.recovery != recovery
-            || quote.deployment.vault_runtime_hash != Some(self.pins.vault_runtime_code_hash)
-            || he(&[&self.evm.code(&recovery)?]) != quote.deployment.runtime_hash
-        {
-            return fail_d(
-                Rule::CapacityPreflight,
-                "continuation calibration differs from the deployed graph",
-            );
-        }
-        self.verify_recovery_dependencies(&recovery)?;
+        self.verify_erc20_recovery_deployment(&quote.deployment)?;
         self.check_erc20_bid(&quote.limits)?;
         let mut limits = quote.limits.clone();
         limits.signed_bytes = limits
@@ -2170,6 +2164,30 @@ impl NativeBridgeV2 {
         }
         record.extra.insert("recovery".into(), schedule);
         Ok(offered)
+    }
+
+    fn verify_erc20_recovery_deployment(&self, deployment: &RecoveryDeployment) -> Result<()> {
+        let (Some(erc20), Some(pins)) = (&self.cfg.erc20, &self.pins.erc20) else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "a pinned ERC20 deployment is required",
+            );
+        };
+        let recovery = erc20_create2(
+            &pins.factory,
+            &he(&[&address_word(&erc20.token)]),
+            &pins.recovery_initcode_hash,
+        );
+        if deployment.recovery != recovery
+            || deployment.vault_runtime_hash != Some(self.pins.vault_runtime_code_hash)
+            || he(&[&self.evm.code(&recovery)?]) != deployment.runtime_hash
+        {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation calibration differs from the deployed graph",
+            );
+        }
+        self.verify_recovery_dependencies(&recovery)
     }
 
     fn verify_recovery_dependencies(&self, recovery: &[u8; 20]) -> Result<()> {
@@ -2888,6 +2906,128 @@ impl NativeBridgeV2 {
         )
     }
 
+    /// Replay the admitted recovery prefix and publish it for wallets sharing this payer store.
+    pub fn index_erc20_recovery_progress(
+        &self,
+        return_id: &[u8; 32],
+        checkpoints: &[Erc20RecoveryCheckpoint<'_>],
+    ) -> Result<()> {
+        let Some(policy) = &self.erc20_return_recovery else {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "continuation lacks an authenticated ERC20 release",
+            );
+        };
+        self.verify_erc20_recovery_deployment(&policy.deployment)?;
+        let Some(record) = self
+            .journal
+            .ret(&hex(return_id))?
+            .filter(|r| r.burned.is_some())
+        else {
+            return refuse(
+                WalletReason::NotPending,
+                "continuation needs a certified return",
+            );
+        };
+        let plan = &record.extra["recovery"];
+        let generation = hex(&super::recovery::recovery_generation(
+            &policy.deployment.salt,
+            &self.domain,
+        ));
+        if plan["generation"].as_str() != Some(&generation) {
+            return refuse(
+                WalletReason::BadDeployment,
+                "continuation belongs to another generation",
+            );
+        }
+        let cuts = plan["runCuts"]
+            .as_array()
+            .ok_or_else(|| Error::Other("missing admitted Run cuts".into()))?;
+        let batch = plan["advanceGaps"].as_u64().unwrap_or(0);
+        let burned = unhex(record.burned.as_deref().unwrap_or(""))?;
+        let eta = unhex_n::<32>(record.eta.as_deref().unwrap_or(""))?;
+        let receipts = self.retrying_trust(|trust| {
+            let session = RecoverySession::create(
+                &self.pins.gamma,
+                &evidence_of(&burned),
+                RecoveryAuthority::new(trust.clone(), |_| Ok(())),
+                &build_params(self.pins.build),
+                policy.deployment.clone(),
+            )?;
+            if session.redemption_id() != eta {
+                return refuse(
+                    WalletReason::BadInput,
+                    "continuation session has the wrong redemption ID",
+                );
+            }
+            let mut from = 0;
+            let mut prior = None;
+            let mut cursor: Option<GapCursor> = None;
+            let mut verified = Vec::new();
+            for (index, checkpoint) in checkpoints.iter().enumerate() {
+                let event = if let Some(cut) = cuts.get(index) {
+                    if !checkpoint.gaps.is_empty() {
+                        return fail_d(Rule::CapacityPreflight, "Run checkpoint has gap witnesses");
+                    }
+                    let count = cut
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(0);
+                    let packet = session.run(from, count, trust, prior)?;
+                    from = packet.end;
+                    packet.event
+                } else {
+                    let Some((seq, receipt)) = prior.filter(|_| from == session.operation_count())
+                    else {
+                        return fail_d(
+                            Rule::CapacityPreflight,
+                            "Advance requires the completed Run schedule",
+                        );
+                    };
+                    if batch == 0 || checkpoint.gaps.len() as u64 != batch {
+                        return fail_d(
+                            Rule::CapacityPreflight,
+                            "Advance must cover the admitted gap batch",
+                        );
+                    }
+                    let start = if cursor.is_none() {
+                        Some(unhex_n(&record.start_head)?)
+                    } else {
+                        None
+                    };
+                    let packet = session.gaps(
+                        GapEntry::Advance,
+                        trust,
+                        &GapPredecessor {
+                            seq,
+                            receipt,
+                            cursor: cursor.take(),
+                        },
+                        checkpoint.gaps,
+                        start,
+                    )?;
+                    cursor = Some(GapCursor {
+                        next: packet.next,
+                        head: packet.head.expect("Advance has an endpoint"),
+                    });
+                    packet.event.expect("Advance has a checkpoint")
+                };
+                verified.push(session.verify_event(trust, checkpoint.receipt, &event)?);
+                prior = Some((index as u64 + 1, checkpoint.receipt));
+            }
+            Ok(verified)
+        })?;
+        for (index, receipt) in receipts.iter().enumerate() {
+            self.journal.index_recovery_progress(
+                self.cfg.chain_id,
+                &record,
+                index as u64 + 1,
+                receipt,
+            )?;
+        }
+        Ok(())
+    }
+
     fn sign_redeem_tx(
         &self,
         record: &ReturnRecord,
@@ -2900,15 +3040,29 @@ impl NativeBridgeV2 {
         let Some(policy) = &self.erc20_return_recovery else {
             return fail_d(Rule::CapacityPreflight, "ordinary route lacks payer limits");
         };
-        let mut spent = std::collections::BTreeSet::new();
-        for send in &record.sends {
-            let nonce = undec64(&send.nonce)?;
-            if nonce < request.nonce {
-                spent.insert(nonce);
+        let payer = signer.address();
+        let mut used = std::collections::BTreeMap::<u64, BigUint>::new();
+        if !record.sends.is_empty() {
+            let finalized = self.evm.nonce(&payer, "finalized")?;
+            for send in &record.sends {
+                let tx = decode_signed_tx(&unhex(&send.raw)?).map_err(Error::Other)?;
+                let nonce = tx.request.nonce;
+                if tx.from != payer
+                    || tx.request.chain_id != request.chain_id
+                    || nonce >= finalized
+                    || nonce >= request.nonce
+                {
+                    continue;
+                }
+                let fee = BigUint::from(tx.request.gas) * tx.request.max_fee_per_gas;
+                let reserved = used.entry(nonce).or_default();
+                if fee > *reserved {
+                    *reserved = fee;
+                }
             }
         }
-        let calls = undec64(record.extra["recovery"]["calls"].as_str().unwrap_or(""))?;
-        let payer = signer.address();
+        let spent_calls = used.len() as u64;
+        let spent_fee = used.values().sum();
         self.journal.check_payer(
             self.cfg.chain_id,
             &payer,
@@ -2917,11 +3071,23 @@ impl NativeBridgeV2 {
             &PayerCheck {
                 drain: true,
                 finalized_nonce: Some(&|| self.evm.nonce(&payer, "finalized")),
+                finalized_block: Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
                 signing_nonce: Some(request.nonce),
-                remaining_calls: Some(calls.saturating_sub(spent.len() as u64)),
+                remaining_calls: Some(remaining_recovery_calls(
+                    &record.extra["recovery"],
+                    0,
+                    spent_calls,
+                )?),
                 max_nonce: Some(policy.limits.max_nonce),
                 before_signing: Some(&|other| {
-                    self.check_erc20_ordinary_attempt(record, &payer, request, other)
+                    self.check_erc20_ordinary_attempt(
+                        record,
+                        &payer,
+                        request,
+                        other,
+                        spent_calls,
+                        &spent_fee,
+                    )
                 }),
                 ..Default::default()
             },
@@ -2937,6 +3103,8 @@ impl NativeBridgeV2 {
         payer: &[u8; 20],
         request: &TxRequest,
         other: &PayerCommitments,
+        spent_calls: u64,
+        spent_fee: &BigUint,
     ) -> Result<()> {
         if self.cfg.erc20.is_none() {
             return Ok(());
@@ -2992,11 +3160,33 @@ impl NativeBridgeV2 {
             || request.max_priority_fee_per_gas > limits.max_priority_fee_per_gas
             || fee > limits.fee_budget
             || fee > limits.balance
-            || fee > self.erc20_free_balance(payer, other)?
         {
             return fail_d(
                 Rule::CapacityPreflight,
                 "ordinary attempt exceeds its signing reserve",
+            );
+        }
+        let mut required = fee;
+        if other.contested_drain {
+            let total = undec(record.extra["recovery"]["totalFee"].as_str().unwrap_or(""))?;
+            let consumed =
+                BigUint::from(spent_calls.min(undec64(field("attemptsBeforeFallback"))?))
+                    * undec(field("gas"))?
+                    * undec(field("maxFeePerGas"))?;
+            if total > consumed {
+                required = required.max(total - consumed);
+            }
+            if &required + spent_fee > limits.fee_budget {
+                return fail_d(
+                    Rule::CapacityPreflight,
+                    "remaining continuation schedule exceeds the authorized payer fee budget",
+                );
+            }
+        }
+        if required > limits.balance || required > self.erc20_free_balance(payer, other)? {
+            return fail_d(
+                Rule::CapacityPreflight,
+                "remaining continuation schedule exceeds the free payer balance",
             );
         }
         Ok(())
@@ -3017,6 +3207,7 @@ impl NativeBridgeV2 {
             &PayerCheck {
                 drain: record.status != "planned",
                 finalized_nonce: Some(&|| self.evm.nonce(payer, "finalized")),
+                finalized_block: Some(&|number, hash| self.evm.is_finalized_block(number, hash)),
                 fence,
                 ..Default::default()
             },
