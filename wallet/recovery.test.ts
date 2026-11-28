@@ -110,6 +110,36 @@ async function setup(t: TestContext, includeOrdinaryRange = false) {
   return { w, open, root, cfg, chain, deployment, aggregator, dir, rpc, rpcOn, views, manifest };
 }
 
+async function sealTestSegments(chain: FakeChain, payer: Wallet, count: number, oversizedIndex?: bigint) {
+  const cfg = payer.bridge.cfg;
+  const owner = firstOwnerOf(payer.owner(0).publicKey);
+  const marker = new Uint8Array(20).fill(0x62);
+  const previous = chain.coldCall;
+  chain.fund(payer.signer.address, 10n ** 18n);
+  chain.coldCall = async (vault, to, data) => {
+    if (!eq(to, marker)) return previous?.(vault, to, data);
+    const index = vault.c;
+    for (let i = 0n; i < cfg.K; i++) {
+      const id = HE(u256(index * cfg.K + i + 1n));
+      vault.deposit(1n, owner, id);
+      vault.redeem(id, index, new Uint8Array(), { ret: verdictAbi({
+        domain: chain.domain, eta: id, minSegment: index, asset: cfg.asset, recipient: payer.signer.address, amount: 1n,
+      }) });
+    }
+    return index === oversizedIndex ? [{ address: marker, topics: [], data: new Uint8Array(LIMITS.receiptLeafNodeBytes) }] : [];
+  };
+  try {
+    for (let i = 0; i < count; i++) {
+      const nonce = await payer.bridge.evm.nonce(payer.signer.address);
+      const tx = await signTx(payer.signer, { chainId: cfg.chainId, nonce, maxFeePerGas: 15n,
+        maxPriorityFeePerGas: 1n, gas: 1_000_000n, to: marker, value: 0n, data: new Uint8Array() });
+      await payer.bridge.evm.sendRaw(tx.raw);
+    }
+  } finally {
+    chain.coldCall = previous;
+  }
+}
+
 test('a deposit with an oversized certified receipt cannot mint offline', async (t) => {
   const { w, chain, cfg, aggregator } = await setup(t);
   const plan = await planDeposit(w, 'wide-deposit', 1n);
@@ -151,27 +181,7 @@ for (const oversizedIndex of [0, 2]) test(`continuation authenticates the whole 
   assert.ok('txHash' in checkpoint);
   const completion = await recoveryRpcSource(w.bridge.evm, checkpoint.txHash)(deployment.recovery, complete.event);
 
-  const producer = await open('shared-seal-producer');
-  chain.fund(producer.signer.address, 10n ** 18n);
-  const owner = firstOwnerOf(w.owner(0).publicKey);
-  const marker = new Uint8Array(20).fill(0x62);
-  chain.coldCall = async (vault, to) => {
-    if (!eq(to, marker)) return;
-    const index = vault.c;
-    for (let i = 0n; i < cfg.K; i++) {
-      const id = HE(u256(index * cfg.K + i + 1n));
-      vault.deposit(1n, owner, id);
-      vault.redeem(id, index, new Uint8Array(), { ret: verdictAbi({
-        ...verdict, eta: id, minSegment: index, recipient: producer.signer.address, amount: 1n,
-      }) });
-    }
-    return index === BigInt(oversizedIndex) ? [{ address: marker, topics: [], data: new Uint8Array(LIMITS.receiptLeafNodeBytes) }] : [];
-  };
-  for (let i = 0; i < 3; i++) {
-    const tx = await signTx(producer.signer, { chainId: cfg.chainId, nonce: BigInt(i), maxFeePerGas: 15n,
-      maxPriorityFeePerGas: 1n, gas: 1_000_000n, to: marker, value: 0n, data: new Uint8Array() });
-    await producer.bridge.evm.sendRaw(tx.raw);
-  }
+  await sealTestSegments(chain, await open('shared-seal-producer'), 3, BigInt(oversizedIndex));
   assert.equal(chain.vault.c, 3n);
   const before = unhex(rec.startHead);
   const seals = await w.bridge.evm.segmentLogs(cfg.vault, BigInt(rec.fromBlock), 0n, 3n);
@@ -254,7 +264,7 @@ test('refused preflight never certifies a spend, and receive verifies the full p
 });
 
 test('Run replay consumes signed arrivals and preserves the other return’s payer reserve', async (t) => {
-  const { w, chain, deployment, cfg } = await setup(t);
+  const { w, open, chain, deployment, cfg } = await setup(t);
   const raw = w.release.recovery as { ranges: { max: { entry: string; operations: number; gaps: number } }[]; backlog: Record<string, string> };
   raw.ranges = raw.ranges.filter(({ max }) => max.entry === 'run' ? max.operations === 1 : max.gaps <= 3);
   Object.assign(raw.backlog, { duringProgress: '2', advancePeakSeals: '1', qualifiedForMs: '33025' });
@@ -309,7 +319,9 @@ test('Run replay consumes signed arrivals and preserves the other return’s pay
   chain.fund(w.signer.address, 10n ** 18n);
   segment = 3n;
   await assert.rejects(recoverStep(w, rec, caps), /observed arrivals exceed the admitted Run endpoint/);
-  segment = 2n;
+  w.bridge.evm.vaultState = state;
+  // The admitted two arrivals now need real, certified archived segments.
+  await sealTestSegments(chain, await open('run-replay-seal-producer'), 2);
   assert.equal((await recoverStep(w, rec, caps)).state, 'checkpoint');
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).cuts.length, 2);
 
