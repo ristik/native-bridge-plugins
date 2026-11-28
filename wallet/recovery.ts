@@ -772,8 +772,10 @@ function definitiveArchiveError(e: unknown): boolean {
   return e instanceof WalletError && (e.reason === 'AlreadyPaid' || e.reason === 'TrustInput');
 }
 
+type CertifiedExecutionHead = Awaited<ReturnType<EvmReader['certifiedExecutionHead']>>;
+
 /** Retain the newest certified execution anchor for this deployment, even if its proof is unavailable. */
-function retainCheckpointAnchor(w: Wallet, block: { header: { number: bigint }; hash: Uint8Array }): void {
+function retainCheckpointAnchor(w: Wallet, block: CertifiedExecutionHead, candidates: readonly CertifiedExecutionHead[]): void {
   const path = join(w.dir, `checkpoint-anchor-${hx(w.bridge.domain).slice(2)}.json`);
   const { number } = block.header;
   if (existsSync(path)) {
@@ -781,10 +783,10 @@ function retainCheckpointAnchor(w: Wallet, block: { header: { number: bigint }; 
     const height = uint(previous.height);
     const hash = bytes(previous.hash, 32);
     if (number < height) throw new WalletError('EvidenceMissing', `certified execution head is behind the retained checkpoint anchor at block ${height}`);
-    if (number === height) {
-      if (!eq(block.hash, hash)) throw new WalletError('ProviderFault', 'conflicting certified execution heads at the retained checkpoint anchor');
-      return;
+    if (candidates.some((candidate) => candidate.header.number === height && !eq(candidate.hash, hash))) {
+      throw new WalletError('ProviderFault', 'conflicting certified execution heads at the retained checkpoint anchor');
     }
+    if (number === height) return;
   }
   writeDurable(path, JSON.stringify({ height: String(number), hash: hx(block.hash) }));
 }
@@ -793,7 +795,8 @@ function retainCheckpointAnchor(w: Wallet, block: { header: { number: bigint }; 
 async function checkpointHistory(w: Wallet, rec: ReturnRecord, session: RecoverySession, archive: readonly EvmReader[],
   start: bigint, head: Uint8Array, limit: number) {
   const cfg = w.bridge.cfg;
-  let block: Awaited<ReturnType<EvmReader['certifiedExecutionHead']>> | undefined;
+  const candidates: CertifiedExecutionHead[] = [];
+  let block: CertifiedExecutionHead | undefined;
   let failed: unknown;
   for (const reader of archive) {
     let candidate;
@@ -807,10 +810,11 @@ async function checkpointHistory(w: Wallet, rec: ReturnRecord, session: Recovery
     if (block?.header.number === candidate.header.number && !eq(block.hash, candidate.hash)) {
       throw new WalletError('ProviderFault', 'conflicting certified execution heads');
     }
+    candidates.push(candidate);
     if (!block || candidate.header.number > block.header.number) block = candidate;
   }
   if (!block) throw failed ?? new WalletError('EvidenceMissing', 'no certified execution head for checkpoint preflight');
-  retainCheckpointAnchor(w, block);
+  retainCheckpointAnchor(w, block, candidates);
   let anchor: CertifiedVaultHead | undefined;
   for (const reader of archive) {
     try {

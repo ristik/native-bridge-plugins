@@ -357,6 +357,47 @@ test('reopen refuses an older certified checkpoint anchor before signing or broa
   assert.equal(send.mock.callCount(), 0);
 });
 
+for (const conflictFirst of [true, false]) test(`reopen refuses a retained checkpoint conflict from the ${conflictFirst ? 'first' : 'second'} reader despite a newer head`, async (t) => {
+  const { w, open, chain, rpc, rpcOn } = await setup(t);
+  await burn(w, 'coin', undefined, undefined, caps);
+  const rec = await w.returnRecord('coin');
+  const fork = chain.fork();
+  await sealTestSegments(chain, await open('anchor-seal-producer'), 1);
+  const retained = await w.bridge.evm.certifiedExecutionHead(w.bridge.cfg, w.trust);
+  const unavailable = t.mock.method(w.bridge.evm, 'vaultHeadAt', async () => { throw new Error('proof unavailable'); });
+  await assert.rejects(recoverStep(w, rec, caps), /proof unavailable/);
+  unavailable.mock.restore();
+
+  const path = join(w.dir, `checkpoint-anchor-${hx(w.bridge.domain).slice(2)}.json`);
+  const saved = readFileSync(path, 'utf8');
+  assert.deepEqual(JSON.parse(saved), { height: String(retained.header.number), hash: hx(retained.hash) });
+  while (BigInt(fork.blocks.length) <= retained.header.number + 1n) await fork.mine([]);
+  const forkRpc = rpcOn(fork);
+  const conflict = await new EvmReader(forkRpc).certifiedExecutionHead(w.bridge.cfg, w.trust);
+  assert.equal(conflict.header.number, retained.header.number);
+  assert.notDeepEqual(conflict.hash, retained.hash);
+  await chain.mine([]);
+  const newer = await w.bridge.evm.certifiedExecutionHead(w.bridge.cfg, w.trust);
+  assert.ok(newer.header.number > retained.header.number);
+
+  const reopened = await open('holder', conflictFirst ? forkRpc : rpc);
+  const alternate = conflictFirst ? rpc : forkRpc;
+  const fetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: string, opts: RequestInit) => {
+    if (url !== 'http://archive.invalid') return fetch(url, opts);
+    const body = JSON.parse(String(opts.body));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: await alternate.call(body.method, body.params) }));
+  });
+  const sign = t.mock.method(reopened.signer, 'signTransaction');
+  const send = t.mock.method(reopened.bridge.evm, 'sendRaw');
+  await assert.rejects(recoverStep(reopened, rec, { ...caps, archives: ['http://archive.invalid'] }), {
+    reason: 'ProviderFault', message: /conflicting certified execution heads at the retained checkpoint anchor/,
+  });
+  assert.equal(readFileSync(path, 'utf8'), saved);
+  assert.equal(sign.mock.callCount(), 0);
+  assert.equal(send.mock.callCount(), 0);
+});
+
 test('Run uses the certified endpoint when the unsigned vault read omits an oversized seal', async (t) => {
   const { w, open, chain, cfg } = await setup(t);
   await burn(w, 'coin', undefined, undefined, caps);
